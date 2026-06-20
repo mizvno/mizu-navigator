@@ -1,0 +1,438 @@
+﻿#![forbid(unsafe_code)]
+
+use crate::core::errors::MizuError;
+use crate::core::types::{Value, VariableStore};
+use crate::parser::{MizuDimension, MizuNode, MizuOverflow, Primitive, StyleRules};
+use crate::render::image_codec::AssetSlot;
+use ego_tree::{NodeId as EgoNodeId, NodeRef, Tree};
+use std::collections::HashMap;
+use taffy::{
+    TaffyTree,
+    geometry::Size,
+    style::{Overflow, Style},
+};
+
+
+/// Mapping from template DOM node IDs to their per-iteration synthetic Taffy
+/// node IDs.  `paint_each` installs this as a temporary override so that
+/// `paint_node` reads Taffy-computed coordinates from the expanded tree
+/// rather than from the stale single-template node.
+pub type EachIterationOverrides = HashMap<EgoNodeId, taffy::prelude::NodeId>;
+
+/// One entry per list element: `(row_container_taffy_id, override_map)`.
+pub type EachGroupEntries = Vec<(taffy::prelude::NodeId, EachIterationOverrides)>;
+
+/// All synthetic Taffy nodes produced during one [`expand_each_nodes`] call.
+///
+/// Stored in `MizuWindowManager` and rebuilt every time `resize_viewport` runs
+/// so that changes to a list variable are reflected in layout on the next frame.
+#[derive(Default)]
+pub struct EachExpansion {
+    /// `each_dom_id → [(row_taffy_id, {template_dom_id → synth_taffy_id})]`
+    pub groups: HashMap<EgoNodeId, EachGroupEntries>,
+    /// Snapshot of the original Taffy children of each `Each` node, taken
+    /// before expansion.  Used to restore the tree before re-expanding.
+    pub original_children: HashMap<EgoNodeId, Vec<taffy::prelude::NodeId>>,
+    /// Every synthetic Taffy node created, collected for bulk removal on the
+    /// next call (prevents arena growth on each frame).
+    pub all_synthetic_ids: Vec<taffy::prelude::NodeId>,
+}
+
+
+/// Expands every `Each` node in the DOM into N synthetic Taffy subtrees
+/// (one per list element) so that `taffy.compute_layout` sees the full
+/// N-row tree and produces correct per-item positions.
+///
+/// **Must** be called before `compute_layout` / `compute_layout_with_measure`
+/// so that Taffy computes the expanded positions.
+///
+/// `prev` is the expansion from the previous frame; its synthetic nodes are
+/// restored / removed before the new expansion is built.
+pub fn expand_each_nodes(
+    dom: &Tree<MizuNode>,
+    store: &VariableStore,
+    taffy: &mut TaffyTree<EgoNodeId>,
+    node_to_taffy_id: &HashMap<EgoNodeId, taffy::prelude::NodeId>,
+    prev: &EachExpansion,
+) -> Result<EachExpansion, MizuError> {
+    // ── Step 1: restore the previous expansion ────────────────────────────
+    // Put the original template nodes back as Each's Taffy children, then
+    // free every synthetic node from the arena.
+    for (&each_dom_id, orig_children) in &prev.original_children {
+        if let Some(&each_taffy_id) = node_to_taffy_id.get(&each_dom_id) {
+            let _ = taffy.set_children(each_taffy_id, orig_children);
+        }
+    }
+    for &synth_id in &prev.all_synthetic_ids {
+        let _ = taffy.remove(synth_id);
+    }
+
+    // ── Step 2: build the new expansion ───────────────────────────────────
+    let mut expansion = EachExpansion::default();
+
+    // Collect Each-node metadata without holding tree borrows.
+    let each_nodes: Vec<(EgoNodeId, String)> = dom
+        .nodes()
+        .filter_map(|node_ref| {
+            let v = node_ref.value();
+            if v.primitive != Primitive::Each {
+                return None;
+            }
+            let (_, list_name) = v.iterator_context.as_ref()?;
+            Some((node_ref.id(), list_name.clone()))
+        })
+        .collect();
+
+    for (each_dom_id, list_name) in each_nodes {
+        let n = match store.get(&list_name).ok() {
+            Some(Value::List(arc)) => arc.len(),
+            _ => continue, // list not yet in store — leave this Each as-is
+        };
+        if n == 0 {
+            continue;
+        }
+
+        let each_taffy_id = match node_to_taffy_id.get(&each_dom_id) {
+            Some(&id) => id,
+            None => continue,
+        };
+
+        // DOM children of this Each are the template nodes.
+        let template_dom_children: Vec<EgoNodeId> = dom
+            .get(each_dom_id)
+            .map(|n| n.children().map(|c| c.id()).collect())
+            .unwrap_or_default();
+
+        if template_dom_children.is_empty() {
+            continue;
+        }
+
+        // Save the original Taffy children for restoration next frame.
+        let orig_taffy_children: Vec<taffy::prelude::NodeId> = template_dom_children
+            .iter()
+            .filter_map(|dom_id| node_to_taffy_id.get(dom_id).copied())
+            .collect();
+        expansion
+            .original_children
+            .insert(each_dom_id, orig_taffy_children);
+
+        // Build N iteration groups, each containing a clone of the template subtree.
+        let mut groups: EachGroupEntries = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let mut overrides: EachIterationOverrides = HashMap::new();
+            let mut row_children: Vec<taffy::prelude::NodeId> = Vec::new();
+
+            for &tmpl_dom_id in &template_dom_children {
+                if let Some(tmpl_node) = dom.get(tmpl_dom_id) {
+                    let synth_id = clone_taffy_subtree(
+                        tmpl_node,
+                        taffy,
+                        node_to_taffy_id,
+                        &mut overrides,
+                        &mut expansion.all_synthetic_ids,
+                    )?;
+                    row_children.push(synth_id);
+                }
+            }
+
+            // Row container: a transparent, non-shrinking flex column that
+            // wraps the synthetic template copies for this iteration.
+            let row_style = taffy::style::Style {
+                flex_shrink: 0.0,
+                ..taffy::style::Style::default()
+            };
+            let row_id = taffy
+                .new_with_children(row_style, &row_children)
+                .map_err(|e| MizuError::ParseError(format!("Each row container: {e}")))?;
+
+            expansion.all_synthetic_ids.push(row_id);
+            groups.push((row_id, overrides));
+        }
+
+        // Replace the Each's Taffy children with the N row containers.
+        let row_ids: Vec<taffy::prelude::NodeId> = groups.iter().map(|(id, _)| *id).collect();
+        taffy
+            .set_children(each_taffy_id, &row_ids)
+            .map_err(|e| MizuError::ParseError(format!("Each set_children: {e}")))?;
+
+        // Ensure the Each container is a Flex column so rows stack vertically
+        // regardless of the display mode the single-template style specified.
+        if let Ok(mut style) = taffy.style(each_taffy_id).cloned() {
+            style.display = taffy::style::Display::Flex;
+            style.flex_direction = taffy::style::FlexDirection::Column;
+            let _ = taffy.set_style(each_taffy_id, style);
+        }
+
+        expansion.groups.insert(each_dom_id, groups);
+    }
+
+    Ok(expansion)
+}
+
+/// Recursively clones the Taffy style-tree rooted at `dom_node` into fresh
+/// synthetic Taffy nodes, preserving every node's style.
+///
+/// Leaf nodes (no DOM children) are created with `new_leaf_with_context` so
+/// that `compute_layout_with_measure`'s measure closure receives the original
+/// DOM node ID and can compute intrinsic text dimensions correctly.
+///
+/// `out_overrides` is extended with `(template_dom_id → synthetic_taffy_id)`
+/// for every node in the cloned subtree.
+fn clone_taffy_subtree(
+    dom_node: NodeRef<MizuNode>,
+    taffy: &mut TaffyTree<EgoNodeId>,
+    node_to_taffy_id: &HashMap<EgoNodeId, taffy::prelude::NodeId>,
+    out_overrides: &mut EachIterationOverrides,
+    all_synthetic_ids: &mut Vec<taffy::prelude::NodeId>,
+) -> Result<taffy::prelude::NodeId, MizuError> {
+    let dom_id = dom_node.id();
+
+    // Clone the style of the original Taffy node (if mapped).
+    // `.cloned()` copies the Style before taffy is borrowed mutably below.
+    let style: taffy::style::Style = node_to_taffy_id
+        .get(&dom_id)
+        .and_then(|&t_id| taffy.style(t_id).ok())
+        .cloned()
+        .unwrap_or_default();
+
+    // Recurse children first (bottom-up) so parent containers can reference
+    // already-created child IDs.
+    let mut child_taffy_ids: Vec<taffy::prelude::NodeId> = Vec::new();
+    for child in dom_node.children() {
+        let child_synth_id = clone_taffy_subtree(
+            child,
+            taffy,
+            node_to_taffy_id,
+            out_overrides,
+            all_synthetic_ids,
+        )?;
+        child_taffy_ids.push(child_synth_id);
+    }
+
+    let synth_id = if child_taffy_ids.is_empty() {
+        // Leaf: carry the DOM node's context for text measurement.
+        taffy
+            .new_leaf_with_context(style, dom_id)
+            .map_err(|e| MizuError::ParseError(format!("clone leaf: {e}")))?
+    } else {
+        taffy
+            .new_with_children(style, &child_taffy_ids)
+            .map_err(|e| MizuError::ParseError(format!("clone container: {e}")))?
+    };
+
+    all_synthetic_ids.push(synth_id);
+    out_overrides.insert(dom_id, synth_id);
+    Ok(synth_id)
+}
+
+/// Translates Mizu custom StyleRules into Native Taffy styles.
+/// Converts percentage values (0.0 to 100.0) into fractions (0.0 to 1.0).
+pub fn translate_style(rules: &StyleRules) -> Style {
+    let mut style = Style::default();
+
+    // 1. width / height
+    if let Some(dim) = &rules.width {
+        style.size.width = match dim {
+            MizuDimension::Pixels(px) => taffy::style::Dimension::Length(*px),
+            MizuDimension::Percent(pct) => taffy::style::Dimension::Percent(pct / 100.0),
+        };
+    }
+    if let Some(dim) = &rules.height {
+        style.size.height = match dim {
+            MizuDimension::Pixels(px) => taffy::style::Dimension::Length(*px),
+            MizuDimension::Percent(pct) => taffy::style::Dimension::Percent(pct / 100.0),
+        };
+    }
+
+    // 2. padding
+    if let Some(dim) = &rules.padding {
+        let taffy_val = match dim {
+            MizuDimension::Pixels(px) => taffy::style::LengthPercentage::Length(*px),
+            MizuDimension::Percent(pct) => taffy::style::LengthPercentage::Percent(pct / 100.0),
+        };
+        style.padding = taffy::geometry::Rect {
+            left: taffy_val,
+            right: taffy_val,
+            top: taffy_val,
+            bottom: taffy_val,
+        };
+    }
+
+    // 3. margin
+    if let Some(dim) = &rules.margin {
+        let taffy_val = match dim {
+            MizuDimension::Pixels(px) => taffy::style::LengthPercentageAuto::Length(*px),
+            MizuDimension::Percent(pct) => taffy::style::LengthPercentageAuto::Percent(pct / 100.0),
+        };
+        style.margin = taffy::geometry::Rect {
+            left: taffy_val,
+            right: taffy_val,
+            top: taffy_val,
+            bottom: taffy_val,
+        };
+    }
+
+    // 4. gap
+    if let Some(dim) = &rules.gap {
+        let taffy_val = match dim {
+            MizuDimension::Pixels(px) => taffy::style::LengthPercentage::Length(*px),
+            MizuDimension::Percent(pct) => taffy::style::LengthPercentage::Percent(pct / 100.0),
+        };
+        style.gap = taffy::geometry::Size {
+            width: taffy_val,
+            height: taffy_val,
+        };
+    }
+
+    // 5. flex properties
+    if let Some(dir) = rules.direction {
+        style.flex_direction = dir;
+    }
+    if let Some(justify) = rules.justify {
+        style.justify_content = Some(justify);
+    }
+    if let Some(align) = rules.align {
+        style.align_items = Some(align);
+    }
+
+    // 7. border
+    if let Some(border_width) = rules.border_width {
+        let taffy_val = taffy::style::LengthPercentage::Length(border_width);
+        style.border = taffy::geometry::Rect {
+            left: taffy_val,
+            right: taffy_val,
+            top: taffy_val,
+            bottom: taffy_val,
+        };
+    }
+
+    // 8. overflow — maps MizuOverflow to Taffy's Point<Overflow> (x and y axis).
+    let taffy_overflow = match rules.overflow {
+        MizuOverflow::Visible => Overflow::Visible,
+        MizuOverflow::Hidden => Overflow::Hidden,
+        MizuOverflow::Scroll => Overflow::Scroll,
+    };
+    style.overflow = taffy::geometry::Point {
+        x: taffy_overflow,
+        y: taffy_overflow,
+    };
+
+    // 9. display — overrides Taffy display mode when explicitly set.
+    if let Some(display) = rules.display {
+        style.display = display;
+    }
+
+    style
+}
+
+/// Recursively traverses the DOM tree bottom-up to build the Taffy tree layout.
+pub fn build_taffy_tree(
+    node: NodeRef<MizuNode>,
+    style_rules_map: &HashMap<String, StyleRules>,
+    taffy: &mut TaffyTree<EgoNodeId>,
+    node_to_taffy_id: &mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
+    image_cache: &HashMap<String, AssetSlot>,
+    chrome_url: &str,
+) -> Result<taffy::prelude::NodeId, MizuError> {
+    let mut children_ids = Vec::new();
+    for child in node.children() {
+        let child_id = build_taffy_tree(
+            child,
+            style_rules_map,
+            taffy,
+            node_to_taffy_id,
+            image_cache,
+            chrome_url,
+        )?;
+        children_ids.push(child_id);
+    }
+
+    let mizu_node = node.value();
+    let mut merged_rules = StyleRules::default();
+
+    // 1. Tag styles
+    let tag_name = mizu_node.primitive.as_str();
+    if let Some(tag_rules) = style_rules_map.get(tag_name) {
+        merged_rules = merged_rules.merge(tag_rules.clone());
+    }
+
+    // 2. Class styles
+    if let Some(class_attr) = mizu_node.attributes.get("class")
+        && let Some(class_rules) = style_rules_map.get(class_attr)
+    {
+        merged_rules = merged_rules.merge(class_rules.clone());
+    }
+
+    let mut style = translate_style(&merged_rules);
+
+    if mizu_node.primitive == Primitive::Window {
+        style.size = Size {
+            width: taffy::style::Dimension::Percent(1.0),
+            height: taffy::style::Dimension::Percent(1.0),
+        };
+    } else if mizu_node.primitive == Primitive::Button {
+        style.flex_shrink = 0.0;
+        style.overflow = taffy::geometry::Point {
+            x: taffy::style::Overflow::Hidden,
+            y: taffy::style::Overflow::Hidden,
+        };
+    } else if mizu_node.primitive == Primitive::Box {
+        style.flex_shrink = 1.0;
+        style.overflow = taffy::geometry::Point {
+            x: taffy::style::Overflow::Hidden,
+            y: taffy::style::Overflow::Hidden,
+        };
+    } else if mizu_node.primitive == Primitive::Image
+        && let Some(src) = mizu_node.attributes.get("src")
+    {
+        let abs_url = if src.starts_with("mizu://") {
+            src.clone()
+        } else if let Ok(base_uri) = crate::network::uri::MizuUri::parse(chrome_url) {
+            let path = if src.starts_with('/') {
+                src.clone()
+            } else {
+                format!("/{}", src)
+            };
+            format!("mizu://{}{}", base_uri.domain, path)
+        } else {
+            src.clone()
+        };
+
+        let mut intr_width = None;
+        let mut intr_height = None;
+
+        if let Some(AssetSlot::Ready(cached)) = image_cache.get(&abs_url) {
+            intr_width = Some(cached.width() as f32);
+            intr_height = Some(cached.height() as f32);
+        }
+
+        if let (Some(w), Some(h)) = (intr_width, intr_height) {
+            style.aspect_ratio = Some(w / h);
+            // Only apply intrinsic pixel dimensions when *neither* axis has
+            // been set by the stylesheet.  If the user specified one axis
+            // (e.g. `width 400`) the aspect_ratio alone is sufficient for
+            // Taffy to derive the other — overwriting it here would break
+            // proportional scaling.
+            if style.size.width == taffy::style::Dimension::Auto
+                && style.size.height == taffy::style::Dimension::Auto
+            {
+                style.size.width = taffy::style::Dimension::Length(w);
+                style.size.height = taffy::style::Dimension::Length(h);
+            }
+        }
+    }
+
+    let taffy_id = if children_ids.is_empty() {
+        taffy
+            .new_leaf_with_context(style, node.id())
+            .map_err(|e| MizuError::ParseError(format!("Failed to create Taffy node: {e}")))?
+    } else {
+        taffy
+            .new_with_children(style, &children_ids)
+            .map_err(|e| MizuError::ParseError(format!("Failed to create Taffy node: {e}")))?
+    };
+
+    node_to_taffy_id.insert(node.id(), taffy_id);
+    Ok(taffy_id)
+}

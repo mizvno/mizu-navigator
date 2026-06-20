@@ -1,0 +1,60 @@
+[package]
+name = "mizu-navigator"
+version = "0.1.0"
+edition = "2024"
+description = "Mizu Navigator"
+license = "GPL-3.0-only"
+repository = ""
+default-run = "mizu-navigator"
+
+[lib]
+name = "mizu"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+nom = "7.1.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+taffy = "0.5"
+
+ego-tree = "0.10"
+winit = "0.29"
+vello = "0.1.0"
+parley = { version = "0.10.0", features = ["complex-scripts"] }
+pollster = "0.3"
+wgpu = "0.19"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time", "net", "macros", "fs"] }
+quinn = "0.11.9"
+rustls = "0.23.40"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = { version = "0.8", features = ["parse"] }
+aes-gcm = "0.10"
+hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+keyring = "3.6.2"
+arboard = "3.6.1"
+webpki-roots = "1.0.7"
+image = { version = "0.25", features = ["gif", "webp"] }
+icu_segmenter = { version = "2", features = ["auto"] }
+hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls", "webpki-roots"] }
+rustc-hash = "2"
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+
+[features]
+default = []
+insecure-dev = []
+
+[profile.dev]
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = "symbols"
