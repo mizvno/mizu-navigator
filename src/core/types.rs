@@ -38,8 +38,12 @@ pub struct Symbol(pub u32);
 /// guarantees that `Symbol(u32)` IDs are identical on both sides.
 #[derive(Debug, Default)]
 pub struct StringInterner {
+    /// Name → `Symbol` lookup, the inverse of `vec`.
     pub map: HashMap<String, Symbol>,
+    /// `Symbol(i)` resolves to `vec[i]`; append-only.
     pub vec: Vec<String>,
+    /// Once `true`, further insertions via `get_or_intern` are a logged caller
+    /// bug (see [`Self::freeze`]).
     pub frozen: bool,
 }
 
@@ -132,11 +136,17 @@ impl StringInterner {
 /// The set of all primitive values in the Mizu type system.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// The absence of a value.
     Null,
+    /// A boolean.
     Bool(bool),
+    /// A signed 64-bit integer.
     Int(i64),
+    /// A 64-bit floating-point number.
     Float(f64),
+    /// A UTF-8 string, shared via `Arc` to keep clones cheap.
     String(Arc<str>),
+    /// An ordered list of values, shared via `Arc` to keep clones cheap.
     List(Arc<Vec<Value>>),
     /// A structural record deserialized from a JSON object response.
     /// Keys are shared string pointers sorted in ascending order; values are
@@ -347,7 +357,9 @@ pub struct StateMachine {
     /// Uses FxHashMap (rustc-hash) instead of the SipHash default because Symbol is a u32
     /// sequential integer — DoS-resistance on integer keys is unnecessary overhead.
     pub global_store: FxHashMap<Symbol, Value>,
+    /// Contiguous stack of local-binding values, indexed by `local_index`.
     pub local_stack: Vec<Value>,
+    /// Symbol bound at each position of `local_stack` (parallel array).
     pub local_symbols: Vec<Symbol>,
     /// O(1) reverse index: Symbol → ordered list of indices into `local_stack` where that
     /// symbol is bound (earliest first, latest last).  Kept in sync with `local_stack` /
@@ -356,9 +368,16 @@ pub struct StateMachine {
     /// Lookup rule: the *last* index in the list is the innermost (shadow-winning) binding.
     /// A binding is in scope when its index ≥ the current frame_pointer.
     pub local_index: FxHashMap<Symbol, Vec<usize>>,
+    /// Running count of evaluation steps since the last reset; see [`MAX_INSTRUCTIONS`].
     pub instruction_count: u64,
+    /// Current `evaluate` recursion depth; see [`MAX_EVAL_DEPTH`].
     pub eval_depth: u32,
+    /// Capability actions (network calls, storage writes, navigation, …)
+    /// queued by the current action/expression evaluation, drained by the
+    /// caller after execution completes.
     pub accumulated_actions: Vec<crate::network::RuntimeAction>,
+    /// `(symbol, previous_value)` pairs recorded by [`Self::set_global`],
+    /// enabling rollback on error and diffing to find mutated variables.
     pub undo_log: Vec<(Symbol, Value)>,
     /// Set of symbols that are computed (derived) variables.
     ///
@@ -368,6 +387,8 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
+    /// Creates an empty state machine with pre-allocated capacity for
+    /// globals, locals, and the undo log.
     pub fn new() -> Self {
         Self {
             global_store: FxHashMap::with_capacity_and_hasher(128, Default::default()),
@@ -382,6 +403,7 @@ impl StateMachine {
         }
     }
 
+    /// Pushes a new local binding of `sym` to `val` onto the local stack.
     pub fn push_local(&mut self, sym: Symbol, val: Value) {
         let idx = self.local_stack.len();
         self.local_stack.push(val);
@@ -389,6 +411,7 @@ impl StateMachine {
         self.local_index.entry(sym).or_default().push(idx);
     }
 
+    /// Pops the most recently pushed local binding, if any.
     pub fn pop_local(&mut self) {
         if let Some(sym) = self.local_symbols.pop() {
             self.local_stack.pop();
@@ -418,11 +441,14 @@ impl StateMachine {
         self.local_symbols.truncate(new_len);
     }
 
+    /// Assigns `val` to the global binding of `sym`, recording the previous
+    /// value in `undo_log` for rollback/diffing.
     pub fn set_global(&mut self, sym: Symbol, val: Value) {
         let old_val = self.global_store.insert(sym, val).unwrap_or(Value::Null);
         self.undo_log.push((sym, old_val));
     }
 
+    /// Returns the global binding of `sym`, or [`Value::Null`] if unset.
     pub fn get_global(&self, sym: Symbol) -> &Value {
         self.global_store.get(&sym).unwrap_or(&Value::Null)
     }
@@ -442,6 +468,9 @@ impl StateMachine {
         None
     }
 
+    /// Looks up `name` in `interner`, then resolves the resulting symbol as a
+    /// local (if in scope) or a non-null global.  Returns `None` if `name` is
+    /// unknown or bound to nothing.
     pub fn get_value_by_name(&self, name: &str, interner: &StringInterner) -> Option<&Value> {
         if let Some(sym) = interner.get(name) {
             if let Some(val) = self.get_local(sym, 0) {
@@ -1197,11 +1226,14 @@ fn safe_compare_int_float(i: i64, f: f64) -> std::cmp::Ordering {
 /// A backwards compatibility layer wrapping StateMachine and StringInterner.
 #[derive(Debug, Clone, Default)]
 pub struct VariableStore {
+    /// The underlying flat evaluator state (globals, locals, budgets, queued actions).
     pub state_machine: StateMachine,
+    /// Name ↔ `Symbol` mapping shared with `state_machine`'s expressions.
     pub interner: StringInterner,
 }
 
 impl VariableStore {
+    /// Creates an empty store with a fresh, unfrozen interner.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1210,6 +1242,7 @@ impl VariableStore {
         }
     }
 
+    /// Creates an empty store reusing an existing (typically frozen) interner.
     #[must_use]
     pub fn with_interner(interner: StringInterner) -> Self {
         Self {
@@ -1218,6 +1251,7 @@ impl VariableStore {
         }
     }
 
+    /// Binds `sym` directly to `value`, bypassing name interning.
     pub fn set_symbol(&mut self, sym: Symbol, value: impl Into<Value>) {
         self.state_machine.set_global(sym, value.into());
     }
@@ -1261,6 +1295,11 @@ impl VariableStore {
         }
     }
 
+    /// Looks up `name` as a local (frame 0) or non-null global.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MizuError::VariableNotFound`] if `name` is unknown or unbound.
     pub fn get(&self, name: &str) -> Result<&Value, MizuError> {
         if let Some(sym) = self.interner.get(name) {
             if let Some(val) = self.state_machine.get_local(sym, 0) {
@@ -1274,6 +1313,13 @@ impl VariableStore {
         Err(MizuError::VariableNotFound(name.to_owned()))
     }
 
+    /// Replaces every `{name}` placeholder in `text` with the string form of
+    /// the corresponding variable's value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MizuError::BindingNotFound`] if a placeholder references an
+    /// unbound name.
     pub fn interpolate(&self, text: &str) -> Result<String, MizuError> {
         let mut buf = String::with_capacity(text.len());
         self.state_machine

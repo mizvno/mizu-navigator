@@ -20,7 +20,7 @@ use winit::{
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
 use crate::network::{ReloadPayload, RuntimeAction, UiEvent, WorkerResponse};
-use crate::parser::logic::{ComputedBinding, MizuFunction};
+use crate::parser::logic::{ComputedBinding, MizuFunction, RootTimer, TimerInterval};
 use crate::parser::{Action, EventBlock, MizuNode, MizuOverflow, Primitive, StyleRules};
 use crate::render::hit_test::hit_test;
 use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
@@ -128,6 +128,21 @@ pub struct MizuWindowManager {
     /// from the network worker.  Drained each frame via `try_recv()` so the UI
     /// thread never blocks on network I/O.
     pub network_rx: tokio::sync::mpsc::Receiver<crate::network::NetworkResult>,
+    /// Root-level `timer` declarations from the `logic` block, in declaration
+    /// order.  Fired by the UI clock; actions execute in the logic worker.
+    pub root_timers: Vec<RootTimer>,
+    /// Priority queue of pending root-timer deadlines (deadline → indices
+    /// into `root_timers`).  Rebuilt by [`Self::setup_timers`].
+    pub root_timer_queue: BTreeMap<std::time::Instant, Vec<usize>>,
+    /// Live inspector UI state (panel visibility, tab, selection, scroll).
+    pub inspector: crate::render::inspector::InspectorState,
+    /// Always-on bounded log of runtime events and network activity, consumed
+    /// by the inspector's Events and Network tabs.
+    pub inspector_log: crate::render::inspector::log::InspectorLog,
+    /// Instant of the most recent mutation per variable, used by the
+    /// inspector's Logic tab to flash freshly-changed values.  Bounded by the
+    /// interner size (entries are overwritten, never accumulated).
+    pub recent_mutations: FxHashMap<Symbol, std::time::Instant>,
 }
 
 impl MizuWindowManager {
@@ -213,6 +228,11 @@ impl MizuWindowManager {
             has_user_gesture: false,
             capability_policy: CapabilityPolicy::new(default_chrome_url),
             network_rx,
+            root_timers: Vec::new(),
+            root_timer_queue: BTreeMap::new(),
+            inspector: crate::render::inspector::InspectorState::new(),
+            inspector_log: crate::render::inspector::log::InspectorLog::new(),
+            recent_mutations: FxHashMap::default(),
         };
 
         manager.rebuild_node_mappings();
@@ -222,10 +242,35 @@ impl MizuWindowManager {
         Ok(manager)
     }
 
-    /// Setup the timer priority queue from the dom tree.
+    /// Resolves a root-timer interval to milliseconds, clamped to ≥ 16 ms.
+    ///
+    /// Variable intervals are read from the store; an unset or non-numeric
+    /// variable yields `None` (the timer is skipped until the variable exists).
+    fn resolve_root_timer_interval(&self, interval: &TimerInterval) -> Option<u64> {
+        let ms = match interval {
+            TimerInterval::Millis(ms) => *ms,
+            TimerInterval::Variable(var_name) => match self.store.get(var_name).ok() {
+                Some(Value::Float(f)) => *f as u64,
+                Some(Value::Int(i)) => *i as u64,
+                _ => return None,
+            },
+        };
+        Some(ms.max(16))
+    }
+
+    /// Setup the timer priority queues (node `every` timers + root `timer`
+    /// declarations) from the current document.
     pub fn setup_timers(&mut self) {
-        self.timer_queue.clear();
+        self.root_timer_queue.clear();
         let now = std::time::Instant::now();
+        for (idx, rt) in self.root_timers.iter().enumerate() {
+            if let Some(interval_ms) = self.resolve_root_timer_interval(&rt.interval) {
+                let deadline = now + std::time::Duration::from_millis(interval_ms);
+                self.root_timer_queue.entry(deadline).or_default().push(idx);
+            }
+        }
+
+        self.timer_queue.clear();
         for node_ref in self.dom.nodes() {
             if let Some(EventBlock::Every { interval, .. }) = node_ref.value().events.get("every") {
                 let mut interval_ms = match interval {
@@ -285,6 +330,7 @@ impl MizuWindowManager {
     pub fn trigger_logic_reload(&self) {
         let mut click_actions = HashMap::new();
         let mut every_actions = HashMap::new();
+        let mut submit_actions = HashMap::new();
 
         for node in self.dom.nodes() {
             let id = node.id();
@@ -297,7 +343,9 @@ impl MizuWindowManager {
                         EventBlock::Every { action, .. } => {
                             every_actions.insert(u32_id, action.clone());
                         }
-                        _ => {}
+                        EventBlock::Submit { action } => {
+                            submit_actions.insert(u32_id, action.clone());
+                        }
                     }
                 }
             }
@@ -307,13 +355,25 @@ impl MizuWindowManager {
         for node in self.dom.nodes() {
             for event in node.value().events.values() {
                 match event {
-                    EventBlock::Click { action } | EventBlock::Every { action, .. } => {
+                    EventBlock::Click { action }
+                    | EventBlock::Every { action, .. }
+                    | EventBlock::Submit { action } => {
                         if let Action::Assign { target, .. } = action {
                             interner.get_or_intern(target);
                         }
                     }
-                    _ => {}
                 }
+            }
+        }
+        if !submit_actions.is_empty() {
+            // The `$form` magic record must survive the interner freeze so
+            // the logic worker can populate it on submission.
+            interner.get_or_intern("$form");
+        }
+        // Root-timer assign targets must also survive the freeze.
+        for rt in &self.root_timers {
+            if let Action::Assign { target, .. } = &rt.action {
+                interner.get_or_intern(target);
             }
         }
 
@@ -330,10 +390,20 @@ impl MizuWindowManager {
             logic_fns: self.logic_fns.clone(),
             click_actions,
             every_actions,
+            submit_actions,
+            root_timer_actions: self.root_timers.iter().map(|rt| rt.action.clone()).collect(),
             interner,
             initial_variables,
             url_registry: self.url_registry.clone(),
-            document_domain: get_raw_domain(&self.chrome_state.url),
+            // For file:// documents, relative `api` endpoints resolve against
+            // localhost — the only meaningful host during local development
+            // (get_raw_domain would yield a filesystem-derived token that is
+            // not a routable hostname).
+            document_domain: if self.chrome_state.url.starts_with("file://") {
+                "localhost".to_string()
+            } else {
+                get_raw_domain(&self.chrome_state.url)
+            },
             computed_bindings: self.computed_bindings.clone(),
         })));
     }
@@ -346,7 +416,12 @@ impl MizuWindowManager {
         logic_fns: FxHashMap<Symbol, MizuFunction>,
         interner: StringInterner,
         computed_bindings: Vec<ComputedBinding>,
+        root_timers: Vec<RootTimer>,
     ) -> Result<(), MizuError> {
+        self.root_timers = root_timers;
+        // Old node ids die with the old tree — drop inspector selection state.
+        self.inspector.reset_document_state();
+        self.recent_mutations.clear();
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy_id = HashMap::new();
 
@@ -403,6 +478,15 @@ impl MizuWindowManager {
             return Ok(());
         }
 
+        // The docked inspector panel reduces the document's usable width.
+        // Centralised here so every call site (resize, F12 toggle, timers)
+        // automatically lays the document out in the remaining space.
+        let width = if self.inspector.open {
+            (width - crate::render::inspector::PANEL_WIDTH).max(120.0)
+        } else {
+            width
+        };
+
         let content_height = (height - CHROME_HEIGHT).max(0.0);
         let viewport_size = Size {
             width: AvailableSpace::Definite(width),
@@ -435,6 +519,9 @@ impl MizuWindowManager {
         let text_layouts = &mut self.text_layouts;
         let text_dimensions = &mut self.text_dimensions;
         let dirty_nodes = &mut self.dirty_nodes;
+        let local_inputs = &self.local_inputs;
+        let node_id_to_u32 = &self.node_id_to_u32;
+        let focused_input = self.focused_node;
 
         self.taffy
             .compute_layout_with_measure(
@@ -466,6 +553,9 @@ impl MizuWindowManager {
                                 layout_cx,
                                 store,
                                 available_width,
+                                local_inputs,
+                                node_id_to_u32,
+                                focused_input,
                             )
                         {
                             text_dimensions.insert(node_id, dims);
@@ -485,6 +575,17 @@ impl MizuWindowManager {
         Ok(())
     }
 
+    /// Marks a node's cached text layout stale (after typing or a focus change
+    /// that swaps placeholder ↔ value rendering) and schedules a layout pass on
+    /// the next `AboutToWait` tick via `typing_layout_dirty`.
+    pub fn mark_text_dirty(&mut self, id: EgoNodeId) {
+        self.dirty_nodes.insert(id);
+        if let Some(&taffy_id) = self.node_to_taffy_id.get(&id) {
+            let _ = self.taffy.mark_dirty(taffy_id);
+        }
+        self.typing_layout_dirty = true;
+    }
+
     /// Resets the redirect hop counter.  Called whenever a navigation is
     /// initiated by the user (or a logic action) and when one completes, so the
     /// [`MAX_REDIRECTS`] budget applies per navigation chain, not globally.
@@ -500,9 +601,30 @@ impl MizuWindowManager {
         self.redirect_count <= MAX_REDIRECTS
     }
 
-    /// Executes a declarative capability action.
+    /// Executes a declarative capability action, recording network-visible
+    /// dispatches (and policy blocks) in the inspector log.
     pub fn execute_capability_action(&mut self, action: RuntimeAction) {
-        crate::render::security::execute_capability_action(
+        use crate::render::inspector::log::NetOutcome;
+        use crate::render::security::CapabilityOutcome;
+
+        // Describe network-visible actions before the action is moved.
+        let described: Option<(String, String, Option<String>)> = match &action {
+            RuntimeAction::ResolvedCall {
+                method,
+                url,
+                target_variable,
+                ..
+            } => Some((method.clone(), url.clone(), Some(target_variable.clone()))),
+            RuntimeAction::StoreLocal { key, .. } => {
+                Some(("STORE".to_string(), key.clone(), None))
+            }
+            RuntimeAction::DownloadMedia { url } => {
+                Some(("MEDIA".to_string(), url.clone(), None))
+            }
+            _ => None,
+        };
+
+        let outcome = crate::render::security::execute_capability_action(
             &mut self.store,
             &self.network_tx,
             &self.logic_tx,
@@ -510,6 +632,43 @@ impl MizuWindowManager {
             &mut self.capability_policy,
             action,
         );
+
+        if let Some((verb, target, correlation)) = described {
+            match outcome {
+                CapabilityOutcome::Blocked(reason) => {
+                    self.inspector_log.push_net_blocked(&verb, &target, reason);
+                }
+                CapabilityOutcome::Dispatched => {
+                    if verb == "STORE" {
+                        // Fire-and-forget: no completion message flows back.
+                        self.inspector_log
+                            .push_net_done(&verb, &target, NetOutcome::Ok);
+                    } else {
+                        self.inspector_log.push_net_start(&verb, &target, correlation);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read-only data sources handed to the inspector's row builder.
+    pub fn inspector_sources(&self) -> crate::render::inspector::model::InspectorSources<'_> {
+        crate::render::inspector::model::InspectorSources {
+            dom: &self.dom,
+            taffy: &self.taffy,
+            node_to_taffy_id: &self.node_to_taffy_id,
+            style_rules: &self.style_rules,
+            store: &self.store,
+            logic_fns: &self.logic_fns,
+            computed_bindings: &self.computed_bindings,
+            url_registry: &self.url_registry,
+            root_timers: &self.root_timers,
+            timer_queue: &self.timer_queue,
+            root_timer_queue: &self.root_timer_queue,
+            capability_policy: &self.capability_policy,
+            log: &self.inspector_log,
+            recent_mutations: &self.recent_mutations,
+        }
     }
 }
 
@@ -605,6 +764,112 @@ pub(crate) fn chrome_url_to_file_sandbox_base(chrome_url: &str) -> Option<String
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Maximum number of bytes a single input field accepts from typing or
+/// pasting.  Prevents unbounded memory growth from key-repeat or a huge paste.
+const INPUT_MAX_BYTES: usize = 4096;
+
+/// Appends the printable characters of `text` to `buf`, respecting
+/// [`INPUT_MAX_BYTES`].  Control characters are dropped.  Returns `true` if at
+/// least one character was appended.
+fn push_input_text(buf: &mut String, text: &str) -> bool {
+    let mut changed = false;
+    for c in text.chars().filter(|c| !c.is_control()) {
+        if buf.len() + c.len_utf8() > INPUT_MAX_BYTES {
+            break;
+        }
+        buf.push(c);
+        changed = true;
+    }
+    changed
+}
+
+/// Finds the nearest `form` ancestor of `node` (including `node` itself).
+fn find_form_ancestor(
+    dom: &ego_tree::Tree<crate::parser::MizuNode>,
+    node: EgoNodeId,
+) -> Option<EgoNodeId> {
+    let mut cur = dom.get(node)?;
+    loop {
+        if cur.value().primitive == crate::parser::Primitive::Form {
+            return Some(cur.id());
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Collects `name` → typed-text pairs from every `input` descendant of the
+/// form containing `member` (a submit button or an input inside the form).
+///
+/// Values come from `local_inputs` (the live text buffers); inputs the user
+/// never touched submit an empty string.  Returns `None` when `member` is not
+/// inside any `form` node.
+fn collect_form_fields(
+    dom: &ego_tree::Tree<crate::parser::MizuNode>,
+    node_id_to_u32: &HashMap<EgoNodeId, u32>,
+    local_inputs: &FxHashMap<u32, String>,
+    member: EgoNodeId,
+) -> Option<FxHashMap<String, crate::core::types::Value>> {
+    let form_id = find_form_ancestor(dom, member)?;
+    let form = dom.get(form_id)?;
+    let mut fields = FxHashMap::default();
+    for desc in form.descendants() {
+        let v = desc.value();
+        if v.primitive == crate::parser::Primitive::Input
+            && let Some(name) = v.attributes.get("name")
+        {
+            let text = node_id_to_u32
+                .get(&desc.id())
+                .and_then(|u| local_inputs.get(u))
+                .cloned()
+                .unwrap_or_default();
+            fields.insert(name.clone(), crate::core::types::Value::from(text));
+        }
+    }
+    Some(fields)
+}
+
+/// Returns the first node inside `member`'s enclosing form that carries a
+/// `submit -> …` event (the form's submit button).  Used to submit on Enter.
+fn find_form_submitter(
+    dom: &ego_tree::Tree<crate::parser::MizuNode>,
+    member: EgoNodeId,
+) -> Option<EgoNodeId> {
+    let form_id = find_form_ancestor(dom, member)?;
+    let form = dom.get(form_id)?;
+    form.descendants()
+        .find(|d| d.value().events.contains_key("submit"))
+        .map(|d| d.id())
+}
+
+/// Dispatches a form submission triggered by `submitter` (a node carrying a
+/// `submit` event): gathers the enclosing form's fields from the live input
+/// buffers and forwards them to the logic worker together with the
+/// submitter's id.  Returns `true` when the submission was dispatched.
+fn dispatch_form_submit(manager: &mut MizuWindowManager, submitter: EgoNodeId) -> bool {
+    let Some(&submitter_u32) = manager.node_id_to_u32.get(&submitter) else {
+        return false;
+    };
+    let Some(fields) = collect_form_fields(
+        &manager.dom,
+        &manager.node_id_to_u32,
+        &manager.local_inputs,
+        submitter,
+    ) else {
+        tracing::warn!("submit event outside any form node; ignored");
+        return false;
+    };
+    manager.has_user_gesture = true;
+    manager.inspector_log.push_event(
+        crate::render::inspector::log::EventKind::Submit,
+        format!("form submit ({} fields)", fields.len()),
+    );
+    let _ = manager.logic_tx.send(UiEvent::SubmitForm {
+        submitter_node_id: submitter_u32,
+        fields,
+    });
+    true
+}
+
 /// Applies a successfully-fetched document: parses all blocks from `source`
 /// and reloads the manager's DOM, styles, logic, and URL registry.
 ///
@@ -639,10 +904,28 @@ fn handle_navigate_success(manager: &mut MizuWindowManager, url: String, source:
                 FxHashMap::default()
             };
             let new_computed = if !blocks.logic_block.trim().is_empty() {
-                match crate::parser::logic::parse_computed(&blocks.logic_block, &mut new_interner) {
+                match crate::parser::logic::parse_computed_with_functions(
+                    &blocks.logic_block,
+                    &mut new_interner,
+                    &logic_fns,
+                ) {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::error!(error = ?e, "computed parse error during navigation");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let new_root_timers = if !blocks.logic_block.trim().is_empty() {
+                match crate::parser::logic::parse_root_timers(
+                    &blocks.logic_block,
+                    &mut new_interner,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "root timer parse error during navigation");
                         Vec::new()
                     }
                 }
@@ -685,6 +968,7 @@ fn handle_navigate_success(manager: &mut MizuWindowManager, url: String, source:
                         logic_fns,
                         new_interner,
                         new_computed,
+                        new_root_timers,
                     ) {
                         tracing::error!(error = ?e, "document reload error");
                     } else {
@@ -708,8 +992,16 @@ fn handle_navigate_success(manager: &mut MizuWindowManager, url: String, source:
 /// Called from the `AboutToWait` drain loop — never from a blocking context.
 fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::NetworkResult) {
     use crate::network::NetworkResult;
+    use crate::render::inspector::log::NetOutcome;
     match res {
         NetworkResult::Success { target_var, data } => {
+            let bytes = match &data {
+                Value::String(s) => Some(s.len()),
+                _ => None,
+            };
+            manager
+                .inspector_log
+                .complete_net(&target_var, NetOutcome::Ok, bytes);
             let _ = manager
                 .logic_tx
                 .send(crate::network::UiEvent::UpdateVariable {
@@ -723,8 +1015,27 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
                     value: crate::core::types::Value::from("Completato.".to_string()),
                 });
         }
+        NetworkResult::FetchFailed { target_var, error } => {
+            tracing::error!(error = ?error, target = %target_var, "fetch failed");
+            manager.inspector_log.complete_net(
+                &target_var,
+                NetOutcome::Failed(error.to_string()),
+                None,
+            );
+            // Write a readable error where the response would have gone, so
+            // the document shows it (e.g. `Status: error: connection refused`).
+            let _ = manager
+                .logic_tx
+                .send(crate::network::UiEvent::UpdateVariable {
+                    name: target_var,
+                    value: crate::core::types::Value::from(format!("error: {error}")),
+                });
+        }
         NetworkResult::Error(e) => {
             tracing::error!(error = ?e, "network error");
+            manager
+                .inspector_log
+                .complete_latest_pending(NetOutcome::Failed(e.to_string()));
             manager.chrome_state.loading = false;
             let _ = manager
                 .logic_tx
@@ -734,9 +1045,15 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
                 });
         }
         NetworkResult::NavigateSuccess { url, source } => {
+            manager
+                .inspector_log
+                .complete_net(&url, NetOutcome::Ok, Some(source.len()));
             handle_navigate_success(manager, url, source);
         }
         NetworkResult::Redirect { new_url } => {
+            manager
+                .inspector_log
+                .complete_latest_pending(NetOutcome::Redirect);
             if manager.register_redirect() {
                 tracing::debug!(
                     url = %new_url,
@@ -745,6 +1062,9 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
                 );
                 manager.chrome_state.url = new_url.clone();
                 manager.chrome_state.loading = true;
+                manager
+                    .inspector_log
+                    .push_net_start("NAV", &new_url, Some(new_url.clone()));
                 let _ = manager
                     .network_tx
                     .send(crate::network::NetworkCmd::Navigate { url: new_url });
@@ -765,6 +1085,9 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
             }
         }
         NetworkResult::FetchImageSuccess { url, image } => {
+            manager
+                .inspector_log
+                .push_net_done("IMG", &url, NetOutcome::Ok);
             manager.fetching_images.remove(&url);
             manager
                 .image_cache
@@ -790,6 +1113,9 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
             }
         }
         NetworkResult::FetchImageFailed { url, error } => {
+            manager
+                .inspector_log
+                .push_net_done("IMG", &url, NetOutcome::Failed(error.to_string()));
             manager.fetching_images.remove(&url);
             manager.image_cache.insert(url.clone(), AssetSlot::Failed);
             tracing::error!(url = %url, error = ?error, "image load failed");
@@ -813,6 +1139,12 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
 /// URLs with any other scheme (e.g. `http://`, `https://`) are ignored with a
 /// warning — Mizu only supports the `mizu://` network protocol.
 fn navigate_to_url(manager: &mut MizuWindowManager, url: String) {
+    // Reloading or navigating to the blank start page is a no-op: there is
+    // nothing to fetch, and `about:` is not a routable scheme.
+    if url == "about:blank" {
+        manager.chrome_state.loading = false;
+        return;
+    }
     // A fresh user/logic-initiated navigation starts a new redirect chain.
     manager.reset_redirect_count();
     let url = match resolve_navigate_url(&manager.chrome_state.url, &url) {
@@ -836,6 +1168,9 @@ fn navigate_to_url(manager: &mut MizuWindowManager, url: String) {
             handle_navigate_success(manager, url, content);
         }
     } else if url.starts_with("mizu://") {
+        manager
+            .inspector_log
+            .push_net_start("NAV", &url, Some(url.clone()));
         let _ = manager
             .network_tx
             .send(crate::network::NetworkCmd::Navigate { url });
@@ -922,6 +1257,7 @@ pub fn run_window_loop(
     initial_url: String,
     #[cfg(feature = "insecure-dev")] allow_insecure: bool,
     computed_bindings: Vec<ComputedBinding>,
+    root_timers: Vec<RootTimer>,
 ) -> Result<(), MizuError> {
     let event_loop = winit::event_loop::EventLoopBuilder::<()>::with_user_event()
         .build()
@@ -938,6 +1274,7 @@ pub fn run_window_loop(
     manager.store = VariableStore::with_interner(interner);
     manager.url_registry = url_registry;
     manager.computed_bindings = computed_bindings;
+    manager.root_timers = root_timers;
 
     // Inject the startup URL into the store
     manager.store.set(
@@ -1116,6 +1453,21 @@ pub fn run_window_loop(
                             last_mouse_logical_y - CHROME_HEIGHT + manager.root_scroll_offset_y,
                         );
                     }
+                    // ── Picker hover: live-highlight the node under the cursor ─
+                    if manager.inspector.open && manager.inspector.picker {
+                        window.set_cursor_icon(winit::window::CursorIcon::Crosshair);
+                        let logical_width =
+                            window.inner_size().width as f32 / scale_factor as f32;
+                        let over_page = last_mouse_logical_x
+                            < crate::render::inspector::panel_left(logical_width);
+                        let hover = if over_page { hit_node_id } else { None };
+                        if manager.inspector.picker_hover != hover {
+                            manager.inspector.picker_hover = hover;
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+
                     let mut is_button = false;
 
                     if let Some(hit_id) = hit_node_id {
@@ -1186,8 +1538,9 @@ pub fn run_window_loop(
                                         lc,
                                     );
                                 }
-                                if manager.focused_node.is_some() {
-                                    manager.focused_node = None;
+                                if let Some(prev) = manager.focused_node.take() {
+                                    // Re-render the blurred input (placeholder returns).
+                                    manager.mark_text_dirty(prev);
                                 }
                             }
                             ChromeHitZone::Background => {
@@ -1195,11 +1548,73 @@ pub fn run_window_loop(
                                 if manager.chrome_state.focused {
                                     manager.chrome_state.focused = false;
                                 }
-                                if manager.focused_node.is_some() {
-                                    manager.focused_node = None;
+                                if let Some(prev) = manager.focused_node.take() {
+                                    // Re-render the blurred input (placeholder returns).
+                                    manager.mark_text_dirty(prev);
                                 }
                             }
                         }
+                        window.request_redraw();
+                        return;
+                    }
+
+                    // ── Click inside the inspector panel ─────────────────────
+                    if manager.inspector.open
+                        && last_mouse_logical_x
+                            >= crate::render::inspector::panel_left(logical_width)
+                    {
+                        let rows = {
+                            let src = manager.inspector_sources();
+                            crate::render::inspector::model::build_rows(&src, &manager.inspector)
+                        };
+                        let x = last_mouse_logical_x
+                            - crate::render::inspector::panel_left(logical_width);
+                        let y = last_mouse_logical_y - CHROME_HEIGHT;
+                        if crate::render::inspector::handle_panel_click(
+                            &mut manager.inspector,
+                            &rows,
+                            x,
+                            y,
+                        ) {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+
+                    // ── Picker mode: the click selects instead of interacting ─
+                    if manager.inspector.open && manager.inspector.picker {
+                        let hit = hit_test(
+                            &manager.dom,
+                            &manager.taffy,
+                            &manager.node_to_taffy_id,
+                            &manager.scroll_offsets,
+                            last_mouse_logical_x,
+                            last_mouse_logical_y - CHROME_HEIGHT + manager.root_scroll_offset_y,
+                        );
+                        if let Some(hit_id) = hit {
+                            manager
+                                .inspector
+                                .select_with_ancestors(&manager.dom, hit_id);
+                            // Bring the selection into view in the Elements tree.
+                            let rows = {
+                                let src = manager.inspector_sources();
+                                crate::render::inspector::model::build_rows(
+                                    &src,
+                                    &manager.inspector,
+                                )
+                            };
+                            if let Some(idx) = rows.iter().position(|r| r.node == Some(hit_id)) {
+                                let logical_height = window.inner_size().height as f32
+                                    / window.scale_factor() as f32;
+                                let viewport_h = (logical_height
+                                    - CHROME_HEIGHT
+                                    - crate::render::inspector::TAB_BAR_HEIGHT)
+                                    .max(0.0);
+                                manager.inspector.scroll_to_row(idx, viewport_h);
+                            }
+                        }
+                        manager.inspector.set_picker(false);
+                        window.set_cursor_icon(winit::window::CursorIcon::Default);
                         window.request_redraw();
                         return;
                     }
@@ -1216,6 +1631,7 @@ pub fn run_window_loop(
                         last_mouse_logical_y - CHROME_HEIGHT + manager.root_scroll_offset_y,
                     );
                     let mut action_node_id = None;
+                    let mut submit_node_id = None;
                     let mut new_focus = None;
                     let mut current_hit = hit_node_id;
 
@@ -1227,7 +1643,10 @@ pub fn run_window_loop(
                             if node_ref.value().events.contains_key("click") {
                                 action_node_id = Some(id);
                             }
-                            if action_node_id.is_some() {
+                            if node_ref.value().events.contains_key("submit") {
+                                submit_node_id = Some(id);
+                            }
+                            if action_node_id.is_some() || submit_node_id.is_some() {
                                 break;
                             }
                             current_hit = node_ref.parent().map(|p| p.id());
@@ -1237,6 +1656,14 @@ pub fn run_window_loop(
                     }
 
                     if manager.focused_node != new_focus {
+                        // Re-render both inputs: the old one regains its
+                        // placeholder, the new one shows the caret.
+                        if let Some(prev) = manager.focused_node {
+                            manager.mark_text_dirty(prev);
+                        }
+                        if let Some(next) = new_focus {
+                            manager.mark_text_dirty(next);
+                        }
                         manager.focused_node = new_focus;
                         window.request_redraw();
                     }
@@ -1244,10 +1671,24 @@ pub fn run_window_loop(
                     if let Some(node_id) = action_node_id
                         && let Some(&u32_id) = manager.node_id_to_u32.get(&node_id)
                     {
+                        if let Some(node_ref) = manager.dom.get(node_id) {
+                            manager.inspector_log.push_event(
+                                crate::render::inspector::log::EventKind::Click,
+                                crate::render::inspector::model::node_label(node_ref.value()),
+                            );
+                        }
                         // Mark user gesture before dispatching — clipboard actions in this
                         // response batch are therefore authorised.
                         manager.has_user_gesture = true;
                         let _ = manager.logic_tx.send(UiEvent::Click { node_id: u32_id });
+                        window.request_redraw();
+                    }
+
+                    // A click on a submit button gathers the enclosing form's
+                    // fields and forwards them to the logic worker.
+                    if let Some(submit_id) = submit_node_id
+                        && dispatch_form_submit(&mut manager, submit_id)
+                    {
                         window.request_redraw();
                     }
                 }
@@ -1255,6 +1696,21 @@ pub fn run_window_loop(
                     event: key_event, ..
                 } => {
                     if !key_event.state.is_pressed() {
+                        return;
+                    }
+
+                    // ── F12 toggles the inspector, regardless of focus ────────
+                    if let winit::keyboard::Key::Named(NamedKey::F12) = key_event.logical_key {
+                        manager.inspector.toggle();
+                        let physical_size = window.inner_size();
+                        let scale = window.scale_factor() as f32;
+                        if let Err(e) = manager.resize_viewport(
+                            physical_size.width as f32 / scale,
+                            physical_size.height as f32 / scale,
+                        ) {
+                            tracing::error!("layout recalculation failed on inspector toggle: {e}");
+                        }
+                        window.request_redraw();
                         return;
                     }
 
@@ -1308,9 +1764,95 @@ pub fn run_window_loop(
                         return;
                     }
 
-                    // ── Global shortcut: Escape exits ────────────────────────
+                    // ── A DOM input has focus — route text-editing keys to it ──
+                    if let Some(focus_id) = manager.focused_node
+                        && let Some(&input_u32) = manager.node_id_to_u32.get(&focus_id)
+                    {
+                        match &key_event.logical_key {
+                            winit::keyboard::Key::Named(NamedKey::Escape) => {
+                                // Blur the input; Escape only exits the app
+                                // when nothing is focused.
+                                manager.focused_node = None;
+                                manager.mark_text_dirty(focus_id);
+                                window.request_redraw();
+                            }
+                            winit::keyboard::Key::Named(NamedKey::Backspace) => {
+                                if let Some(buf) = manager.local_inputs.get_mut(&input_u32)
+                                    && buf.pop().is_some()
+                                {
+                                    manager.mark_text_dirty(focus_id);
+                                    window.request_redraw();
+                                }
+                            }
+                            winit::keyboard::Key::Named(NamedKey::Enter) => {
+                                // Enter submits the enclosing form, exactly
+                                // like clicking its submit button.
+                                if let Some(submitter) =
+                                    find_form_submitter(&manager.dom, focus_id)
+                                    && dispatch_form_submit(&mut manager, submitter)
+                                {
+                                    window.request_redraw();
+                                }
+                            }
+                            _ => {
+                                let is_paste = manager.modifiers.control_key()
+                                    && matches!(
+                                        &key_event.logical_key,
+                                        winit::keyboard::Key::Character(c)
+                                            if c.eq_ignore_ascii_case("v")
+                                    );
+                                if is_paste {
+                                    if let Ok(mut cb) = arboard::Clipboard::new()
+                                        && let Ok(text) = cb.get_text()
+                                    {
+                                        let buf = manager
+                                            .local_inputs
+                                            .entry(input_u32)
+                                            .or_default();
+                                        if push_input_text(buf, &text) {
+                                            manager.mark_text_dirty(focus_id);
+                                            window.request_redraw();
+                                        }
+                                    }
+                                } else if !manager.modifiers.control_key()
+                                    && !manager.modifiers.alt_key()
+                                    && !manager.modifiers.super_key()
+                                    && let Some(text) = key_event.text.as_deref()
+                                {
+                                    let buf =
+                                        manager.local_inputs.entry(input_u32).or_default();
+                                    if push_input_text(buf, text) {
+                                        manager.mark_text_dirty(focus_id);
+                                        window.request_redraw();
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+
+                    // ── Escape: picker → inspector → exit, in that order ─────
                     if let winit::keyboard::Key::Named(NamedKey::Escape) = key_event.logical_key {
-                        elwt.exit();
+                        if manager.inspector.picker {
+                            manager.inspector.set_picker(false);
+                            window.set_cursor_icon(winit::window::CursorIcon::Default);
+                            window.request_redraw();
+                        } else if manager.inspector.open {
+                            manager.inspector.toggle();
+                            let physical_size = window.inner_size();
+                            let scale = window.scale_factor() as f32;
+                            if let Err(e) = manager.resize_viewport(
+                                physical_size.width as f32 / scale,
+                                physical_size.height as f32 / scale,
+                            ) {
+                                tracing::error!(
+                                    "layout recalculation failed on inspector close: {e}"
+                                );
+                            }
+                            window.request_redraw();
+                        } else {
+                            elwt.exit();
+                        }
                     }
                 }
                 WindowEvent::ModifiersChanged(modifiers) => {
@@ -1322,6 +1864,19 @@ pub fn run_window_loop(
                         MouseScrollDelta::LineDelta(_dx, dy) => -dy * 20.0,
                         MouseScrollDelta::PixelDelta(physical) => -(physical.y as f32) / scale,
                     };
+
+                    // ── Wheel over the inspector panel scrolls its content ────
+                    if manager.inspector.open {
+                        let logical_width = window.inner_size().width as f32 / scale;
+                        if last_mouse_logical_x
+                            >= crate::render::inspector::panel_left(logical_width)
+                            && last_mouse_logical_y >= CHROME_HEIGHT
+                        {
+                            manager.inspector.scroll_by(delta_y * 2.0);
+                            window.request_redraw();
+                            return;
+                        }
+                    }
 
                     let mut candidate = hit_test(
                         &manager.dom,
@@ -1500,6 +2055,49 @@ pub fn run_window_loop(
                         );
                     }
 
+                    // ── Layer 3: Inspector panel + selection highlight ───────
+                    if manager.inspector.open {
+                        let logical_height = height as f32 / scale as f32;
+                        // While picking, highlight the node under the cursor;
+                        // otherwise the committed selection.
+                        let highlight_target = if manager.inspector.picker {
+                            manager.inspector.picker_hover
+                        } else {
+                            manager.inspector.selected
+                        };
+                        if let Some(sel) = highlight_target
+                            && let Some(rect) = crate::render::inspector::node_screen_rect(
+                                &manager.dom,
+                                &manager.taffy,
+                                &manager.node_to_taffy_id,
+                                &manager.scroll_offsets,
+                                manager.root_scroll_offset_y,
+                                CHROME_HEIGHT,
+                                sel,
+                            )
+                        {
+                            crate::render::inspector::paint::paint_node_highlight(
+                                &mut scene,
+                                rect,
+                                scale as f32,
+                            );
+                        }
+                        let rows = {
+                            let src = manager.inspector_sources();
+                            crate::render::inspector::model::build_rows(&src, &manager.inspector)
+                        };
+                        crate::render::inspector::paint::paint_panel(
+                            &mut scene,
+                            &mut manager.inspector,
+                            &rows,
+                            logical_width,
+                            logical_height,
+                            scale as f32,
+                            &mut manager.font_cx,
+                            &mut manager.layout_cx,
+                        );
+                    }
+
                     if has_animations || manager.chrome_state.loading {
                         window.request_redraw();
                     }
@@ -1558,8 +2156,15 @@ pub fn run_window_loop(
                 match res {
                     Ok(response) => {
                         for (name, val) in response.state_update.mutated_variables {
+                            manager.inspector_log.push_event(
+                                crate::render::inspector::log::EventKind::Mutation,
+                                format!("{name} = {val}"),
+                            );
                             let sym = manager.store.interner.get_or_intern(&name);
                             manager.store.set(name, val);
+                            manager
+                                .recent_mutations
+                                .insert(sym, std::time::Instant::now());
                             state_changed = true;
                             mutated_symbols.push(sym);
                         }
@@ -1641,6 +2246,9 @@ pub fn run_window_loop(
                                     &mut manager.layout_cx,
                                     &manager.store,
                                     current_width,
+                                    &manager.local_inputs,
+                                    &manager.node_id_to_u32,
+                                    manager.focused_node,
                                 )
                             {
                                 manager.text_layouts.insert(node_id, layout);
@@ -1697,6 +2305,7 @@ pub fn run_window_loop(
                 }
             }
 
+            let mut timers_fired = false;
             while let Some(&deadline) = manager.timer_queue.keys().next() {
                 if now >= deadline {
                     if let Some(node_ids) = manager.timer_queue.remove(&deadline) {
@@ -1708,6 +2317,15 @@ pub fn run_window_loop(
                                 if let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) {
                                     let _ =
                                         manager.logic_tx.send(UiEvent::Timer { node_id: u32_id });
+                                    timers_fired = true;
+                                    if manager.inspector.open {
+                                        manager.inspector_log.push_event(
+                                            crate::render::inspector::log::EventKind::Timer,
+                                            crate::render::inspector::model::node_label(
+                                                node_ref.value(),
+                                            ),
+                                        );
+                                    }
                                 }
 
                                 let mut interval_ms = match interval {
@@ -1739,6 +2357,42 @@ pub fn run_window_loop(
                 }
             }
 
+            // Root `timer` declarations fire on the same clock; the action is
+            // dispatched to the logic worker by declaration index.
+            while let Some(&deadline) = manager.root_timer_queue.keys().next() {
+                if now >= deadline {
+                    if let Some(indices) = manager.root_timer_queue.remove(&deadline) {
+                        for idx in indices {
+                            let interval = match manager.root_timers.get(idx) {
+                                Some(rt) => manager.resolve_root_timer_interval(&rt.interval),
+                                None => continue,
+                            };
+                            let _ = manager
+                                .logic_tx
+                                .send(UiEvent::RootTimer { index: idx as u32 });
+                            timers_fired = true;
+                            if manager.inspector.open {
+                                manager.inspector_log.push_event(
+                                    crate::render::inspector::log::EventKind::Timer,
+                                    format!("root timer #{idx}"),
+                                );
+                            }
+                            if let Some(interval_ms) = interval {
+                                let next_deadline =
+                                    now + std::time::Duration::from_millis(interval_ms);
+                                manager
+                                    .root_timer_queue
+                                    .entry(next_deadline)
+                                    .or_default()
+                                    .push(idx);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
             if redraw {
                 let physical_size = window.inner_size();
                 let logical_width = physical_size.width as f32 / window.scale_factor() as f32;
@@ -1762,6 +2416,38 @@ pub fn run_window_loop(
                     }
                 })
                 .or(next_wakeup);
+
+            if let Some(&t) = manager.root_timer_queue.keys().next() {
+                next_wakeup = Some(next_wakeup.map(|w| w.min(t)).unwrap_or(t));
+            }
+
+            // Timer actions execute asynchronously in the logic worker; wake
+            // again shortly so their responses are drained without waiting a
+            // full timer period.
+            if timers_fired {
+                let drain_at = now + std::time::Duration::from_millis(16);
+                next_wakeup = Some(next_wakeup.map(|w| w.min(drain_at)).unwrap_or(drain_at));
+            }
+
+            // Inspector Events tab shows live countdowns and Logic flashes
+            // recent mutations — refresh those views at ~2 Hz while visible.
+            if manager.inspector.open
+                && matches!(
+                    manager.inspector.tab,
+                    crate::render::inspector::InspectorTab::Events
+                        | crate::render::inspector::InspectorTab::Logic
+                )
+            {
+                if now.duration_since(manager.inspector.last_events_refresh)
+                    >= std::time::Duration::from_millis(500)
+                {
+                    manager.inspector.last_events_refresh = now;
+                    window.request_redraw();
+                }
+                let tick =
+                    manager.inspector.last_events_refresh + std::time::Duration::from_millis(500);
+                next_wakeup = Some(next_wakeup.map(|w| w.min(tick)).unwrap_or(tick));
+            }
 
             // While a network fetch is in flight, poll every 16 ms so the
             // try_recv drain fires regularly and the UI stays responsive.

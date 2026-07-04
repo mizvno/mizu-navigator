@@ -331,8 +331,15 @@ fn strip_comment(line: &str) -> &str {
             b'\\' if in_string => {
                 i += 1; // skip the escaped char (bounds-safe: i+1 may == len)
             }
-            // Outside a string, a `//` pair starts a comment.
-            b'/' if !in_string && i + 1 < len && bytes[i + 1] == b'/' => {
+            // Outside a string, a `//` pair starts a comment — but only at the
+            // start of the line or after whitespace.  This keeps `//` inside
+            // unquoted URLs intact (`media logo mizu://cdn.example.com/x.png`
+            // in the `urls` block must not lose everything after `mizu:`).
+            b'/' if !in_string
+                && i + 1 < len
+                && bytes[i + 1] == b'/'
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace()) =>
+            {
                 return &line[..i];
             }
             _ => {}
@@ -535,6 +542,21 @@ mod tests {
         // `//` inside a string literal must NOT be treated as a comment.
         let line = r#"    text "visit http://example.com for info""#;
         assert_eq!(strip_comment(line), line);
+    }
+
+    #[test]
+    fn strip_preserves_unquoted_mizu_url() {
+        // `urls` block targets are unquoted: the `//` of the scheme must not
+        // start a comment (it is preceded by `:`, not whitespace).
+        let line = "  media logo mizu://cdn.example.com/logo.png";
+        assert_eq!(strip_comment(line), line);
+    }
+
+    #[test]
+    fn strip_comment_after_unquoted_url() {
+        // A real comment after an unquoted URL is delimited by whitespace.
+        let line = "  media logo mizu://cdn.example.com/x.png // the logo";
+        assert_eq!(strip_comment(line), "  media logo mizu://cdn.example.com/x.png ");
     }
 
     #[test]

@@ -25,6 +25,13 @@ pub fn extract_placeholders(text: &str) -> Vec<String> {
 }
 
 /// Computes logical size and Parley text layout for a DOM node.
+///
+/// For `input` nodes the rendered text comes from `local_inputs` (the live
+/// per-node typing buffers, keyed by u32 id).  An untouched, unfocused input
+/// shows its `placeholder` attribute dimmed; an empty focused input renders a
+/// single space so the line metrics — and therefore the box height — stay
+/// stable across the empty ↔ non-empty transition.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_node_text(
     node_id: EgoNodeId,
     dom: &Tree<MizuNode>,
@@ -33,6 +40,9 @@ pub fn calculate_node_text(
     layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
     store: &VariableStore,
     available_width: Option<f32>,
+    local_inputs: &rustc_hash::FxHashMap<u32, String>,
+    node_id_to_u32: &HashMap<EgoNodeId, u32>,
+    focused_input: Option<EgoNodeId>,
 ) -> Option<((f32, f32), parley::Layout<vello::peniko::Color>)> {
     let node_ref = dom.get(node_id)?;
     let mizu_node = node_ref.value();
@@ -41,8 +51,27 @@ pub fn calculate_node_text(
         return None;
     }
 
-    let raw_text = if mizu_node.primitive == Primitive::Input {
-        String::new()
+    let is_input = mizu_node.primitive == Primitive::Input;
+    let mut is_placeholder = false;
+    let raw_text = if is_input {
+        let typed = node_id_to_u32
+            .get(&node_id)
+            .and_then(|u| local_inputs.get(u))
+            .map(String::as_str)
+            .unwrap_or("");
+        if !typed.is_empty() {
+            typed.to_string()
+        } else if focused_input != Some(node_id)
+            && let Some(ph) = mizu_node.attributes.get("placeholder")
+            && !ph.is_empty()
+        {
+            is_placeholder = true;
+            ph.clone()
+        } else {
+            // Invisible single space: keeps line metrics stable and puts the
+            // caret at the left edge when the input is focused and empty.
+            " ".to_string()
+        }
     } else if let Some(text) = mizu_node.attributes.get("content") {
         text.clone()
     } else {
@@ -67,6 +96,10 @@ pub fn calculate_node_text(
     }
     if let Some(ref tc) = merged.color {
         text_color = to_vello_color(tc);
+    }
+    if is_placeholder {
+        // Placeholder renders dimmed: same hue, reduced alpha.
+        text_color = vello::peniko::Color::rgba8(text_color.r, text_color.g, text_color.b, 120);
     }
 
     let text_to_draw = if mizu_node.primitive == Primitive::Input {
@@ -96,7 +129,9 @@ pub fn calculate_node_text(
     ));
 
     let mut layout = builder.build(&text_to_draw);
-    let mut is_nowrap = false;
+    // Inputs are single-line: long text is clipped by the paint layer instead
+    // of wrapping (which would grow the box height while typing).
+    let mut is_nowrap = is_input;
     if let Some(parent) = node_ref.parent()
         && parent.value().primitive == Primitive::Button
     {

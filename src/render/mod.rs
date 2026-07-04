@@ -4,6 +4,8 @@
 pub mod chrome_vello;
 /// Spatial hit-testing for input events.
 pub mod hit_test;
+/// In-window developer inspector panel (F12).
+pub mod inspector;
 /// Image and animation decoders.
 pub mod image_codec;
 /// Layout tree builder and translator.

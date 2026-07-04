@@ -31,6 +31,21 @@ pub(crate) fn normalize_path_components(path: &std::path::Path) -> std::path::Pa
     out
 }
 
+/// Strips Windows' verbatim prefix (`\\?\`) from a path.
+///
+/// [`std::fs::canonicalize`] on Windows returns verbatim paths whose prefix
+/// component (`VerbatimDisk`) never matches the plain `Disk` prefix of a
+/// lexically-normalised path, so `Path::starts_with` would always fail when
+/// one side was canonicalised and the other was not (e.g. an existing sandbox
+/// base vs. a not-yet-existing target).  No-op on non-Windows paths.
+fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest.to_string());
+    }
+    p
+}
+
 /// Returns `true` if `target` is contained within `sandbox_base`.
 ///
 /// Uses [`std::fs::canonicalize`] when both paths exist (resolves symlinks);
@@ -42,10 +57,13 @@ pub(crate) fn file_sandbox_contains(
     sandbox_base: &std::path::Path,
     target: &std::path::Path,
 ) -> bool {
-    let canon_base = std::fs::canonicalize(sandbox_base)
-        .unwrap_or_else(|_| normalize_path_components(sandbox_base));
-    let canon_target =
-        std::fs::canonicalize(target).unwrap_or_else(|_| normalize_path_components(target));
+    let canon_base = strip_verbatim_prefix(
+        std::fs::canonicalize(sandbox_base)
+            .unwrap_or_else(|_| normalize_path_components(sandbox_base)),
+    );
+    let canon_target = strip_verbatim_prefix(
+        std::fs::canonicalize(target).unwrap_or_else(|_| normalize_path_components(target)),
+    );
     !canon_base.as_os_str().is_empty()
         && !canon_target.as_os_str().is_empty()
         && canon_target.starts_with(&canon_base)
@@ -212,6 +230,18 @@ pub fn get_raw_domain(url: &str) -> String {
     "unknown".to_string()
 }
 
+/// Outcome of a capability dispatch, reported to the caller so the UI (e.g.
+/// the inspector's network log) can show what actually happened — in
+/// particular when an action was blocked by policy before leaving the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityOutcome {
+    /// The action was forwarded to the responsible subsystem.
+    Dispatched,
+    /// The action was rejected by a client-side policy; the reason is
+    /// human-readable and safe to display.
+    Blocked(String),
+}
+
 /// Executes a declarative capability action, enforcing per-origin policy.
 ///
 /// `policy` tracks storage quota and rate limits for the current origin; it
@@ -227,12 +257,13 @@ pub fn execute_capability_action(
     chrome_url: &str,
     policy: &mut CapabilityPolicy,
     action: RuntimeAction,
-) {
+) -> CapabilityOutcome {
     match action {
-        RuntimeAction::None => {}
+        RuntimeAction::None => CapabilityOutcome::Dispatched,
         RuntimeAction::ResolvedCall {
             method,
             url,
+            payload,
             target_variable,
         } => {
             // Block outbound calls from file:// origins to non-local mizu:// hosts.
@@ -245,26 +276,28 @@ pub fn execute_capability_action(
                     .map(|u| !crate::network::worker::is_local_host(&u.domain))
                     .unwrap_or(true); // parse failure → fail-secure: treat as remote
             if chrome_url.starts_with("file://") && target_is_remote_mizu {
-                tracing::warn!(
-                    url = %url,
-                    "SecurityViolation: file:// origin blocked from outbound call to remote mizu:// host"
+                let reason = format!(
+                    "file:// origin blocked from outbound call to remote host {url}"
                 );
-                return;
+                tracing::warn!(url = %url, "SecurityViolation: {reason}");
+                return CapabilityOutcome::Blocked(reason);
             }
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::Fetch {
                 method,
                 url,
                 target_var: target_variable,
                 is_remote_origin: chrome_url.starts_with("mizu://"),
+                payload,
             }) {
                 tracing::warn!(error = %e, "network channel closed; Fetch command dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::StoreLocal { key, value } => {
             let byte_count = estimate_value_bytes(&value);
             if let Err(e) = policy.check_storage_write(byte_count) {
                 tracing::warn!(error = %e, key = %key, "StorageStore blocked by capability policy");
-                return;
+                return CapabilityOutcome::Blocked(e.to_string());
             }
             // Offload the entire storage operation (keyring IPC + filesystem
             // write) to the network worker's Tokio blocking pool so the UI
@@ -275,6 +308,7 @@ pub fn execute_capability_action(
             {
                 tracing::warn!(error = %e, "network channel closed; StorageStore command dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::CopyToClipboard { .. } => {
             // Must be intercepted and handled in window.rs (gesture + DOM lookup).
@@ -282,6 +316,7 @@ pub fn execute_capability_action(
             tracing::warn!(
                 "CopyToClipboard reached execute_capability_action — should have been intercepted upstream"
             );
+            CapabilityOutcome::Blocked("clipboard action bypassed the gesture gate".to_string())
         }
         RuntimeAction::GetSystemTime { target_variable } => {
             let now = std::time::SystemTime::now();
@@ -295,11 +330,13 @@ pub fn execute_capability_action(
             }) {
                 tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::Navigate { url } => {
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::Navigate { url }) {
                 tracing::warn!(error = %e, "network channel closed; Navigate command dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::NetworkCall {
             method,
@@ -319,6 +356,7 @@ pub fn execute_capability_action(
             }) {
                 tracing::warn!(error = %e, "network channel closed; NetworkRequest command dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::DownloadMedia { url } => {
             tracing::info!(url = %url, "download media requested");
@@ -336,9 +374,11 @@ pub fn execute_capability_action(
             }) {
                 tracing::warn!(error = %e, "network channel closed; FetchImage command dropped");
             }
+            CapabilityOutcome::Dispatched
         }
         RuntimeAction::DownloadAlias { .. } => {
             tracing::warn!("unresolved DownloadAlias reached capability executor");
+            CapabilityOutcome::Blocked("unresolved download alias".to_string())
         }
     }
 }
@@ -443,6 +483,22 @@ mod tests {
             Path::new("home/user/app"),
             Path::new("home/user/app/about.mizu"),
         ));
+    }
+
+    #[test]
+    fn file_sandbox_contains_existing_base_missing_target() {
+        // Regression: on Windows, canonicalising an EXISTING base yields a
+        // verbatim path (`\\?\C:\…`) while a MISSING target falls back to the
+        // lexical form — the mixed prefixes made starts_with always fail, so
+        // any not-yet-existing file inside the sandbox was reported as an
+        // escape.  A missing file directly inside an existing base must be
+        // contained.
+        let base = std::env::temp_dir();
+        let target = base.join("mizu_sandbox_regression_missing_file.bin");
+        assert!(
+            super::file_sandbox_contains(&base, &target),
+            "missing file inside an existing sandbox base must be contained"
+        );
     }
 
     #[test]
@@ -630,5 +686,52 @@ mod tests {
             "non-mizu:// URL must fail to parse"
         );
         // In execute_capability_action the .unwrap_or(true) makes parse failures block the call.
+    }
+
+    // ------------------------------------------------------------------
+    // POST/PUT/QUERY payload plumbing: ResolvedCall → NetworkCmd::Fetch
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolved_call_payload_reaches_network_cmd() {
+        // Regression: the payload declared in the document used to be silently
+        // dropped during ResolvedCall dispatch, so POST bodies never reached
+        // the wire.  It must now be forwarded intact into NetworkCmd::Fetch.
+        let (network_tx, mut network_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
+        let mut store = crate::core::types::VariableStore::new();
+        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+
+        let payload = Value::String(Arc::from(r#"{"who":"mizu"}"#));
+        super::execute_capability_action(
+            &mut store,
+            &network_tx,
+            &logic_tx,
+            "mizu://example.com/index.mizu",
+            &mut policy,
+            crate::network::RuntimeAction::ResolvedCall {
+                method: "POST".to_string(),
+                url: "mizu://example.com/api/v1/submit".to_string(),
+                payload: Some(payload.clone()),
+                target_variable: "result".to_string(),
+            },
+        );
+
+        match network_rx.try_recv() {
+            Ok(crate::network::NetworkCmd::Fetch {
+                method,
+                payload: sent,
+                ..
+            }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(
+                    sent,
+                    Some(payload),
+                    "POST payload must survive the ResolvedCall → Fetch dispatch"
+                );
+            }
+            other => panic!("expected NetworkCmd::Fetch, got {other:?}"),
+        }
     }
 }

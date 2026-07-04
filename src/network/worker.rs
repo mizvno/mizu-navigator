@@ -625,6 +625,7 @@ pub fn spawn_network_thread(
                         url,
                         target_var,
                         is_remote_origin,
+                        payload,
                     } => {
                         let tx_clone = tx.clone();
                         let endpoint_clone = endpoint.clone();
@@ -639,6 +640,31 @@ pub fn spawn_network_thread(
                             };
                             let _permit = permit; // RAII: released when this task exits
 
+                            // Serialise the optional payload to JSON once, before any I/O,
+                            // so a serialisation failure aborts cleanly without touching
+                            // the network.
+                            let request_body = match payload
+                                .as_ref()
+                                .map(|v| serde_json::to_vec(&crate::core::types::to_json(v)))
+                            {
+                                Some(Ok(vec)) => Some(bytes::Bytes::from(vec)),
+                                Some(Err(e)) => {
+                                    if tx_clone
+                                        .send(NetworkResult::Error(MizuError::Network(format!(
+                                            "request payload serialisation failed: {e}"
+                                        ))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::trace!(
+                                            "UI channel closed; payload serialisation error dropped"
+                                        );
+                                    }
+                                    return;
+                                }
+                                None => None,
+                            };
+
                             match handle_fetch(
                                 &endpoint_clone,
                                 &pool_clone,
@@ -646,6 +672,7 @@ pub fn spawn_network_thread(
                                 &method,
                                 &url,
                                 is_remote_origin,
+                                request_body,
                             )
                             .await
                             {
@@ -668,7 +695,16 @@ pub fn spawn_network_thread(
                                     }
                                 }
                                 Err(e) => {
-                                    if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
+                                    // Surface the failure into the call's bound
+                                    // variable so the document can display it.
+                                    if tx_clone
+                                        .send(NetworkResult::FetchFailed {
+                                            target_var,
+                                            error: e,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         tracing::trace!("UI channel closed; Fetch error result dropped");
                                     }
                                 }
@@ -698,6 +734,7 @@ pub fn spawn_network_thread(
                                 "GET",
                                 &url,
                                 false,
+                                None,
                             )
                             .await
                             {
@@ -849,6 +886,7 @@ pub fn spawn_network_thread(
                                 "GET",
                                 &url,
                                 is_remote_origin,
+                                None,
                             )
                             .await
                             {
@@ -982,7 +1020,20 @@ fn handle_fetch_file(url_str: &str, sandbox_base: Option<&str>) -> Result<Vec<u8
         )));
     }
 
-    std::fs::read(target).map_err(MizuError::IoError)
+    // TOCTOU hardening: resolve the path exactly once (following any symlinks),
+    // re-verify the *resolved* form against the sandbox, then read through it.
+    // The checked path and the read path are therefore the same filesystem
+    // object — a symlink swapped in between check and read cannot redirect the
+    // read outside the sandbox.
+    let resolved = std::fs::canonicalize(target).map_err(MizuError::IoError)?;
+    if !crate::render::security::file_sandbox_contains(&base, &resolved) {
+        return Err(MizuError::SecurityViolation(format!(
+            "file:// access denied: resolved path '{}' escapes sandbox base '{}'",
+            resolved.display(),
+            base.display()
+        )));
+    }
+    std::fs::read(&resolved).map_err(MizuError::IoError)
 }
 
 /// Decodes a raw network response body to a `Value::String` using lossy UTF-8.
@@ -1002,9 +1053,18 @@ async fn handle_fetch(
     method: &str,
     url_str: &str,
     _is_remote_origin: bool,
+    request_body: Option<bytes::Bytes>,
 ) -> Result<(Option<String>, crate::core::types::Value), MizuError> {
-    let (status, headers, body) =
-        handle_fetch_raw(endpoint, pool, dns, method, url_str, _is_remote_origin).await?;
+    let (status, headers, body) = handle_fetch_raw(
+        endpoint,
+        pool,
+        dns,
+        method,
+        url_str,
+        _is_remote_origin,
+        request_body,
+    )
+    .await?;
     let domain = MizuUri::parse(url_str)
         .map(|u| u.domain)
         .unwrap_or_default();
@@ -1028,6 +1088,7 @@ async fn handle_fetch_raw(
     method: &str,
     url_str: &str,
     _is_remote_origin: bool,
+    request_body: Option<bytes::Bytes>,
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     if url_str.starts_with("file://") {
         return Err(MizuError::SecurityViolation(
@@ -1050,20 +1111,72 @@ async fn handle_fetch_raw(
     .await?;
 
     // First attempt. On a connection-level error, evict and retry once.
-    match do_h3_request(pool, endpoint, addr, &uri, method, opt_entry.as_ref()).await {
+    // `Bytes::clone` is a cheap refcount bump, so the retry reuses the payload.
+    match do_h3_request(
+        pool,
+        endpoint,
+        addr,
+        &uri,
+        method,
+        opt_entry.as_ref(),
+        request_body.clone(),
+    )
+    .await
+    {
         Ok(resp) => Ok(resp),
         Err(MizuError::Network(_)) => {
             pool.evict(&uri.domain).await;
             // Re-validate the vault entry in case the first attempt consumed it.
             let opt_entry2 = load_valid_entry(&vault_domain, method)?;
-            do_h3_request(pool, endpoint, addr, &uri, method, opt_entry2.as_ref()).await
+            do_h3_request(
+                pool,
+                endpoint,
+                addr,
+                &uri,
+                method,
+                opt_entry2.as_ref(),
+                request_body,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
 }
 
+/// Hard ceiling on the total number of body bytes accepted from a single
+/// HTTP/3 response (32 MiB).
+///
+/// Without this cap a malicious or compromised server could stream an
+/// unbounded body and exhaust client memory — the accumulation loop in
+/// [`do_h3_request`] would `extend_from_slice` forever.  32 MiB comfortably
+/// covers any legitimate Mizu document or media asset (image decode is
+/// additionally bounded by `MAX_IMAGE_ALLOC_BYTES` after download).
+const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Checks that appending `incoming_len` bytes to a body of `current_len` bytes
+/// stays within [`MAX_RESPONSE_BODY_BYTES`].
+///
+/// Returns [`MizuError::SecurityViolation`] on overflow so the caller aborts
+/// the transfer; `SecurityViolation` is deliberately not a retryable error
+/// class (unlike `MizuError::Network`), so the oversized download is not
+/// re-attempted on a fresh connection.
+pub(crate) fn check_response_body_budget(
+    current_len: usize,
+    incoming_len: usize,
+) -> Result<(), MizuError> {
+    if current_len.saturating_add(incoming_len) > MAX_RESPONSE_BODY_BYTES {
+        return Err(MizuError::SecurityViolation(format!(
+            "response body exceeds the {MAX_RESPONSE_BODY_BYTES}-byte limit; transfer aborted"
+        )));
+    }
+    Ok(())
+}
+
 /// Sends a single HTTP/3 request on a pooled connection and reads the full
 /// response.
+///
+/// `body` carries the optional JSON-serialised request payload (POST / PUT /
+/// QUERY).  `None` sends a body-less request (GET / DELETE / navigation).
 async fn do_h3_request(
     pool: &H3ConnectionPool,
     endpoint: &Endpoint,
@@ -1071,6 +1184,7 @@ async fn do_h3_request(
     uri: &MizuUri,
     method: &str,
     opt_entry: Option<&VaultEntry>,
+    body: Option<bytes::Bytes>,
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     let h3_client = pool.get_or_connect(endpoint, addr, &uri.domain).await?;
 
@@ -1090,6 +1204,11 @@ async fn do_h3_request(
         );
     }
 
+    // Request payloads are always JSON (serialised from a Mizu `Value`).
+    if body.is_some() {
+        req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
+    }
+
     let req = req_builder
         .body(())
         .map_err(|e| MizuError::Network(format!("Request build error: {e}")))?;
@@ -1105,7 +1224,13 @@ async fn do_h3_request(
             .map_err(|e| MizuError::Network(format!("H3 send_request failed: {e}")))?
     };
 
-    // Signal end of request body (all Mizu requests carry no body).
+    // Transmit the request payload (if any), then signal end of body.
+    if let Some(payload_bytes) = body {
+        stream
+            .send_data(payload_bytes)
+            .await
+            .map_err(|e| MizuError::Network(format!("H3 send_data failed: {e}")))?;
+    }
     stream
         .finish()
         .await
@@ -1122,7 +1247,8 @@ async fn do_h3_request(
 
     // Read all DATA frames.  `recv_data()` returns `impl bytes::Buf`; we
     // drain each chunk via `Buf::chunk()` + `Buf::advance()` to avoid
-    // allocating an intermediate owned buffer.
+    // allocating an intermediate owned buffer.  Accumulation is capped by
+    // MAX_RESPONSE_BODY_BYTES — see `check_response_body_budget`.
     let mut body: Vec<u8> = Vec::new();
     while let Some(mut chunk) = stream
         .recv_data()
@@ -1132,6 +1258,7 @@ async fn do_h3_request(
         use bytes::Buf as _;
         while chunk.has_remaining() {
             let slice = chunk.chunk();
+            check_response_body_budget(body.len(), slice.len())?;
             body.extend_from_slice(slice);
             let len = slice.len();
             chunk.advance(len);
@@ -1373,6 +1500,33 @@ mod tests {
         );
     }
 
+    // — response body size ceiling (check_response_body_budget)
+
+    #[test]
+    fn test_response_body_budget_allows_under_limit() {
+        assert!(check_response_body_budget(0, 1024).is_ok());
+        assert!(check_response_body_budget(MAX_RESPONSE_BODY_BYTES - 1, 1).is_ok());
+    }
+
+    #[test]
+    fn test_response_body_budget_rejects_over_limit() {
+        let result = check_response_body_budget(MAX_RESPONSE_BODY_BYTES, 1);
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "exceeding the body ceiling must yield SecurityViolation (non-retryable): {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_response_body_budget_no_overflow_panic() {
+        // usize::MAX incoming must saturate, not wrap around to a small value.
+        let result = check_response_body_budget(1, usize::MAX);
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "saturating add must still reject: {result:?}"
+        );
+    }
+
     #[test]
     fn test_parse_body_value_multibyte_utf8_preserved() {
         // Valid multi-byte UTF-8 (e.g. Japanese) must round-trip without replacement.
@@ -1505,6 +1659,7 @@ mod tests {
                 "GET",
                 "file:///etc/passwd",
                 is_remote_origin,
+                None,
             )
             .await;
             assert!(
@@ -2220,21 +2375,24 @@ mod tests {
 #[allow(dead_code)] // intentional: available in test builds and insecure-dev builds
 pub(crate) const INSECURE_DEV_ACTIVE: bool = cfg!(feature = "insecure-dev");
 
-/// Returns `true` when `host` is a loopback address, an RFC 1918 private IP, or
-/// a `.local` / `.localhost` hostname.
+/// Returns `true` when `host` is a loopback address (`127.0.0.0/8`, `::1`) or a
+/// loopback hostname (`localhost`, `*.localhost`).
+///
+/// Deliberately excludes RFC 1918 private ranges and `.local` (mDNS) names:
+/// on a shared LAN those can be claimed or answered by other machines, so they
+/// receive no special trust — neither for the insecure-dev TLS bypass, nor for
+/// the file→remote SSRF block, nor for the storage quota tier.  Only traffic
+/// that provably never leaves this machine is treated as local.
 ///
 /// Compiled in all configurations so that the locality invariant is testable
 /// regardless of the active feature set.
 #[allow(dead_code)] // intentional: used by is_local_server_name (insecure-dev) and tests
 pub(crate) fn is_local_host(host: &str) -> bool {
-    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+    if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
     if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        return match addr {
-            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
-            std::net::IpAddr::V6(v6) => v6.is_loopback(),
-        };
+        return addr.is_loopback();
     }
     false
 }
@@ -2250,7 +2408,7 @@ fn is_local_server_name(server_name: &rustls::pki_types::ServerName<'_>) -> bool
         rustls::pki_types::ServerName::IpAddress(addr) => match addr {
             rustls::pki_types::IpAddr::V4(v4) => {
                 let std_v4 = std::net::Ipv4Addr::from(*v4);
-                std_v4.is_loopback() || std_v4.is_private()
+                std_v4.is_loopback()
             }
             rustls::pki_types::IpAddr::V6(v6) => {
                 let std_v6 = std::net::Ipv6Addr::from(*v6);
@@ -2263,10 +2421,11 @@ fn is_local_server_name(server_name: &rustls::pki_types::ServerName<'_>) -> bool
 
 /// TLS verifier active only in `insecure-dev` builds when `--allow-insecure` is set.
 ///
-/// * **Local hosts** (loopback / RFC 1918 / `.local`): bypasses certificate verification
-///   and emits a `tracing::warn!`.
-/// * **All other hosts**: delegates to WebPKI — `--allow-insecure` has no effect for
-///   public servers; invalid certificates still cause connection failures.
+/// * **Loopback hosts** (`localhost` / `*.localhost` / `127.0.0.0/8` / `::1`):
+///   bypasses certificate verification and emits a `tracing::warn!`.
+/// * **All other hosts** (including RFC 1918 LAN addresses and `.local` mDNS
+///   names): delegates to WebPKI — `--allow-insecure` has no effect for them;
+///   invalid certificates still cause connection failures.
 #[cfg(feature = "insecure-dev")]
 struct LocalOrWebPkiVerifier {
     webpki: Arc<rustls::client::WebPkiServerVerifier>,
@@ -2335,6 +2494,11 @@ mod tests_insecure_dev {
 
     /// Verifies that `INSECURE_DEV_ACTIVE` is `false` in the default (production)
     /// build.  The bypass must never be compiled in without an explicit opt-in.
+    ///
+    /// Gated on `not(feature = "insecure-dev")`: when the suite itself is
+    /// compiled with the opt-in feature the constant is `true` by definition,
+    /// so the assertion is only meaningful in the default configuration.
+    #[cfg(not(feature = "insecure-dev"))]
     #[test]
     fn test_insecure_mode_disabled_by_default() {
         assert!(
@@ -2343,7 +2507,9 @@ mod tests_insecure_dev {
         );
     }
 
-    /// Public hostnames and non-RFC-1918 IPs must be rejected by `is_local_host`.
+    /// Everything that is not provably loopback must be rejected by
+    /// `is_local_host` — public hosts, but also RFC 1918 LAN addresses and
+    /// `.local` mDNS names, which other machines on a shared network can claim.
     #[test]
     fn test_insecure_mode_rejected_for_public_hosts() {
         let public_hosts = [
@@ -2351,39 +2517,31 @@ mod tests_insecure_dev {
             "8.8.8.8",
             "1.1.1.1",
             "evil.localhost.example.com", // not a .localhost suffix
-            "192.167.0.1",                // outside RFC 1918
-            "172.15.255.255",             // outside 172.16/12
-            "11.0.0.1",                   // outside 10.0.0.0/8
+            "bar.local",                  // mDNS — spoofable on a shared LAN
+            "192.168.0.1",                // RFC 1918 — not loopback
+            "10.0.0.1",                   // RFC 1918 — not loopback
+            "172.16.0.1",                 // RFC 1918 — not loopback
+            "192.167.0.1",
+            "172.15.255.255",
+            "11.0.0.1",
         ];
         for host in public_hosts {
             assert!(
                 !is_local_host(host),
-                "is_local_host must return false for public host: {host}"
+                "is_local_host must return false for non-loopback host: {host}"
             );
         }
     }
 
-    /// Loopback, RFC 1918 addresses, and `.local` / `.localhost` hostnames must
+    /// Only loopback addresses and `localhost` / `*.localhost` hostnames must
     /// be accepted by `is_local_host`.
     #[test]
     fn test_insecure_mode_allowed_for_loopback() {
-        let local_hosts = [
-            "localhost",
-            "foo.localhost",
-            "bar.local",
-            "127.0.0.1",
-            "::1",
-            "192.168.0.1",
-            "192.168.255.254",
-            "10.0.0.1",
-            "10.255.255.255",
-            "172.16.0.1",
-            "172.31.255.255",
-        ];
+        let local_hosts = ["localhost", "foo.localhost", "127.0.0.1", "127.1.2.3", "::1"];
         for host in local_hosts {
             assert!(
                 is_local_host(host),
-                "is_local_host must return true for local host: {host}"
+                "is_local_host must return true for loopback host: {host}"
             );
         }
     }

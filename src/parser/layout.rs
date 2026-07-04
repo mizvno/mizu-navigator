@@ -698,50 +698,52 @@ pub fn parse_layout_with_urls(
         let (mut node, is_markdown, inline_text) =
             parse_primitive_and_attrs(trimmed, line_idx + 1, interner)?;
 
-        // ── Compile-time media guard ────────────────────────────────────────
+        // ── Compile-time media guard + alias resolution ─────────────────────
         // If a URL registry is provided, validate that `image src: alias`
-        // points to a declared `media` endpoint.
+        // points to a declared `media` endpoint and rewrite the attribute to
+        // the endpoint's absolute URL — the renderer consumes concrete URLs.
         // (`download(alias)` is validated in `parse_action_with_urls` at action parse time.)
-        #[allow(clippy::collapsible_if)]
-        if let Some(registry) = url_registry {
-            if node.primitive == Primitive::Image
-                && let Some(src_alias) = node.attributes.get("src")
-            {
-                // Remote-origin documents must never embed local file:// assets.
-                // Catch this at parse time so the error appears with the source line number
-                // rather than as a runtime network failure.
-                if is_remote_origin && src_alias.starts_with("file://") {
-                    return Err(MizuError::ParseError(format!(
-                        "line {}: SecurityViolation: remote documents cannot embed \
-                         local file:// assets (src: {src_alias})",
-                        line_idx + 1
-                    )));
-                }
+        if let Some(registry) = url_registry
+            && node.primitive == Primitive::Image
+            && let Some(src_alias) = node.attributes.get("src").cloned()
+        {
+            // Remote-origin documents must never embed local file:// assets.
+            // Catch this at parse time so the error appears with the source line number
+            // rather than as a runtime network failure.
+            if is_remote_origin && src_alias.starts_with("file://") {
+                return Err(MizuError::ParseError(format!(
+                    "line {}: SecurityViolation: remote documents cannot embed \
+                     local file:// assets (src: {src_alias})",
+                    line_idx + 1
+                )));
+            }
 
-                // Direct paths (containing `.` or `/`, or starting with a URL scheme)
-                // are used as-is by the renderer — only symbolic aliases need registry validation.
-                let is_direct_path = src_alias.contains('/')
-                    || src_alias.contains('.')
-                    || src_alias.starts_with("mizu://")
-                    || (src_alias.starts_with("file://") && !is_remote_origin);
-                if !is_direct_path {
-                    let sym = interner.get_or_intern(src_alias);
-                    match registry.get(&sym) {
-                        None => {
-                            return Err(MizuError::ParseError(format!(
-                                "line {}: image `src` alias `{src_alias}` is not declared \
-                                 in the `urls` block",
-                                line_idx + 1
-                            )));
-                        }
-                        Some(ep) if ep.kind != EndpointKind::Media => {
-                            return Err(MizuError::ParseError(format!(
-                                "line {}: image `src` alias `{src_alias}` points to an \
-                                 `api` endpoint, not a `media` endpoint",
-                                line_idx + 1
-                            )));
-                        }
-                        _ => {}
+            // Direct paths (containing `.` or `/`, or starting with a URL scheme)
+            // are used as-is by the renderer — only symbolic aliases need registry validation.
+            let is_direct_path = src_alias.contains('/')
+                || src_alias.contains('.')
+                || src_alias.starts_with("mizu://")
+                || (src_alias.starts_with("file://") && !is_remote_origin);
+            if !is_direct_path {
+                let sym = interner.get_or_intern(&src_alias);
+                match registry.get(&sym) {
+                    None => {
+                        return Err(MizuError::ParseError(format!(
+                            "line {}: image `src` alias `{src_alias}` is not declared \
+                             in the `urls` block",
+                            line_idx + 1
+                        )));
+                    }
+                    Some(ep) if ep.kind != EndpointKind::Media => {
+                        return Err(MizuError::ParseError(format!(
+                            "line {}: image `src` alias `{src_alias}` points to an \
+                             `api` endpoint, not a `media` endpoint",
+                            line_idx + 1
+                        )));
+                    }
+                    Some(ep) => {
+                        node.attributes
+                            .insert("src".to_string(), ep.raw_target.clone());
                     }
                 }
             }
@@ -1408,6 +1410,35 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
     // `download(alias)` built-in function
     // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn media_alias_resolved_to_absolute_url() {
+        use crate::parser::urls::{EndpointKind, UrlEndpoint};
+
+        let mut interner = StringInterner::new();
+        let logo_sym = interner.get_or_intern("logo");
+        let mut registry: UrlRegistry = rustc_hash::FxHashMap::default();
+        registry.insert(
+            logo_sym,
+            UrlEndpoint {
+                kind: EndpointKind::Media,
+                raw_target: "mizu://cdn.local/logo.png".to_string(),
+            },
+        );
+
+        let layout = "window \"App\"\n    image src \"logo\"\n";
+        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false).unwrap();
+        let img = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Image)
+            .expect("image node not found");
+        assert_eq!(
+            img.value().attributes.get("src").map(String::as_str),
+            Some("mizu://cdn.local/logo.png"),
+            "media alias must be rewritten to its absolute URL at parse time"
+        );
+    }
 
     #[test]
     fn test_download_builtin_parsed() {

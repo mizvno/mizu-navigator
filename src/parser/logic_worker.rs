@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::core::errors::MizuError;
-use crate::core::types::{Symbol, VariableStore};
+use crate::core::types::{Symbol, Value, VariableStore};
 use crate::network::RuntimeAction;
 use crate::network::messages::{StateUpdate, UiEvent, WorkerResponse};
 use crate::parser::logic::{ComputedBinding, recompute_computed_bindings};
@@ -22,6 +22,10 @@ pub struct LogicWorker {
     pub click_actions: HashMap<u32, Action>,
     /// Timer (every) action mappings for layout nodes.
     pub every_actions: HashMap<u32, Action>,
+    /// Submit action mappings, keyed by the submit button's node id.
+    pub submit_actions: HashMap<u32, Action>,
+    /// Root-level `timer` actions from the `logic` block, in declaration order.
+    pub root_timer_actions: Vec<Action>,
     /// URL registry for resolving compile-time endpoint aliases at runtime.
     pub url_registry: UrlRegistry,
     /// Domain of the current document, used to compose `mizu://` URLs for `api` endpoints.
@@ -46,6 +50,8 @@ impl LogicWorker {
                 logic_fns: FxHashMap::default(),
                 click_actions: HashMap::new(),
                 every_actions: HashMap::new(),
+                submit_actions: HashMap::new(),
+                root_timer_actions: Vec::new(),
                 url_registry: FxHashMap::default(),
                 document_domain: String::new(),
                 computed_vars: Vec::new(),
@@ -63,6 +69,8 @@ impl LogicWorker {
                     self.logic_fns = payload.logic_fns;
                     self.click_actions = payload.click_actions;
                     self.every_actions = payload.every_actions;
+                    self.submit_actions = payload.submit_actions;
+                    self.root_timer_actions = payload.root_timer_actions;
                     self.url_registry = payload.url_registry;
                     self.document_domain = payload.document_domain;
 
@@ -132,17 +140,41 @@ impl LogicWorker {
                     }
                 }
 
+                UiEvent::RootTimer { index } => {
+                    if let Some(action) = self.root_timer_actions.get(index as usize).cloned() {
+                        self.execute_and_respond(&action);
+                    }
+                }
+
                 UiEvent::SubmitForm {
-                    form_node_id: _,
+                    submitter_node_id,
                     fields,
                 } => {
                     self.store.state_machine.undo_log.clear();
+                    // Populate the `$form` magic record first, so the submit
+                    // action can read `$form.<field>` regardless of whether
+                    // the individual field names are declared variables.
+                    let record: std::collections::BTreeMap<std::sync::Arc<str>, Value> = fields
+                        .iter()
+                        .map(|(k, v)| (std::sync::Arc::from(k.as_str()), v.clone()))
+                        .collect();
+                    self.store
+                        .set_runtime("$form", Value::Record(std::sync::Arc::new(record)));
                     for (field_name, field_value) in fields {
                         // Use set_runtime (not set) so that form field names
                         // not declared in the logic block never create new
                         // symbols in the frozen interner.  Declared fields are
                         // updated normally; undeclared ones are logged + dropped.
                         self.store.set_runtime(&field_name, field_value);
+                    }
+                    // Execute the submit button's declared action (e.g.
+                    // `submit -> name = $form.who`).  Field mutations above
+                    // must reach the UI even if the action itself fails, so
+                    // the undo log is NOT cleared here.
+                    if let Some(action) = self.submit_actions.get(&submitter_node_id).cloned()
+                        && let Err(e) = execute_action(&action, &mut self.store, &self.logic_fns)
+                    {
+                        tracing::warn!(error = %e, "form submit action failed");
                     }
                     self.recompute_after_mutation();
                     self.send_response();
@@ -180,43 +212,75 @@ impl LogicWorker {
         let document_domain = &self.document_domain;
         let url_registry = &self.url_registry;
         let raw_actions = std::mem::take(&mut self.store.state_machine.accumulated_actions);
-        let runtime_actions: Vec<RuntimeAction> = raw_actions
-            .into_iter()
-            .map(|action| {
-                if let RuntimeAction::NetworkCall {
-                    ref method,
+        let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
+        // Unresolved aliases surface a readable error in the call's bound
+        // variable instead of silently dropping the action — the user must
+        // see *why* nothing happened.
+        let mut alias_errors: Vec<(String, Value)> = Vec::new();
+        for action in raw_actions {
+            match action {
+                RuntimeAction::NetworkCall {
+                    method,
                     endpoint_symbol,
-                    ref path_param,
-                    ref target_variable,
-                    ..
-                } = action
-                {
+                    payload,
+                    path_param,
+                    target_variable,
+                } => {
                     let sym = crate::core::types::Symbol(endpoint_symbol);
                     if let Some(ep) = url_registry.get(&sym) {
                         let url = resolve_endpoint_url(document_domain, ep, path_param.as_deref());
-                        return RuntimeAction::ResolvedCall {
+                        runtime_actions.push(RuntimeAction::ResolvedCall {
                             method: method.as_str().to_owned(),
                             url,
-                            target_variable: target_variable.clone(),
-                        };
+                            payload,
+                            target_variable,
+                        });
+                    } else {
+                        let alias = self
+                            .store
+                            .interner
+                            .resolve(sym)
+                            .unwrap_or("<unknown>")
+                            .to_owned();
+                        tracing::warn!(
+                            alias = %alias,
+                            target = %target_variable,
+                            "NetworkCall alias not found in the urls block; surfacing error"
+                        );
+                        alias_errors.push((
+                            target_variable,
+                            Value::from(format!(
+                                "error: endpoint alias `{alias}` is not declared in the urls block"
+                            )),
+                        ));
+                        runtime_actions.push(RuntimeAction::None);
                     }
                 }
-                if let RuntimeAction::DownloadAlias { endpoint_symbol } = action {
+                RuntimeAction::DownloadAlias { endpoint_symbol } => {
                     let sym = crate::core::types::Symbol(endpoint_symbol);
                     if let Some(ep) = url_registry.get(&sym) {
-                        return RuntimeAction::DownloadMedia {
+                        runtime_actions.push(RuntimeAction::DownloadMedia {
                             url: ep.raw_target.clone(),
-                        };
+                        });
+                    } else {
+                        tracing::warn!(
+                            endpoint_symbol,
+                            "DownloadAlias could not be resolved at runtime"
+                        );
+                        runtime_actions.push(RuntimeAction::None);
                     }
-                    tracing::warn!(
-                        endpoint_symbol,
-                        "DownloadAlias could not be resolved at runtime"
-                    );
-                    return RuntimeAction::None;
                 }
-                action
-            })
-            .collect();
+                other => runtime_actions.push(other),
+            }
+        }
+        for (name, val) in alias_errors {
+            // Only surface into declared variables: the frozen interner must
+            // not grow, and an undeclared target could never be displayed.
+            if self.store.interner.get(&name).is_some() {
+                self.store.set_runtime(&name, val.clone());
+                mutated_variables.push((name, val));
+            }
+        }
         if let Err(e) = self.tx.send(Ok(WorkerResponse {
             state_update: StateUpdate { mutated_variables },
             runtime_actions,

@@ -332,7 +332,10 @@ pub struct ComputedBinding {
     pub name: Symbol,
     /// The expression that defines this variable's value.
     pub expr: Expr,
-    /// Symbols of all variables referenced by `expr` (may include other comp vars).
+    /// Symbols of all variables this binding may read: those referenced
+    /// directly by `expr` plus — when parsed via
+    /// [`parse_computed_with_functions`] — the globals read transitively inside
+    /// any called logic function.  May include other comp vars.
     pub depends_on: Vec<Symbol>,
 }
 
@@ -1384,6 +1387,29 @@ pub fn parse_computed(
     logic_content: &str,
     interner: &mut StringInterner,
 ) -> Result<Vec<ComputedBinding>, MizuError> {
+    parse_computed_with_functions(logic_content, interner, &FxHashMap::default())
+}
+
+/// Like [`parse_computed`], but additionally derives **transitive** data
+/// dependencies through the bodies of called logic functions.
+///
+/// Mizu functions may read global variables directly (`f(a) : a + z` reads the
+/// global `z`).  A binding `comp y = f(x)` therefore depends on `z` even though
+/// `z` never appears in the binding's own right-hand side.  Walking only the
+/// RHS would leave `y` stale when `z` mutates; this variant unions the
+/// variables read by every function reachable from the RHS (the call graph is
+/// a DAG — see [`parse_logic`]'s `check_dag` — so the walk terminates).
+///
+/// The dependency set is a deliberate over-approximation: parameters and
+/// `let`-locals of called functions may be included.  Extra entries are
+/// harmless (they can only trigger a spurious recompute); missing entries
+/// would cause stale computed values.
+pub fn parse_computed_with_functions(
+    logic_content: &str,
+    interner: &mut StringInterner,
+    functions: &FxHashMap<Symbol, MizuFunction>,
+) -> Result<Vec<ComputedBinding>, MizuError> {
+    let function_names: FxHashSet<Symbol> = functions.keys().copied().collect();
     let all_lines: Vec<&str> = logic_content.lines().collect();
 
     let baseline = all_lines
@@ -1433,6 +1459,13 @@ pub fn parse_computed(
         let name_sym = interner.get_or_intern(name);
         let mut dep_set: FxHashSet<Symbol> = FxHashSet::default();
         collect_vars(&expr, &mut dep_set);
+        // Union the globals read inside every function reachable from the RHS,
+        // so mutations to those globals also trigger a recompute.
+        collect_reachable_function_reads(&expr, functions, &function_names, &mut dep_set);
+        // Function names are code references, not data dependencies.
+        for fname in &function_names {
+            dep_set.remove(fname);
+        }
         dep_set.remove(&name_sym);
 
         bindings.push(ComputedBinding {
@@ -1616,6 +1649,39 @@ fn collect_calls(expr: &Expr, out: &mut FxHashSet<Symbol>, function_names: &FxHa
             collect_calls(else_expr, out, function_names);
         }
         Expr::FieldAccess { base, .. } => collect_calls(base, out, function_names),
+    }
+}
+
+/// Unions into `out` every variable symbol read by any function transitively
+/// reachable from `expr` through the call graph.
+///
+/// Used by [`parse_computed_with_functions`] to make `comp` dependency sets
+/// sound with respect to globals read *inside* called functions.  The walk is
+/// an iterative worklist with a visited set, so it terminates even on a
+/// (DAG-check-rejected, hence impossible) cyclic graph — defence in depth.
+fn collect_reachable_function_reads(
+    expr: &Expr,
+    functions: &FxHashMap<Symbol, MizuFunction>,
+    function_names: &FxHashSet<Symbol>,
+    out: &mut FxHashSet<Symbol>,
+) {
+    let mut initial_calls: FxHashSet<Symbol> = FxHashSet::default();
+    collect_calls(expr, &mut initial_calls, function_names);
+
+    let mut visited: FxHashSet<Symbol> = FxHashSet::default();
+    let mut worklist: Vec<Symbol> = initial_calls.into_iter().collect();
+
+    while let Some(sym) = worklist.pop() {
+        if !visited.insert(sym) {
+            continue;
+        }
+        let Some(func) = functions.get(&sym) else {
+            continue;
+        };
+        collect_vars(&func.body, out);
+        let mut nested_calls: FxHashSet<Symbol> = FxHashSet::default();
+        collect_calls(&func.body, &mut nested_calls, function_names);
+        worklist.extend(nested_calls);
     }
 }
 
@@ -4047,6 +4113,41 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let mutated: FxHashSet<Symbol> = [x_sym].into_iter().collect();
         super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated);
         assert_eq!(*store.state_machine.get_global(double_sym), Value::Int(14));
+    }
+
+    #[test]
+    fn test_comp_depends_on_globals_read_inside_functions() {
+        // `f` reads the global `z` internally; `comp y = f(x)` must therefore
+        // recompute when `z` mutates, not only when `x` does.  Pre-regression,
+        // the dependency walk stopped at the comp RHS and `y` went stale.
+        let src = "    f(a: num) : a + z\n    comp y = f(x)\n";
+        let mut interner = StringInterner::new();
+        let fns = super::parse_logic(src, &mut interner).unwrap();
+        let computed = super::parse_computed_with_functions(src, &mut interner, &fns).unwrap();
+        assert_eq!(computed.len(), 1);
+
+        let z_sym = interner.get("z").unwrap();
+        assert!(
+            computed[0].depends_on.contains(&z_sym),
+            "comp must transitively depend on the global `z` read inside `f`"
+        );
+
+        let mut store = VariableStore::with_interner(interner);
+        store.set("x", Value::Int(1));
+        store.set("z", Value::Int(10));
+
+        let all_syms: FxHashSet<Symbol> =
+            store.state_machine.global_store.keys().copied().collect();
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms);
+        let y_sym = store.interner.get("y").unwrap();
+        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(11));
+
+        // Mutate ONLY z — y must recompute through the transitive dependency.
+        store.state_machine.undo_log.clear();
+        store.set("z", Value::Int(20));
+        let mutated: FxHashSet<Symbol> = [z_sym].into_iter().collect();
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated);
+        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(21));
     }
 
     #[test]

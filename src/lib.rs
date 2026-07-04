@@ -6,10 +6,13 @@
 //! * **Evaluator** — expression evaluator
 //! * **Renderer** — GPU-accelerated layout engine (Phase 3+)
 //!
-//! ## Guiding Principles (from `MIZU_GUIDELINES.md`)
+//! ## Guiding Principles
 //!
-//! * **Turing-incomplete by design** — no loops, no recursion, no mutable
-//!   rebinding.
+//! * **Turing-incomplete by design** — no loops, no recursion; the function
+//!   call graph is verified acyclic before anything runs, so every single
+//!   reaction is guaranteed to terminate.  Expressions are pure (no assignment
+//!   or loop nodes exist in the AST); document state changes only through
+//!   declared actions fired by outside events (clicks, timers, responses).
 //! * **Zero `unsafe` code** — enforced crate-wide by `#![forbid(unsafe_code)]`.
 //! * **Zero `unwrap` / `expect`** — every fallible operation surfaces through
 //!   the [`core::errors::MizuError`] type hierarchy.

@@ -59,7 +59,9 @@ pub enum MizuError {
     /// runtime that must remain responsive even under adversarial inputs.
     #[error("type error: expected `{expected}`, found `{found}`")]
     TypeError {
+        /// The Mizu type name that was required in this position.
         expected: &'static str,
+        /// The Mizu type name actually produced by evaluation.
         found: &'static str,
     },
 

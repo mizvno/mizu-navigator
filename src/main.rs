@@ -13,10 +13,43 @@ use std::path::Path;
 
 use mizu::core::errors::MizuError;
 use mizu::core::types::StringInterner;
-use mizu::parser::logic::parse_computed;
-use mizu::parser::{parse_layout, parse_logic, parse_style, parse_urls, split_source};
+use mizu::parser::logic::{parse_computed_with_functions, parse_root_timers};
+use mizu::parser::{parse_layout_with_urls, parse_logic, parse_style, parse_urls, split_source};
 use mizu::render::run_window_loop;
 use tracing_subscriber::EnvFilter;
+
+/// Built-in start page shown when the navigator is launched without a file
+/// argument — the equivalent of a browser's blank "new tab" page.
+///
+/// It carries no logic, no urls, and no event handlers: it can only be looked
+/// at, and the user navigates away via the URL bar.
+const START_PAGE: &str = r#"style
+  window
+    background #0f1115
+    direction column
+    align center
+    justify center
+    gap 10
+
+  .brand
+    color #7cc4ff
+    font-size 36
+
+  .hint
+    color #6b7280
+    font-size 15
+
+layout
+  window "Mizu"
+    t "Mizu" class "brand"
+    t "Type a mizu:// address in the bar above to begin" class "hint"
+"#;
+
+/// Pseudo-URL shown in the chrome for the built-in start page.
+///
+/// Not a `mizu://` origin (no network trust) and not a `file://` origin (no
+/// sandbox base): the start page gets the most restrictive capability tier.
+const START_PAGE_URL: &str = "about:blank";
 
 /// Orchestrates the compiler phases and coordinates layout engine binding.
 fn run() -> Result<(), MizuError> {
@@ -31,14 +64,6 @@ fn run() -> Result<(), MizuError> {
         .filter(|a| !a.starts_with("--"))
         .collect();
 
-    if file_args.is_empty() {
-        #[cfg(feature = "insecure-dev")]
-        tracing::error!("usage: mizu [--allow-insecure] <file.mizu>");
-        #[cfg(not(feature = "insecure-dev"))]
-        tracing::error!("usage: mizu <file.mizu>");
-        std::process::exit(1);
-    }
-
     #[cfg(feature = "insecure-dev")]
     if allow_insecure {
         tracing::warn!(
@@ -46,29 +71,41 @@ fn run() -> Result<(), MizuError> {
         );
     }
 
-    let file_path = file_args[0];
-    let path = Path::new(file_path);
-
-    let current_dir = path.parent().unwrap_or(Path::new("."));
-    let current_dir = if current_dir.as_os_str().is_empty() {
-        Path::new(".")
+    // Without a file argument, open the built-in blank start page instead of
+    // exiting — like a browser launched with no URL.
+    let (source, current_dir, window_url) = if file_args.is_empty() {
+        tracing::info!("no document argument; opening the built-in start page");
+        (
+            START_PAGE.to_owned(),
+            std::path::PathBuf::from("."),
+            START_PAGE_URL.to_owned(),
+        )
     } else {
-        current_dir
+        let file_path = file_args[0];
+        let path = Path::new(file_path);
+
+        let current_dir = path.parent().unwrap_or(Path::new("."));
+        let current_dir = if current_dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            current_dir
+        };
+
+        // Construct absolute canonical URI for the loaded file
+        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut path_str = canonical_path.to_string_lossy().into_owned();
+        if path_str.starts_with(r"\\?\") {
+            path_str = path_str[4..].to_string();
+        }
+        let window_url = format!("file:///{}", path_str.replace('\\', "/"));
+
+        let bytes = fs::read(path)?;
+        let source = String::from_utf8_lossy(&bytes).to_string();
+        (source, current_dir.to_path_buf(), window_url)
     };
 
-    // Construct absolute canonical URI for the loaded file
-    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut path_str = canonical_path.to_string_lossy().into_owned();
-    if path_str.starts_with(r"\\?\") {
-        path_str = path_str[4..].to_string();
-    }
-    let window_url = format!("file:///{}", path_str.replace('\\', "/"));
-
-    let bytes = fs::read(path)?;
-    let source = String::from_utf8_lossy(&bytes).to_string();
-
     // Phase 2: Macro splitter
-    let parsed = split_source(&source, current_dir)?;
+    let parsed = split_source(&source, &current_dir)?;
 
     // Create shared interner for logic and layout
     let mut interner = StringInterner::new();
@@ -82,13 +119,21 @@ fn run() -> Result<(), MizuError> {
 
     // Phase 4: Compile logic
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
-    let computed_bindings = parse_computed(&parsed.logic_block, &mut interner)?;
+    let computed_bindings =
+        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns)?;
+    let root_timers = parse_root_timers(&parsed.logic_block, &mut interner)?;
 
     // Phase 3: Parse styles
     let style_rules = parse_style(&parsed.style_block)?;
 
-    // Phase 5: Assemble arena DOM
-    let dom_tree = parse_layout(&parsed.layout_block, &mut interner)?;
+    // Phase 5: Assemble arena DOM.  The registry enables compile-time media
+    // guards and resolves `image src "alias"` to absolute URLs.
+    let dom_tree = parse_layout_with_urls(
+        &parsed.layout_block,
+        &mut interner,
+        Some(&url_registry),
+        window_url.starts_with("mizu://"),
+    )?;
 
     // Phase 8: Start native window and event loop
     run_window_loop(
@@ -101,6 +146,7 @@ fn run() -> Result<(), MizuError> {
         #[cfg(feature = "insecure-dev")]
         allow_insecure,
         computed_bindings,
+        root_timers,
     )?;
 
     Ok(())
