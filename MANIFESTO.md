@@ -6,7 +6,7 @@ The point is one thing: a page you receive from a stranger should be safe to ope
 
 Four things follow from that, so far.
 
-**Every execution ends.** No loops, no recursion; the call graph is checked before anything runs. You never have to wonder whether a page will hang. It can't.
+**Every reaction ends.** No loops, no recursion; the call graph is checked before anything runs. A page can keep reacting for as long as you keep it open — a timer can tick again, a click can land again — but no single reaction can run forever. You never have to wonder whether a page will freeze. It can't.
 
 **It reads top to bottom.** Nothing is used before it's declared, so the order you read is the order it runs. The document means exactly what it says.
 
