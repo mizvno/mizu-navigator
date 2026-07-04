@@ -12,7 +12,7 @@
 //! | Pool | Servers | Covers |
 //! |------|---------|--------|
 //! | **Primary** | Quad9 + Cloudflare DoT | ICANN domains (`.com`, `.org`, …) |
-//! | **OpenNIC** | OpenNIC Tier-2 DoT | Alternative TLDs (`.mizu`, `.geek`, …) |
+//! | **OpenNIC** | OpenNIC Tier-2 DoT | Alternative TLDs (`.geek`, `.pirate`, …) |
 //!
 //! Every query's TLD is inspected before dispatch (see [`select_pool_for_domain`]):
 //! * OpenNIC TLDs → OpenNIC pool.
@@ -118,7 +118,7 @@ pub enum DnsPool {
 /// ```
 /// use mizu::network::opennic::{select_pool_for_domain, DnsPool};
 /// assert_eq!(select_pool_for_domain("google.com"), DnsPool::Primary);
-/// assert_eq!(select_pool_for_domain("chat.mizu"), DnsPool::OpenNic);
+/// assert_eq!(select_pool_for_domain("chat.geek"), DnsPool::OpenNic);
 /// ```
 pub fn select_pool_for_domain(domain: &str) -> DnsPool {
     let bare = domain.trim_end_matches('.');
@@ -477,11 +477,15 @@ mod tests {
 
         // FQDN notation (trailing dot) must be handled correctly
         assert_eq!(select_pool_for_domain("google.com."), DnsPool::Primary);
-        assert_eq!(select_pool_for_domain("chat.mizu."), DnsPool::OpenNic);
+        assert_eq!(select_pool_for_domain("chat.geek."), DnsPool::OpenNic);
+
+        // `.mizu` is NOT an OpenNIC TLD (it does not exist in any root):
+        // it must fall through to the primary pool like any unknown TLD.
+        assert_eq!(select_pool_for_domain("app.mizu"), DnsPool::Primary);
 
         // OpenNIC TLDs → OpenNIC pool
         assert_eq!(select_pool_for_domain("site.geek"), DnsPool::OpenNic);
-        assert_eq!(select_pool_for_domain("app.mizu"), DnsPool::OpenNic);
+        assert_eq!(select_pool_for_domain("app.dyn"), DnsPool::OpenNic);
         assert_eq!(select_pool_for_domain("board.bbs"), DnsPool::OpenNic);
         assert_eq!(select_pool_for_domain("project.indy"), DnsPool::OpenNic);
         assert_eq!(select_pool_for_domain("mirror.libre"), DnsPool::OpenNic);
@@ -490,7 +494,7 @@ mod tests {
 
         // TLD comparison must be case-insensitive
         assert_eq!(select_pool_for_domain("site.GEEK"), DnsPool::OpenNic);
-        assert_eq!(select_pool_for_domain("app.Mizu"), DnsPool::OpenNic);
+        assert_eq!(select_pool_for_domain("forum.Pirate"), DnsPool::OpenNic);
     }
 
     // ── Required test: cross-pool failover ──────────────────────────────────
