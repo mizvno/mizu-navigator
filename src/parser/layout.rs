@@ -649,6 +649,24 @@ pub fn parse_layout_with_urls(
         let (mut node, is_markdown, inline_text) =
             parse_primitive_and_attrs(trimmed, line_idx + 1, interner)?;
 
+        // ── Image src: reject absolute network URLs unconditionally ─────────
+        // A literal `mizu://` (or http[s]://) in `src` is a network channel
+        // that bypasses the `urls` registry entirely — a tracking-pixel /
+        // exfiltration vector. Only a declared `media` alias or a local
+        // relative path is allowed. This runs regardless of whether a registry
+        // was supplied, so the rule cannot be skipped.
+        if node.primitive == Primitive::Image
+            && let Some(src_val) = node.attributes.get("src")
+            && (src_val.starts_with("mizu://")
+                || src_val.starts_with("http://")
+                || src_val.starts_with("https://"))
+        {
+            return Err(MizuError::ParseError(format!(
+                "line {}: absolute URLs are not allowed in src; declare a media alias in the urls block",
+                line_idx + 1
+            )));
+        }
+
         // ── Compile-time media guard + alias resolution ─────────────────────
         // If a URL registry is provided, validate that `image src: alias`
         // points to a declared `media` endpoint and rewrite the attribute to
@@ -669,11 +687,12 @@ pub fn parse_layout_with_urls(
                 )));
             }
 
-            // Direct paths (containing `.` or `/`, or starting with a URL scheme)
-            // are used as-is by the renderer — only symbolic aliases need registry validation.
+            // A relative path (contains `.` or `/`) or a sandboxed local
+            // `file://` (local documents only) is used as-is by the renderer;
+            // absolute network URLs were already rejected above. Everything
+            // else is a symbolic alias that must resolve against the registry.
             let is_direct_path = src_alias.contains('/')
                 || src_alias.contains('.')
-                || src_alias.starts_with("mizu://")
                 || (src_alias.starts_with("file://") && !is_remote_origin);
             if !is_direct_path {
                 let sym = interner.get_or_intern(&src_alias);
@@ -895,13 +914,17 @@ mod tests {
     }
 
     #[test]
-    fn mizu_url_src_skips_guard() {
-        // An absolute mizu:// URL is a direct path — guard skipped.
+    fn mizu_url_src_is_rejected() {
+        // An absolute mizu:// URL bypasses the urls registry and is now a hard
+        // compile error (see test_absolute_url_src_is_rejected for the message).
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"mizu://cdn.example.com/img.png\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
-        assert!(result.is_ok(), "mizu:// URL must bypass guard: {result:?}");
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
+            "mizu:// URL in src must be rejected: {result:?}"
+        );
     }
 
     #[test]
@@ -1416,6 +1439,55 @@ mod tests {
             img.value().attributes.get("src").map(String::as_str),
             Some("mizu://cdn.local/logo.png"),
             "media alias must be rewritten to its absolute URL at parse time"
+        );
+    }
+
+    #[test]
+    fn test_absolute_url_src_is_rejected() {
+        // A literal absolute network URL in `src` bypasses the urls registry
+        // and must be a hard compile error, with or without a registry present.
+        let layout = "window \"App\"\n    image src \"mizu://evil.example/pixel.png\"\n";
+
+        let no_registry = parse_layout(layout, &mut StringInterner::new());
+        match no_registry {
+            Err(MizuError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("absolute URLs are not allowed in src"),
+                    "error must reject absolute src, got: {msg}"
+                );
+                assert!(
+                    msg.contains("media alias"),
+                    "error must point at media aliases, got: {msg}"
+                );
+                assert!(msg.contains("line 2"), "error must carry line number, got: {msg}");
+            }
+            other => panic!("expected ParseError for absolute src (no registry), got: {other:?}"),
+        }
+
+        // Same rejection even when a registry is supplied.
+        let mut interner = StringInterner::new();
+        let registry: UrlRegistry = rustc_hash::FxHashMap::default();
+        let with_registry = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        assert!(
+            matches!(with_registry, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
+            "absolute src must be rejected with a registry too, got: {with_registry:?}"
+        );
+    }
+
+    #[test]
+    fn test_relative_src_still_allowed() {
+        // A relative path must keep working (used as-is by the renderer).
+        let layout = "window \"App\"\n    image src \"assets/logo.png\"\n";
+        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
+        let img = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Image)
+            .expect("image node not found");
+        assert_eq!(
+            img.value().attributes.get("src").map(String::as_str),
+            Some("assets/logo.png"),
+            "relative src must be preserved unchanged"
         );
     }
 

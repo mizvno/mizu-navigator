@@ -347,6 +347,16 @@ pub fn parse_style(style_content: &str) -> Result<HashMap<String, StyleRules>, M
             continue;
         }
 
+        // ── Targeted: absolute URL in background-image ────────────────────────
+        // Give the actionable message before the generic no-`:` rule below
+        // catches the `://` and reports a confusing "syntax noise" error.
+        if trimmed.starts_with("background-image") && trimmed.contains("://") {
+            return Err(MizuError::ParseError(format!(
+                "line {line_num}: absolute URLs are not allowed in background-image; \
+                 use a local relative path"
+            )));
+        }
+
         // ── Reject CSS syntax noise immediately ───────────────────────────────
         // Colons and semicolons are never valid in Mizu style syntax.
         if trimmed.contains(':') || trimmed.contains(';') {
@@ -503,6 +513,19 @@ fn apply_property(
         "background" => rules.background = Some(parse_background(value, line_num)?),
         "background-image" => {
             let path = value.trim_matches('"');
+            // Same rule as `image src`: a literal absolute network URL bypasses
+            // the `urls` registry and is a covert network channel. Only a local
+            // relative path is accepted here (the style renderer does not
+            // resolve media aliases for background-image).
+            if path.starts_with("mizu://")
+                || path.starts_with("http://")
+                || path.starts_with("https://")
+            {
+                return Err(MizuError::ParseError(format!(
+                    "line {line_num}: absolute URLs are not allowed in background-image; \
+                     use a local relative path"
+                )));
+            }
             rules.background_image = Some(path.to_string());
         }
         "background-size" => {
@@ -822,6 +845,31 @@ mod tests {
         MizuDimension, MizuOverflow, parse_color, parse_style,
     };
     use crate::core::errors::MizuError;
+
+    // ────────────────────────────────────────────────────────────────────────
+    // background-image: absolute URLs rejected
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn background_image_absolute_url_is_rejected() {
+        let style = "  .hero\n    background-image \"mizu://cdn.example/bg.png\"\n";
+        let result = parse_style(style);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in background-image")),
+            "absolute background-image URL must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn background_image_relative_path_is_allowed() {
+        let style = "  .hero\n    background-image \"assets/bg.png\"\n";
+        let rules = parse_style(style).expect("relative background-image must parse");
+        assert_eq!(
+            rules.get("hero").and_then(|r| r.background_image.as_deref()),
+            Some("assets/bg.png"),
+            "relative background-image path must be preserved"
+        );
+    }
 
     // ────────────────────────────────────────────────────────────────────────
     // Hex colour parser
