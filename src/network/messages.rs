@@ -15,8 +15,6 @@ pub struct ReloadPayload {
     pub logic_fns: FxHashMap<Symbol, MizuFunction>,
     /// Click action mappings, keyed by the u32 id of the triggering node.
     pub click_actions: HashMap<u32, Action>,
-    /// Timer (`every …`) action mappings, keyed by the u32 id of the owning node.
-    pub every_actions: HashMap<u32, Action>,
     /// Submit action mappings, keyed by the u32 id of the node carrying the
     /// `submit -> …` event (typically a `button type "submit"`).
     pub submit_actions: HashMap<u32, Action>,
@@ -146,11 +144,6 @@ pub enum UiEvent {
     /// A click landed on a node carrying a `click -> …` action.
     Click {
         /// u32 id of the clicked node.
-        node_id: u32,
-    },
-    /// A recurring `every …` timer fired for a node.
-    Timer {
-        /// u32 id of the node owning the timer.
         node_id: u32,
     },
     /// A root-level `timer …` declared in the `logic` block fired.

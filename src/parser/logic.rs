@@ -1345,7 +1345,7 @@ pub fn parse_root_timers(
         let interval_str = rest[..arrow_pos].trim();
         let action_str = rest[arrow_pos + 2..].trim();
 
-        // Parse interval — mirrors parse_interval in layout.rs.
+        // Parse the root-timer interval.
         // Accepted forms: `500ms`, `60s`, `1.5s`, bare integer (ms), variable name.
         let interval = if let Some(ms_str) = interval_str.strip_suffix("ms") {
             match ms_str.trim().parse::<u64>() {

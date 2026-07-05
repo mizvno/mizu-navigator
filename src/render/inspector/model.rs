@@ -96,8 +96,6 @@ pub struct InspectorSources<'a> {
     pub url_registry: &'a UrlRegistry,
     /// Root-level `timer` declarations.
     pub root_timers: &'a [RootTimer],
-    /// Pending node-timer deadlines.
-    pub timer_queue: &'a BTreeMap<Instant, Vec<EgoNodeId>>,
     /// Pending root-timer deadlines (values index into `root_timers`).
     pub root_timer_queue: &'a BTreeMap<Instant, Vec<usize>>,
     /// Per-origin storage budget.
@@ -146,9 +144,6 @@ pub fn node_label(node: &MizuNode) -> String {
     }
     if node.events.contains_key("submit") {
         markers.push_str(" [submit]");
-    }
-    if node.events.contains_key("every") {
-        markers.push_str(" [every]");
     }
     label.push_str(&markers);
     label
@@ -527,31 +522,6 @@ fn events_rows(src: &InspectorSources<'_>) -> Vec<Row> {
             RowKind::Normal,
         ));
     }
-    for node_ref in src.dom.nodes() {
-        if let Some(EventBlock::Every { interval, action }) = node_ref.value().events.get("every")
-        {
-            any_timer = true;
-            let interval = match interval {
-                crate::parser::layout::Interval::Literal(ms) => fmt_millis(*ms),
-                crate::parser::layout::Interval::Variable(name) => format!("{{{name}}}"),
-            };
-            let id = node_ref.id();
-            let deadline = src
-                .timer_queue
-                .iter()
-                .find(|(_, ids)| ids.contains(&id))
-                .map(|(d, _)| *d);
-            rows.push(Row::plain(
-                1,
-                format!(
-                    "every {interval} -> {}   ({})",
-                    format_action(action, interner),
-                    fmt_countdown(deadline, now)
-                ),
-                RowKind::Normal,
-            ));
-        }
-    }
     if !any_timer {
         rows.push(Row::plain(1, "(none)", RowKind::Dim));
     }
@@ -564,7 +534,6 @@ fn events_rows(src: &InspectorSources<'_>) -> Vec<Row> {
             let action = match block {
                 EventBlock::Click { action } => action,
                 EventBlock::Submit { action } => action,
-                EventBlock::Every { .. } => continue,
             };
             any_action = true;
             rows.push(Row::plain(

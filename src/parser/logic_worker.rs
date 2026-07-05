@@ -20,8 +20,6 @@ pub struct LogicWorker {
     pub logic_fns: FxHashMap<Symbol, MizuFunction>,
     /// Click action mappings for layout nodes.
     pub click_actions: HashMap<u32, Action>,
-    /// Timer (every) action mappings for layout nodes.
-    pub every_actions: HashMap<u32, Action>,
     /// Submit action mappings, keyed by the submit button's node id.
     pub submit_actions: HashMap<u32, Action>,
     /// Root-level `timer` actions from the `logic` block, in declaration order.
@@ -49,7 +47,6 @@ impl LogicWorker {
                 store: VariableStore::new(),
                 logic_fns: FxHashMap::default(),
                 click_actions: HashMap::new(),
-                every_actions: HashMap::new(),
                 submit_actions: HashMap::new(),
                 root_timer_actions: Vec::new(),
                 url_registry: FxHashMap::default(),
@@ -68,7 +65,6 @@ impl LogicWorker {
                 UiEvent::Reload(payload) => {
                     self.logic_fns = payload.logic_fns;
                     self.click_actions = payload.click_actions;
-                    self.every_actions = payload.every_actions;
                     self.submit_actions = payload.submit_actions;
                     self.root_timer_actions = payload.root_timer_actions;
                     self.url_registry = payload.url_registry;
@@ -130,12 +126,6 @@ impl LogicWorker {
 
                 UiEvent::Click { node_id } => {
                     if let Some(action) = self.click_actions.get(&node_id).cloned() {
-                        self.execute_and_respond(&action);
-                    }
-                }
-
-                UiEvent::Timer { node_id } => {
-                    if let Some(action) = self.every_actions.get(&node_id).cloned() {
                         self.execute_and_respond(&action);
                     }
                 }

@@ -59,8 +59,6 @@ pub struct MizuWindowManager {
     pub logic_fns: FxHashMap<Symbol, MizuFunction>,
     /// Logical scroll offsets for each container (in pixels).
     pub scroll_offsets: HashMap<EgoNodeId, f32>,
-    /// Priority queue of active timers (deadline -> list of node IDs).
-    pub timer_queue: BTreeMap<std::time::Instant, Vec<EgoNodeId>>,
     /// Async-compatible sender for commands to the background network thread.
     pub network_tx: tokio::sync::mpsc::UnboundedSender<crate::network::NetworkCmd>,
     /// Currently focused node for text input.
@@ -199,7 +197,6 @@ impl MizuWindowManager {
             store: VariableStore::new(),
             logic_fns,
             scroll_offsets: HashMap::new(),
-            timer_queue: BTreeMap::new(),
             network_tx,
             focused_node: None,
             chrome_state: ChromeState::default(),
@@ -258,8 +255,8 @@ impl MizuWindowManager {
         Some(ms.max(16))
     }
 
-    /// Setup the timer priority queues (node `every` timers + root `timer`
-    /// declarations) from the current document.
+    /// Setup the timer priority queue from the document's root `timer`
+    /// declarations (the only timer form Mizu supports).
     pub fn setup_timers(&mut self) {
         self.root_timer_queue.clear();
         let now = std::time::Instant::now();
@@ -267,31 +264,6 @@ impl MizuWindowManager {
             if let Some(interval_ms) = self.resolve_root_timer_interval(&rt.interval) {
                 let deadline = now + std::time::Duration::from_millis(interval_ms);
                 self.root_timer_queue.entry(deadline).or_default().push(idx);
-            }
-        }
-
-        self.timer_queue.clear();
-        for node_ref in self.dom.nodes() {
-            if let Some(EventBlock::Every { interval, .. }) = node_ref.value().events.get("every") {
-                let mut interval_ms = match interval {
-                    crate::parser::layout::Interval::Literal(ms) => *ms,
-                    crate::parser::layout::Interval::Variable(var_name) => {
-                        let val = self.store.get(var_name).ok();
-                        match val {
-                            Some(Value::Float(f)) => *f as u64,
-                            Some(Value::Int(i)) => *i as u64,
-                            _ => continue,
-                        }
-                    }
-                };
-                if interval_ms < 16 {
-                    interval_ms = 16;
-                }
-                let deadline = now + std::time::Duration::from_millis(interval_ms);
-                self.timer_queue
-                    .entry(deadline)
-                    .or_default()
-                    .push(node_ref.id());
             }
         }
     }
@@ -329,7 +301,6 @@ impl MizuWindowManager {
     /// Triggers the logic worker reload event to reset the remote state.
     pub fn trigger_logic_reload(&self) {
         let mut click_actions = HashMap::new();
-        let mut every_actions = HashMap::new();
         let mut submit_actions = HashMap::new();
 
         for node in self.dom.nodes() {
@@ -339,9 +310,6 @@ impl MizuWindowManager {
                     match event_block {
                         EventBlock::Click { action } => {
                             click_actions.insert(u32_id, action.clone());
-                        }
-                        EventBlock::Every { action, .. } => {
-                            every_actions.insert(u32_id, action.clone());
                         }
                         EventBlock::Submit { action } => {
                             submit_actions.insert(u32_id, action.clone());
@@ -355,9 +323,7 @@ impl MizuWindowManager {
         for node in self.dom.nodes() {
             for event in node.value().events.values() {
                 match event {
-                    EventBlock::Click { action }
-                    | EventBlock::Every { action, .. }
-                    | EventBlock::Submit { action } => {
+                    EventBlock::Click { action } | EventBlock::Submit { action } => {
                         if let Action::Assign { target, .. } = action {
                             interner.get_or_intern(target);
                         }
@@ -389,7 +355,6 @@ impl MizuWindowManager {
         let _ = self.logic_tx.send(UiEvent::Reload(Box::new(ReloadPayload {
             logic_fns: self.logic_fns.clone(),
             click_actions,
-            every_actions,
             submit_actions,
             root_timer_actions: self.root_timers.iter().map(|rt| rt.action.clone()).collect(),
             interner,
@@ -443,7 +408,7 @@ impl MizuWindowManager {
         self.root_taffy_id = root_taffy_id;
 
         self.scroll_offsets.clear();
-        self.timer_queue.clear();
+        self.root_timer_queue.clear();
         self.focused_node = None;
         self.root_scroll_offset_y = 0.0;
         self.chrome_state.focused = false;
@@ -663,7 +628,6 @@ impl MizuWindowManager {
             computed_bindings: &self.computed_bindings,
             url_registry: &self.url_registry,
             root_timers: &self.root_timers,
-            timer_queue: &self.timer_queue,
             root_timer_queue: &self.root_timer_queue,
             capability_policy: &self.capability_policy,
             log: &self.inspector_log,
@@ -2288,7 +2252,7 @@ pub fn run_window_loop(
 
             let now = std::time::Instant::now();
             let mut redraw = false;
-            let mut next_wakeup = manager.timer_queue.keys().next().copied();
+            let mut next_wakeup = manager.root_timer_queue.keys().next().copied();
 
             if let Some((w, h)) = manager.pending_resize {
                 let elapsed = now.duration_since(manager.last_layout_time);
@@ -2306,56 +2270,6 @@ pub fn run_window_loop(
             }
 
             let mut timers_fired = false;
-            while let Some(&deadline) = manager.timer_queue.keys().next() {
-                if now >= deadline {
-                    if let Some(node_ids) = manager.timer_queue.remove(&deadline) {
-                        for node_id in node_ids {
-                            if let Some(node_ref) = manager.dom.get(node_id)
-                                && let Some(EventBlock::Every { interval, .. }) =
-                                    node_ref.value().events.get("every")
-                            {
-                                if let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) {
-                                    let _ =
-                                        manager.logic_tx.send(UiEvent::Timer { node_id: u32_id });
-                                    timers_fired = true;
-                                    if manager.inspector.open {
-                                        manager.inspector_log.push_event(
-                                            crate::render::inspector::log::EventKind::Timer,
-                                            crate::render::inspector::model::node_label(
-                                                node_ref.value(),
-                                            ),
-                                        );
-                                    }
-                                }
-
-                                let mut interval_ms = match interval {
-                                    crate::parser::layout::Interval::Literal(ms) => *ms,
-                                    crate::parser::layout::Interval::Variable(var_name) => {
-                                        let val = manager.store.get(var_name).ok();
-                                        match val {
-                                            Some(Value::Float(f)) => *f as u64,
-                                            Some(Value::Int(i)) => *i as u64,
-                                            _ => 16,
-                                        }
-                                    }
-                                };
-                                if interval_ms < 16 {
-                                    interval_ms = 16;
-                                }
-                                let next_deadline =
-                                    now + std::time::Duration::from_millis(interval_ms);
-                                manager
-                                    .timer_queue
-                                    .entry(next_deadline)
-                                    .or_default()
-                                    .push(node_id);
-                            }
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
 
             // Root `timer` declarations fire on the same clock; the action is
             // dispatched to the logic worker by declaration index.
@@ -2402,20 +2316,6 @@ pub fn run_window_loop(
                 }
                 window.request_redraw();
             }
-
-            next_wakeup = manager
-                .timer_queue
-                .keys()
-                .next()
-                .copied()
-                .map(|t| {
-                    if let Some(w) = next_wakeup {
-                        t.min(w)
-                    } else {
-                        t
-                    }
-                })
-                .or(next_wakeup);
 
             if let Some(&t) = manager.root_timer_queue.keys().next() {
                 next_wakeup = Some(next_wakeup.map(|w| w.min(t)).unwrap_or(t));

@@ -80,16 +80,12 @@ pub struct MizuNode {
     pub conditional_classes: Vec<ConditionalClass>,
 }
 
-/// Represents a timer interval, either literal ms or a variable pointer.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Interval {
-    /// A constant interval in milliseconds.
-    Literal(u64),
-    /// A variable identifier whose value specifies milliseconds.
-    Variable(String),
-}
-
 /// A behavioral event block attached to a node.
+///
+/// Note: there is intentionally no node-local timer. Recurring behaviour is
+/// declared exclusively as a root `timer` in the `logic` block, so a
+/// document's entire temporal surface is enumerable without walking the layout
+/// tree (and cannot be multiplied by `each`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventBlock {
     /// Triggered on click (e.g. `click -> Redirect("/home")`).
@@ -100,13 +96,6 @@ pub enum EventBlock {
     /// Triggered on form submit (e.g. `submit -> SendForm`).
     Submit {
         /// Action payload to execute on submission.
-        action: Action,
-    },
-    /// Triggered on a recurring timer (e.g. `every 500ms -> count = count + 1`).
-    Every {
-        /// The time interval between triggers.
-        interval: Interval,
-        /// The action to execute on each tick.
         action: Action,
     },
 }
@@ -172,20 +161,6 @@ fn parse_quoted_string(s: &str) -> Result<(String, &str), MizuError> {
     Err(MizuError::ParseError(
         "Unterminated double-quoted string".to_string(),
     ))
-}
-
-/// Parses a time interval string into an `Interval` enum.
-fn parse_interval(s: &str) -> Interval {
-    if let Some(num_str) = s.strip_suffix("ms") {
-        if let Ok(ms) = num_str.parse::<u64>() {
-            return Interval::Literal(ms);
-        }
-    } else if let Some(num_str) = s.strip_suffix('s')
-        && let Ok(s_val) = num_str.parse::<f64>()
-    {
-        return Interval::Literal((s_val * 1000.0) as u64);
-    }
-    Interval::Variable(s.to_string())
 }
 
 /// Layout-only attribute keywords that are never valid as standalone tokens
@@ -280,26 +255,10 @@ fn parse_attributes_and_events(
                 break; // Action consumes the rest of the line
             }
         } else if key == "every" {
-            let rest_trimmed = rest.trim_start();
-            if let Some(arrow_pos) = rest_trimmed.find("->") {
-                let interval_str = rest_trimmed[..arrow_pos].trim();
-                let action_str = rest_trimmed[arrow_pos + 2..].trim();
-                // Same pre-check for `every` actions.
-                if let Some(kw) = find_trailing_layout_keyword(action_str) {
-                    return Err(MizuError::ParseError(format!(
-                        "layout attribute `{kw}` found inside `every ->` action\n  \
-                         hint: move `{kw}` to the element line"
-                    )));
-                }
-                events.insert(
-                    "every".to_string(),
-                    EventBlock::Every {
-                        interval: parse_interval(interval_str),
-                        action: crate::parser::logic::parse_action(action_str, interner)?,
-                    },
-                );
-                break; // Action consumes the rest of the line
-            }
+            return Err(MizuError::ParseError(
+                "node timers are not allowed; declare a root timer in the logic block instead"
+                    .to_string(),
+            ));
         }
 
         // Validate key format
@@ -550,7 +509,12 @@ pub fn parse_layout_with_urls(
             return Err(MizuError::ParseError(
                 "download -> alias is no longer supported; use click -> download(alias)".to_string(),
             ));
-        } else if first_word == "click" || first_word == "submit" || first_word == "every" {
+        } else if first_word == "every" {
+            return Err(MizuError::ParseError(format!(
+                "line {}: node timers are not allowed; declare a root timer in the logic block instead",
+                line_idx + 1
+            )));
+        } else if first_word == "click" || first_word == "submit" {
             let arrow_pos = rest.find("->").ok_or_else(|| {
                 MizuError::ParseError(format!(
                     "line {}: Event `{first_word}` is missing the `->` arrow syntax",
@@ -572,19 +536,6 @@ pub fn parse_layout_with_urls(
                 "submit" => EventBlock::Submit {
                     action: parse_action_with_urls(value, interner, url_registry)?,
                 },
-                "every" => {
-                    let interval_str = rest[..arrow_pos].trim();
-                    if interval_str.is_empty() {
-                        return Err(MizuError::ParseError(format!(
-                            "line {}: Event `every` is missing its interval",
-                            line_idx + 1
-                        )));
-                    }
-                    EventBlock::Every {
-                        interval: parse_interval(interval_str),
-                        action: parse_action_with_urls(value, interner, url_registry)?,
-                    }
-                }
                 _ => {
                     return Err(MizuError::ParseError(format!(
                         "line {}: internal: unexpected event keyword `{first_word}`",
@@ -844,9 +795,7 @@ pub fn parse_layout_with_urls(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EventBlock, Interval, Primitive, parse_interval, parse_layout, parse_layout_with_urls,
-    };
+    use super::{EventBlock, Primitive, parse_layout, parse_layout_with_urls};
     use crate::core::errors::MizuError;
     use crate::core::types::StringInterner;
     use crate::parser::logic::parse_action;
@@ -972,17 +921,6 @@ mod tests {
             }
             other => panic!("expected ParseError for undeclared symbolic alias, got: {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_parse_interval() {
-        assert_eq!(parse_interval("500ms"), Interval::Literal(500));
-        assert_eq!(parse_interval("2s"), Interval::Literal(2000));
-        assert_eq!(parse_interval("1.5s"), Interval::Literal(1500));
-        assert_eq!(
-            parse_interval("speed"),
-            Interval::Variable("speed".to_string())
-        );
     }
 
     #[test]
@@ -1132,39 +1070,78 @@ mod tests {
     }
 
     #[test]
-    fn test_every_event_block() {
+    fn test_every_child_line_is_rejected_with_line_number() {
+        // Node timers were removed: the child-line form must be a hard error
+        // that carries the offending line number and points at root timers.
         let layout = r#"
     window "App"
         box
             every 500ms -> count = count + 1
-        text "Time"
-            every tick_rate -> UpdateTime
 "#;
-        // Use a shared interner so symbols match between parse_layout and parse_action.
-        let mut interner = StringInterner::new();
-        let tree = parse_layout(layout, &mut interner).unwrap();
-        // Skip the Text child inserted for "App"
-        let mut children = tree.root().children().filter(|n| {
-            n.value().primitive != Primitive::Text || n.value().events.contains_key("every")
-        });
+        let result = parse_layout(layout, &mut StringInterner::new());
+        match result {
+            Err(MizuError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("node timers are not allowed"),
+                    "error must state that node timers are not allowed, got: {msg}"
+                );
+                assert!(
+                    msg.contains("root timer in the logic block"),
+                    "error must point at root timers, got: {msg}"
+                );
+                assert!(
+                    msg.contains("line 4"),
+                    "error must carry the offending line number, got: {msg}"
+                );
+            }
+            other => panic!("expected ParseError for child-line `every`, got: {other:?}"),
+        }
+    }
 
-        let bx = children.next().unwrap();
-        assert_eq!(
-            bx.value().events.get("every"),
-            Some(&EventBlock::Every {
-                interval: Interval::Literal(500),
-                action: parse_action("count = count + 1", &mut interner).unwrap(),
-            })
-        );
+    #[test]
+    fn test_every_inline_is_rejected() {
+        // The inline form (`t "x" every 1s -> …`) must be rejected too.
+        let layout = r#"
+    window "App"
+        text "Time" every 1s -> ticks = ticks + 1
+"#;
+        let result = parse_layout(layout, &mut StringInterner::new());
+        match result {
+            Err(MizuError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("node timers are not allowed"),
+                    "error must state that node timers are not allowed, got: {msg}"
+                );
+            }
+            other => panic!("expected ParseError for inline `every`, got: {other:?}"),
+        }
+    }
 
-        let txt = children.next().unwrap();
-        assert_eq!(
-            txt.value().events.get("every"),
-            Some(&EventBlock::Every {
-                interval: Interval::Variable("tick_rate".to_string()),
-                action: parse_action("UpdateTime", &mut interner).unwrap(),
-            })
-        );
+    #[test]
+    fn test_every_inside_each_is_rejected() {
+        // Regression guard for the resource-amplification vector: an `every`
+        // nested in an `each` would have multiplied into one timer per list
+        // element, driven by remote data. It must fail to compile.
+        let layout = r#"
+    window "App"
+        each item in items
+            box
+                every 100ms -> n = n + 1
+"#;
+        let result = parse_layout(layout, &mut StringInterner::new());
+        match result {
+            Err(MizuError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("node timers are not allowed"),
+                    "error must state that node timers are not allowed, got: {msg}"
+                );
+                assert!(
+                    msg.contains("line 5"),
+                    "error must carry the offending line number, got: {msg}"
+                );
+            }
+            other => panic!("expected ParseError for `every` inside `each`, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1321,6 +1298,8 @@ mod tests {
 
     #[test]
     fn test_trailing_class_after_every_action_is_error() {
+        // `every` is rejected outright now; the error must still be a clean
+        // ParseError (not a panic) even with trailing garbage on the line.
         let layout = r#"
     window "App"
         box class "timer"
