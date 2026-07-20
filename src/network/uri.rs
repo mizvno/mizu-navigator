@@ -11,69 +11,101 @@ pub struct MizuUri {
 
 impl MizuUri {
     /// Parses a URI string, expecting the `mizu://` scheme.
+    ///
+    /// Structural parsing — scheme, authority, host, userinfo, port, path,
+    /// query, and fragment splitting — is fully delegated to the `url`
+    /// crate's WHATWG URL Standard implementation rather than hand-rolled
+    /// byte scanning. Boundary detection between those components is
+    /// exactly the class of code where ad-hoc string splitting invites
+    /// origin-spoofing and injection bugs (a stray `?`/`#`/`@` landing on
+    /// the wrong side of a `find()` call). `mizu://`-specific policy — no
+    /// credentials, no explicit port, non-empty host — is enforced
+    /// afterward, on the already-validated components the parser hands
+    /// back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MizuError::Network`] if the URI is not `mizu://`-scheme,
+    /// has no host, carries userinfo credentials or an explicit port, or
+    /// contains a raw ASCII control character anywhere in the input.
     pub fn parse(uri: &str) -> Result<Self, MizuError> {
-        if let Some(rest) = uri.strip_prefix("mizu://") {
-            // Locate the first character that ends the host component.
-            // Without this, `mizu://evil.com?q=x` stores `"evil.com?q=x"` as the
-            // domain, which bypasses all downstream validation and allows an attacker
-            // to smuggle query/fragment data into the domain field (origin spoofing).
-            let host_end = rest
-                .find(['/', '?', '#'])
-                .unwrap_or(rest.len());
-            let domain = rest[..host_end].to_string();
-            let path_rest = &rest[host_end..];
-
-            if domain.is_empty() {
-                return Err(MizuError::Network(
-                    "Empty domain in mizu:// URI".to_string(),
-                ));
-            }
-            // Belt-and-suspenders: ensure no query/fragment delimiters leaked into
-            // the domain string despite the host_end scan above.
-            if domain.contains('?') || domain.contains('#') {
-                return Err(MizuError::Network(
-                    "mizu:// domain must not contain '?' or '#'".to_string(),
-                ));
-            }
-            // Reject credential-spoofing attempts: `@` embeds userinfo in the host.
-            if domain.contains('@') {
-                return Err(MizuError::Network(
-                    "mizu:// domain must not contain '@' (credential-spoofing attempt rejected)"
-                        .to_string(),
-                ));
-            }
-            // The mizu protocol uses a fixed port (MIZU_PORT); explicit port overrides
-            // are not part of the spec and indicate either a misconfigured client or an
-            // attempt to redirect traffic to an attacker-controlled port.
-            if domain.contains(':') {
-                return Err(MizuError::Network(
-                    "mizu:// domain must not contain ':' (port specifications are not allowed)"
-                        .to_string(),
-                ));
-            }
-            // ASCII control characters (U+0000–U+001F and U+007F) have no legitimate
-            // use in a domain name and can be used to smuggle hidden data or confuse
-            // downstream parsers.
-            if domain.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                return Err(MizuError::Network(
-                    "mizu:// domain contains control characters".to_string(),
-                ));
-            }
-            // Only paths (starting with '/') carry through; '?' and '#' components
-            // that immediately follow the host are discarded — the mizu protocol
-            // does not define query strings or fragment identifiers at the transport
-            // layer, so they have no legitimate use and may only indicate injection.
-            let path = if path_rest.starts_with('/') {
-                path_rest.to_string()
-            } else {
-                "/".to_string()
-            };
-            Ok(Self { domain, path })
-        } else {
-            Err(MizuError::Network(
-                "URI must use the mizu:// scheme".to_string(),
-            ))
+        // The WHATWG URL parser silently *strips* ASCII tab/CR/LF found
+        // anywhere in the input before parsing even begins, and silently
+        // *percent-encodes* other C0 controls (e.g. DEL) into the host
+        // instead of rejecting them. Both are a sanitize-rather-than-reject
+        // behaviour this runtime treats as fail-insecure elsewhere (see
+        // `core::types::from_json`'s depth handling: truncating malicious
+        // input is not an acceptable substitute for rejecting it). A raw
+        // control byte is never legitimate in a URI — RFC 3986 requires
+        // percent-encoding for any such byte — so it is rejected outright
+        // before it ever reaches the parser, rather than trusting the
+        // parser's silent normalisation.
+        if uri.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(MizuError::Network(
+                "mizu:// URI contains control characters".to_string(),
+            ));
         }
+
+        let parsed = url::Url::parse(uri)
+            .map_err(|e| MizuError::Network(format!("invalid mizu:// URI: {e}")))?;
+
+        if parsed.scheme() != "mizu" {
+            return Err(MizuError::Network(
+                "URI must use the mizu:// scheme".to_string(),
+            ));
+        }
+
+        // A single-slash URI (`mizu:/host`) or a bare `mizu://` with no
+        // authority parses successfully under the WHATWG grammar but with
+        // no host component at all.
+        let domain = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| MizuError::Network("Empty domain in mizu:// URI".to_string()))?
+            .to_string();
+
+        // mizu:// carries no userinfo: `user[:pass]@host` is a
+        // credential/origin-spoofing vector (the classic
+        // `trusted.com@evil.com` phishing trick), not an authentication
+        // mechanism the protocol defines. A bare `@` with an empty
+        // username and no password (`mizu://@host`) is normalised away
+        // entirely by the URL parser — `username()`/`password()` come
+        // back empty exactly as if the `@` were never present — so there
+        // is no spoofable text left and it is intentionally not rejected
+        // here, unlike the old parser's blanket "any `@` char" scan.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(MizuError::Network(
+                "mizu:// domain must not contain credentials".to_string(),
+            ));
+        }
+
+        // The mizu protocol uses a single implicit port; an explicit port
+        // override is either a misconfigured client or an attempt to
+        // redirect traffic to an attacker-controlled port.
+        if parsed.port().is_some() {
+            return Err(MizuError::Network(
+                "mizu:// domain must not contain a port".to_string(),
+            ));
+        }
+
+        // The mizu:// transport layer defines no query string or fragment
+        // of its own. A query attached to an explicit path is forwarded
+        // verbatim as part of the request target — mizu apps rely on this
+        // to call REST-style endpoints (`/search?q=hello`) — but a query
+        // with no path to attach to (`mizu://host?x`) has nothing
+        // legitimate to smuggle itself into and simply collapses to the
+        // document root, exactly as a fragment (`mizu://host#x`) does.
+        let raw_path = parsed.path();
+        let path = if raw_path.is_empty() {
+            "/".to_string()
+        } else {
+            match parsed.query() {
+                Some(q) => format!("{raw_path}?{q}"),
+                None => raw_path.to_string(),
+            }
+        };
+
+        Ok(Self { domain, path })
     }
 }
 
@@ -101,25 +133,37 @@ mod tests {
     #[test]
     fn test_empty_domain() {
         assert!(MizuUri::parse("mizu:///data").is_err());
+        assert!(MizuUri::parse("mizu://").is_err());
     }
 
     // m4 — strict URI validation tests
 
     #[test]
     fn test_at_sign_in_domain_rejected() {
-        // `user@host` syntax can be used to spoof the displayed origin.
+        // `user[:pass]@host` syntax can be used to spoof the displayed origin.
         let cases = [
             "mizu://user@evil.com/page",
-            "mizu://@evil.com/page",
             "mizu://user:pass@evil.com/",
         ];
         for uri in cases {
             let result = MizuUri::parse(uri);
             assert!(
                 matches!(result, Err(crate::core::errors::MizuError::Network(_))),
-                "expected Network error for URI with '@': {uri}"
+                "expected Network error for URI with credentials: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn test_bare_at_with_no_credentials_is_not_spoofable_and_is_accepted() {
+        // `mizu://@evil.com/page` has an `@` delimiter but an empty
+        // username and no password — the WHATWG URL parser normalises this
+        // away entirely (there is no text before `@` to misread as a
+        // trusted domain, unlike `trusted.com@evil.com`), so `username()`
+        // and `password()` come back empty and there is nothing to reject.
+        let uri = MizuUri::parse("mizu://@evil.com/page").unwrap();
+        assert_eq!(uri.domain, "evil.com");
+        assert_eq!(uri.path, "/page");
     }
 
     #[test]
@@ -141,7 +185,11 @@ mod tests {
 
     #[test]
     fn test_control_characters_in_domain_rejected() {
-        // Control chars (0x00–0x1F, 0x7F) in a domain name are always malicious.
+        // Control chars (0x00-0x1F, 0x7F) anywhere in the URI are always
+        // malicious — RFC 3986 requires percent-encoding for any such
+        // byte, so a raw one is never legitimate. Caught by the pre-parse
+        // scan before `url::Url::parse` gets a chance to silently strip
+        // (tab/CR/LF) or percent-encode (DEL, other C0 controls) them.
         let cases = [
             "mizu://evil\x00.com/",
             "mizu://evil\r\n.com/",
@@ -152,7 +200,7 @@ mod tests {
             let result = MizuUri::parse(uri);
             assert!(
                 matches!(result, Err(crate::core::errors::MizuError::Network(_))),
-                "expected Network error for URI with control char"
+                "expected Network error for URI with control char: {uri:?}, got {result:?}"
             );
         }
     }
@@ -170,7 +218,6 @@ mod tests {
     #[test]
     fn test_query_string_cannot_poison_domain() {
         // `mizu://evil.com?inject=x` must NOT store "evil.com?inject=x" as the domain.
-        // The host boundary scan must terminate at '?'.
         let uri = MizuUri::parse("mizu://evil.com?inject=x").unwrap();
         assert_eq!(
             uri.domain, "evil.com",
@@ -180,17 +227,17 @@ mod tests {
 
     #[test]
     fn test_fragment_cannot_poison_domain() {
-        // `mizu://evil.com#frag` must terminate the host at '#'.
+        // `mizu://evil.com#frag` must not leak the fragment into the domain.
         let uri = MizuUri::parse("mizu://evil.com#frag").unwrap();
         assert_eq!(uri.domain, "evil.com");
     }
 
     #[test]
     fn test_query_before_path_does_not_reach_domain() {
-        // `mizu://evil.com?q=x/page` — the '?' fires before '/', so domain='evil.com'.
+        // `mizu://evil.com?q=x/page` — no explicit path exists before the
+        // query, so the request target collapses to the document root.
         let uri = MizuUri::parse("mizu://evil.com?q=x/page").unwrap();
         assert_eq!(uri.domain, "evil.com");
-        // Path is '/' because path_rest starts with '?', not '/'.
         assert_eq!(uri.path, "/");
     }
 
@@ -204,10 +251,16 @@ mod tests {
 
     #[test]
     fn test_query_inside_path_segment_allowed() {
-        // If the path itself contains '?', that is in path_rest (after the first '/'),
-        // so it is preserved in the path and never touches the domain.
+        // A query attached to an explicit path is forwarded verbatim —
+        // mizu apps rely on this to call REST-style endpoints.
         let uri = MizuUri::parse("mizu://api.local/search?q=hello").unwrap();
         assert_eq!(uri.domain, "api.local");
         assert_eq!(uri.path, "/search?q=hello");
+    }
+
+    #[test]
+    fn test_malformed_uri_is_rejected_not_panicking() {
+        assert!(MizuUri::parse("not a uri at all").is_err());
+        assert!(MizuUri::parse("").is_err());
     }
 }
