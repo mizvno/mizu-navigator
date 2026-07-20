@@ -1,4 +1,4 @@
-﻿//! # `logic` — Mizu Logic Block Parser, DAG Validator & Expression Evaluator
+//! # `logic` — Mizu Logic Block Parser, DAG Validator & Expression Evaluator
 //!
 //! This module implements Phase 4 of the Mizu compilation pipeline: it
 //! transforms the raw `logic_block` string produced by [`super::splitter`]
@@ -65,7 +65,7 @@
 #![forbid(unsafe_code)]
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::core::errors::MizuError;
@@ -712,16 +712,8 @@ fn parse_expr(
     // ── Null denotation (prefix / atoms) ────────────────────────────────
     let mut lhs = match cursor.next() {
         Some(Token::Num(n)) => {
-            // DESIGN: the lexer produces only `f64`, so the Int-vs-Float choice
-            // here is driven purely by the *value* (`4/2` → Int, `5/2` → Float).
-            // This makes a literal's static type depend on its runtime value.
-            // Unresolved: either unify on a single `num` type, or distinguish
-            // integer vs float literals already in the lexer. See also [B].
-            if n.fract() == 0.0 {
-                Expr::Literal(Value::Int(*n as i64))
-            } else {
-                Expr::Literal(Value::Float(*n))
-            }
+            let scaled = (*n * (crate::core::types::DECIMAL_SCALE as f64)).round() as i64;
+            Expr::Literal(Value::Int(scaled))
         }
         Some(Token::Bool(b)) => Expr::Literal(Value::Bool(*b)),
         Some(Token::Str(s)) => Expr::Literal(Value::String(std::sync::Arc::from(s.as_str()))),
@@ -776,6 +768,21 @@ fn parse_expr(
                             "expected `)` after arguments of call to `{name}`"
                         )));
                     }
+                }
+                // `get_system_time`'s argument selects which global variable is
+                // overwritten with the current time — it must be a single bare
+                // identifier, fixed at parse time, never a computed expression.
+                // Without this restriction the target could be derived (even
+                // indirectly) from untrusted data (`$form`, a network response),
+                // making the write's destination invisible to the static flow
+                // checker (`parser::flow`), which assumes every assignment
+                // target is a known Symbol. See `SECURITY-INVARIANTS.md`.
+                if name == "get_system_time" && !matches!(args.as_slice(), [Expr::Variable(_)]) {
+                    return Err(MizuError::ParseError(
+                        "get_system_time expects a single bare variable identifier, \
+                         e.g. get_system_time(my_var) — not a computed expression"
+                            .to_string(),
+                    ));
                 }
                 Expr::FunctionCall {
                     name: interner.get_or_intern(&name),
@@ -1346,7 +1353,7 @@ pub fn parse_root_timers(
         let action_str = rest[arrow_pos + 2..].trim();
 
         // Parse the root-timer interval.
-        // Accepted forms: `500ms`, `60s`, `1.5s`, bare integer (ms), variable name.
+        // Accepted forms: `500ms`, `60s`, `1s`, bare integer (ms), variable name.
         let interval = if let Some(ms_str) = interval_str.strip_suffix("ms") {
             match ms_str.trim().parse::<u64>() {
                 Ok(ms) => TimerInterval::Millis(ms),
@@ -1475,6 +1482,24 @@ pub fn parse_computed_with_functions(
         });
     }
 
+    // Reject documents that declare more `comp` bindings than
+    // MAX_COMP_BINDINGS. `recompute_computed_bindings` grants each firing
+    // comp its own fresh MAX_INSTRUCTIONS budget (see that constant's docs
+    // and `formal/MizuFormal/Budget.lean`'s `T1_reaction_bound`), so an
+    // unbounded comp count would let a single event cascade through
+    // arbitrarily many full-budget re-evaluations. Rejecting here, at parse
+    // time, turns that into a clear load-time error instead of a runtime
+    // DoS or an undiagnosable timeout.
+    if bindings.len() > crate::core::types::MAX_COMP_BINDINGS {
+        return Err(MizuError::ParseError(format!(
+            "document declares {} `comp` bindings, exceeding the maximum of {} \
+             (MAX_COMP_BINDINGS); split the logic across fewer computed variables \
+             or reduce reliance on derived state",
+            bindings.len(),
+            crate::core::types::MAX_COMP_BINDINGS
+        )));
+    }
+
     topo_sort_computed(bindings)
 }
 
@@ -1540,16 +1565,111 @@ fn topo_sort_computed(bindings: Vec<ComputedBinding>) -> Result<Vec<ComputedBind
     Ok(sorted)
 }
 
+/// Reverse index mapping a symbol to the indices (into a `&[ComputedBinding]`
+/// slice, in the same topological order produced by [`topo_sort_computed`])
+/// of every binding whose `depends_on` contains that symbol.
+///
+/// Lets [`recompute_computed_bindings`] jump straight to the bindings a
+/// mutation could possibly affect instead of scanning the whole document.
+pub type CompReverseIndex = FxHashMap<Symbol, Vec<usize>>;
+
+/// Builds the [`CompReverseIndex`] for `bindings`.
+///
+/// Call this once, whenever `bindings` is loaded or replaced (e.g. on
+/// document reload) — the index is keyed by binding *position*, so it goes
+/// stale if `bindings` is reordered or mutated without rebuilding it.
+pub fn build_comp_reverse_index(bindings: &[ComputedBinding]) -> CompReverseIndex {
+    let mut index: CompReverseIndex = FxHashMap::default();
+    for (i, cb) in bindings.iter().enumerate() {
+        for &dep_sym in &cb.depends_on {
+            index.entry(dep_sym).or_default().push(i);
+        }
+    }
+    index
+}
+
 /// Re-evaluates computed bindings whose dependencies include any symbol in `mutated`.
 ///
-/// `bindings` must be in topological order (see [`parse_computed`]).
+/// `bindings` must be in topological order (see [`parse_computed`]), and
+/// `reverse_index` must be the [`CompReverseIndex`] built from that same slice
+/// via [`build_comp_reverse_index`] (typically cached once at document load
+/// time rather than rebuilt on every call).
 /// Any newly evaluated comp binding that produces a changed value is recorded in
 /// `store.state_machine.undo_log` via [`VariableStore::set_symbol`], so it will be
 /// picked up by the logic worker's `send_response` along with the original mutations.
 ///
 /// Returns a superset of `mutated` extended with the symbols of any comp bindings
 /// that were re-evaluated, so a chained call can propagate the recomputation.
+///
+/// ## Algorithm
+///
+/// Rather than scanning every binding to test `depends_on ∩ changed`, this
+/// walks only the bindings reachable from `mutated` through the reverse
+/// index, expanding the candidate set to a fixed point as newly recomputed
+/// comps unlock their own dependents:
+///
+/// 1. Seed a candidate set with every binding index reachable from `mutated`.
+/// 2. Repeatedly pop the *smallest* remaining candidate index and evaluate it
+///    (if its dependencies still intersect `changed` — always true by
+///    construction, checked defensively). If it changes, fold the indices of
+///    its own dependents (via the reverse index) back into the candidate set.
+///
+/// Because `bindings` is topologically sorted (a comp's dependencies always
+/// have a strictly smaller index than the comp itself), any dependent
+/// unlocked by evaluating index `i` has index `> i`. Processing candidates in
+/// ascending order therefore visits exactly the same bindings, in the same
+/// relative order, that the original full left-to-right scan would have
+/// visited — it just skips the ones that scan would have `continue`d past
+/// without evaluating. The observable result (which bindings get recomputed,
+/// in what order, with what final values) is identical to the O(#bindings)
+/// scan; see `test_recompute_matches_naive_scan_randomized` for a randomized
+/// equivalence check.
 pub fn recompute_computed_bindings(
+    store: &mut VariableStore,
+    bindings: &[ComputedBinding],
+    functions: &FxHashMap<Symbol, MizuFunction>,
+    mutated: &FxHashSet<Symbol>,
+    reverse_index: &CompReverseIndex,
+) -> FxHashSet<Symbol> {
+    if bindings.is_empty() {
+        return mutated.clone();
+    }
+    let mut changed = mutated.clone();
+
+    let mut candidates: BTreeSet<usize> = BTreeSet::new();
+    for sym in mutated {
+        if let Some(idxs) = reverse_index.get(sym) {
+            candidates.extend(idxs.iter().copied());
+        }
+    }
+
+    while let Some(i) = candidates.pop_first() {
+        let cb = &bindings[i];
+        if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
+            continue;
+        }
+        store.state_machine.instruction_count = 0;
+        if let Ok(val) = store
+            .state_machine
+            .evaluate(&cb.expr, 0, functions, &store.interner)
+        {
+            store.set_symbol(cb.name, val);
+            if changed.insert(cb.name)
+                && let Some(idxs) = reverse_index.get(&cb.name)
+            {
+                candidates.extend(idxs.iter().copied());
+            }
+        }
+    }
+    changed
+}
+
+/// Reference implementation kept byte-for-byte equivalent to the pre-index
+/// O(#bindings) algorithm, used only to verify [`recompute_computed_bindings`]
+/// stays behaviourally identical after the reverse-index optimization (see
+/// `test_recompute_matches_naive_scan_randomized`).
+#[cfg(test)]
+fn recompute_computed_bindings_naive_scan(
     store: &mut VariableStore,
     bindings: &[ComputedBinding],
     functions: &FxHashMap<Symbol, MizuFunction>,
@@ -1717,6 +1837,7 @@ const SIDE_EFFECT_BUILTINS: &[&str] = &[
     "store_local",
     "navigate",
     "download",
+    "get_system_time",
 ];
 
 /// Walks `expr` and returns the name of the first side-effecting function
@@ -2067,6 +2188,26 @@ pub fn parse_action_with_urls(
     }
 }
 
+/// True for ASCII control characters (`< 0x20` or `DEL`, `0x7F`).
+///
+/// Mirrors `isCtl` in `formal/MizuFormal/Semantics.lean`.
+fn is_ctl(c: char) -> bool {
+    (c as u32) < 0x20 || c as u32 == 0x7F
+}
+
+/// The `path_param` validation gate (G2): rejects path separators (`/`,
+/// `\`), ASCII control characters, and the `..` traversal substring, so a
+/// value bound from an untrusted network response can never restructure the
+/// endpoint's URL path when substituted into it.
+///
+/// Mirrors `pathParamOk` in `formal/MizuFormal/Semantics.lean`; every call
+/// site that consumes a `path_param` (`execute_action` below and
+/// `resolve_endpoint_url` in `logic_worker.rs`) must run it before the value
+/// is used to build a URL.
+pub(crate) fn path_param_ok(s: &str) -> bool {
+    !s.chars().any(|c| c == '/' || c == '\\' || is_ctl(c)) && !s.contains("..")
+}
+
 /// Executes a compiled [`Action`] against the provided variable store.
 ///
 /// Returns `true` if the action was an assignment (store mutated), `false` otherwise.
@@ -2138,26 +2279,32 @@ pub fn execute_action(
                 let v = store
                     .state_machine
                     .evaluate(pp, 0, functions, &store.interner)?;
-                Some(match v {
+                let s = match v {
                     Value::String(s) => s.to_string(),
                     Value::Int(n) => n.to_string(),
-                    Value::Float(f) => f.to_string(),
                     _ => {
                         return Err(MizuError::ExecutionError(
                             "path_param must be a string or number".to_string(),
                         ));
                     }
-                })
+                };
+                if !path_param_ok(&s) {
+                    return Err(MizuError::ExecutionError(
+                        "path_param must be a single path segment".to_string(),
+                    ));
+                }
+                Some(s)
             } else {
                 None
             };
+            let target_variable = store.interner.get_or_intern(target_var);
             store.state_machine.accumulated_actions.push(
                 crate::network::RuntimeAction::NetworkCall {
                     method: method.clone(),
                     endpoint_symbol: alias_sym.0,
                     payload: payload_val,
                     path_param: path_param_str,
-                    target_variable: target_var.clone(),
+                    target_variable,
                 },
             );
             Ok(true)
@@ -2182,81 +2329,65 @@ pub fn evaluate(
 }
 
 /// Applies a binary arithmetic operator to two already-evaluated values.
-pub(crate) fn apply_binop(op: &BinOp, lv: Value, rv: Value) -> Result<Value, MizuError> {
+///
+/// `instruction_count` is threaded through so string concatenation — the one
+/// case here whose real cost (an O(len(l)+len(r)) allocation and copy) is not
+/// a flat unit of work — can charge proportionally to its actual size before
+/// performing the allocation, the same discipline `filter`/`count`/`sort`
+/// already apply to their native passes in `types.rs`.
+pub(crate) fn apply_binop(
+    op: &BinOp,
+    lv: Value,
+    rv: Value,
+    instruction_count: &mut u64,
+) -> Result<Value, MizuError> {
     match (op, lv, rv) {
         // Num operations — Int×Int uses checked arithmetic to catch overflow in release builds.
         (BinOp::Add, Value::Int(l), Value::Int(r)) => l
             .checked_add(r)
             .map(Value::Int)
             .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
-        (BinOp::Add, Value::Int(l), Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
-        (BinOp::Add, Value::Float(l), Value::Int(r)) => Ok(Value::Float(l + r as f64)),
-        (BinOp::Add, Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
 
         (BinOp::Sub, Value::Int(l), Value::Int(r)) => l
             .checked_sub(r)
             .map(Value::Int)
             .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
-        (BinOp::Sub, Value::Int(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
-        (BinOp::Sub, Value::Float(l), Value::Int(r)) => Ok(Value::Float(l - r as f64)),
-        (BinOp::Sub, Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
 
         (BinOp::Mul, Value::Int(l), Value::Int(r)) => l
             .checked_mul(r)
+            .map(|product| product / crate::core::types::DECIMAL_SCALE)
             .map(Value::Int)
             .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
-        (BinOp::Mul, Value::Int(l), Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
-        (BinOp::Mul, Value::Float(l), Value::Int(r)) => Ok(Value::Float(l * r as f64)),
-        (BinOp::Mul, Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
 
         (BinOp::Div, Value::Int(l), Value::Int(r)) => {
             if r == 0 {
-                Err(MizuError::DivisionByZero)
-            } else {
-                match (l.checked_rem(r), l.checked_div(r)) {
-                    (Some(rem), Some(div)) => {
-                        if rem == 0 {
-                            Ok(Value::Int(div))
-                        } else {
-                            Ok(Value::Float(l as f64 / r as f64))
-                        }
-                    }
-                    _ => Err(MizuError::ExecutionError("integer overflow".to_owned())),
-                }
+                return Err(MizuError::DivisionByZero);
             }
-        }
-        (BinOp::Div, Value::Int(l), Value::Float(r)) => {
-            if r == 0.0 {
-                Err(MizuError::DivisionByZero)
-            } else {
-                Ok(Value::Float(l as f64 / r))
+            let numerator = l.saturating_mul(crate::core::types::DECIMAL_SCALE);
+            numerator
+                .checked_div(r)
+                .map(Value::Int)
+                .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned()))
+        },
+
+        // String concatenation via `+`: charge the combined length before
+        // allocating, mirroring filter/count/sort — otherwise a chain of
+        // nested `let`s doubling a string bypasses MAX_INSTRUCTIONS entirely
+        // (each `+` is one AST node regardless of operand size) while real
+        // allocation cost grows exponentially with nesting depth.
+        (BinOp::Add, Value::String(l), Value::String(r)) => {
+            let concat_cost = (l.len() as u64).saturating_add(r.len() as u64);
+            *instruction_count = instruction_count.saturating_add(concat_cost);
+            if *instruction_count > crate::core::types::MAX_INSTRUCTIONS {
+                return Err(MizuError::Timeout);
             }
-        }
-        (BinOp::Div, Value::Float(l), Value::Int(r)) => {
-            if r == 0 {
-                Err(MizuError::DivisionByZero)
-            } else {
-                Ok(Value::Float(l / r as f64))
-            }
-        }
-        (BinOp::Div, Value::Float(l), Value::Float(r)) => {
-            if r == 0.0 {
-                Err(MizuError::DivisionByZero)
-            } else {
-                Ok(Value::Float(l / r))
-            }
+            Ok(Value::String(std::sync::Arc::from(
+                format!("{l}{r}").as_str(),
+            )))
         }
 
-        // String concatenation via `+`
-        (BinOp::Add, Value::String(l), Value::String(r)) => Ok(Value::String(
-            std::sync::Arc::from(format!("{l}{r}").as_str()),
-        )),
-
-        // Equality — works across numerics (with coercion) and strings/bools
+        // Equality — works across numerics and strings/bools
         (BinOp::Eq, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l == r)),
-        (BinOp::Eq, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l == r)),
-        (BinOp::Eq, Value::Int(l), Value::Float(r)) => Ok(Value::Bool(l as f64 == r)),
-        (BinOp::Eq, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l == r as f64)),
         (BinOp::Eq, Value::String(l), Value::String(r)) => Ok(Value::Bool(l == r)),
         (BinOp::Eq, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l == r)),
         (BinOp::Eq, Value::Null, Value::Null) => Ok(Value::Bool(true)),
@@ -2265,9 +2396,6 @@ pub(crate) fn apply_binop(op: &BinOp, lv: Value, rv: Value) -> Result<Value, Miz
 
         // Inequality — mirrors equality
         (BinOp::Ne, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l != r)),
-        (BinOp::Ne, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l != r)),
-        (BinOp::Ne, Value::Int(l), Value::Float(r)) => Ok(Value::Bool(l as f64 != r)),
-        (BinOp::Ne, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l != r as f64)),
         (BinOp::Ne, Value::String(l), Value::String(r)) => Ok(Value::Bool(l != r)),
         (BinOp::Ne, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l != r)),
         (BinOp::Ne, Value::Null, Value::Null) => Ok(Value::Bool(false)),
@@ -2276,24 +2404,9 @@ pub(crate) fn apply_binop(op: &BinOp, lv: Value, rv: Value) -> Result<Value, Miz
 
         // Ordering — numeric types only
         (BinOp::Lt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l < r)),
-        (BinOp::Lt, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l < r)),
-        (BinOp::Lt, Value::Int(l), Value::Float(r)) => Ok(Value::Bool((l as f64) < r)),
-        (BinOp::Lt, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l < r as f64)),
-
         (BinOp::Gt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l > r)),
-        (BinOp::Gt, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l > r)),
-        (BinOp::Gt, Value::Int(l), Value::Float(r)) => Ok(Value::Bool((l as f64) > r)),
-        (BinOp::Gt, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l > r as f64)),
-
         (BinOp::Le, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l <= r)),
-        (BinOp::Le, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l <= r)),
-        (BinOp::Le, Value::Int(l), Value::Float(r)) => Ok(Value::Bool((l as f64) <= r)),
-        (BinOp::Le, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l <= r as f64)),
-
         (BinOp::Ge, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l >= r)),
-        (BinOp::Ge, Value::Float(l), Value::Float(r)) => Ok(Value::Bool(l >= r)),
-        (BinOp::Ge, Value::Int(l), Value::Float(r)) => Ok(Value::Bool((l as f64) >= r)),
-        (BinOp::Ge, Value::Float(l), Value::Int(r)) => Ok(Value::Bool(l >= r as f64)),
 
         // Logical AND / OR — bool operands only
         (BinOp::And, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l && r)),
@@ -2310,7 +2423,7 @@ pub(crate) fn apply_binop(op: &BinOp, lv: Value, rv: Value) -> Result<Value, Miz
 /// Returns the Mizu type-name string for a runtime value.
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
-        Value::Int(_) | Value::Float(_) => "num",
+        Value::Int(_) => "num",
         Value::String(_) => "string",
         Value::Bool(_) => "bool",
         Value::List(_) => "list",
@@ -2334,7 +2447,7 @@ pub(crate) fn check_type(
     let ok = matches!(
         (val, expected),
         (Value::Int(_), ValueType::Num)
-            | (Value::Float(_), ValueType::Num)
+            
             | (Value::String(_), ValueType::Str)
             | (Value::Bool(_), ValueType::Bool)
             | (Value::List(_), ValueType::List)
@@ -2360,8 +2473,9 @@ fn leading_spaces(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, BinOp, Expr, MizuFunction, NetworkMethod, TimerInterval, Value, ValueType,
-        VariableStore, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,
+        Action, BinOp, ComputedBinding, Expr, MizuFunction, NetworkMethod, TimerInterval, Value,
+        ValueType, VariableStore, parse_action, parse_action_with_urls, parse_logic,
+        parse_root_timers,
     };
     use crate::core::errors::MizuError;
     use crate::core::types::{StringInterner, Symbol};
@@ -2417,7 +2531,7 @@ mod tests {
         assert!(fns.contains_key(&pi_sym));
         let f = &fns[&pi_sym];
         assert!(f.params.is_empty());
-        assert_eq!(f.body, Expr::Literal(Value::Float(3.14159)));
+        assert_eq!(f.body, Expr::Literal(Value::Int(31416)));
     }
 
     #[test]
@@ -2543,7 +2657,7 @@ mod tests {
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
         // 2 + 12 = 14
-        assert_eq!(result, Value::Int(14));
+        assert_eq!(result, Value::Int(14 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2553,7 +2667,7 @@ mod tests {
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
-        assert_eq!(result, Value::Int(20));
+        assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2563,7 +2677,7 @@ mod tests {
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
-        assert_eq!(result, Value::Int(5));
+        assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2573,7 +2687,7 @@ mod tests {
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
-        assert_eq!(result, Value::Int(1));
+        assert_eq!(result, Value::Int(1 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2583,7 +2697,7 @@ mod tests {
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
-        assert_eq!(result, Value::Int(9));
+        assert_eq!(result, Value::Int(9 * crate::core::types::DECIMAL_SCALE));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -2592,10 +2706,10 @@ mod tests {
 
     #[test]
     fn evaluate_literal_num() {
-        let expr = Expr::Literal(Value::Float(42.0));
+        let expr = Expr::Literal(Value::Int(420_000));
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(42.0));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(420_000));
     }
 
     #[test]
@@ -2609,60 +2723,60 @@ mod tests {
     #[test]
     fn evaluate_variable_lookup() {
         let mut store = VariableStore::new();
-        store.set("x", 7.0_f64);
+        store.set("x", 70_000_i64);
         let x_sym = store.interner.get("x").unwrap();
         let store = Rc::new(store);
         let expr = Expr::Variable(x_sym);
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(7.0));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(70_000));
     }
 
     #[test]
     fn evaluate_addition() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(3.0))),
+            left: Box::new(Expr::Literal(Value::Int(30_000))),
             op: BinOp::Add,
-            right: Box::new(Expr::Literal(Value::Float(4.0))),
+            right: Box::new(Expr::Literal(Value::Int(40_000))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(7.0));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(70_000));
     }
 
     #[test]
     fn evaluate_subtraction() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(10.0))),
+            left: Box::new(Expr::Literal(Value::Int(100_000))),
             op: BinOp::Sub,
-            right: Box::new(Expr::Literal(Value::Float(3.5))),
+            right: Box::new(Expr::Literal(Value::Int(35_000))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(6.5));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(65_000));
     }
 
     #[test]
     fn evaluate_multiplication() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(6.0))),
+            left: Box::new(Expr::Literal(Value::Int(60_000))),
             op: BinOp::Mul,
-            right: Box::new(Expr::Literal(Value::Float(7.0))),
+            right: Box::new(Expr::Literal(Value::Int(70_000))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(42.0));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(420_000));
     }
 
     #[test]
     fn evaluate_division() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(15.0))),
+            left: Box::new(Expr::Literal(Value::Int(150_000))),
             op: BinOp::Div,
-            right: Box::new(Expr::Literal(Value::Float(3.0))),
+            right: Box::new(Expr::Literal(Value::Int(30_000))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Float(5.0));
+        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(50_000));
     }
 
     #[test]
@@ -2688,15 +2802,15 @@ mod tests {
         let (fns, interner) = single_fn(src).unwrap();
         let vat_sym = interner.get("vat").unwrap();
         let mut store = VariableStore::with_interner(interner);
-        store.set("p", 100.0_f64);
+        store.set("p", 100 * crate::core::types::DECIMAL_SCALE);
         let store = Rc::new(store);
         let call_expr = Expr::FunctionCall {
             name: vat_sym,
-            args: vec![Expr::Literal(Value::Float(100.0))],
+            args: vec![Expr::Literal(Value::Int(100 * crate::core::types::DECIMAL_SCALE))],
         };
         let result = evaluate(&call_expr, &store, &fns).unwrap();
         // 100 * 1.22 = 122
-        assert_eq!(result, Value::Float(122.0));
+        assert_eq!(result, Value::Int(122 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2709,12 +2823,12 @@ mod tests {
         let quadruple_sym = interner.get("quadruple").unwrap();
         let call_expr = Expr::FunctionCall {
             name: quadruple_sym,
-            args: vec![Expr::Literal(Value::Float(3.0))],
+            args: vec![Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE))],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &store, &fns).unwrap();
         // 3 * 4 = 12
-        assert_eq!(result, Value::Float(12.0));
+        assert_eq!(result, Value::Int(12 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -2729,20 +2843,14 @@ mod tests {
         let call_expr = Expr::FunctionCall {
             name: total_sym,
             args: vec![
-                Expr::Literal(Value::Float(10.0)),
-                Expr::Literal(Value::Float(3.0)),
+                Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)),
+                Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)),
             ],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &store, &fns).unwrap();
         // netto = 10 * 3 = 30, result = 30 * 1.22 = 36.6
-        let expected = 30.0_f64 * 1.22_f64;
-        match result {
-            Value::Float(n) => {
-                assert!((n - expected).abs() < 1e-10, "got {n}, expected {expected}")
-            }
-            other => panic!("expected Float, got {other:?}"),
-        }
+        assert_eq!(result, Value::Int(366_000));
     }
 
     #[test]
@@ -2752,18 +2860,18 @@ mod tests {
         let (fns, interner) = single_fn(src).unwrap();
         let area_sym = interner.get("area").unwrap();
         let mut outer_store = VariableStore::with_interner(interner);
-        outer_store.set("w", 999.0_f64); // should be ignored inside the function
+        outer_store.set("w", 999 * crate::core::types::DECIMAL_SCALE); // should be ignored inside the function
         let outer_store = Rc::new(outer_store);
         let call_expr = Expr::FunctionCall {
             name: area_sym,
             args: vec![
-                Expr::Literal(Value::Float(5.0)),
-                Expr::Literal(Value::Float(4.0)),
+                Expr::Literal(Value::Int(5 * crate::core::types::DECIMAL_SCALE)),
+                Expr::Literal(Value::Int(4 * crate::core::types::DECIMAL_SCALE)),
             ],
         };
         // Function arguments override the outer store inside the function body.
         let result = evaluate(&call_expr, &outer_store, &fns).unwrap();
-        assert_eq!(result, Value::Float(20.0));
+        assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -2823,7 +2931,7 @@ mod tests {
     #[test]
     fn error_num_plus_bool_is_type_error() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(1.0))),
+            left: Box::new(Expr::Literal(Value::Int(1))),
             op: BinOp::Add,
             right: Box::new(Expr::Literal(Value::Bool(true))),
         };
@@ -2839,7 +2947,7 @@ mod tests {
     #[test]
     fn error_num_mul_string_is_type_error() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Float(2.0))),
+            left: Box::new(Expr::Literal(Value::Int(2))),
             op: BinOp::Mul,
             right: Box::new(Expr::Literal(Value::String(std::sync::Arc::from("oops")))),
         };
@@ -2854,7 +2962,7 @@ mod tests {
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Literal(Value::Bool(true))),
             op: BinOp::Sub,
-            right: Box::new(Expr::Literal(Value::Float(1.0))),
+            right: Box::new(Expr::Literal(Value::Int(1))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
@@ -2887,7 +2995,7 @@ mod tests {
         let add_sym = interner.get("add").unwrap();
         let call_expr = Expr::FunctionCall {
             name: add_sym,
-            args: vec![Expr::Literal(Value::Float(1.0))],
+            args: vec![Expr::Literal(Value::Int(1))],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &store, &fns);
@@ -2905,8 +3013,8 @@ mod tests {
         let call_expr = Expr::FunctionCall {
             name: inc_sym,
             args: vec![
-                Expr::Literal(Value::Float(1.0)),
-                Expr::Literal(Value::Float(2.0)),
+                Expr::Literal(Value::Int(1)),
+                Expr::Literal(Value::Int(2)),
             ],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
@@ -3035,20 +3143,20 @@ mod tests {
     #[test]
     fn execute_action_assignment_mutates_store() {
         let mut store = VariableStore::new();
-        store.set("count", 1.0_f64);
+        store.set("count", 10_000_i64);
         let mut store = Rc::new(store);
         let functions = FxHashMap::default();
 
         let action = parse_action("count = count + 1", &mut StringInterner::new()).unwrap();
         let mutated = execute_action(&action, &mut store, &functions).unwrap();
         assert!(mutated);
-        assert_eq!(*store.get("count").unwrap(), Value::Float(2.0));
+        assert_eq!(*store.get("count").unwrap(), Value::Int(20_000));
     }
 
     #[test]
     fn execute_action_pure_expression_no_mutation() {
         let mut store = VariableStore::new();
-        store.set("count", 1.0_f64);
+        store.set("count", 10_000_i64);
         let mut store = Rc::new(store);
         let functions = FxHashMap::default();
 
@@ -3056,13 +3164,184 @@ mod tests {
         let mutated = execute_action(&action, &mut store, &functions).unwrap();
         assert!(!mutated);
         // Ensure count wasn't mutated
-        assert_eq!(*store.get("count").unwrap(), Value::Float(1.0));
+        assert_eq!(*store.get("count").unwrap(), Value::Int(10_000));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // execute_action — path_param validation gate (G2)
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn network_call_action(path_param_value: &str) -> Action {
+        Action::NetworkCall {
+            method: NetworkMethod::Get,
+            alias_sym: Symbol(0),
+            payload: None,
+            path_param: Some(Box::new(Expr::Literal(Value::from(path_param_value)))),
+            target_var: "data".to_string(),
+        }
+    }
+
+    #[test]
+    fn path_param_ok_accepts_single_alphanumeric_segment() {
+        assert!(super::path_param_ok("abc123"));
+        assert!(super::path_param_ok("foo-bar_123.~baz"));
+    }
+
+    #[test]
+    fn path_param_ok_rejects_forward_slash() {
+        assert!(!super::path_param_ok("a/b"));
+    }
+
+    #[test]
+    fn path_param_ok_rejects_backslash() {
+        assert!(!super::path_param_ok("a\\b"));
+    }
+
+    #[test]
+    fn path_param_ok_rejects_traversal_substring() {
+        assert!(!super::path_param_ok(".."));
+        assert!(!super::path_param_ok("a..b"));
+    }
+
+    #[test]
+    fn path_param_ok_rejects_control_characters() {
+        assert!(!super::path_param_ok("a\nb"));
+        assert!(!super::path_param_ok("a\tb"));
+        assert!(!super::path_param_ok("a\u{7F}b"));
+    }
+
+    #[test]
+    fn execute_action_network_call_valid_path_param_accepted() {
+        let mut store = Rc::new(VariableStore::new());
+        let functions = FxHashMap::default();
+
+        let action = network_call_action("abc123");
+        let mutated = execute_action(&action, &mut store, &functions).unwrap();
+        assert!(mutated);
+        assert_eq!(store.state_machine.accumulated_actions.len(), 1);
+        match &store.state_machine.accumulated_actions[0] {
+            crate::network::RuntimeAction::NetworkCall { path_param, .. } => {
+                assert_eq!(path_param.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected NetworkCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_action_network_call_path_param_with_slash_rejected() {
+        let mut store = Rc::new(VariableStore::new());
+        let functions = FxHashMap::default();
+
+        let action = network_call_action("../etc/passwd");
+        let err = execute_action(&action, &mut store, &functions).unwrap_err();
+        assert!(
+            matches!(err, MizuError::ExecutionError(_)),
+            "expected ExecutionError, got {err:?}"
+        );
+        assert!(
+            store.state_machine.accumulated_actions.is_empty(),
+            "a rejected path_param must not be queued as a network action"
+        );
+    }
+
+    #[test]
+    fn execute_action_network_call_path_param_with_backslash_rejected() {
+        let mut store = Rc::new(VariableStore::new());
+        let functions = FxHashMap::default();
+
+        let action = network_call_action("a\\b");
+        let err = execute_action(&action, &mut store, &functions).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+    }
+
+    #[test]
+    fn execute_action_network_call_path_param_with_control_char_rejected() {
+        let mut store = Rc::new(VariableStore::new());
+        let functions = FxHashMap::default();
+
+        let action = network_call_action("a\nb");
+        let err = execute_action(&action, &mut store, &functions).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
     #[test]
     fn parse_action_invalid_assignment() {
         let err = parse_action("= 5", &mut StringInterner::new()).unwrap_err();
         assert!(matches!(err, MizuError::ParseError(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // get_system_time — argument must be a bare identifier (RM-04)
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_system_time_bare_identifier_accepted() {
+        let mut interner = StringInterner::new();
+        let action = parse_action("get_system_time(my_var)", &mut interner).unwrap();
+        let Action::Eval(Expr::FunctionCall { name, args }) = action else {
+            panic!("expected Action::Eval(FunctionCall), got: {action:?}");
+        };
+        assert_eq!(interner.resolve(name), Some("get_system_time"));
+        let my_var_sym = interner.get("my_var").unwrap();
+        assert_eq!(args, vec![Expr::Variable(my_var_sym)]);
+    }
+
+    #[test]
+    fn get_system_time_field_access_target_rejected() {
+        // The gap this closes: a target derived (even indirectly) from
+        // untrusted data, e.g. `$form.evil`, must be rejected at parse time
+        // — it can no longer even be expressed in a document.
+        let err = parse_action("get_system_time($form.evil)", &mut StringInterner::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, MizuError::ParseError(_)),
+            "expected ParseError for a field-access target, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn get_system_time_string_literal_target_rejected() {
+        // The pre-fix syntax (argument evaluated to a string used for a
+        // dynamic lookup) must no longer parse at all.
+        let err = parse_action(r#"get_system_time("my_var")"#, &mut StringInterner::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, MizuError::ParseError(_)),
+            "expected ParseError for a string-literal target, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn get_system_time_binop_target_rejected() {
+        let err = parse_action("get_system_time(a + b)", &mut StringInterner::new())
+            .unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+    }
+
+    #[test]
+    fn get_system_time_no_args_rejected() {
+        let err = parse_action("get_system_time()", &mut StringInterner::new()).unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+    }
+
+    #[test]
+    fn get_system_time_two_args_rejected() {
+        let err =
+            parse_action("get_system_time(a, b)", &mut StringInterner::new()).unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+    }
+
+    #[test]
+    fn find_side_effect_call_detects_get_system_time() {
+        // get_system_time was missing from SIDE_EFFECT_BUILTINS, meaning a
+        // conditional-class condition (a pure "observation" context,
+        // re-evaluated every frame) could invoke it undetected.
+        let mut interner = StringInterner::new();
+        let expr = super::parse_expr_standalone("get_system_time(x)", &mut interner).unwrap();
+        assert_eq!(
+            super::find_side_effect_call(&expr, &interner),
+            Some("get_system_time".to_string())
+        );
     }
 
     #[test]
@@ -3073,7 +3352,7 @@ mod tests {
         assert!(fns.contains_key(&count_sym));
         let f = &fns[&count_sym];
         assert!(f.params.is_empty());
-        assert_eq!(f.body, Expr::Literal(Value::Int(10)));
+        assert_eq!(f.body, Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)));
     }
 
     #[test]
@@ -3309,23 +3588,23 @@ mod tests {
 
     #[test]
     fn if_then_else_true_branch() {
-        assert_eq!(eval_src("if true then 1 else 2").unwrap(), Value::Int(1));
+        assert_eq!(eval_src("if true then 1 else 2").unwrap(), Value::Int(1 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
     fn if_then_else_false_branch() {
-        assert_eq!(eval_src("if false then 1 else 2").unwrap(), Value::Int(2));
+        assert_eq!(eval_src("if false then 1 else 2").unwrap(), Value::Int(2 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
     fn if_then_else_with_expression_condition() {
         assert_eq!(
             eval_src("if 3 > 2 then 10 else 20").unwrap(),
-            Value::Int(10)
+            Value::Int(10 * crate::core::types::DECIMAL_SCALE)
         );
         assert_eq!(
             eval_src("if 1 > 2 then 10 else 20").unwrap(),
-            Value::Int(20)
+            Value::Int(20 * crate::core::types::DECIMAL_SCALE)
         );
     }
 
@@ -3339,28 +3618,28 @@ mod tests {
 
     #[test]
     fn ternary_true_branch() {
-        assert_eq!(eval_src("true ? 1 : 2").unwrap(), Value::Int(1));
+        assert_eq!(eval_src("true ? 1 : 2").unwrap(), Value::Int(1 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
     fn ternary_false_branch() {
-        assert_eq!(eval_src("false ? 1 : 2").unwrap(), Value::Int(2));
+        assert_eq!(eval_src("false ? 1 : 2").unwrap(), Value::Int(2 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
     fn ternary_with_expression_condition() {
-        assert_eq!(eval_src("5 > 3 ? 100 : 200").unwrap(), Value::Int(100));
-        assert_eq!(eval_src("1 == 2 ? 100 : 200").unwrap(), Value::Int(200));
+        assert_eq!(eval_src("5 > 3 ? 100 : 200").unwrap(), Value::Int(100 * crate::core::types::DECIMAL_SCALE));
+        assert_eq!(eval_src("1 == 2 ? 100 : 200").unwrap(), Value::Int(200 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
     fn ternary_right_associative() {
         // `true ? 1 : false ? 2 : 3` → `true ? 1 : (false ? 2 : 3)` → 1
-        assert_eq!(eval_src("true ? 1 : false ? 2 : 3").unwrap(), Value::Int(1));
+        assert_eq!(eval_src("true ? 1 : false ? 2 : 3").unwrap(), Value::Int(1 * crate::core::types::DECIMAL_SCALE));
         // `false ? 1 : false ? 2 : 3` → `false ? 1 : (false ? 2 : 3)` → 3
         assert_eq!(
             eval_src("false ? 1 : false ? 2 : 3").unwrap(),
-            Value::Int(3)
+            Value::Int(3 * crate::core::types::DECIMAL_SCALE)
         );
     }
 
@@ -3393,7 +3672,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let va_sym = interner.get("absolute_value").unwrap();
         let mut store = VariableStore::with_interner(interner);
         let pos = fns[&va_sym].body.clone();
-        store.set("n", Value::Float(5.0));
+        store.set("n", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
         let v = store
             .state_machine
             .evaluate(&pos, 0, &fns, &store.interner)
@@ -4000,7 +4279,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn apply_binop_add_overflow() {
-        let result = super::apply_binop(&BinOp::Add, Value::Int(i64::MAX), Value::Int(1));
+        let mut ic = 0u64;
+        let result = super::apply_binop(&BinOp::Add, Value::Int(i64::MAX), Value::Int(1), &mut ic);
         assert!(
             matches!(result, Err(MizuError::ExecutionError(_))),
             "expected ExecutionError for i64::MAX + 1, got: {result:?}"
@@ -4009,7 +4289,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn apply_binop_mul_overflow() {
-        let result = super::apply_binop(&BinOp::Mul, Value::Int(i64::MAX), Value::Int(2));
+        let mut ic = 0u64;
+        let result = super::apply_binop(&BinOp::Mul, Value::Int(i64::MAX), Value::Int(2), &mut ic);
         assert!(
             matches!(result, Err(MizuError::ExecutionError(_))),
             "expected ExecutionError for i64::MAX * 2, got: {result:?}"
@@ -4018,7 +4299,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn apply_binop_sub_underflow() {
-        let result = super::apply_binop(&BinOp::Sub, Value::Int(i64::MIN), Value::Int(1));
+        let mut ic = 0u64;
+        let result = super::apply_binop(&BinOp::Sub, Value::Int(i64::MIN), Value::Int(1), &mut ic);
         assert!(
             matches!(result, Err(MizuError::ExecutionError(_))),
             "expected ExecutionError for i64::MIN - 1, got: {result:?}"
@@ -4027,7 +4309,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn apply_binop_div_overflow() {
-        let result = super::apply_binop(&BinOp::Div, Value::Int(i64::MIN), Value::Int(-1));
+        let mut ic = 0u64;
+        let result = super::apply_binop(&BinOp::Div, Value::Int(i64::MIN), Value::Int(-1), &mut ic);
         assert!(
             matches!(result, Err(MizuError::ExecutionError(_))),
             "expected ExecutionError for i64::MIN / -1, got: {result:?}"
@@ -4047,6 +4330,41 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
             matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("cycle")),
             "expected cycle error, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_comp_binding_cap_rejected() {
+        // MAX_COMP_BINDINGS + 1 independent `comp` declarations must be rejected
+        // at parse time with a clear, diagnosable error — not accepted and left
+        // to blow up the per-reaction instruction budget at runtime (see
+        // `MAX_COMP_BINDINGS`'s docs in `core::types` and `formal/MizuFormal/Budget.lean`'s
+        // `T1_shipped_capped`).
+        let too_many = crate::core::types::MAX_COMP_BINDINGS + 1;
+        let mut src = String::new();
+        for i in 0..too_many {
+            src.push_str(&format!("    comp c{i} = {i}\n"));
+        }
+        let mut interner = StringInterner::new();
+        let result = super::parse_computed(&src, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("MAX_COMP_BINDINGS")),
+            "expected a ParseError naming MAX_COMP_BINDINGS, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_comp_binding_cap_allows_exactly_the_limit() {
+        // The cap must reject documents *above* the limit without rejecting
+        // documents that declare exactly MAX_COMP_BINDINGS comps.
+        let at_limit = crate::core::types::MAX_COMP_BINDINGS;
+        let mut src = String::new();
+        for i in 0..at_limit {
+            src.push_str(&format!("    comp c{i} = {i}\n"));
+        }
+        let mut interner = StringInterner::new();
+        let result = super::parse_computed(&src, &mut interner);
+        assert!(result.is_ok(), "expected Ok at exactly the cap, got: {result:?}");
+        assert_eq!(result.unwrap().len(), at_limit);
     }
 
     #[test]
@@ -4077,17 +4395,18 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let src = "    comp derived = total + 1\n";
         let mut interner = StringInterner::new();
         let computed = super::parse_computed(src, &mut interner).unwrap();
+        let reverse_index = super::build_comp_reverse_index(&computed);
 
         let mut store = VariableStore::with_interner(interner);
-        store.set("total", Value::Int(5));
+        store.set("total", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
 
         let fns = FxHashMap::default();
         let all_syms: FxHashSet<Symbol> =
             store.state_machine.global_store.keys().copied().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms);
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms, &reverse_index);
 
         let derived_sym = store.interner.get("derived").unwrap();
-        assert_eq!(*store.state_machine.get_global(derived_sym), Value::Int(6));
+        assert_eq!(*store.state_machine.get_global(derived_sym), Value::Int(6 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -4095,24 +4414,25 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let src = "    comp double = x * 2\n";
         let mut interner = StringInterner::new();
         let computed = super::parse_computed(src, &mut interner).unwrap();
+        let reverse_index = super::build_comp_reverse_index(&computed);
 
         let mut store = VariableStore::with_interner(interner);
-        store.set("x", Value::Int(10));
+        store.set("x", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
         let fns = FxHashMap::default();
 
         let all_syms: FxHashSet<Symbol> =
             store.state_machine.global_store.keys().copied().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms);
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms, &reverse_index);
         let double_sym = store.interner.get("double").unwrap();
-        assert_eq!(*store.state_machine.get_global(double_sym), Value::Int(20));
+        assert_eq!(*store.state_machine.get_global(double_sym), Value::Int(20 * crate::core::types::DECIMAL_SCALE));
 
         // Mutate x and recompute
         store.state_machine.undo_log.clear();
-        store.set("x", Value::Int(7));
+        store.set("x", Value::Int(7 * crate::core::types::DECIMAL_SCALE));
         let x_sym = store.interner.get("x").unwrap();
         let mutated: FxHashSet<Symbol> = [x_sym].into_iter().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated);
-        assert_eq!(*store.state_machine.get_global(double_sym), Value::Int(14));
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
+        assert_eq!(*store.state_machine.get_global(double_sym), Value::Int(14 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -4124,6 +4444,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let mut interner = StringInterner::new();
         let fns = super::parse_logic(src, &mut interner).unwrap();
         let computed = super::parse_computed_with_functions(src, &mut interner, &fns).unwrap();
+        let reverse_index = super::build_comp_reverse_index(&computed);
         assert_eq!(computed.len(), 1);
 
         let z_sym = interner.get("z").unwrap();
@@ -4133,21 +4454,21 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         );
 
         let mut store = VariableStore::with_interner(interner);
-        store.set("x", Value::Int(1));
-        store.set("z", Value::Int(10));
+        store.set("x", Value::Int(1 * crate::core::types::DECIMAL_SCALE));
+        store.set("z", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
 
         let all_syms: FxHashSet<Symbol> =
             store.state_machine.global_store.keys().copied().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms);
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms, &reverse_index);
         let y_sym = store.interner.get("y").unwrap();
-        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(11));
+        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(11 * crate::core::types::DECIMAL_SCALE));
 
         // Mutate ONLY z — y must recompute through the transitive dependency.
         store.state_machine.undo_log.clear();
-        store.set("z", Value::Int(20));
+        store.set("z", Value::Int(20 * crate::core::types::DECIMAL_SCALE));
         let mutated: FxHashSet<Symbol> = [z_sym].into_iter().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated);
-        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(21));
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
+        assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(21 * crate::core::types::DECIMAL_SCALE));
     }
 
     #[test]
@@ -4168,17 +4489,256 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         assert!(a_pos < b_pos, "a must precede b in topological order");
 
         let mut store = VariableStore::with_interner(interner);
-        store.set("x", Value::Int(3));
+        store.set("x", Value::Int(3 * crate::core::types::DECIMAL_SCALE));
         let fns = FxHashMap::default();
+        let reverse_index = super::build_comp_reverse_index(&computed);
 
         let all_syms: FxHashSet<Symbol> =
             store.state_machine.global_store.keys().copied().collect();
-        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms);
+        super::recompute_computed_bindings(&mut store, &computed, &fns, &all_syms, &reverse_index);
 
         let a_sym = store.interner.get("a").unwrap();
         let b_sym = store.interner.get("b").unwrap();
-        assert_eq!(*store.state_machine.get_global(a_sym), Value::Int(4));
-        assert_eq!(*store.state_machine.get_global(b_sym), Value::Int(8));
+        assert_eq!(*store.state_machine.get_global(a_sym), Value::Int(4 * crate::core::types::DECIMAL_SCALE));
+        assert_eq!(*store.state_machine.get_global(b_sym), Value::Int(8 * crate::core::types::DECIMAL_SCALE));
+    }
+
+    /// Minimal xorshift64 PRNG — deterministic per-seed, dependency-free.
+    /// Good enough for generating varied DAG shapes; not for anything security-sensitive.
+    struct TestRng(u64);
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_range(&mut self, n: usize) -> usize {
+            if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        }
+    }
+
+    /// Builds a random `comp` DAG of `n_comps` bindings over `n_base` base
+    /// globals: comp `i` may depend on any base global or any earlier comp
+    /// (index `< i`), which keeps the resulting `Vec<ComputedBinding>` in a
+    /// valid topological order by construction — the same invariant
+    /// `topo_sort_computed` establishes — without needing to run the full
+    /// text parser.
+    fn random_comp_dag(
+        rng: &mut TestRng,
+        interner: &mut StringInterner,
+        n_base: usize,
+        n_comps: usize,
+        max_deps: usize,
+    ) -> (Vec<Symbol>, Vec<ComputedBinding>) {
+        let base_syms: Vec<Symbol> = (0..n_base)
+            .map(|i| interner.get_or_intern(&format!("g{i}")))
+            .collect();
+
+        let mut comp_syms: Vec<Symbol> = Vec::with_capacity(n_comps);
+        let mut bindings: Vec<ComputedBinding> = Vec::with_capacity(n_comps);
+        for i in 0..n_comps {
+            let name = interner.get_or_intern(&format!("c{i}"));
+            comp_syms.push(name);
+
+            let pool_len = n_base + i;
+            let n_deps = rng.next_range(max_deps + 1);
+            let mut deps: Vec<Symbol> = Vec::new();
+            for _ in 0..n_deps {
+                let idx = rng.next_range(pool_len);
+                let dep_sym = if idx < n_base {
+                    base_syms[idx]
+                } else {
+                    comp_syms[idx - n_base]
+                };
+                if !deps.contains(&dep_sym) {
+                    deps.push(dep_sym);
+                }
+            }
+
+            // expr = (i+1)*100 + dep_0 + dep_1 + ...
+            let mut expr = Expr::Literal(Value::Int((i as i64 + 1) * 100));
+            for &d in &deps {
+                expr = Expr::BinaryOp {
+                    left: Box::new(expr),
+                    op: BinOp::Add,
+                    right: Box::new(Expr::Variable(d)),
+                };
+            }
+
+            bindings.push(ComputedBinding { name, expr, depends_on: deps });
+        }
+        (base_syms, bindings)
+    }
+
+    /// Equivalence check: the reverse-index-driven `recompute_computed_bindings`
+    /// must produce byte-for-byte identical results (returned `changed` set and
+    /// final global store) to the pre-optimization O(#bindings) linear scan,
+    /// across many randomly shaped comp DAGs and mutation sequences. This is
+    /// the empirical guarantee that the optimization in this file is purely a
+    /// performance change, not a semantic one.
+    #[test]
+    fn test_recompute_matches_naive_scan_randomized() {
+        let fns = FxHashMap::default();
+
+        for seed in 1..=300u64 {
+            let mut rng = TestRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let n_base = 2 + rng.next_range(8); // 2..=9
+            let n_comps = 3 + rng.next_range(40); // 3..=42
+            let max_deps = 1 + rng.next_range(3); // 1..=3
+
+            let mut interner = StringInterner::new();
+            let (base_syms, bindings) =
+                random_comp_dag(&mut rng, &mut interner, n_base, n_comps, max_deps);
+            let reverse_index = super::build_comp_reverse_index(&bindings);
+
+            let mut store_old = VariableStore::with_interner(interner.clone());
+            let mut store_new = VariableStore::with_interner(interner);
+            for (gi, &sym) in base_syms.iter().enumerate() {
+                let v = Value::Int((gi as i64 + 1) * 10);
+                store_old.set_symbol(sym, v.clone());
+                store_new.set_symbol(sym, v);
+            }
+
+            // Initial load: every base global counts as mutated, as a real
+            // document load would treat it (see `LogicWorker`'s `Reload` handler).
+            let all_syms: FxHashSet<Symbol> = base_syms.iter().copied().collect();
+            let changed_old = super::recompute_computed_bindings_naive_scan(
+                &mut store_old, &bindings, &fns, &all_syms,
+            );
+            let changed_new = super::recompute_computed_bindings(
+                &mut store_new, &bindings, &fns, &all_syms, &reverse_index,
+            );
+            assert_eq!(changed_old, changed_new, "seed {seed}: initial changed-set diverged");
+            assert_eq!(
+                store_old.state_machine.global_store, store_new.state_machine.global_store,
+                "seed {seed}: initial store state diverged"
+            );
+
+            // Fire a sequence of random mutation events and compare after each.
+            for _event in 0..15 {
+                let n_mut = 1 + rng.next_range(n_base);
+                let mut mutated: FxHashSet<Symbol> = FxHashSet::default();
+                for _ in 0..n_mut {
+                    mutated.insert(base_syms[rng.next_range(n_base)]);
+                }
+                for &sym in &mutated {
+                    let v = Value::Int((rng.next_u64() % 1000) as i64);
+                    store_old.set_symbol(sym, v.clone());
+                    store_new.set_symbol(sym, v);
+                }
+
+                let changed_old = super::recompute_computed_bindings_naive_scan(
+                    &mut store_old, &bindings, &fns, &mutated,
+                );
+                let changed_new = super::recompute_computed_bindings(
+                    &mut store_new, &bindings, &fns, &mutated, &reverse_index,
+                );
+                assert_eq!(changed_old, changed_new, "seed {seed}: changed-set diverged after mutation");
+                assert_eq!(
+                    store_old.state_machine.global_store, store_new.state_machine.global_store,
+                    "seed {seed}: store state diverged after mutation"
+                );
+            }
+        }
+    }
+
+    /// Demonstrates the reverse-index optimization's payoff: with a large
+    /// document (many independent comps) but a small blast radius (mutating
+    /// one variable affects exactly one comp), the naive O(#bindings) scan
+    /// pays for the whole document on every event while the indexed version
+    /// only ever touches the affected binding.
+    ///
+    /// [`crate::core::types::MAX_COMP_BINDINGS`] (500) caps documents parsed
+    /// through [`parse_computed_with_functions`]; this test builds bindings
+    /// directly (bypassing the parser and that cap) to explore a size regime
+    /// well beyond it, so the asymptotic gap is unambiguous. No external
+    /// benchmark harness (e.g. `criterion`) is wired into this crate, so this
+    /// is a plain timed `#[test]`; run with `cargo test --release -- --nocapture
+    /// bench_recompute_large_document_small_blast_radius` to see the printed timings.
+    #[test]
+    fn bench_recompute_large_document_small_blast_radius() {
+        const N_COMPS: usize = 20_000;
+        const N_EVENTS: usize = 500;
+
+        let mut interner = StringInterner::new();
+        let base_syms: Vec<Symbol> = (0..N_COMPS)
+            .map(|i| interner.get_or_intern(&format!("base{i}")))
+            .collect();
+
+        // Every comp depends on exactly one, distinct base global — so a
+        // mutation to a single base global is only ever relevant to one comp
+        // out of N_COMPS.
+        let bindings: Vec<ComputedBinding> = (0..N_COMPS)
+            .map(|i| {
+                let name = interner.get_or_intern(&format!("comp{i}"));
+                ComputedBinding {
+                    name,
+                    expr: Expr::BinaryOp {
+                        left: Box::new(Expr::Variable(base_syms[i])),
+                        op: BinOp::Add,
+                        right: Box::new(Expr::Literal(Value::Int(1))),
+                    },
+                    depends_on: vec![base_syms[i]],
+                }
+            })
+            .collect();
+
+        let reverse_index = super::build_comp_reverse_index(&bindings);
+        let fns = FxHashMap::default();
+
+        let mut store_old = VariableStore::with_interner(interner.clone());
+        let mut store_new = VariableStore::with_interner(interner);
+        for &sym in &base_syms {
+            store_old.set_symbol(sym, Value::Int(0));
+            store_new.set_symbol(sym, Value::Int(0));
+        }
+
+        // Every event mutates the same single variable, which affects
+        // exactly one of the N_COMPS bindings — the smallest possible blast
+        // radius against a document far larger than any real one can be.
+        let target = base_syms[0];
+
+        let start_old = std::time::Instant::now();
+        for n in 0..N_EVENTS {
+            store_old.set_symbol(target, Value::Int(n as i64));
+            let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
+            super::recompute_computed_bindings_naive_scan(&mut store_old, &bindings, &fns, &mutated);
+        }
+        let old_elapsed = start_old.elapsed();
+
+        let start_new = std::time::Instant::now();
+        for n in 0..N_EVENTS {
+            store_new.set_symbol(target, Value::Int(n as i64));
+            let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
+            super::recompute_computed_bindings(
+                &mut store_new, &bindings, &fns, &mutated, &reverse_index,
+            );
+        }
+        let new_elapsed = start_new.elapsed();
+
+        // Both algorithms must still agree on the final result — this test
+        // exists to measure speed, not to re-litigate correctness (see
+        // `test_recompute_matches_naive_scan_randomized` for that).
+        assert_eq!(
+            store_old.state_machine.global_store,
+            store_new.state_machine.global_store
+        );
+
+        println!(
+            "bench_recompute_large_document_small_blast_radius: {N_COMPS} comps, {N_EVENTS} events \
+             — naive scan = {old_elapsed:?}, reverse-index = {new_elapsed:?} \
+             ({:.1}x faster)",
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(1e-12)
+        );
+
+        assert!(
+            new_elapsed * 2 < old_elapsed,
+            "expected the reverse-index version to be at least 2x faster on a large \
+             document with a small blast radius; naive={old_elapsed:?} indexed={new_elapsed:?}"
+        );
     }
 
     // ── Depth guard tests ────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-﻿//! # `layout` — Mizu Layout Parser & Arena-based DOM Constructor
+//! # `layout` — Mizu Layout Parser & Arena-based DOM Constructor
 //!
 //! This module implements Phase 5 of the Mizu compilation pipeline. It takes
 //! the raw `layout_block` produced by [`super::splitter`], tokenises and parses
@@ -761,6 +761,19 @@ pub fn parse_layout_with_urls(
                 stack.pop();
             } else {
                 break;
+            }
+        }
+
+        if node.primitive == Primitive::Each {
+            for &(_, parent_id) in stack.iter() {
+                if let Some(parent_node) = tree.get(parent_id) {
+                    if parent_node.value().primitive == Primitive::Each {
+                        return Err(MizuError::ParseError(format!(
+                            "line {}: nested `each` blocks are strictly forbidden",
+                            line_idx + 1
+                        )));
+                    }
+                }
             }
         }
 
@@ -1715,12 +1728,12 @@ mod tests {
             .unwrap();
         assert_eq!(box_node.value().conditional_classes[0].class_name, "active");
 
-        let mut record_map: std::collections::BTreeMap<Arc<str>, Value> =
-            std::collections::BTreeMap::new();
-        record_map.insert(Arc::from("done"), Value::Bool(true));
+        let mut record_map: Vec<(Arc<str>, Value)> =
+            Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
+        record_map.push((Arc::from("done"), Value::Bool(true)));
 
         let mut store = VariableStore::with_interner(interner);
-        store.set("item", Value::Record(Arc::new(record_map)));
+        store.set("item", { record_map.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(record_map)) });
 
         let cc = &box_node.value().conditional_classes[0];
         let result = evaluate(&cc.condition, &mut store, &FxHashMap::default(), 0).unwrap();

@@ -1,0 +1,5 @@
+name = "MizuFormal"
+defaultTargets = ["MizuFormal"]
+
+[[lean_lib]]
+name = "MizuFormal"

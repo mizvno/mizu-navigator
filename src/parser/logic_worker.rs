@@ -1,4 +1,4 @@
-﻿//! Logic worker module executing the state machine on a dedicated background thread.
+//! Logic worker module executing the state machine on a dedicated background thread.
 
 #![forbid(unsafe_code)]
 
@@ -6,7 +6,10 @@ use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value, VariableStore};
 use crate::network::RuntimeAction;
 use crate::network::messages::{StateUpdate, UiEvent, WorkerResponse};
-use crate::parser::logic::{ComputedBinding, recompute_computed_bindings};
+use crate::parser::logic::{
+    ComputedBinding, CompReverseIndex, build_comp_reverse_index, path_param_ok,
+    recompute_computed_bindings,
+};
 use crate::parser::{Action, EndpointKind, MizuFunction, UrlEndpoint, UrlRegistry, execute_action};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -30,6 +33,10 @@ pub struct LogicWorker {
     pub document_domain: String,
     /// Computed (derived) variable bindings in topological order.
     pub computed_vars: Vec<ComputedBinding>,
+    /// Reverse index (symbol → dependent binding indices) over `computed_vars`,
+    /// rebuilt once whenever `computed_vars` is (re)loaded so
+    /// `recompute_computed_bindings` never has to scan every binding per event.
+    pub computed_reverse_index: CompReverseIndex,
     /// Receiving channel for UI events.
     rx: Receiver<UiEvent>,
     /// Sending channel for state updates, capability actions, or timeout errors.
@@ -37,26 +44,57 @@ pub struct LogicWorker {
 }
 
 impl LogicWorker {
+    /// Explicit stack size for the dedicated evaluator thread, overriding the
+    /// platform default (commonly ~1 MiB on Windows, ~2–8 MiB on Linux/macOS
+    /// depending on `ulimit`/pthread defaults).
+    ///
+    /// `evaluate`/`evaluate_impl` recurse up to `MAX_EVAL_DEPTH` (256) levels
+    /// deep (see [`crate::core::types::MAX_EVAL_DEPTH`]), and the depth guard
+    /// itself only fires *after* one more nested call is already on the
+    /// stack, so the worst case is ~257 stacked frames of a large, non-tail
+    /// recursive function. Measured empirically via
+    /// `core::types::tests::measure_stack_usage_at_max_eval_depth`, which
+    /// drives a 300-level `evaluate()` chain (the same shape used by
+    /// `core::types::tests::cross_function_composition_depth_guard`, which
+    /// first caught this exact production gap: on the platform default stack
+    /// size it crashed with a native stack overflow in debug builds before
+    /// the depth guard could intervene) on threads with a fixed
+    /// `stack_size`, doubling from 16 KiB until it survives:
+    ///   - debug build:   smallest surviving `stack_size` = 4 MiB
+    ///   - release build: smallest surviving `stack_size` = 256 KiB
+    ///
+    /// 16 MiB is ~4x the measured debug floor and ~64x the measured release
+    /// floor, and matches the value `cross_function_composition_depth_guard`'s
+    /// sibling test (`eval_depth_guard`) already relies on as proven-safe —
+    /// a large margin against interpreter changes, platform stack-frame
+    /// layout differences, and future growth of `evaluate_impl`'s frame size.
+    pub(crate) const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
     /// Spawns a permanent native thread executing the LogicWorker.
     pub fn spawn(
         rx: Receiver<UiEvent>,
         tx: Sender<Result<WorkerResponse, MizuError>>,
     ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let mut worker = Self {
-                store: VariableStore::new(),
-                logic_fns: FxHashMap::default(),
-                click_actions: HashMap::new(),
-                submit_actions: HashMap::new(),
-                root_timer_actions: Vec::new(),
-                url_registry: FxHashMap::default(),
-                document_domain: String::new(),
-                computed_vars: Vec::new(),
-                rx,
-                tx,
-            };
-            worker.run_loop();
-        })
+        std::thread::Builder::new()
+            .name("logic-worker".to_owned())
+            .stack_size(Self::STACK_SIZE_BYTES)
+            .spawn(move || {
+                let mut worker = Self {
+                    store: VariableStore::new(),
+                    logic_fns: FxHashMap::default(),
+                    click_actions: HashMap::new(),
+                    submit_actions: HashMap::new(),
+                    root_timer_actions: Vec::new(),
+                    url_registry: FxHashMap::default(),
+                    document_domain: String::new(),
+                    computed_vars: Vec::new(),
+                    computed_reverse_index: FxHashMap::default(),
+                    rx,
+                    tx,
+                };
+                worker.run_loop();
+            })
+            .expect("failed to spawn LogicWorker thread")
     }
 
     fn run_loop(&mut self) {
@@ -85,6 +123,9 @@ impl LogicWorker {
 
                     // Load computed bindings and register their symbols as read-only.
                     self.computed_vars = payload.computed_bindings;
+                    // Built once per reload; `recompute_after_mutation` reuses it on
+                    // every subsequent event instead of rescanning `computed_vars`.
+                    self.computed_reverse_index = build_comp_reverse_index(&self.computed_vars);
                     let comp_syms: FxHashSet<Symbol> =
                         self.computed_vars.iter().map(|cb| cb.name).collect();
                     self.store.state_machine.computed_var_syms = comp_syms;
@@ -119,6 +160,7 @@ impl LogicWorker {
                         &computed,
                         &self.logic_fns,
                         &all_syms,
+                        &self.computed_reverse_index,
                     );
 
                     self.send_response();
@@ -149,7 +191,7 @@ impl LogicWorker {
                         .map(|(k, v)| (std::sync::Arc::from(k.as_str()), v.clone()))
                         .collect();
                     self.store
-                        .set_runtime("$form", Value::Record(std::sync::Arc::new(record)));
+                        .set_runtime("$form", { let mut vec_rec: Vec<_> = record.into_iter().collect(); vec_rec.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(std::sync::Arc::from(vec_rec)) });
                     for (field_name, field_value) in fields {
                         // Use set_runtime (not set) so that form field names
                         // not declared in the logic block never create new
@@ -172,9 +214,15 @@ impl LogicWorker {
 
                 UiEvent::UpdateVariable { name, value } => {
                     self.store.state_machine.undo_log.clear();
-                    // `name` comes from a network response target variable; it must
-                    // have been declared in the logic block to be meaningful in the
-                    // UI.  Use set_runtime to guard the frozen interner.
+                    // `name` is a resolved string, not a pre-validated Symbol
+                    // (see the UiEvent::UpdateVariable doc comment): the
+                    // sender's interner clone and this worker's are
+                    // independent post-freeze, so a Symbol computed on the
+                    // other side has no defined meaning here. set_runtime
+                    // resolves the name against this worker's own frozen
+                    // table and silently drops it if the document never
+                    // declared it — the frozen interner is never grown by
+                    // network-response-driven names.
                     self.store.set_runtime(&name, value);
                     self.recompute_after_mutation();
                     self.send_response();
@@ -191,10 +239,8 @@ impl LogicWorker {
         }
         for (sym, old_val) in original_values {
             let cur_val = self.store.state_machine.get_global(sym);
-            if &old_val != cur_val
-                && let Some(name) = self.store.interner.resolve(sym)
-            {
-                mutated_variables.push((name.to_string(), cur_val.clone()));
+            if &old_val != cur_val {
+                mutated_variables.push((sym, cur_val.clone()));
             }
         }
         self.store.state_machine.undo_log.clear();
@@ -218,13 +264,33 @@ impl LogicWorker {
                 } => {
                     let sym = crate::core::types::Symbol(endpoint_symbol);
                     if let Some(ep) = url_registry.get(&sym) {
-                        let url = resolve_endpoint_url(document_domain, ep, path_param.as_deref());
-                        runtime_actions.push(RuntimeAction::ResolvedCall {
-                            method: method.as_str().to_owned(),
-                            url,
-                            payload,
-                            target_variable,
-                        });
+                        match resolve_endpoint_url(document_domain, ep, path_param.as_deref()) {
+                            Ok(url) => {
+                                runtime_actions.push(RuntimeAction::ResolvedCall {
+                                    method: method.as_str().to_owned(),
+                                    url,
+                                    payload,
+                                    target_variable, });
+                            }
+                            Err(e) => {
+                                let name = self
+                                    .store
+                                    .interner
+                                    .resolve(target_variable)
+                                    .unwrap_or("<unknown>")
+                                    .to_owned();
+                                tracing::warn!(
+                                    target = %name,
+                                    error = %e,
+                                    "NetworkCall path_param failed validation; surfacing error"
+                                );
+                                alias_errors.push((
+                                    name,
+                                    Value::from(format!("error: {e}")),
+                                ));
+                                runtime_actions.push(RuntimeAction::None);
+                            }
+                        }
                     } else {
                         let alias = self
                             .store
@@ -234,11 +300,11 @@ impl LogicWorker {
                             .to_owned();
                         tracing::warn!(
                             alias = %alias,
-                            target = %target_variable,
+                            target = %target_variable.0,
                             "NetworkCall alias not found in the urls block; surfacing error"
                         );
                         alias_errors.push((
-                            target_variable,
+                            target_variable.0.to_string(),
                             Value::from(format!(
                                 "error: endpoint alias `{alias}` is not declared in the urls block"
                             )),
@@ -268,7 +334,7 @@ impl LogicWorker {
             // not grow, and an undeclared target could never be displayed.
             if self.store.interner.get(&name).is_some() {
                 self.store.set_runtime(&name, val.clone());
-                mutated_variables.push((name, val));
+                mutated_variables.push((self.store.interner.get_or_intern(&name), val));
             }
         }
         if let Err(e) = self.tx.send(Ok(WorkerResponse {
@@ -289,13 +355,20 @@ impl LogicWorker {
 ///   URL).
 ///
 /// If `path_param` is `Some` and the URL contains a `{…}` placeholder, the
-/// first placeholder is replaced with the param value.  Otherwise the param is
-/// appended after a `/`.
+/// first placeholder is replaced with the percent-encoded param value. Otherwise the
+/// encoded param is appended after a `/`. Note: only the first placeholder is replaced;
+/// a second `{…}` is left literal (this is the intended behavior).
+///
+/// `path_param` is re-validated against the same gate as `execute_action` in
+/// `logic.rs` before it is ever substituted into the URL — this is the last
+/// consumption point before the value leaves the process, so it must not be
+/// possible to reach this function with an unvalidated `path_param` via a
+/// different code path.
 pub(crate) fn resolve_endpoint_url(
     document_domain: &str,
     ep: &UrlEndpoint,
     path_param: Option<&str>,
-) -> String {
+) -> Result<String, MizuError> {
     let base_url = match ep.kind {
         EndpointKind::Api => {
             // raw_target starts with `/`; trim it so there is no double slash.
@@ -305,16 +378,38 @@ pub(crate) fn resolve_endpoint_url(
         EndpointKind::Media => ep.raw_target.clone(),
     };
     if let Some(pp) = path_param {
+        if !path_param_ok(pp) {
+            return Err(MizuError::ExecutionError(
+                "path_param must be a single path segment".to_string(),
+            ));
+        }
+        // Percent-encode the path param
+        let mut encoded = String::with_capacity(pp.len());
+        for b in pp.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(b as char);
+                }
+                _ => {
+                    encoded.push('%');
+                    let hex = b"0123456789ABCDEF";
+                    encoded.push(hex[(b >> 4) as usize] as char);
+                    encoded.push(hex[(b & 0xF) as usize] as char);
+                }
+            }
+        }
+        let pp = &encoded;
+
         // Replace the first `{…}` placeholder if present, otherwise append.
         if let Some(open) = base_url.find('{')
             && let Some(rel_close) = base_url[open..].find('}')
         {
             let close = open + rel_close + 1;
-            return format!("{}{}{}", &base_url[..open], pp, &base_url[close..]);
+            return Ok(format!("{}{}{}", &base_url[..open], pp, &base_url[close..]));
         }
-        format!("{}/{}", base_url.trim_end_matches('/'), pp)
+        Ok(format!("{}/{}", base_url.trim_end_matches('/'), pp))
     } else {
-        base_url
+        Ok(base_url)
     }
 }
 
@@ -331,7 +426,13 @@ impl LogicWorker {
             .map(|(sym, _)| *sym)
             .collect();
         let computed = self.computed_vars.clone();
-        recompute_computed_bindings(&mut self.store, &computed, &self.logic_fns, &mutated);
+        recompute_computed_bindings(
+            &mut self.store,
+            &computed,
+            &self.logic_fns,
+            &mutated,
+            &self.computed_reverse_index,
+        );
     }
 
     fn execute_and_respond(&mut self, action: &Action) {
@@ -439,14 +540,14 @@ mod tests {
 
     #[test]
     fn api_endpoint_gets_full_mizu_url() {
-        let url = resolve_endpoint_url("example.com", &api("/v1/products"), None);
+        let url = resolve_endpoint_url("example.com", &api("/v1/products"), None).unwrap();
         assert_eq!(url, "mizu://example.com/v1/products");
     }
 
     #[test]
     fn api_path_leading_slash_not_doubled() {
         // raw_target always starts with `/`; the composed URL must not have `//`.
-        let url = resolve_endpoint_url("host.mizu", &api("/health"), None);
+        let url = resolve_endpoint_url("host.mizu", &api("/health"), None).unwrap();
         assert_eq!(url, "mizu://host.mizu/health");
         assert!(
             !url.contains("//health"),
@@ -456,19 +557,19 @@ mod tests {
 
     #[test]
     fn api_endpoint_path_param_appended_when_no_placeholder() {
-        let url = resolve_endpoint_url("example.com", &api("/v1/products"), Some("42"));
+        let url = resolve_endpoint_url("example.com", &api("/v1/products"), Some("42")).unwrap();
         assert_eq!(url, "mizu://example.com/v1/products/42");
     }
 
     #[test]
     fn api_endpoint_placeholder_substituted() {
-        let url = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("99"));
+        let url = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("99")).unwrap();
         assert_eq!(url, "mizu://api.local/v1/items/99");
     }
 
     #[test]
     fn api_endpoint_nested_placeholder_substituted() {
-        let url = resolve_endpoint_url("api.local", &api("/v1/users/{uid}/posts/{pid}"), Some("7"));
+        let url = resolve_endpoint_url("api.local", &api("/v1/users/{uid}/posts/{pid}"), Some("7")).unwrap();
         // Only the first placeholder is replaced.
         assert_eq!(url, "mizu://api.local/v1/users/7/posts/{pid}");
     }
@@ -479,7 +580,7 @@ mod tests {
             "ignored.com",
             &media("mizu://cdn.example.com/logo.png"),
             None,
-        );
+        ).unwrap();
         assert_eq!(url, "mizu://cdn.example.com/logo.png");
     }
 
@@ -489,7 +590,158 @@ mod tests {
             "ignored.com",
             &media("mizu://cdn.example.com/assets"),
             Some("icon.png"),
-        );
+        ).unwrap();
         assert_eq!(url, "mizu://cdn.example.com/assets/icon.png");
+    }
+
+    #[test]
+    fn path_param_with_reserved_chars_percent_encoded() {
+        let url = resolve_endpoint_url("api.local", &api("/v1/search/{query}"), Some("a b&c?d=1%")).unwrap();
+        assert_eq!(url, "mizu://api.local/v1/search/a%20b%26c%3Fd%3D1%25");
+    }
+
+    #[test]
+    fn path_param_plain_segment_unchanged() {
+        let url = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("foo-bar_123.~baz")).unwrap();
+        assert_eq!(url, "mizu://api.local/v1/items/foo-bar_123.~baz");
+    }
+
+    #[test]
+    fn path_param_with_slash_rejected() {
+        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a/b")).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+    }
+
+    #[test]
+    fn path_param_with_traversal_rejected() {
+        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("..")).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+    }
+
+    #[test]
+    fn path_param_with_control_char_rejected() {
+        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a\nb")).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+    }
+
+    /// End-to-end regression test for the stack-size fix in
+    /// `LogicWorker::spawn`: drives a real `LogicWorker` background thread
+    /// (spawned exactly as production does, via `LogicWorker::spawn`) through
+    /// a 300-level-deep expression — the same shape used by
+    /// `core::types::tests::eval_depth_guard` and
+    /// `cross_function_composition_depth_guard`, deep enough to exceed
+    /// `MAX_EVAL_DEPTH` (256) — and asserts the worker returns the controlled
+    /// "evaluation nesting too deep" error rather than the process crashing
+    /// with a native stack overflow.
+    ///
+    /// Before `LogicWorker::spawn` used an explicit `stack_size`, this same
+    /// scenario reliably overflowed the platform-default stack in debug
+    /// builds (see `STACK_SIZE_BYTES`'s doc comment for the measurement that
+    /// proved it). Because a real stack overflow aborts the whole process and
+    /// cannot be caught with `catch_unwind`, this test re-execs the test
+    /// binary as a child process and inspects its exit status — mirroring
+    /// `cross_function_composition_depth_guard` in `core::types`.
+    #[test]
+    fn logic_worker_thread_survives_max_eval_depth_without_native_crash() {
+        const CHILD_ENV: &str = "MIZU_LOGICWORKER_DEPTH_CHILD";
+        const OK_MARKER: &str = "LOGICWORKER_DEPTH_GUARD_OK";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_logic_worker_depth_guard_child(OK_MARKER);
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = std::process::Command::new(exe)
+            .arg("parser::logic_worker::tests::logic_worker_thread_survives_max_eval_depth_without_native_crash")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("failed to spawn child test process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success() && stdout.contains(OK_MARKER),
+            "LogicWorker's dedicated thread must survive a MAX_EVAL_DEPTH=256+ \
+             evaluation without a native stack overflow (status={:?}).\n\
+             --- child stdout ---\n{}\n--- child stderr ---\n{}",
+            output.status,
+            stdout,
+            stderr
+        );
+    }
+
+    /// Runs the actual scenario on the current process: spawns a real
+    /// `LogicWorker`, reloads it with a click action bound to a 300-level
+    /// deep `BinaryOp` chain, fires the click, and prints `ok_marker` iff the
+    /// worker responds with the expected controlled error instead of the
+    /// process crashing.
+    fn run_logic_worker_depth_guard_child(ok_marker: &str) {
+        use crate::network::messages::{ReloadPayload, UiEvent};
+        use crate::parser::logic::{BinOp, Expr};
+        use std::sync::mpsc;
+
+        let (tx_in, rx_in) = mpsc::channel::<UiEvent>();
+        let (tx_out, rx_out) = mpsc::channel::<Result<WorkerResponse, MizuError>>();
+        let _handle = LogicWorker::spawn(rx_in, tx_out);
+
+        // 300-level deep chain: exceeds MAX_EVAL_DEPTH (256), same shape as
+        // core::types::tests::eval_depth_guard /
+        // cross_function_composition_depth_guard.
+        let mut expr = Expr::Literal(Value::Int(0));
+        for _ in 0..300 {
+            expr = Expr::BinaryOp {
+                left: Box::new(expr),
+                op: BinOp::Add,
+                right: Box::new(Expr::Literal(Value::Int(0))),
+            };
+        }
+
+        let mut click_actions = HashMap::new();
+        click_actions.insert(0u32, Action::Eval(expr));
+
+        let mut interner = StringInterner::new();
+        interner.freeze();
+
+        tx_in
+            .send(UiEvent::Reload(Box::new(ReloadPayload {
+                logic_fns: FxHashMap::default(),
+                click_actions,
+                submit_actions: HashMap::new(),
+                root_timer_actions: Vec::new(),
+                interner,
+                initial_variables: Vec::new(),
+                url_registry: FxHashMap::default(),
+                document_domain: String::new(),
+                computed_bindings: Vec::new(),
+            })))
+            .expect("worker thread must be alive to receive Reload");
+        rx_out
+            .recv()
+            .expect("worker must respond to Reload")
+            .expect("reload must not error");
+
+        tx_in
+            .send(UiEvent::Click { node_id: 0 })
+            .expect("worker thread must still be alive after Reload");
+
+        match rx_out.recv() {
+            Ok(Err(MizuError::ExecutionError(msg))) if msg.contains("nesting too deep") => {
+                println!("{ok_marker}");
+            }
+            // Also acceptable: the instruction budget could in principle be
+            // exhausted first depending on constant tuning — still a clean,
+            // bounded error, not a crash.
+            Ok(Err(MizuError::Timeout)) => {
+                println!("{ok_marker}");
+            }
+            other => {
+                println!("UNEXPECTED_RESULT: {other:?}");
+            }
+        }
     }
 }

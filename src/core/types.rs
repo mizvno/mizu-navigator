@@ -1,10 +1,10 @@
-﻿//! # `types` — Core Value Primitives and Variable Store
+//! # `types` — Core Value Primitives and Variable Store
 //!
 //! This module defines the fundamental data model of the Mizu runtime.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -18,24 +18,52 @@ use crate::parser::logic::{Expr, MizuFunction, apply_binop, check_type, type_nam
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(pub u32);
 
+/// The scale factor used for fixed-point arithmetic.
+pub const DECIMAL_SCALE: i64 = 10_000;
+
 /// Map strings to symbols and resolve symbols back to strings.
 ///
+/// ## Concurrency model
+///
+/// The UI thread and the logic worker thread each own an independent
+/// **clone** of a `StringInterner` — there is no shared/locked table, so
+/// there is no lock contention on this cold path (interning happens at
+/// parse/reload time; see the module-level architecture note below). The two
+/// clones are guaranteed to agree on every `Symbol(u32)` ID *at the moment of
+/// the clone* because [`Clone`] preserves the source's contents exactly.
+/// [`freeze`](Self::freeze) is the boundary that keeps them agreeing
+/// afterward: once frozen, a thread must not mint symbols for names the
+/// other clone has never seen, because the other clone has no way to learn
+/// about them and the two tables would silently diverge (`Symbol(7)` meaning
+/// one string on one thread and a different string, or nothing, on the
+/// other).
+///
 /// After the initial parse phase the interner **must** be
-/// [`freeze`](Self::freeze)d.  A frozen interner still adds new symbols when
-/// [`get_or_intern`](Self::get_or_intern) is called with an unknown name
-/// (to keep existing callers working), but it emits a `tracing::warn!` for
-/// every such addition so the divergence is immediately observable in logs.
+/// [`freeze`](Self::freeze)d. Post-freeze code that may encounter strings
+/// not declared in the logic block (form field names, network response
+/// variable names) must use [`VariableStore::set_runtime`] instead of
+/// [`VariableStore::set`]. `set_runtime` calls [`get`](Self::get) rather than
+/// [`get_or_intern`](Self::get_or_intern) and silently discards unknown
+/// names, so the frozen symbol table is never mutated by untrusted runtime
+/// content — this is also the load-bearing defence against a document (or a
+/// malicious network response / form) growing the symbol table unboundedly.
 ///
-/// Post-freeze code that may encounter strings not declared in the logic block
-/// (form field names, network response variable names) must use
-/// [`VariableStore::set_runtime`] instead of [`VariableStore::set`].
-/// `set_runtime` calls [`get`](Self::get) rather than
-/// [`get_or_intern`](Self::get_or_intern) and silently discards unknown names,
-/// so the frozen symbol table is never mutated.
+/// [`get_or_intern`](Self::get_or_intern) itself remains a plain,
+/// **thread-local** insert-or-lookup: calling it post-freeze with a genuinely
+/// new name does intern it (there is no dummy/sentinel `Symbol` — every
+/// `Symbol` this type ever returns is real and resolvable), but only in
+/// *this* thread's own copy, and it logs a `tracing::warn!` because it means
+/// a caller produced a `Symbol` that has no defined meaning on the other
+/// thread's clone. The architectural rule that prevents this from happening
+/// in practice is: never send a freshly-`get_or_intern`-ed post-freeze
+/// `Symbol` across the UI↔worker channel. Cross-thread messages instead
+/// carry the resolved `String` name (see [`crate::network::UiEvent::UpdateVariable`])
+/// and the receiving thread resolves it against its *own* frozen table via
+/// `set_runtime`/`get` — the two clones never need to invent a shared ID for
+/// the same runtime string, because neither side is trusted to mint one on
+/// the other's behalf.
 ///
-/// Cloning a frozen interner produces a **frozen** copy.  Both the UI thread
-/// and the logic worker hold frozen interners after the parse phase, which
-/// guarantees that `Symbol(u32)` IDs are identical on both sides.
+/// Cloning a frozen interner produces a **frozen** copy.
 #[derive(Debug, Default)]
 pub struct StringInterner {
     /// Name → `Symbol` lookup, the inverse of `vec`.
@@ -78,43 +106,50 @@ impl StringInterner {
 
     /// Marks the interner as frozen.
     ///
-    /// After this call any [`get_or_intern`](Self::get_or_intern) that would
-    /// add a previously-unknown symbol emits `tracing::warn!`.  The symbol is
-    /// still added — to keep callers working — but the warning surfaces the
-    /// caller bug so it can be fixed.
+    /// After this call, [`get_or_intern`](Self::get_or_intern) still works
+    /// correctly (it never returns a bogus/unresolvable `Symbol`) but logs a
+    /// `tracing::warn!` when asked to mint a symbol for a name it hasn't
+    /// seen before — that symbol is only valid on *this* thread's clone of
+    /// the table, so producing one post-freeze is a caller bug (see the
+    /// type-level docs for the architectural rule that avoids this).
     ///
     /// Cloning a frozen interner produces a frozen copy (see [`Clone`]).
     pub fn freeze(&mut self) {
         self.frozen = true;
     }
 
-    /// Interns `s` and returns its [`Symbol`].
+    /// Interns `s` and returns its [`Symbol`], inserting it into this
+    /// interner's own table if it is not already present.
     ///
-    /// If the interner is frozen and `s` is not yet present, a `tracing::warn!`
-    /// is emitted and the symbol is added anyway.  This indicates a caller bug:
-    /// post-freeze code should only look up already-interned names.  Use
-    /// [`get`](Self::get) or [`VariableStore::set_runtime`] instead of calling
-    /// this method with runtime-generated strings after freeze.
+    /// Every `Symbol` this method returns is real and resolvable via
+    /// [`resolve`](Self::resolve) — there is no sentinel/dummy value. If the
+    /// interner is frozen and `s` is not yet present, the insert still
+    /// happens (so the caller always gets a working `Symbol` back), but a
+    /// `tracing::warn!` is emitted: a `Symbol` minted here has no defined
+    /// meaning on any *other* thread's clone of this table, so this should
+    /// only ever happen for names local to this thread. Cross-thread code
+    /// that may encounter runtime-generated strings must use
+    /// [`get`](Self::get) or [`VariableStore::set_runtime`] instead.
     pub fn get_or_intern(&mut self, s: &str) -> Symbol {
         if let Some(&sym) = self.map.get(s) {
-            sym
-        } else {
-            if self.frozen {
-                tracing::warn!(
-                    name = s,
-                    "StringInterner is frozen: interning '{}' post-freeze adds a symbol \
-                     absent from the other thread's interner — use set_runtime for \
-                     runtime-generated variable names",
-                    s
-                );
-                return Symbol(u32::MAX);
-            }
-            let id = self.vec.len() as u32;
-            let sym = Symbol(id);
-            self.map.insert(s.to_string(), sym);
-            self.vec.push(s.to_string());
-            sym
+            return sym;
         }
+        if self.frozen {
+            tracing::warn!(
+                name = s,
+                "StringInterner is frozen: interning '{}' post-freeze — the resulting \
+                 Symbol is only valid on this thread's copy of the table and has no \
+                 defined meaning elsewhere; cross-thread code must resolve names via \
+                 set_runtime/get against its own frozen table instead of minting a new \
+                 Symbol to send across threads",
+                s
+            );
+        }
+        let id = self.vec.len() as u32;
+        let sym = Symbol(id);
+        self.map.insert(s.to_string(), sym);
+        self.vec.push(s.to_string());
+        sym
     }
 
     /// Returns the [`Symbol`] for `s` if it was interned, or `None`.
@@ -136,24 +171,18 @@ impl StringInterner {
 /// The set of all primitive values in the Mizu type system.
 #[derive(Debug, Clone)]
 pub enum Value {
-    /// The absence of a value.
+    /// A null or empty value.
     Null,
-    /// A boolean.
+    /// A boolean value (true or false).
     Bool(bool),
-    /// A signed 64-bit integer.
+    /// A scaled 64-bit integer representing a fixed-point decimal.
     Int(i64),
-    /// A 64-bit floating-point number.
-    Float(f64),
-    /// A UTF-8 string, shared via `Arc` to keep clones cheap.
+    /// A reference-counted string.
     String(Arc<str>),
-    /// An ordered list of values, shared via `Arc` to keep clones cheap.
+    /// A reference-counted list of nested values.
     List(Arc<Vec<Value>>),
-    /// A structural record deserialized from a JSON object response.
-    /// Keys are shared string pointers sorted in ascending order; values are
-    /// recursive `Value`s.  Using `BTreeMap` instead of `FxHashMap` guarantees
-    /// that keys are always in sorted order at construction time, making
-    /// [`compare_values`] O(K) with zero allocations on the hot path.
-    Record(Arc<BTreeMap<Arc<str>, Value>>),
+    /// A reference-counted record of key-value pairs sorted by key.
+    Record(Arc<[(Arc<str>, Value)]>),
 }
 
 impl PartialEq for Value {
@@ -162,17 +191,26 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => {
-                if a.is_nan() && b.is_nan() {
-                    false
-                } else {
-                    a == b
-                }
-            }
             (Value::String(a), Value::String(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Record(a), Value::Record(b)) => a == b,
             _ => false,
+        }
+    }
+}
+
+impl Value {
+    /// Safely retrieves the value associated with `field` if this value is a `Value::Record`.
+    /// Performs a binary search on the sorted key-value record slice.
+    pub fn get_field(&self, field: &str) -> Option<&Value> {
+        match self {
+            Value::Record(slice) => {
+                slice
+                    .binary_search_by_key(&field, |(k, _)| k.as_ref())
+                    .map(|idx| &slice[idx].1)
+                    .ok()
+            }
+            _ => None,
         }
     }
 }
@@ -182,8 +220,22 @@ impl fmt::Display for Value {
         match self {
             Value::Null => write!(f, "null"),
             Value::Bool(b) => write!(f, "{b}"),
-            Value::Int(i) => write!(f, "{i}"),
-            Value::Float(n) => write!(f, "{n}"),
+            Value::Int(i) => {
+                let integer_part = i / DECIMAL_SCALE;
+                let fractional_part = (i % DECIMAL_SCALE).abs();
+
+                if fractional_part == 0 {
+                    write!(f, "{}", integer_part)
+                } else {
+                    let mut frac_str = format!("{:04}", fractional_part);
+                    frac_str = frac_str.trim_end_matches('0').to_string();
+                    if *i < 0 && integer_part == 0 {
+                        write!(f, "-{}.{}", integer_part, frac_str)
+                    } else {
+                        write!(f, "{}.{}", integer_part, frac_str)
+                    }
+                }
+            }
             Value::String(s) => write!(f, "{s}"),
             Value::List(items) => {
                 write!(f, "[")?;
@@ -211,12 +263,6 @@ impl fmt::Display for Value {
     }
 }
 
-impl From<f64> for Value {
-    #[inline]
-    fn from(n: f64) -> Self {
-        Value::Float(n)
-    }
-}
 
 impl From<i64> for Value {
     #[inline]
@@ -246,51 +292,80 @@ impl From<&str> for Value {
     }
 }
 
-/// Maximum nesting depth accepted by [`from_json`] before clamping to
-/// [`Value::Null`].  Prevents a maliciously-crafted deeply-nested JSON payload
-/// from overflowing the native call stack.
-const MAX_JSON_DEPTH: u32 = 64;
+/// Maximum nesting depth accepted by [`from_json`]; payloads nested deeper
+/// are rejected with `Err(MizuError::SecurityViolation)`. Prevents a
+/// maliciously-crafted deeply-nested JSON payload from overflowing the
+/// native call stack.
+///
+/// # Consistency with [`MAX_EVAL_DEPTH`]
+///
+/// This is intentionally tied to [`MAX_EVAL_DEPTH`] rather than given an
+/// independent, smaller value. The evaluator can legitimately construct a
+/// [`Value`] nested up to `MAX_EVAL_DEPTH` levels deep (e.g. `StorageStore`
+/// persisting a deeply-nested record built by a script), and that value is
+/// later round-tripped through `serde_json` by `storage::read_all`. If
+/// `MAX_JSON_DEPTH` were lower than `MAX_EVAL_DEPTH`, a value the evaluator
+/// was allowed to build would silently fail to come back on the next load
+/// (see `storage::tests::read_all_skips_over_deep_record_but_returns_rest`)
+/// — an availability/correctness bug, not a security one, since the data
+/// triggering it was produced by the app itself, not attacker input. Keeping
+/// `MAX_JSON_DEPTH >= MAX_EVAL_DEPTH` guarantees anything the evaluator can
+/// build is always re-readable from storage.
+const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 
 /// Converts a `serde_json::Value` into a Mizu [`Value`].
 ///
 /// Mapping:
 /// * `null` → [`Value::Null`]
 /// * `bool` → [`Value::Bool`]
-/// * integer number → [`Value::Int`]
-/// * floating-point number → [`Value::Float`]
+/// * number (integer or floating-point — `Value` has no separate
+///   floating-point variant) → [`Value::Int`], scaled by `DECIMAL_SCALE`
+///   and rounded to the nearest fixed-point value
 /// * string → [`Value::String`]
 /// * array → [`Value::List`] (elements converted recursively, depth-bounded)
 /// * object → [`Value::Record`] (values converted recursively, depth-bounded)
 ///
-/// Nesting beyond [`MAX_JSON_DEPTH`] is silently clamped to [`Value::Null`]
-/// rather than overflowing the native call stack.
-pub fn from_json(json: &serde_json::Value) -> Value {
+/// # Errors
+///
+/// Returns [`MizuError::SecurityViolation`] if any element is nested deeper
+/// than [`MAX_JSON_DEPTH`], rather than silently truncating the payload to
+/// [`Value::Null`]. A malicious deeply-nested payload must be rejected
+/// outright — truncation would let a caller mistake attacker-controlled data
+/// for a legitimate absence of a value.
+pub fn from_json(json: &serde_json::Value) -> Result<Value, MizuError> {
     from_json_bounded(json, 0)
 }
 
-fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Value {
+fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, MizuError> {
     if depth > MAX_JSON_DEPTH {
-        return Value::Null;
+        return Err(MizuError::SecurityViolation(format!(
+            "JSON payload exceeds maximum nesting depth of {MAX_JSON_DEPTH}"
+        )));
     }
     match json {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else {
-                Value::Float(n.as_f64().unwrap_or(f64::NAN))
-            }
+            let float_val = n.as_f64().unwrap_or(0.0);
+            let scaled = (float_val * (DECIMAL_SCALE as f64)).round() as i64;
+            Ok(Value::Int(scaled))
         }
-        serde_json::Value::String(s) => Value::String(Arc::from(s.as_str())),
-        serde_json::Value::Array(arr) => Value::List(Arc::new(
-            arr.iter().map(|v| from_json_bounded(v, depth + 1)).collect(),
-        )),
-        serde_json::Value::Object(map) => Value::Record(Arc::new(
-            map.iter()
-                .map(|(k, v)| (Arc::from(k.as_str()), from_json_bounded(v, depth + 1)))
-                .collect::<BTreeMap<_, _>>(),
-        )),
+        serde_json::Value::String(s) => Ok(Value::String(Arc::from(s.as_str()))),
+        serde_json::Value::Array(arr) => {
+            let items = arr
+                .iter()
+                .map(|v| from_json_bounded(v, depth + 1))
+                .collect::<Result<Vec<Value>, MizuError>>()?;
+            Ok(Value::List(Arc::new(items)))
+        }
+        serde_json::Value::Object(map) => {
+            let mut slice: Vec<(Arc<str>, Value)> = map
+                .iter()
+                .map(|(k, v)| Ok((Arc::from(k.as_str()), from_json_bounded(v, depth + 1)?)))
+                .collect::<Result<Vec<(Arc<str>, Value)>, MizuError>>()?;
+            slice.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(Value::Record(Arc::from(slice)))
+        }
     }
 }
 
@@ -299,10 +374,11 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Value {
 /// Mapping (inverse of [`from_json`]):
 /// * [`Value::Null`]    → `null`
 /// * [`Value::Bool`]   → `bool`
-/// * [`Value::Int`]    → `number` (JSON integer)
-/// * [`Value::Float`]  → `number` (JSON float); NaN / ±Inf → `null` (JSON
-///   has no representation for non-finite floats, and this mirrors the
-///   `unwrap_or(f64::NAN)` fallback in [`from_json`]).
+/// * [`Value::Int`]    → `number` (unscaled by `DECIMAL_SCALE` back to a
+///   JSON float — `Value` has no floating-point variant of its own; the
+///   fixed-point `Int` representation stands in for both integers and
+///   floats. Falls back to `null` if the unscaled value isn't finite,
+///   which `serde_json::Number` cannot represent.)
 /// * [`Value::String`] → `string`
 /// * [`Value::List`]   → `array` (elements converted recursively)
 /// * [`Value::Record`] → `object` (values converted recursively)
@@ -310,14 +386,16 @@ pub fn to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::Value::Number((*i).into()),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        Value::Int(i) => {
+            let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
+            serde_json::Number::from_f64(unscaled)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        },
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::List(items) => serde_json::Value::Array(items.iter().map(to_json).collect()),
-        Value::Record(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
+        Value::Record(slice) => {
+            let obj: serde_json::Map<String, serde_json::Value> = slice
                 .iter()
                 .map(|(k, v)| (k.to_string(), to_json(v)))
                 .collect();
@@ -337,9 +415,46 @@ pub fn to_json(val: &Value) -> serde_json::Value {
 ///
 /// 20 000 instructions covers deeply-nested real expressions with significant
 /// headroom while still bounding worst-case execution to microseconds on any
-/// modern CPU (a tight arithmetic loop in Rust takes ~1 ns/instruction;
-/// 20 000 × 1 ns = 20 µs, well inside any UI frame budget).
+/// modern CPU — *provided* every charge tracks real cost. A flat AST-node
+/// charge is only safe for genuinely O(1) work (arithmetic, comparisons,
+/// variable lookups); operations whose native cost scales with data size
+/// (`filter`/`count`'s list scan, `sort`'s `n·log₂n` comparisons, string
+/// concatenation's `len(l)+len(r)` allocation) pre-charge that size against
+/// the budget *before* doing the work, so a single AST node can never hide
+/// more than one unit of real cost per charged instruction. With that
+/// invariant held, a tight ~1 ns/instruction loop bounds worst-case
+/// execution to roughly 20 000 × 1 ns = 20 µs of *actual* work, not just
+/// 20 000 AST-node visits — well inside any UI frame budget.
 pub const MAX_INSTRUCTIONS: u64 = 20_000;
+
+/// Maximum number of `comp` (computed/derived variable) bindings a single
+/// document may declare.
+///
+/// [`MAX_INSTRUCTIONS`] bounds the cost of evaluating *one* expression, but
+/// [`crate::parser::logic::recompute_computed_bindings`] resets and re-applies
+/// that budget for *every* comp binding that fires in a cascading recompute
+/// (see `formal/MizuFormal/Budget.lean`'s `T1_reaction_bound`, which prices a
+/// whole reaction at `(1 + #comps) · MAX_INSTRUCTIONS`). That theorem is an
+/// honest bound *in terms of the document* — it does not, by itself, bound
+/// the number of comps a document may declare. Without this cap, a document
+/// with thousands of comps all transitively depending on one mutable
+/// variable would let a single event legitimately burn `#comps ×
+/// MAX_INSTRUCTIONS` of real interpreter work, which is a practical DoS
+/// vector for a document loaded from an untrusted origin even though no
+/// individual budget check is violated.
+///
+/// This is enforced at parse time (see `parser::logic::parse_computed_with_functions`),
+/// so an over-large document is rejected with a clear `ParseError` at load
+/// time rather than degrading silently (or timing out undiagnosably) at
+/// first interaction.
+///
+/// 500 is a conservative **starting value**, not a value derived from
+/// telemetry of real documents: the example/reference documents shipped in
+/// this repository (`docs/reference/examples/*.mizu`) use at most two `comp`
+/// bindings, so there is no existing corpus of legitimate high-comp-count
+/// documents to calibrate against. Revisit this constant if real usage
+/// demonstrates a legitimate need for more.
+pub const MAX_COMP_BINDINGS: usize = 500;
 
 /// Maximum recursion depth for [`StateMachine::evaluate`].
 ///
@@ -348,6 +463,10 @@ pub const MAX_INSTRUCTIONS: u64 = 20_000;
 /// that slipped through [`crate::parser::logic::MAX_PARSE_DEPTH`]).
 /// 256 is well below the native stack limit (~8 MB / ~64 B per frame ≈ thousands
 /// of levels) while being unreachable by any legitimate Mizu expression.
+///
+/// This is also the floor for [`MAX_JSON_DEPTH`]: a [`Value`] built up to
+/// this depth by the evaluator must remain re-readable from encrypted
+/// storage on the next load.
 pub const MAX_EVAL_DEPTH: u32 = 256;
 
 /// Data-oriented flat state machine with a contiguous local variable stack and O(1) global lookup.
@@ -675,7 +794,7 @@ impl StateMachine {
             Expr::BinaryOp { left, op, right } => {
                 let lv = self.evaluate(left, frame_pointer, functions, interner)?;
                 let rv = self.evaluate(right, frame_pointer, functions, interner)?;
-                apply_binop(op, lv, rv)
+                apply_binop(op, lv, rv, &mut self.instruction_count)
             }
             Expr::FunctionCall { name: sym, args } => {
                 let resolved_name = interner.resolve(*sym).unwrap_or("<unknown>");
@@ -701,24 +820,41 @@ impl StateMachine {
                         return Ok(Value::Bool(true));
                     }
                     "get_system_time" => {
-                        if args.len() != 1 {
-                            return Err(MizuError::ExecutionError(
-                                "get_system_time expects 1 argument (target variable name)"
-                                    .to_string(),
-                            ));
-                        }
-                        let val = self.evaluate(&args[0], frame_pointer, functions, interner)?;
-                        let var_name = match val {
-                            Value::String(s) => s.to_string(),
+                        // arg[0] must be a bare variable identifier (Expr::Variable),
+                        // never evaluated — mirrors `download`'s alias argument.
+                        //
+                        // Before this restriction, the argument was evaluated as an
+                        // arbitrary expression to a string used to *look up* the
+                        // write target at runtime, making get_system_time the only
+                        // construct in the language whose assignment target was
+                        // chosen dynamically rather than fixed at parse time. That
+                        // broke the static flow checker's core assumption (every
+                        // write target is a known Symbol, `parser::flow.rs`) and put
+                        // the write out of reach of taint analysis entirely: a
+                        // target string derived from `$form`/a network response
+                        // could redirect the write to any variable with no static
+                        // check able to see it. Requiring a bare identifier here
+                        // fixes the target at parse time, so this is now analyzable
+                        // exactly like any other assignment.
+                        let target_variable = match args.as_slice() {
+                            [Expr::Variable(sym)] => *sym,
                             _ => {
                                 return Err(MizuError::ExecutionError(
-                                    "get_system_time argument must be a string".to_string(),
+                                    "get_system_time expects a single bare variable \
+                                     identifier, e.g. get_system_time(my_var)"
+                                        .to_string(),
                                 ));
                             }
                         };
+                        if self.computed_var_syms.contains(&target_variable) {
+                            return Err(MizuError::ExecutionError(
+                                "get_system_time cannot target a computed variable"
+                                    .to_string(),
+                            ));
+                        }
                         self.accumulated_actions.push(
                             crate::network::RuntimeAction::GetSystemTime {
-                                target_variable: var_name,
+                                target_variable,
                             },
                         );
                         return Ok(Value::Bool(true));
@@ -781,13 +917,9 @@ impl StateMachine {
                         let filtered: Vec<Value> = list
                             .iter()
                             .filter(|item| {
-                                if let Value::Record(map) = item {
-                                    map.get(field.as_ref())
-                                        .map(|v| v == &target)
-                                        .unwrap_or(false)
-                                } else {
-                                    false
-                                }
+                                item.get_field(field.as_ref())
+                                    .map(|v| v == &target)
+                                    .unwrap_or(false)
                             })
                             .cloned()
                             .collect();
@@ -825,13 +957,9 @@ impl StateMachine {
                         let n = list
                             .iter()
                             .filter(|item| {
-                                if let Value::Record(map) = item {
-                                    map.get(field.as_ref())
-                                        .map(|v| v == &target)
-                                        .unwrap_or(false)
-                                } else {
-                                    false
-                                }
+                                item.get_field(field.as_ref())
+                                    .map(|v| v == &target)
+                                    .unwrap_or(false)
                             })
                             .count();
                         return Ok(Value::Int(n as i64));
@@ -1005,16 +1133,16 @@ impl StateMachine {
             }
             Expr::FieldAccess { base, field } => {
                 let base_val = self.evaluate(base, frame_pointer, functions, interner)?;
-                match base_val {
-                    Value::Record(map) => map
-                        .get(field.as_ref())
-                        .cloned()
-                        .ok_or_else(|| MizuError::VariableNotFound(field.to_string())),
-                    other => Err(MizuError::TypeError {
+                if !matches!(base_val, Value::Record(_)) {
+                    return Err(MizuError::TypeError {
                         expected: "record",
-                        found: type_name(&other),
-                    }),
+                        found: type_name(&base_val),
+                    });
                 }
+                base_val
+                    .get_field(field.as_ref())
+                    .cloned()
+                    .ok_or_else(|| MizuError::VariableNotFound(field.to_string()))
             }
         }
     }
@@ -1023,11 +1151,7 @@ impl StateMachine {
 
 /// Returns the value of `field` in `item` if `item` is a `Record`.
 fn field_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
-    if let Value::Record(map) = item {
-        map.get(field)
-    } else {
-        None
-    }
+    item.get_field(field)
 }
 
 /// Navigates a dot-separated path through nested `Value::Record` values,
@@ -1035,10 +1159,7 @@ fn field_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
 fn resolve_dot_path<'a>(root: &'a Value, segments: &[&str]) -> Option<&'a Value> {
     let mut current = root;
     for segment in segments {
-        match current {
-            Value::Record(map) => current = map.get(*segment)?,
-            _ => return None,
-        }
+        current = current.get_field(segment)?;
     }
     Some(current)
 }
@@ -1049,17 +1170,16 @@ fn resolve_dot_path<'a>(root: &'a Value, segments: &[&str]) -> Option<&'a Value>
 /// values belong to different variants.  The ordering is arbitrary but fixed,
 /// which is sufficient to satisfy Strict Weak Ordering.
 ///
-/// Weights: Null=1, Bool=2, Int=3, Float=4, String=5, List=6, Record=7.
+/// Weights: Null=1, Bool=2, Int=3, String=4, List=5, Record=6.
 #[inline]
 fn variant_weight(v: &Value) -> u8 {
     match v {
         Value::Null => 1,
         Value::Bool(_) => 2,
         Value::Int(_) => 3,
-        Value::Float(_) => 4,
-        Value::String(_) => 5,
-        Value::List(_) => 6,
-        Value::Record(_) => 7,
+        Value::String(_) => 4,
+        Value::List(_) => 5,
+        Value::Record(_) => 6,
     }
 }
 
@@ -1069,12 +1189,21 @@ fn variant_weight(v: &Value) -> u8 {
 /// Rules:
 /// * `(None, None)` → `Equal`
 /// * `(None, Some(_))` → `Less` / `(Some(_), None)` → `Greater`  (None is smallest)
-/// * Same-variant pairs use native ordering; `Float` NaN is treated as `Less` than
-///   any finite value so transitivity is preserved.
-/// * Cross-type `Int`/`Float` pairs use [`safe_compare_int_float`] which avoids the
-///   53-bit mantissa precision trap of a naive `i64 as f64` cast.
+/// * Same-variant pairs use native ordering.
 /// * All other heterogeneous pairs are ordered by [`variant_weight`], which is
-///   deterministic and total, removing the old `_ => Equal` trap.
+///   deterministic and total.
+///
+/// A single call here costs O(string length) for a `String` pair, or more for
+/// nested `List`/`Record` pairs — not O(1) like the numeric/bool cases. This
+/// is safe *without* its own instruction charge because `sort`'s caller
+/// already pre-charges `n·log₂n` for the whole pass (bounding the *count* of
+/// calls), and every `Value` reachable here is itself already
+/// budget-bounded: a `String`/`List`/`Record` built by the evaluator can only
+/// be as large as the instructions already spent constructing it (string
+/// concatenation charges its length — see `apply_binop`; there is no runtime
+/// operator that grows a `List`/`Record`, so their size is fixed at parse
+/// time), and values delivered by a network response are bounded separately
+/// at the network layer, not by this instruction budget at all.
 fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -1085,29 +1214,11 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (Some(Value::Null), Some(Value::Null)) => Ordering::Equal,
         (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
         (Some(Value::Int(x)), Some(Value::Int(y))) => x.cmp(y),
-        (Some(Value::Float(x)), Some(Value::Float(y))) => {
-            // NaN is treated as less than any finite value so that sort_by
-            // satisfies Strict Weak Ordering (NaN < finite, NaN == NaN).
-            match (x.is_nan(), y.is_nan()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            }
-        }
         (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
 
-        (Some(Value::Int(x)), Some(Value::Float(y))) => safe_compare_int_float(*x, *y),
-        (Some(Value::Float(x)), Some(Value::Int(y))) => safe_compare_int_float(*y, *x).reverse(),
-
-        // List: lexicographic element-wise comparison, shorter list is lesser on tie.
-        //
-        // Without this arm both arms fall to the heterogeneous catch-all below,
-        // which compares variant_weight(List) == variant_weight(List) and always
-        // returns Ordering::Equal, making sort_by over lists of lists non-deterministic.
         (Some(Value::List(x)), Some(Value::List(y))) => {
-            for (a, b) in x.iter().zip(y.iter()) {
-                let ord = compare_values(Some(a), Some(b));
+            for (elem_a, elem_b) in x.iter().zip(y.iter()) {
+                let ord = compare_values(Some(elem_a), Some(elem_b));
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -1115,19 +1226,9 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
             x.len().cmp(&y.len())
         }
 
-        // Record: O(K) zero-allocation comparison.
-        // BTreeMap iterates in ascending key order by construction, so no
-        // temporary Vec or sort call is needed — a zip of the two iterators
-        // visits every (key, value) pair in the same sorted order for both
-        // operands without a single heap allocation.
-        //
-        // The old FxHashMap path allocated two Vec<&Arc<str>> and called
-        // sort_unstable() at every comparison step, giving O(K log K) per
-        // compare and O(N log N · K log K) total for a list sort — a
-        // DoS-exploitable heap-thrashing path that also bypassed MAX_INSTRUCTIONS.
         (Some(Value::Record(x)), Some(Value::Record(y))) => {
             for ((ka, va), (kb, vb)) in x.iter().zip(y.iter()) {
-                let key_ord = ka.as_ref().cmp(kb.as_ref());
+                let key_ord = ka.cmp(kb);
                 if key_ord != Ordering::Equal {
                     return key_ord;
                 }
@@ -1143,84 +1244,6 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     }
 }
 
-/// Compares an `i64` integer with an `f64` float without ever casting the
-/// integer to `f64`, which would silently lose bits for `|i| > 2^53`.
-///
-/// ## Algorithm
-///
-/// Let **i** be the integer operand and **f** be the float operand.
-///
-/// 1. **NaN** — treated as greater than every integer (arbitrary but fixed;
-///    preserves Strict Weak Ordering because the NaN position is consistent
-///    with the `Float ↔ Float` arm in [`compare_values`] where NaN is *less*
-///    than finite values).
-///
-/// 2. **Float out of `i64` range** — if `f ≥ 2^63` (the smallest f64 that
-///    would overflow `i64::MAX`) then every `i64` is less; if `f < −2^63`
-///    (below `i64::MIN`) then every `i64` is greater.  No cast is needed.
-///
-/// 3. **Floor extraction** — within the safe range, compute `floor_i = ⌊f⌋`
-///    as `f.floor() as i64`.  This is well-defined: `f.floor()` returns a
-///    value that is an exact `f64`-representable integer inside the range, so
-///    the subsequent `as i64` cast is exact and lossless.
-///
-/// 4. **Integer-part comparison** — compare `i` with `floor_i`.
-///    * If `i ≠ floor_i`: return that order directly.
-///    * If `i = floor_i`: **f** has the same integer part as **i**.
-///      - If `f > f.floor()` (i.e. **f** has a positive fractional part,
-///        e.g. 10.5) then **i < f** → `Less`.
-///      - Otherwise **f** is a perfect integer (no fraction) and **i = f**
-///        exactly → `Equal`.
-///
-/// ## SWO guarantees
-///
-/// * **Irreflexivity** (`a < a` is false): step 4 produces `Equal` when
-///   `i == f_floor` and `f == f_floor` (perfect integer).
-/// * **Asymmetry**: if `compare_int_float(i, f) = Less` then the caller
-///   inverts with `.reverse()` to obtain `Greater` for the symmetric arm,
-///   so the pair is never both Less.
-/// * **Transitivity**: all four steps produce a total, branching-free,
-///   case-split ordering with no `Equal`-by-default escape hatch.
-fn safe_compare_int_float(i: i64, f: f64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    // Step 1 — NaN is defined as Greater than any integer.
-    if f.is_nan() {
-        return Ordering::Greater;
-    }
-
-    // Step 2 — bounds check to guarantee the f64→i64 cast below is defined.
-    // 2^63 as f64 = 9223372036854775808.0 — the first value > i64::MAX.
-    // i64::MIN as f64 = -9223372036854775808.0 — already representable exactly.
-    const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0_f64; // 2^63
-    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0_f64; // −2^63
-
-    if f >= I64_MAX_PLUS_ONE {
-        return Ordering::Less;
-    }
-    if f < I64_MIN_F64 {
-        return Ordering::Greater;
-    }
-
-    // Step 3 — extract the integer part via floor (rounds toward −∞).
-    // Within [I64_MIN_F64, I64_MAX_PLUS_ONE) the result of f.floor() is an
-    // exact integer representable in f64, so `as i64` is lossless.
-    let floor_i = f.floor() as i64;
-
-    // Step 4 — compare integer parts first, fractional part as tie-breaker.
-    let cmp = i.cmp(&floor_i);
-    if cmp != Ordering::Equal {
-        return cmp;
-    }
-
-    // `f > f.floor()` is true for any non-integer f (positive OR negative),
-    // e.g. 10.5 > 10.0, -10.5 > -11.0.
-    if f > f.floor() {
-        Ordering::Less
-    } else {
-        Ordering::Equal
-    }
-}
 
 
 /// A backwards compatibility layer wrapping StateMachine and StringInterner.
@@ -1367,24 +1390,6 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    #[test]
-    fn float_from_f64() {
-        let v = Value::from(3.14_f64);
-        assert_eq!(v, Value::Float(3.14));
-    }
-
-    #[test]
-    fn float_display_integer() {
-        let v = Value::Float(42.0);
-        assert_eq!(v.to_string(), "42");
-    }
-
-    #[test]
-    fn float_display_fractional() {
-        let v = Value::Float(1.5);
-        assert_eq!(v.to_string(), "1.5");
-    }
-
 
     #[test]
     fn string_from_string_ref() {
@@ -1432,14 +1437,14 @@ mod tests {
 
     #[test]
     fn list_display_single_element() {
-        let v = Value::List(std::sync::Arc::new(vec![Value::Float(1.0)]));
+        let v = Value::List(std::sync::Arc::new(vec![Value::Int(10_000)]));
         assert_eq!(v.to_string(), "[1]");
     }
 
     #[test]
     fn list_display_multiple_elements() {
         let v = Value::List(std::sync::Arc::new(vec![
-            Value::Float(1.0),
+            Value::Int(10_000),
             Value::String(std::sync::Arc::from("two")),
             Value::Bool(false),
         ]));
@@ -1449,21 +1454,21 @@ mod tests {
     #[test]
     fn list_display_nested() {
         let inner = Value::List(std::sync::Arc::new(vec![
-            Value::Float(2.0),
-            Value::Float(3.0),
+            Value::Int(20_000),
+            Value::Int(30_000),
         ]));
-        let outer = Value::List(std::sync::Arc::new(vec![Value::Float(1.0), inner]));
+        let outer = Value::List(std::sync::Arc::new(vec![Value::Int(10_000), inner]));
         assert_eq!(outer.to_string(), "[1, [2, 3]]");
     }
 
 
     #[test]
-    fn store_set_and_get_float() {
+    fn store_set_and_get_int_scaled() {
         let mut store = VariableStore::new();
-        store.set("price", Value::Float(9.99));
+        store.set("price", Value::Int(99_900));
         let result = store.get("price");
         assert!(result.is_ok());
-        assert_eq!(*result.unwrap(), Value::Float(9.99));
+        assert_eq!(*result.unwrap(), Value::Int(99_900));
     }
 
     #[test]
@@ -1487,8 +1492,8 @@ mod tests {
     fn store_set_and_get_list() {
         let mut store = VariableStore::new();
         let list = Value::List(std::sync::Arc::new(vec![
-            Value::Float(1.0),
-            Value::Float(2.0),
+            Value::Int(10_000),
+            Value::Int(20_000),
         ]));
         store.set("items", list.clone());
         assert_eq!(*store.get("items").unwrap(), list);
@@ -1498,10 +1503,10 @@ mod tests {
     fn store_set_convenience_into() {
         // `set` accepts any `impl Into<Value>`, so raw Rust types work directly.
         let mut store = VariableStore::new();
-        store.set("x", 7.0_f64);
+        store.set("x", 7_i64);
         store.set("greeting", "hi");
         store.set("active", false);
-        assert_eq!(*store.get("x").unwrap(), Value::Float(7.0));
+        assert_eq!(*store.get("x").unwrap(), Value::Int(7));
         assert_eq!(
             *store.get("greeting").unwrap(),
             Value::String(std::sync::Arc::from("hi"))
@@ -1512,27 +1517,27 @@ mod tests {
     #[test]
     fn store_overwrite_binding() {
         let mut store = VariableStore::new();
-        store.set("count", 1.0_f64);
-        store.set("count", 2.0_f64);
-        assert_eq!(*store.get("count").unwrap(), Value::Float(2.0));
+        store.set("count", 1_i64);
+        store.set("count", 2_i64);
+        assert_eq!(*store.get("count").unwrap(), Value::Int(2));
     }
 
     #[test]
     fn store_scope_chaining() {
         let mut store = VariableStore::new();
-        store.set("x", 10.0_f64);
-        store.set("y", 20.0_f64);
+        store.set("x", 10_i64);
+        store.set("y", 20_i64);
 
         let fp = store.state_machine.local_stack.len();
         let x_sym = store.interner.get_or_intern("x");
         let y_sym = store.interner.get_or_intern("y");
         let z_sym = store.interner.get_or_intern("z");
 
-        store.state_machine.push_local(x_sym, Value::from(15.0_f64));
+        store.state_machine.push_local(x_sym, Value::from(15_i64));
 
         assert_eq!(
             *store.state_machine.get_local(x_sym, fp).unwrap(),
-            Value::from(15.0_f64)
+            Value::from(15_i64)
         );
         assert!(store.state_machine.get_local(y_sym, fp).is_none());
         assert!(store.state_machine.get_local(z_sym, fp).is_none());
@@ -1640,22 +1645,18 @@ mod tests {
     #[test]
     fn json_object_becomes_record() {
         let json: serde_json::Value = serde_json::from_str(r#"{"id":1,"name":"Neko"}"#).unwrap();
-        let val = from_json(&json);
-        if let Value::Record(map) = val {
-            assert_eq!(map.get(&Arc::from("id")), Some(&Value::Int(1)));
-            assert_eq!(
-                map.get(&Arc::from("name")),
-                Some(&Value::String(Arc::from("Neko")))
-            );
-        } else {
-            panic!("expected Value::Record, got {val:?}");
-        }
+        let val = from_json(&json).unwrap();
+        assert_eq!(val.get_field("id"), Some(&Value::Int(10_000)));
+        assert_eq!(
+            val.get_field("name"),
+            Some(&Value::String(Arc::from("Neko")))
+        );
     }
 
     #[test]
     fn json_array_of_objects() {
         let json: serde_json::Value = serde_json::from_str(r#"[{"id":1},{"id":2}]"#).unwrap();
-        let val = from_json(&json);
+        let val = from_json(&json).unwrap();
         if let Value::List(items) = val {
             assert_eq!(items.len(), 2);
             assert!(
@@ -1674,41 +1675,38 @@ mod tests {
     #[test]
     fn json_string_passthrough() {
         let json: serde_json::Value = serde_json::from_str(r#""hello""#).unwrap();
-        let val = from_json(&json);
+        let val = from_json(&json).unwrap();
         assert_eq!(val, Value::String(Arc::from("hello")));
     }
 
     #[test]
     fn json_null_becomes_value_null() {
-        let val = from_json(&serde_json::Value::Null);
+        let val = from_json(&serde_json::Value::Null).unwrap();
         assert_eq!(val, Value::Null);
     }
 
     #[test]
     fn json_bool_becomes_value_bool() {
-        assert_eq!(from_json(&serde_json::json!(true)), Value::Bool(true));
-        assert_eq!(from_json(&serde_json::json!(false)), Value::Bool(false));
+        assert_eq!(from_json(&serde_json::json!(true)).unwrap(), Value::Bool(true));
+        assert_eq!(from_json(&serde_json::json!(false)).unwrap(), Value::Bool(false));
     }
 
     #[test]
     fn json_integer_becomes_value_int() {
-        let val = from_json(&serde_json::json!(42));
-        assert_eq!(val, Value::Int(42));
+        let val = from_json(&serde_json::json!(42)).unwrap();
+        assert_eq!(val, Value::Int(420_000));
     }
 
     #[test]
-    fn json_float_becomes_value_float() {
-        let val = from_json(&serde_json::json!(3.14));
-        assert!(matches!(val, Value::Float(_)));
-        if let Value::Float(f) = val {
-            assert!((f - 3.14).abs() < 1e-10);
-        }
+    fn json_float_becomes_value_int() {
+        let val = from_json(&serde_json::json!(3.14)).unwrap();
+        assert_eq!(val, Value::Int(31_400));
     }
 
     #[test]
     fn record_display_contains_fields() {
         let json: serde_json::Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
-        let val = from_json(&json);
+        let val = from_json(&json).unwrap();
         let display = val.to_string();
         assert!(
             display.contains("x"),
@@ -1730,44 +1728,32 @@ mod tests {
 
 
     #[test]
-    fn from_json_depth_limit_clamps_to_null() {
-        // Build a 100-level nested array: [[[[...[42]...]]]]
-        // Levels 0..=MAX_JSON_DEPTH (64) are parsed as List.
-        // Level 65 exceeds the limit and must be clamped to Value::Null,
-        // preventing a native stack overflow on malicious payloads.
+    fn from_json_depth_limit_returns_err() {
+        // Build a 300-level nested array: [[[[...[42]...]]]]
+        // Nesting beyond MAX_JSON_DEPTH (== MAX_EVAL_DEPTH == 256) must be
+        // rejected outright with Err(MizuError::SecurityViolation) rather
+        // than silently clamped to Value::Null — a clamp would let a caller
+        // mistake a malicious deeply-nested payload for legitimate absent
+        // data.
         let mut json = serde_json::json!(42_i64);
-        for _ in 0..100 {
+        for _ in 0..300 {
             json = serde_json::json!([json]);
         }
 
         let result = from_json(&json);
 
-        // Walk down the parsed tree; we must hit Value::Null before reaching
-        // the Int(42) leaf at depth 100.
-        let mut current = &result;
-        for depth in 0..100 {
-            match current {
-                Value::List(items) if !items.is_empty() => {
-                    current = &items[0];
-                }
-                Value::Null => {
-                    assert!(depth > 0, "top-level must not be Null");
-                    return; // depth clamp triggered — test passes
-                }
-                other => {
-                    panic!("unexpected value at depth {depth}: {other:?}");
-                }
-            }
-        }
-        panic!("walked 100 levels without hitting Null — depth limit not enforced");
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "deeply-nested JSON must be rejected with SecurityViolation, got: {result:?}"
+        );
     }
 
     #[test]
     fn from_json_shallow_nesting_parses_fully() {
-        // A 3-level nested array (well within MAX_JSON_DEPTH=64) must parse
+        // A 3-level nested array (well within MAX_JSON_DEPTH) must parse
         // completely — the depth limit must not truncate legitimate data.
         let json = serde_json::json!([[[42_i64]]]);
-        let result = from_json(&json);
+        let result = from_json(&json).unwrap();
 
         let l1 = match &result {
             Value::List(v) => &v[0],
@@ -1781,13 +1767,13 @@ mod tests {
             Value::List(v) => &v[0],
             other => panic!("level 2 must be List: {other:?}"),
         };
-        assert_eq!(*leaf, Value::Int(42), "leaf must be Int(42)");
+        assert_eq!(*leaf, Value::Int(420_000), "leaf must be Int(420_000)");
     }
 
     #[test]
     fn store_interpolate_string() {
         let mut store = VariableStore::new();
-        store.set("count", 42.0_f64);
+        store.set("count", 42 * super::DECIMAL_SCALE);
         store.set("name", "Mizu");
 
         let result = store.interpolate("{name} has {count} items");
@@ -1811,9 +1797,9 @@ mod tests {
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
-        let mut map: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        map.insert(Arc::from("name"), Value::String(Arc::from("Neko")));
-        store.set("item", Value::Record(Arc::new(map)));
+        let mut map: Vec<(Arc<str>, Value)> = Vec::new();
+        map.push((Arc::from("name"), Value::String(Arc::from("Neko"))));
+        store.set("item", Value::Record(Arc::from(map)));
 
         let item_sym = store.interner.get_or_intern("item");
         let expr = Expr::FieldAccess {
@@ -1836,8 +1822,8 @@ mod tests {
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
-        let map: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        store.set("item", Value::Record(Arc::new(map)));
+        let map: Vec<(Arc<str>, Value)> = Vec::new();
+        store.set("item", Value::Record(Arc::from(map)));
 
         let item_sym = store.interner.get_or_intern("item");
         let expr = Expr::FieldAccess {
@@ -1879,10 +1865,10 @@ mod tests {
     #[test]
     fn interpolate_dot_access() {
         let mut store = VariableStore::new();
-        let mut map: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        map.insert(Arc::from("name"), Value::String(Arc::from("Neko")));
-        map.insert(Arc::from("age"), Value::Int(3));
-        store.set("item", Value::Record(Arc::new(map)));
+        let mut map: Vec<(Arc<str>, Value)> = Vec::new();
+        map.push((Arc::from("age"), Value::Int(3 * super::DECIMAL_SCALE)));
+        map.push((Arc::from("name"), Value::String(Arc::from("Neko"))));
+        store.set("item", Value::Record(Arc::from(map)));
 
         let result = store
             .interpolate("The cat is {item.name} and is {item.age} years old")
@@ -1934,9 +1920,9 @@ mod tests {
         // without cloning the StateMachine or StringInterner.
         let store = VariableStore::new(); // empty global store
 
-        let mut inner: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        inner.insert(Arc::from("name"), Value::String(Arc::from("Neko")));
-        let record = Value::Record(Arc::new(inner));
+        let mut inner: Vec<(Arc<str>, Value)> = Vec::new();
+        inner.push((Arc::from("name"), Value::String(Arc::from("Neko"))));
+        let record = Value::Record(Arc::from(inner));
 
         let mut overlay = HashMap::new();
         overlay.insert("item".to_string(), record);
@@ -1955,9 +1941,9 @@ mod tests {
         // {item.name} when `item` is absent from the overlay but present in the
         // store must fall back correctly.
         let mut store = VariableStore::new();
-        let mut inner: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        inner.insert(Arc::from("name"), Value::String(Arc::from("Stripe")));
-        store.set("item", Value::Record(Arc::new(inner)));
+        let mut inner: Vec<(Arc<str>, Value)> = Vec::new();
+        inner.push((Arc::from("name"), Value::String(Arc::from("Stripe"))));
+        store.set("item", Value::Record(Arc::from(inner)));
 
         let overlay: HashMap<String, Value> = HashMap::new(); // empty overlay
         let result = store
@@ -2002,11 +1988,11 @@ mod tests {
         let items: Vec<Value> = rows
             .iter()
             .map(|(name, done, priority, _)| {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("done"), Value::Bool(*done));
-                m.insert(Arc::from("name"), Value::String(Arc::from(*name)));
-                m.insert(Arc::from("priority"), Value::Int(*priority));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("done"), Value::Bool(*done)));
+                m.push((Arc::from("name"), Value::String(Arc::from(*name))));
+                m.push((Arc::from("priority"), Value::Int(*priority)));
+                Value::Record(Arc::from(m))
             })
             .collect();
         Value::List(Arc::new(items))
@@ -2047,11 +2033,7 @@ mod tests {
         };
         assert_eq!(items.len(), 3);
         for item in items.iter() {
-            if let Value::Record(m) = item {
-                assert_eq!(m.get("done"), Some(&Value::Bool(true)));
-            } else {
-                panic!("expected record");
-            }
+            assert_eq!(item.get_field("done"), Some(&Value::Bool(true)));
         }
     }
 
@@ -2071,11 +2053,7 @@ mod tests {
             panic!("expected list")
         };
         assert_eq!(items.len(), 1);
-        if let Value::Record(m) = &items[0] {
-            assert_eq!(m.get("name"), Some(&Value::String(Arc::from("gamma"))));
-        } else {
-            panic!("expected record");
-        }
+        assert_eq!(items[0].get_field("name"), Some(&Value::String(Arc::from("gamma"))));
     }
 
     #[test]
@@ -2148,12 +2126,8 @@ mod tests {
         let priorities: Vec<i64> = items
             .iter()
             .map(|item| {
-                if let Value::Record(m) = item {
-                    if let Some(Value::Int(p)) = m.get("priority") {
-                        *p
-                    } else {
-                        panic!()
-                    }
+                if let Some(&Value::Int(p)) = item.get_field("priority") {
+                    p
                 } else {
                     panic!()
                 }
@@ -2181,12 +2155,8 @@ mod tests {
         let priorities: Vec<i64> = items
             .iter()
             .map(|item| {
-                if let Value::Record(m) = item {
-                    if let Some(Value::Int(p)) = m.get("priority") {
-                        *p
-                    } else {
-                        panic!()
-                    }
+                if let Some(&Value::Int(p)) = item.get_field("priority") {
+                    p
                 } else {
                     panic!()
                 }
@@ -2213,12 +2183,8 @@ mod tests {
         let names: Vec<String> = items
             .iter()
             .map(|item| {
-                if let Value::Record(m) = item {
-                    if let Some(Value::String(s)) = m.get("name") {
-                        s.to_string()
-                    } else {
-                        panic!()
-                    }
+                if let Some(Value::String(s)) = item.get_field("name") {
+                    s.to_string()
                 } else {
                     panic!()
                 }
@@ -2247,9 +2213,9 @@ mod tests {
     fn make_large_list(n: usize) -> Value {
         let items: Vec<Value> = (0..n)
             .map(|i| {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("v"), Value::Int(i as i64));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("v"), Value::Int(i as i64)));
+                Value::Record(Arc::from(m))
             })
             .collect();
         Value::List(Arc::new(items))
@@ -2313,6 +2279,55 @@ mod tests {
     }
 
     #[test]
+    fn string_concat_doubling_chain_triggers_timeout_early() {
+        // Reproduces the exponential-doubling bypass: a chain of nested
+        // `let`s each doubling a string (`let s = s + s in …`). Before the
+        // concat charge, this was bounded only by MAX_EVAL_DEPTH (256) and
+        // would reach gigabyte-scale strings within ~30-40 levels while
+        // burning under 1% of the nominal instruction budget. With the
+        // concat charge, cumulative cost after k doublings from a
+        // 1-byte seed is 2*(2^k - 1) instructions, which exceeds
+        // MAX_INSTRUCTIONS (20 000) around k≈14 — so 40 levels (well under
+        // the 256-level depth guard, and nowhere near problematic string
+        // sizes) must already time out.
+        use crate::parser::logic::{BinOp, Expr};
+        use rustc_hash::FxHashMap;
+
+        let mut store = VariableStore::new();
+        let sym = store.interner.get_or_intern("s");
+
+        let mut body = Expr::Variable(sym);
+        for _ in 0..40 {
+            let double_val = Expr::BinaryOp {
+                left: Box::new(Expr::Variable(sym)),
+                op: BinOp::Add,
+                right: Box::new(Expr::Variable(sym)),
+            };
+            body = Expr::Let {
+                name: sym,
+                value: Box::new(double_val),
+                body: Box::new(body),
+            };
+        }
+        let ast = Expr::Let {
+            name: sym,
+            value: Box::new(Expr::Literal(Value::String(Arc::from("a")))),
+            body: Box::new(body),
+        };
+
+        store.state_machine.instruction_count = 0;
+        store.state_machine.eval_depth = 0;
+        let fns = FxHashMap::default();
+        let result = store.state_machine.evaluate(&ast, 0, &fns, &store.interner);
+
+        assert!(
+            matches!(result, Err(MizuError::Timeout)),
+            "40-level string-doubling chain must hit the instruction budget \
+             (around level 14) instead of completing, got: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_filter_small_list_still_works() {
         // The budget charge must not break normal-sized lists.
         use crate::parser::logic::Expr;
@@ -2335,265 +2350,63 @@ mod tests {
         );
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // get_system_time — dynamic write-target closed (RM-04)
+    // ────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn compare_nan_less_than_finite() {
-        use std::cmp::Ordering;
-        assert_eq!(
-            compare_values(Some(&Value::Float(f64::NAN)), Some(&Value::Float(1.0))),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn compare_nan_equal_nan() {
-        use std::cmp::Ordering;
-        assert_eq!(
-            compare_values(Some(&Value::Float(f64::NAN)), Some(&Value::Float(f64::NAN))),
-            Ordering::Equal
-        );
-    }
-
-    #[test]
-    fn compare_finite_greater_than_nan() {
-        use std::cmp::Ordering;
-        assert_eq!(
-            compare_values(Some(&Value::Float(1.0)), Some(&Value::Float(f64::NAN))),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn sort_nan_is_deterministic() {
-        // Build the same three-element list in two different insertion orders
-        // and verify that sorting both produces identical results with NaN first.
-        fn make_list(a: f64, b: f64, c: f64) -> Vec<Value> {
-            vec![Value::Float(a), Value::Float(b), Value::Float(c)]
-        }
-
-        let mut order1 = make_list(1.0, f64::NAN, 3.0);
-        let mut order2 = make_list(3.0, 1.0, f64::NAN);
-
-        order1.sort_by(|a, b| compare_values(Some(a), Some(b)));
-        order2.sort_by(|a, b| compare_values(Some(a), Some(b)));
-
-        // NaN != NaN under IEEE 754, so compare element-wise using is_nan() for the
-        // NaN slot and direct equality for the finite slots.
-        let nan_first = |list: &[Value]| {
-            matches!(list[0], Value::Float(x) if x.is_nan())
-                && list[1] == Value::Float(1.0)
-                && list[2] == Value::Float(3.0)
-        };
-        assert!(
-            nan_first(&order1),
-            "order1 must be [NaN, 1.0, 3.0]: {order1:?}"
-        );
-        assert!(
-            nan_first(&order2),
-            "order2 must be [NaN, 1.0, 3.0]: {order2:?}"
-        );
-    }
-
-    #[test]
-    fn test_large_number_ordering_precision() {
-        // 2^53 + 1 = 9007199254740993 cannot be represented exactly as f64:
-        // the nearest f64 is 9007199254740992.0, which equals 2^53.
-        // A naive `i as f64` cast would wrongly treat them as equal.
-        use std::cmp::Ordering;
-
-        let big_int = 9_007_199_254_740_993_i64; // 2^53 + 1
-        let exact_f64 = 9_007_199_254_740_992.0_f64; // 2^53 (nearest f64)
-
-        // Int(2^53+1) must be strictly GREATER than Float(2^53)
-        assert_eq!(
-            compare_values(Some(&Value::Int(big_int)), Some(&Value::Float(exact_f64))),
-            Ordering::Greater,
-            "Int(2^53+1) must be > Float(2^53)"
-        );
-
-        // Symmetric: Float(2^53) must be strictly LESS than Int(2^53+1)
-        assert_eq!(
-            compare_values(Some(&Value::Float(exact_f64)), Some(&Value::Int(big_int))),
-            Ordering::Less,
-            "Float(2^53) must be < Int(2^53+1)"
-        );
-
-        // Sort a mixed list to verify no panic and correct order
-        let mut items = vec![
-            Value::Int(big_int),
-            Value::Float(exact_f64),
-            Value::Int(big_int - 1), // 2^53 == exact_f64 as i64
-        ];
-        items.sort_by(|a, b| compare_values(Some(a), Some(b)));
-
-        // Expected ascending order: Int(2^53-1 ... actually 2^53) < Float(2^53) < Int(2^53+1)
-        // Note: big_int - 1 == 9007199254740992 == exact_f64 as i64, so they compare Equal
-        // and their relative order is stable but unspecified — just check no panic and
-        // that Int(big_int) is last.
-        assert!(
-            matches!(items.last(), Some(Value::Int(n)) if *n == big_int),
-            "Int(2^53+1) must sort last: {items:?}"
-        );
-    }
-
-
-    /// Thin wrapper so the tests can call the private function by name.
-    fn cmp_if(i: i64, f: f64) -> std::cmp::Ordering {
-        super::safe_compare_int_float(i, f)
-    }
-
-    #[test]
-    fn scif_nan_is_greater_than_any_int() {
-        use std::cmp::Ordering;
-        // NaN is defined as Greater → Int is Less than NaN.
-        assert_eq!(cmp_if(0, f64::NAN), Ordering::Greater);
-        assert_eq!(cmp_if(i64::MAX, f64::NAN), Ordering::Greater);
-        assert_eq!(cmp_if(i64::MIN, f64::NAN), Ordering::Greater);
-        assert_eq!(cmp_if(-1_000_000, f64::NAN), Ordering::Greater);
-    }
-
-    #[test]
-    fn scif_above_i64_range_int_is_less() {
-        use std::cmp::Ordering;
-        // f >= 2^63: every i64 is below f.
-        let above = 9_223_372_036_854_775_808.0_f64; // 2^63, first value > i64::MAX
-        assert_eq!(cmp_if(i64::MAX, above), Ordering::Less);
-        assert_eq!(cmp_if(0, above), Ordering::Less);
-        assert_eq!(cmp_if(i64::MIN, above), Ordering::Less);
-        assert_eq!(cmp_if(i64::MAX, f64::INFINITY), Ordering::Less);
-    }
-
-    #[test]
-    fn scif_below_i64_range_int_is_greater() {
-        use std::cmp::Ordering;
-        // f < -2^63: every i64 is above f.
-        // Note: the literal -9_223_372_036_854_775_809.0_f64 rounds to exactly
-        // i64::MIN as f64 due to f64 precision, so use NEG_INFINITY and the
-        // next f64 below i64::MIN (which is i64::MIN as f64 - 1 ULP, but in
-        // practice NEG_INFINITY is the canonical out-of-range sentinel).
-        assert_eq!(cmp_if(i64::MIN, f64::NEG_INFINITY), Ordering::Greater);
-        assert_eq!(cmp_if(0, f64::NEG_INFINITY), Ordering::Greater);
-        assert_eq!(cmp_if(i64::MAX, f64::NEG_INFINITY), Ordering::Greater);
-    }
-
-    #[test]
-    fn scif_exact_integer_equality() {
-        use std::cmp::Ordering;
-        // f is a perfect integer — comparison must be exact.
-        assert_eq!(cmp_if(0, 0.0_f64), Ordering::Equal);
-        assert_eq!(cmp_if(1, 1.0_f64), Ordering::Equal);
-        assert_eq!(cmp_if(-1, -1.0_f64), Ordering::Equal);
-        assert_eq!(cmp_if(42, 42.0_f64), Ordering::Equal);
-        // 2^53 is exactly representable as f64.
-        let two_pow_53 = 9_007_199_254_740_992_i64;
-        assert_eq!(cmp_if(two_pow_53, two_pow_53 as f64), Ordering::Equal);
-    }
-
-    #[test]
-    fn scif_positive_fraction_int_is_less() {
-        use std::cmp::Ordering;
-        // floor(10.5) = 10; i == 10 == floor_i; f > floor → Less.
-        assert_eq!(cmp_if(10, 10.5_f64), Ordering::Less, "10 < 10.5");
-        assert_eq!(cmp_if(0, 0.9_f64), Ordering::Less, "0 < 0.9");
-        assert_eq!(cmp_if(100, 100.001_f64), Ordering::Less, "100 < 100.001");
-    }
-
-    #[test]
-    fn scif_positive_fraction_int_above_floor() {
-        use std::cmp::Ordering;
-        // i > floor_i → Greater, regardless of fractional part.
-        assert_eq!(cmp_if(11, 10.5_f64), Ordering::Greater, "11 > 10.5");
-        assert_eq!(cmp_if(1, 0.9_f64), Ordering::Greater, "1 > 0.9");
-    }
-
-    #[test]
-    fn scif_negative_fraction_floor_based() {
-        // This is the KEY correctness difference vs a truncation-based approach.
-        //
-        // f = -10.5  →  floor(-10.5) = -11
-        //   • i = -10: i.cmp(&-11) = Greater  (-10 > -10.5) ✓
-        //   • i = -11: i.cmp(&-11) = Equal; f > floor (-10.5 > -11.0) → Less
-        //              so -11 < -10.5 ✓
-        //   • i = -12: i.cmp(&-11) = Less      (-12 < -10.5) ✓
-        use std::cmp::Ordering;
-        assert_eq!(cmp_if(-10, -10.5_f64), Ordering::Greater, "-10 > -10.5");
-        assert_eq!(cmp_if(-11, -10.5_f64), Ordering::Less, "-11 < -10.5");
-        assert_eq!(cmp_if(-12, -10.5_f64), Ordering::Less, "-12 < -10.5");
-
-        // More cases
-        assert_eq!(cmp_if(0, -0.5_f64), Ordering::Greater, "0 > -0.5");
-        assert_eq!(cmp_if(-1, -0.5_f64), Ordering::Less, "-1 < -0.5");
-        assert_eq!(cmp_if(-1, -1.9_f64), Ordering::Greater, "-1 > -1.9");
-        assert_eq!(cmp_if(-2, -1.9_f64), Ordering::Less, "-2 < -1.9");
-    }
-
-    #[test]
-    fn scif_symmetry_via_reverse() {
-        // compare_values calls safe_compare_int_float(*y, *x).reverse() for the
-        // Float/Int arm.  Verify symmetry holds for both positive and negative fracs.
-        use std::cmp::Ordering;
-        let cases: &[(i64, f64, Ordering)] = &[
-            (10, 10.5, Ordering::Less),      // i < f
-            (11, 10.5, Ordering::Greater),   // i > f
-            (10, 10.0, Ordering::Equal),     // exact
-            (-10, -10.5, Ordering::Greater), // i > f
-            (-11, -10.5, Ordering::Less),    // i < f
-        ];
-        for &(i, f, expected) in cases {
-            assert_eq!(
-                cmp_if(i, f),
-                expected,
-                "cmp_if({i}, {f}) expected {expected:?}"
-            );
-            // The symmetric (Float, Int) arm uses .reverse()
-            assert_eq!(
-                cmp_if(i, f).reverse(),
-                expected.reverse(),
-                "reverse of cmp_if({i}, {f})"
-            );
+    fn get_system_time_bare_variable_queues_correct_target() {
+        use crate::network::RuntimeAction;
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let target_sym = store.interner.get_or_intern("elapsed");
+        let args = vec![Expr::Variable(target_sym)];
+        let result = eval_builtin(&mut store, "get_system_time", args).unwrap();
+        assert_eq!(result, Value::Bool(true));
+        assert_eq!(store.state_machine.accumulated_actions.len(), 1);
+        match &store.state_machine.accumulated_actions[0] {
+            RuntimeAction::GetSystemTime { target_variable } => {
+                assert_eq!(*target_variable, target_sym);
+            }
+            other => panic!("expected GetSystemTime, got: {other:?}"),
         }
     }
 
     #[test]
-    fn scif_swo_transitivity_mixed_sort() {
-        // Sort a mixed Vec<Value> containing Int and Float values that straddle
-        // fractional boundaries.  Must not panic and must produce ascending order.
-        let mut values = vec![
-            Value::Float(10.5_f64),
-            Value::Int(10),
-            Value::Float(-0.5_f64),
-            Value::Int(-1),
-            Value::Float(0.0_f64),
-            Value::Int(0),
-            Value::Float(-10.5_f64),
-            Value::Int(-10),
-            Value::Int(-11),
-            Value::Float(f64::NAN),
-        ];
-
-        // Must not panic (SWO requires no contradiction).
-        values.sort_by(|a, b| compare_values(Some(a), Some(b)));
-
-        // In compare_values, Float(NaN) vs Int(x) uses
-        // safe_compare_int_float(x, NaN).reverse() = Greater.reverse() = Less,
-        // meaning Float(NaN) < Int(x) → NaN sorts FIRST in ascending order.
+    fn get_system_time_non_variable_arg_rejected_at_runtime() {
+        // Defense in depth: even if an `Expr::FunctionCall` for
+        // get_system_time were constructed directly (bypassing the parser's
+        // own bare-identifier restriction — e.g. from a future code path,
+        // or a test), the evaluator itself must still reject a target that
+        // isn't a bare Symbol fixed at construction time. This is exactly
+        // the shape the pre-fix code accepted: an expression (here a
+        // literal, but conceptually `$form.x`) evaluated at runtime to pick
+        // the write target.
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![Expr::Literal(Value::String(Arc::from("evil_target")))];
+        let err = eval_builtin(&mut store, "get_system_time", args).unwrap_err();
         assert!(
-            matches!(values.first(), Some(Value::Float(x)) if x.is_nan()),
-            "NaN must sort first in a mixed Int/Float list: {values:?}"
+            matches!(err, MizuError::ExecutionError(_)),
+            "expected ExecutionError for a non-bare-identifier target, got: {err:?}"
         );
-
-        // -11 must come before -10.5 (since -11 < -10.5).
-        let pos_11 = values
-            .iter()
-            .position(|v| matches!(v, Value::Int(-11)))
-            .unwrap();
-        let pos_10_5 = values
-            .iter()
-            .position(|v| matches!(v, Value::Float(x) if *x == -10.5))
-            .unwrap();
         assert!(
-            pos_11 < pos_10_5,
-            "Int(-11) must precede Float(-10.5): {values:?}"
+            store.state_machine.accumulated_actions.is_empty(),
+            "a rejected target must not queue a GetSystemTime action"
+        );
+    }
+
+    #[test]
+    fn get_system_time_computed_variable_target_rejected_at_runtime() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let comp_sym = store.interner.get_or_intern("derived");
+        store.state_machine.computed_var_syms.insert(comp_sym);
+        let args = vec![Expr::Variable(comp_sym)];
+        let err = eval_builtin(&mut store, "get_system_time", args).unwrap_err();
+        assert!(
+            matches!(err, MizuError::ExecutionError(_)),
+            "expected ExecutionError when targeting a computed variable, got: {err:?}"
         );
     }
 
@@ -2603,23 +2416,23 @@ mod tests {
         // Before the fix, heterogeneous pairs collapsed to Equal, violating
         // transitivity and causing undefined sort behaviour.
         let mut items = vec![
-            // score: String("hello")  — variant weight 5
+            // score: String("hello")  — variant weight 4
             {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("score"), Value::String(Arc::from("hello")));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("score"), Value::String(Arc::from("hello"))));
+                Value::Record(Arc::from(m))
             },
             // score: Int(10)  — variant weight 3
             {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("score"), Value::Int(10));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("score"), Value::Int(10)));
+                Value::Record(Arc::from(m))
             },
             // score: Int(1)  — variant weight 3, lower numeric value
             {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("score"), Value::Int(1));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("score"), Value::Int(1)));
+                Value::Record(Arc::from(m))
             },
         ];
 
@@ -2627,19 +2440,17 @@ mod tests {
         items.sort_by(|a, b| compare_values(field_value(a, "score"), field_value(b, "score")));
 
         // Expected: Int(1) < Int(10) < String("hello")
-        // (all Ints have weight 3 < String weight 5; within Ints, 1 < 10)
+        // (all Ints have weight 3 < String weight 4; within Ints, 1 < 10)
         let scores: Vec<String> = items
             .iter()
             .map(|item| {
-                if let Value::Record(m) = item {
-                    match m.get("score") {
-                        Some(Value::Int(n)) => n.to_string(),
-                        Some(Value::String(s)) => s.to_string(),
+                item.get_field("score")
+                    .map(|v| match v {
+                        Value::Int(n) => n.to_string(),
+                        Value::String(s) => s.to_string(),
                         _ => "?".to_string(),
-                    }
-                } else {
-                    panic!("expected Record")
-                }
+                    })
+                    .unwrap_or_else(|| "?".to_string())
             })
             .collect();
 
@@ -2652,18 +2463,17 @@ mod tests {
 
     #[test]
     fn test_variant_weight_ordering() {
-        // None < Null < Bool < Int < Float < String < List < Record
+        // None < Null < Bool < Int < String < List < Record
         assert!(variant_weight(&Value::Null) < variant_weight(&Value::Bool(true)));
         assert!(variant_weight(&Value::Bool(true)) < variant_weight(&Value::Int(0)));
-        assert!(variant_weight(&Value::Int(0)) < variant_weight(&Value::Float(0.0)));
-        assert!(variant_weight(&Value::Float(0.0)) < variant_weight(&Value::String(Arc::from(""))));
+        assert!(variant_weight(&Value::Int(0)) < variant_weight(&Value::String(Arc::from(""))));
         assert!(
             variant_weight(&Value::String(Arc::from("")))
                 < variant_weight(&Value::List(Arc::new(vec![])))
         );
         assert!(
             variant_weight(&Value::List(Arc::new(vec![])))
-                < variant_weight(&Value::Record(Arc::new(BTreeMap::new())))
+                < variant_weight(&Value::Record(Arc::from(Vec::new())))
         );
     }
 
@@ -2731,6 +2541,284 @@ mod tests {
             .expect("depth-guard test thread must not panic");
     }
 
+    /// Cross-function composition of `MAX_EVAL_DEPTH`.
+    ///
+    /// [`crate::parser::logic::MAX_PARSE_DEPTH`] (256) bounds nesting depth
+    /// **per expression tree parsed in isolation** — a function body is one
+    /// such tree, and the expression at a call site is another. Nothing at
+    /// parse time prevents a ~250-level-deep function body from being
+    /// invoked from within a call-site expression that is itself nested
+    /// several levels deep, which would compose to a total `evaluate()`
+    /// recursion depth exceeding 256 even though neither individual tree
+    /// violates `MAX_PARSE_DEPTH`.
+    ///
+    /// This test builds exactly that scenario directly on the AST (bypassing
+    /// the parser, as `eval_depth_guard` above does) and checks that
+    /// `eval_depth` — which is a single running counter on `StateMachine`,
+    /// never reset at a function-call boundary (only `local_stack` is
+    /// truncated there, see the `Expr::FunctionCall` arm of `evaluate_impl`)
+    /// — still fires cleanly.
+    ///
+    /// Unlike `eval_depth_guard`, this test deliberately does **not** run on
+    /// an arbitrarily-generous stack. Production's `LogicWorker`
+    /// (`parser::logic_worker::LogicWorker::spawn`) evaluates on a thread
+    /// started with an explicit
+    /// [`crate::parser::logic_worker::LogicWorker::STACK_SIZE_BYTES`]-sized
+    /// stack (16 MiB) — so this test re-execs the test binary as a child
+    /// process and runs the scenario on a thread built with that exact same
+    /// constant, to determine whether the depth guard reliably wins the race
+    /// against native stack exhaustion under the conditions production
+    /// actually runs under, rather than under the artificially generous
+    /// conditions of `eval_depth_guard`. A real native stack overflow aborts
+    /// the process (it cannot be caught with `catch_unwind`), so this has to
+    /// be observed from a parent process inspecting the child's exit status.
+    #[test]
+    fn cross_function_composition_depth_guard() {
+        const CHILD_ENV: &str = "MIZU_DEPTH_COMPOSITION_CHILD";
+        const OK_MARKER: &str = "DEPTH_GUARD_FIRED_CLEANLY";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_cross_function_composition_child(OK_MARKER);
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = std::process::Command::new(exe)
+            .arg("core::types::tests::cross_function_composition_depth_guard")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("failed to spawn child test process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success() && stdout.contains(OK_MARKER),
+            "cross-function eval_depth composition did not cleanly hit the \
+             MAX_EVAL_DEPTH guard on a default-size thread (status={:?}). \
+             This may indicate a native stack overflow occurring before the \
+             eval_depth check can intervene, which would be a SEPARATE, \
+             more serious finding than a missing guard.\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
+            output.status, stdout, stderr
+        );
+    }
+
+    /// Runs the actual cross-function composition scenario on a thread built
+    /// with the same `stack_size` production's `LogicWorker::spawn` uses
+    /// ([`crate::parser::logic_worker::LogicWorker::STACK_SIZE_BYTES`]), and
+    /// prints `ok_marker` iff `evaluate` returned the expected
+    /// `MAX_EVAL_DEPTH` error rather than panicking, hanging, or (silently,
+    /// from this process's point of view) crashing.
+    fn run_cross_function_composition_child(ok_marker: &'static str) {
+        use crate::parser::logic_worker::LogicWorker;
+        use rustc_hash::FxHashMap;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(LogicWorker::STACK_SIZE_BYTES)
+            .spawn(move || run_cross_function_composition_scenario(ok_marker))
+            .expect("thread spawn must succeed");
+
+        handle.join().expect("composition scenario thread must not panic");
+    }
+
+    /// The actual cross-function composition scenario, run on whatever
+    /// thread `run_cross_function_composition_child` builds.
+    fn run_cross_function_composition_scenario(ok_marker: &str) {
+        use crate::parser::logic::{BinOp, Expr, MizuFunction};
+        use rustc_hash::FxHashMap;
+
+        let mut store = VariableStore::new();
+        let param = store.interner.get_or_intern("x");
+        let func_sym = store.interner.get_or_intern("deeply_nested_fn");
+
+        // Function body: ~250 levels of BinaryOp nesting -- representative
+        // of the deepest single expression tree the parser will accept
+        // under MAX_PARSE_DEPTH (256) for a function body parsed on its own.
+        let mut body = Expr::Variable(param);
+        for _ in 0..250 {
+            body = Expr::BinaryOp {
+                left: Box::new(body),
+                op: BinOp::Add,
+                right: Box::new(Expr::Literal(Value::Int(0))),
+            };
+        }
+        let func = MizuFunction {
+            params: vec![(param, None)],
+            body,
+        };
+        let mut functions = FxHashMap::default();
+        functions.insert(func_sym, func);
+
+        // Call-site expression: another ~20 levels of nesting -- itself
+        // comfortably under MAX_PARSE_DEPTH on its own -- wrapping a call
+        // to the function above. Neither tree alone violates
+        // MAX_PARSE_DEPTH, but composed at evaluation time they exceed
+        // MAX_EVAL_DEPTH (256).
+        let mut call_site = Expr::FunctionCall {
+            name: func_sym,
+            args: vec![Expr::Literal(Value::Int(1))],
+        };
+        for _ in 0..20 {
+            call_site = Expr::BinaryOp {
+                left: Box::new(call_site),
+                op: BinOp::Add,
+                right: Box::new(Expr::Literal(Value::Int(0))),
+            };
+        }
+
+        store.state_machine.instruction_count = 0;
+        store.state_machine.eval_depth = 0;
+
+        let result = store
+            .state_machine
+            .evaluate(&call_site, 0, &functions, &store.interner);
+
+        match result {
+            Err(MizuError::ExecutionError(msg)) if msg.contains("nesting too deep") => {
+                println!("{ok_marker}");
+            }
+            // Also acceptable: the instruction budget could in principle be
+            // exhausted first depending on constant tuning: still a clean,
+            // bounded error, not a crash.
+            Err(MizuError::Timeout) => {
+                println!("{ok_marker}");
+            }
+            other => {
+                println!("UNEXPECTED_RESULT: {other:?}");
+            }
+        }
+    }
+
+    /// Measures the real native stack depth required to run a `evaluate()`
+    /// chain deep enough to trip `MAX_EVAL_DEPTH` (256), in whichever profile
+    /// the test binary was built under (debug or `--release`).
+    ///
+    /// The comment on `eval_depth_guard` above only established that debug
+    /// frames are "several KB" each; it never quantified the release-mode
+    /// case, where `evaluate`/`evaluate_impl` frames are dramatically
+    /// smaller after inlining and optimization. Production's `LogicWorker`
+    /// (`parser::logic_worker::LogicWorker::spawn`) always runs in whatever
+    /// profile the binary was built under, so a release-only guess is not
+    /// good enough either — this test probes a fixed ladder of candidate
+    /// stack sizes and, for each, re-execs this same test binary (a real
+    /// native stack overflow aborts the process and cannot be caught with
+    /// `catch_unwind`, so it must be observed from a parent process) to run
+    /// the same 300-level chain used by `cross_function_composition_depth_guard`
+    /// on a thread built with exactly that `stack_size`. The smallest
+    /// candidate that survives is the empirical per-profile floor.
+    ///
+    /// This is a manual measurement tool, not a correctness gate — it is
+    /// `#[ignore]`d so normal `cargo test` runs stay fast. Run it directly to
+    /// reproduce the numbers documented next to `LogicWorker::spawn` and in
+    /// `walkthrough.md`:
+    ///   `cargo test --release --lib core::types::tests::measure_stack_usage_at_max_eval_depth -- --ignored --nocapture`
+    ///   `cargo test          --lib core::types::tests::measure_stack_usage_at_max_eval_depth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_stack_usage_at_max_eval_depth() {
+        const STACK_ENV: &str = "MIZU_STACK_MEASURE_BYTES";
+        const OK_MARKER: &str = "STACK_MEASURE_OK";
+
+        if let Some(bytes) = std::env::var_os(STACK_ENV) {
+            let stack_size: usize = bytes
+                .to_str()
+                .expect("env var must be UTF-8")
+                .parse()
+                .expect("env var must be a valid usize");
+            run_stack_measurement_child(stack_size, OK_MARKER);
+            return;
+        }
+
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+
+        let exe = std::env::current_exe().expect("current_exe");
+        // Doubling ladder from 16 KiB up to 4 MiB covers everywhere a
+        // per-frame estimate in the tens-of-KB-to-single-KB range could land,
+        // for both debug and release.
+        let candidates: &[usize] = &[
+            16 * 1024,
+            32 * 1024,
+            64 * 1024,
+            128 * 1024,
+            256 * 1024,
+            512 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ];
+
+        let mut smallest_safe: Option<usize> = None;
+        for &size in candidates {
+            let output = std::process::Command::new(&exe)
+                .arg("core::types::tests::measure_stack_usage_at_max_eval_depth")
+                .arg("--exact")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .arg("--ignored")
+                .env(STACK_ENV, size.to_string())
+                .output()
+                .expect("failed to spawn measurement child process");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let safe = output.status.success() && stdout.contains(OK_MARKER);
+            println!(
+                "[{profile}] stack_size={size} bytes ({:.1} KiB) -> {}",
+                size as f64 / 1024.0,
+                if safe { "survived" } else { "CRASHED" }
+            );
+            if safe && smallest_safe.is_none() {
+                smallest_safe = Some(size);
+            }
+        }
+
+        println!(
+            "[{profile}] RESULT: smallest tested stack_size that survives a \
+             300-level eval_depth chain (exceeds MAX_EVAL_DEPTH=256) = {:?}",
+            smallest_safe
+        );
+    }
+
+    /// Runs the actual 300-level `evaluate()` chain — identical in shape to
+    /// `eval_depth_guard` and `cross_function_composition_depth_guard` — on a
+    /// thread built with exactly `stack_size` bytes, and prints `ok_marker`
+    /// iff it completes without a native stack overflow (regardless of
+    /// whether the result is the depth-guard error or a timeout — both are
+    /// controlled, non-crashing outcomes).
+    fn run_stack_measurement_child(stack_size: usize, ok_marker: &str) {
+        use crate::parser::logic::{BinOp, Expr};
+        use rustc_hash::FxHashMap;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn(|| {
+                let mut ast = Expr::Literal(Value::Int(0));
+                for _ in 0..300 {
+                    ast = Expr::BinaryOp {
+                        left: Box::new(ast),
+                        op: BinOp::Add,
+                        right: Box::new(Expr::Literal(Value::Int(0))),
+                    };
+                }
+
+                let mut store = VariableStore::new();
+                store.state_machine.instruction_count = 0;
+                store.state_machine.eval_depth = 0;
+                let fns = FxHashMap::default();
+
+                let _ = store.state_machine.evaluate(&ast, 0, &fns, &store.interner);
+            })
+            .expect("thread spawn must succeed");
+
+        handle.join().expect("measurement thread must not panic");
+        println!("{ok_marker}");
+    }
 
     #[test]
     fn interpolate_deep_dot_path() {
@@ -2738,11 +2826,11 @@ mod tests {
         let mut store = VariableStore::new();
 
         // Build: a = { b: { c: "value" } }
-        let mut inner: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        inner.insert(Arc::from("c"), Value::String(Arc::from("value")));
-        let mut outer: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        outer.insert(Arc::from("b"), Value::Record(Arc::new(inner)));
-        store.set("a", Value::Record(Arc::new(outer)));
+        let mut inner: Vec<(Arc<str>, Value)> = Vec::new();
+        inner.push((Arc::from("c"), Value::String(Arc::from("value"))));
+        let mut outer: Vec<(Arc<str>, Value)> = Vec::new();
+        outer.push((Arc::from("b"), Value::Record(Arc::from(inner))));
+        store.set("a", Value::Record(Arc::from(outer)));
 
         let result = store
             .interpolate("{a.b.c}")
@@ -2758,9 +2846,9 @@ mod tests {
         // {a.b.c} where `b` is a String, not a Record — must fall back to literal.
         let mut store = VariableStore::new();
 
-        let mut outer: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        outer.insert(Arc::from("b"), Value::String(Arc::from("not_a_record")));
-        store.set("a", Value::Record(Arc::new(outer)));
+        let mut outer: Vec<(Arc<str>, Value)> = Vec::new();
+        outer.push((Arc::from("b"), Value::String(Arc::from("not_a_record"))));
+        store.set("a", Value::Record(Arc::from(outer)));
 
         let result = store
             .interpolate("{a.b.c}")
@@ -2788,7 +2876,12 @@ mod tests {
     }
 
     #[test]
-    fn frozen_interner_new_symbol_refused() {
+    fn frozen_interner_new_symbol_is_still_real_and_resolvable() {
+        // `get_or_intern` never returns a dummy/sentinel Symbol: even when
+        // called post-freeze (a caller bug, since the resulting Symbol only
+        // has meaning on this thread's copy of the table — see the
+        // type-level docs), it must intern the name for real rather than
+        // silently corrupting the caller with an unresolvable placeholder.
         let mut interner = StringInterner::new();
         interner.get_or_intern("existing");
         interner.freeze();
@@ -2797,15 +2890,17 @@ mod tests {
         let old_vec_len = interner.vec.len();
 
         let sym = interner.get_or_intern("runtime-added");
-        
-        // Assert that the internal maps/vecs did not grow
-        assert_eq!(interner.map.len(), old_map_len);
-        assert_eq!(interner.vec.len(), old_vec_len);
-        
-        // Assert fallback symbol is returned
-        assert_eq!(sym, Symbol(u32::MAX));
-        assert_eq!(interner.resolve(sym), None);
-        assert_eq!(interner.get("runtime-added"), None);
+
+        // The table did grow by exactly one entry.
+        assert_eq!(interner.map.len(), old_map_len + 1);
+        assert_eq!(interner.vec.len(), old_vec_len + 1);
+
+        // The returned symbol is real: it resolves back to the name and is
+        // found by both `get` and a subsequent `get_or_intern`.
+        assert_ne!(sym, Symbol(u32::MAX), "no sentinel/dummy Symbol must ever be returned");
+        assert_eq!(interner.resolve(sym), Some("runtime-added"));
+        assert_eq!(interner.get("runtime-added"), Some(sym));
+        assert_eq!(interner.get_or_intern("runtime-added"), sym);
     }
 
     /// M1 fix: clone must preserve `frozen = true` so that the logic worker's
@@ -2909,25 +3004,25 @@ mod tests {
     #[test]
     fn compare_records_equal_content() {
         use std::cmp::Ordering;
-        let mut ma: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        ma.insert(Arc::from("x"), Value::Int(1));
-        let mut mb: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        mb.insert(Arc::from("x"), Value::Int(1));
-        let a = Value::Record(Arc::new(ma));
-        let b = Value::Record(Arc::new(mb));
+        let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
+        ma.push((Arc::from("x"), Value::Int(1)));
+        let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
+        mb.push((Arc::from("x"), Value::Int(1)));
+        let a = Value::Record(Arc::from(ma));
+        let b = Value::Record(Arc::from(mb));
         assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Equal);
     }
 
     #[test]
-    fn compare_records_by_value_same_keys() {
+    fn compare_records_same_keys() {
         use std::cmp::Ordering;
-        // Both records have key "x"; the one with Int(2) sorts after Int(1).
-        let mut ma: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        ma.insert(Arc::from("x"), Value::Int(1));
-        let mut mb: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        mb.insert(Arc::from("x"), Value::Int(2));
-        let a = Value::Record(Arc::new(ma));
-        let b = Value::Record(Arc::new(mb));
+        // { x: 1 } < { x: 2 }
+        let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
+        ma.push((Arc::from("x"), Value::Int(1)));
+        let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
+        mb.push((Arc::from("x"), Value::Int(2)));
+        let a = Value::Record(Arc::from(ma));
+        let b = Value::Record(Arc::from(mb));
         assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
         assert_eq!(compare_values(Some(&b), Some(&a)), Ordering::Greater);
     }
@@ -2936,12 +3031,12 @@ mod tests {
     fn compare_records_by_key_name() {
         use std::cmp::Ordering;
         // { a: 1 } < { b: 1 } because "a" < "b"
-        let mut ma: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        ma.insert(Arc::from("a"), Value::Int(1));
-        let mut mb: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        mb.insert(Arc::from("b"), Value::Int(1));
-        let a = Value::Record(Arc::new(ma));
-        let b = Value::Record(Arc::new(mb));
+        let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
+        ma.push((Arc::from("a"), Value::Int(1)));
+        let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
+        mb.push((Arc::from("b"), Value::Int(1)));
+        let a = Value::Record(Arc::from(ma));
+        let b = Value::Record(Arc::from(mb));
         assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
     }
 
@@ -2949,13 +3044,13 @@ mod tests {
     fn compare_records_shorter_less_than_longer() {
         use std::cmp::Ordering;
         // { x: 1 } < { x: 1, y: 2 } (same keys up to len, shorter is Less)
-        let mut ma: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        ma.insert(Arc::from("x"), Value::Int(1));
-        let mut mb: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-        mb.insert(Arc::from("x"), Value::Int(1));
-        mb.insert(Arc::from("y"), Value::Int(2));
-        let a = Value::Record(Arc::new(ma));
-        let b = Value::Record(Arc::new(mb));
+        let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
+        ma.push((Arc::from("x"), Value::Int(1)));
+        let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
+        mb.push((Arc::from("x"), Value::Int(1)));
+        mb.push((Arc::from("y"), Value::Int(2)));
+        let a = Value::Record(Arc::from(ma));
+        let b = Value::Record(Arc::from(mb));
         assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
         assert_eq!(compare_values(Some(&b), Some(&a)), Ordering::Greater);
     }
@@ -2968,9 +3063,9 @@ mod tests {
         let mut records: Vec<Value> = (0..4_i64)
             .rev()
             .map(|i| {
-                let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
-                m.insert(Arc::from("v"), Value::Int(i));
-                Value::Record(Arc::new(m))
+                let mut m: Vec<(Arc<str>, Value)> = Vec::new();
+                m.push((Arc::from("v"), Value::Int(i)));
+                Value::Record(Arc::from(m))
             })
             .collect();
         // compare_values on two Records now compares keys then values.
@@ -2978,8 +3073,8 @@ mod tests {
         let vals: Vec<i64> = records
             .iter()
             .map(|r| {
-                if let Value::Record(m) = r {
-                    if let Some(Value::Int(n)) = m.get("v") { *n } else { panic!() }
+                if let Some(&Value::Int(n)) = r.get_field("v") {
+                    n
                 } else {
                     panic!()
                 }
@@ -3008,11 +3103,12 @@ mod tests {
         // to verify that BTreeMap's sorted iterator is key-order, not
         // insertion-order.
         let make = |a: i64, b: i64| {
-            let mut m: BTreeMap<Arc<str>, Value> = BTreeMap::new();
+            let mut m: Vec<(Arc<str>, Value)> = Vec::new();
             // Insert in reverse alphabetical order — BTreeMap must still iterate "alpha" first.
-            m.insert(Arc::from("zeta"), Value::Int(b));
-            m.insert(Arc::from("alpha"), Value::Int(a));
-            Value::Record(Arc::new(m))
+            m.push((Arc::from("zeta"), Value::Int(b)));
+            m.push((Arc::from("alpha"), Value::Int(a)));
+            m.sort_by(|x, y| x.0.cmp(&y.0));
+            Value::Record(Arc::from(m))
         };
 
         let r1 = make(1, 10); // { alpha:1, zeta:10 }
@@ -3031,8 +3127,8 @@ mod tests {
         let alpha_vals: Vec<i64> = records
             .iter()
             .map(|r| {
-                if let Value::Record(m) = r {
-                    if let Some(Value::Int(n)) = m.get("alpha") { *n } else { panic!() }
+                if let Some(&Value::Int(n)) = r.get_field("alpha") {
+                    n
                 } else {
                     panic!()
                 }

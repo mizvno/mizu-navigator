@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use crate::core::errors::MizuError;
 use crate::core::types::{Value, VariableStore};
@@ -19,6 +19,14 @@ use taffy::{
 /// rather than from the stale single-template node.
 pub type EachIterationOverrides = HashMap<EgoNodeId, taffy::prelude::NodeId>;
 
+/// Global budget for synthetic layout nodes (L1 invariant).
+///
+/// L1 — No unmetered work proportional to remote data. Any subsystem that
+/// performs O(data) allocation or CPU work must draw from an explicit,
+/// named budget. This constant sits at the same order as MAX_INSTRUCTIONS
+/// so the expression cliff and the layout cliff coincide.
+pub const MAX_SYNTHETIC_LAYOUT_NODES: usize = 20_000;
+
 /// One entry per list element: `(row_container_taffy_id, override_map)`.
 pub type EachGroupEntries = Vec<(taffy::prelude::NodeId, EachIterationOverrides)>;
 
@@ -36,6 +44,8 @@ pub struct EachExpansion {
     /// Every synthetic Taffy node created, collected for bulk removal on the
     /// next call (prevents arena growth on each frame).
     pub all_synthetic_ids: Vec<taffy::prelude::NodeId>,
+    /// Number of hidden list items per `Each` node due to budget truncation.
+    pub truncated: HashMap<EgoNodeId, usize>,
 }
 
 
@@ -69,6 +79,7 @@ pub fn expand_each_nodes(
 
     // ── Step 2: build the new expansion ───────────────────────────────────
     let mut expansion = EachExpansion::default();
+    let mut remaining_budget = MAX_SYNTHETIC_LAYOUT_NODES;
 
     // Collect Each-node metadata without holding tree borrows.
     let each_nodes: Vec<(EgoNodeId, String)> = dom
@@ -107,6 +118,20 @@ pub fn expand_each_nodes(
             continue;
         }
 
+        let mut template_size = 0;
+        for &tmpl_dom_id in &template_dom_children {
+            template_size += count_dom_subtree_size(dom, tmpl_dom_id);
+        }
+        
+        let budget_per_row = template_size + 1; // +1 for the row container
+        let max_rows = remaining_budget / budget_per_row;
+        let clamped_n = n.min(max_rows);
+
+        if clamped_n < n {
+            expansion.truncated.insert(each_dom_id, n - clamped_n);
+        }
+        remaining_budget -= clamped_n * budget_per_row;
+
         // Save the original Taffy children for restoration next frame.
         let orig_taffy_children: Vec<taffy::prelude::NodeId> = template_dom_children
             .iter()
@@ -117,9 +142,9 @@ pub fn expand_each_nodes(
             .insert(each_dom_id, orig_taffy_children);
 
         // Build N iteration groups, each containing a clone of the template subtree.
-        let mut groups: EachGroupEntries = Vec::with_capacity(n);
+        let mut groups: EachGroupEntries = Vec::with_capacity(clamped_n);
 
-        for _ in 0..n {
+        for _ in 0..clamped_n {
             let mut overrides: EachIterationOverrides = HashMap::new();
             let mut row_children: Vec<taffy::prelude::NodeId> = Vec::new();
 
@@ -168,6 +193,17 @@ pub fn expand_each_nodes(
     }
 
     Ok(expansion)
+}
+
+/// Helper to count the total nodes in a DOM subtree.
+fn count_dom_subtree_size(dom: &Tree<MizuNode>, root: EgoNodeId) -> usize {
+    let mut count = 1;
+    if let Some(node) = dom.get(root) {
+        for child in node.children() {
+            count += count_dom_subtree_size(dom, child.id());
+        }
+    }
+    count
 }
 
 /// Recursively clones the Taffy style-tree rooted at `dom_node` into fresh
@@ -435,4 +471,83 @@ pub fn build_taffy_tree(
 
     node_to_taffy_id.insert(node.id(), taffy_id);
     Ok(taffy_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{Value, VariableStore, StringInterner};
+    use crate::parser::layout::parse_layout;
+    use std::sync::Arc;
+
+    fn setup_test_store(items: Vec<Value>) -> VariableStore {
+        let interner = StringInterner::new();
+        let mut store = VariableStore::with_interner(interner);
+        store.set("items", Value::List(Arc::new(items)));
+        store
+    }
+
+    #[test]
+    fn each_small_list_unaffected_by_budget() {
+        let mut interner = StringInterner::new();
+        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let store = setup_test_store(vec![Value::Bool(true); 5]);
+        let mut taffy = TaffyTree::new();
+        let mut node_to_taffy = HashMap::new();
+        for node in dom.nodes() {
+            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+        }
+        
+        let prev = EachExpansion::default();
+        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev).unwrap();
+        
+        assert!(expansion.truncated.is_empty(), "Small list should not be truncated");
+        let each_node = dom.root().children().next().unwrap().id();
+        assert_eq!(expansion.groups.get(&each_node).unwrap().len(), 5);
+    }
+    
+    #[test]
+    fn each_huge_list_clamped_to_budget() {
+        let mut interner = StringInterner::new();
+        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let store = setup_test_store(vec![Value::Bool(true); MAX_SYNTHETIC_LAYOUT_NODES + 100]);
+        let mut taffy = TaffyTree::new();
+        let mut node_to_taffy = HashMap::new();
+        for node in dom.nodes() {
+            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+        }
+        
+        let prev = EachExpansion::default();
+        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev).unwrap();
+        
+        let each_node = dom.root().children().next().unwrap().id();
+        let truncated = expansion.truncated.get(&each_node).copied().unwrap_or(0);
+        assert!(truncated > 0, "Huge list must be truncated");
+        assert_eq!(expansion.groups.get(&each_node).unwrap().len() + truncated, MAX_SYNTHETIC_LAYOUT_NODES + 100);
+    }
+
+    #[test]
+    fn repeated_expansion_no_arena_growth() {
+        let mut interner = StringInterner::new();
+        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let store = setup_test_store(vec![Value::Bool(true); 10]);
+        let mut taffy = TaffyTree::new();
+        let mut node_to_taffy = HashMap::new();
+        for node in dom.nodes() {
+            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+        }
+        
+        let mut expansion = EachExpansion::default();
+        let mut base_node_count = 0;
+        
+        for i in 0..5 {
+            expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &expansion).unwrap();
+            let total_nodes = taffy.total_node_count();
+            if i == 0 {
+                base_node_count = total_nodes;
+            } else {
+                assert_eq!(total_nodes, base_node_count, "Taffy arena should not grow across repeated expansions");
+            }
+        }
+    }
 }

@@ -34,8 +34,8 @@
 //!   primitives — that is the responsibility of Phase 3+ parsers.
 //! * It does **not** validate the *content* of the injected blocks (e.g.,
 //!   whether a `.mlg` file contains syntactically valid Mizu functions).
-//! * It does **not** track multi-line `"""` markdown fences at this stage;
-//!   those are a layout-parser concern.
+//! * It does **not** interpret multi-line `"""` blocks; the layout parser owns
+//!   all block-level structure.
 
 #![forbid(unsafe_code)]
 
