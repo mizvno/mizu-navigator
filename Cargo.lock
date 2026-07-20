@@ -1452,6 +1452,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2069,6 +2078,7 @@ dependencies = [
  "h3-quinn",
  "hex",
  "hickory-resolver",
+ "hkdf",
  "hmac",
  "http",
  "icu_segmenter",
@@ -2078,6 +2088,7 @@ dependencies = [
  "parley",
  "pollster",
  "quinn",
+ "redb",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
  "serde",
@@ -2089,10 +2100,12 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "vello",
  "webpki-roots 1.0.8",
  "wgpu",
  "winit",
+ "zeroize",
 ]
 
 [[package]]
@@ -2908,6 +2921,15 @@ checksum = "c4ed38b89c2c77ff968c524145ad65fb010f38af5c7a224b53b81d47ac2daa81"
 dependencies = [
  "bytemuck",
  "font-types 0.11.3",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

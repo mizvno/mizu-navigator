@@ -1,4 +1,5 @@
 ﻿use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use quinn::Endpoint;
 
@@ -27,345 +28,219 @@ type H3Client = Arc<tokio::sync::Mutex<H3Sender>>;
 pub(crate) const MIZU_ALPN: &[u8] = b"mizu/3";
 
 
-/// A storage mutation command forwarded from the network dispatch loop to the
-/// dedicated storage actor thread.
-///
-/// Keeping this type separate from [`NetworkCmd`] means the actor's API surface
-/// is minimal: it only ever sees domain/key/value triples, never QUIC state.
-pub(crate) struct StorageCmd {
-    pub(crate) domain: String,
-    pub(crate) key: String,
-    pub(crate) value: crate::core::types::Value,
-}
-
 // ---------------------------------------------------------------------------
-// Storage Actor: Write-Behind Cache with Debouncing
+// Storage dispatch: debounced, per-domain batched redb writes (RM-12)
 //
-// ## Motivation
+// `NetworkCmd::StorageStore` commands are no longer written straight through
+// to `crate::core::storage::StoragePool` one record (one `redb` write
+// transaction) at a time. Instead they are queued in a
+// [`StorageWriteDebouncer`]: commands for the same domain arriving within
+// `STORAGE_DEBOUNCE_WINDOW` are coalesced (last-write-wins per key) and
+// committed together via `StorageEngine::write_batch` in a *single* `redb`
+// write transaction — instead of one transaction (and, absent a `Durability`
+// override in `open_db`, likely one `fsync`) per key. A domain that
+// accumulates `STORAGE_BATCH_MAX_KEYS` distinct keys before the window
+// elapses is flushed immediately rather than continuing to buffer, bounding
+// both memory and worst-case write latency under sustained writes (e.g.
+// `store_local` called once per keystroke or per animation frame).
 //
-// Writing the full encrypted JSON map on *every* `StorageCmd` causes O(N) I/O
-// for N rapid mutations to the same domain (e.g. 50 keystrokes each triggering
-// `localStorage.set`).  The final state only needed one write, but we paid for
-// 50 full encrypt-then-write cycles — O(N²) cumulative write-amplification that
-// stresses flash storage and degrades SSD longevity.
+// DURABILITY TRADEOFF — read before touching this: a write queued by the
+// debouncer is only guaranteed durable once its batch's `redb` transaction
+// commits, up to `STORAGE_DEBOUNCE_WINDOW` (or until `STORAGE_BATCH_MAX_KEYS`
+// is reached) after the document's `store_local(key, value)` call returns
+// control to the evaluator. If the process terminates abnormally (crash,
+// `kill -9`, power loss) inside that window, the write is lost even though
+// `store_local` already "completed" from the document's perspective. This is
+// an accepted, explicit tradeoff for this runtime:
+//   * Mizu documents have no `read_local` (invariant S1, `SECURITY-INVARIANTS.md`)
+//     and therefore cannot observe whether a given write has landed — there is
+//     no *document-visible* correctness invariant this weakens, only the
+//     informal expectation that storage survives a clean-ish exit, and the
+//     window is short (low hundreds of ms) either way.
+//   * It does NOT apply to authentication tokens: `VaultEntry`
+//     (`network::vault`) never goes through `StoragePool`/`redb` at all — every
+//     `save()` writes straight to the OS keyring — so bearer tokens keep the
+//     pre-existing immediate-write guarantee unconditionally, unaffected by
+//     this change.
+//   * Any future caller that needs a guaranteed-immediate, non-debounced write
+//     to redb-backed local storage can call `StoragePool::write_record`
+//     directly (this file's own tests do exactly that) — it bypasses the
+//     debouncer entirely and remains a single, immediately-durable
+//     transaction, as documented on `write_record` itself.
 //
-// ## Current Design: Write-Behind Cache with Quiescence Debouncing
-//
-// The actor maintains an in-memory map of dirty-but-unflushed mutations per
-// domain.  A domain is only flushed after it has been quiescent (no new
-// mutations) for at least `STORAGE_DEBOUNCE` (500 ms).  A burst of 50 writes
-// within 100 ms coalesces to a single disk flush — O(1) I/O per burst,
-// regardless of burst size.
-//
-// On graceful shutdown (the channel sender is dropped), every pending domain is
-// flushed synchronously before the actor thread exits — zero data loss on
-// normal application exit.  Unexpected termination (SIGKILL, power loss) can
-// lose at most one debounce window of data.
-//
-// ## Trade-Off vs. Embedded Key-Value Store
-//
-// | Dimension          | Current (write-behind JSON)     | Future (redb / sled / SQLite)      |
-// |--------------------|---------------------------------|------------------------------------|
-// | Write cost         | O(map_size) per flush           | O(1) per key (WAL / append-only)  |
-// | Read cost          | O(1) cold read per domain       | O(log N) per key                   |
-// | Crash durability   | tmp-then-rename                 | WAL / COW B-tree                   |
-// | Memory overhead    | map in RAM while dirty          | kernel page cache                  |
-// | Code complexity    | ~130 LOC, zero external deps    | external crate + FFI audit         |
-//
-// Encryption constraint: AES-256-GCM operates on the entire plaintext at once.
-// Per-record encryption would need per-record nonces + AEAD tags (+28 B each)
-// and a key-derivation scheme (e.g. HKDF per-domain + per-key salt), breaking
-// the current "one keyring entry per domain" model.
-//
-// An embedded KV store with page-level cipher (SQLCipher, redb custom codec)
-// is viable but requires auditing for `unsafe` code, which is forbidden here.
-//
-// Recommendation: profile before migrating.  Adopt `redb` only when storage
-// becomes a measurable bottleneck, paired with HKDF-based per-record key
-// derivation to preserve the current threat model without C FFI.
+// Dispatching each flush via `tokio::task::spawn_blocking` keeps the keyring
+// IPC and filesystem I/O off both the UI thread and the async dispatch loop
+// below, exactly as before this change.
 // ---------------------------------------------------------------------------
 
-/// How long a domain must be mutation-free before its in-memory state is
-/// flushed to disk.  500 ms balances durability against write-amplification:
-/// low enough that normal navigation/form-submit commits within half a second,
-/// high enough that rapid key-repeat events coalesce to a single write.
-const STORAGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Debounce window for [`StorageWriteDebouncer`]: writes to the same domain
+/// arriving within this window of the first buffered (unflushed) write are
+/// batched into one `redb` transaction. Chosen from the middle of the
+/// 100–250ms range suggested for this kind of UI-driven debounce: long enough
+/// to coalesce a burst of per-keystroke/per-frame writes, short enough that
+/// the durability window above stays unnoticeable in practice.
+pub(crate) const STORAGE_DEBOUNCE_WINDOW: Duration = Duration::from_millis(150);
 
-/// Absolute maximum time a dirty domain entry may remain unflushed, regardless
-/// of how frequently new mutations arrive.  Bounds both RAM growth (the pending
-/// map never holds more than 3 s of mutations per domain) and durability
-/// exposure (at most 3 s of data can be lost on unexpected termination).
-///
-/// Without this ceiling, a continuous stream of sub-debounce mutations starves
-/// the flush indefinitely — write-behind never fires, RAM grows without bound.
-const STORAGE_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Maximum number of distinct keys buffered for one domain before a flush is
+/// forced immediately, regardless of how much of `STORAGE_DEBOUNCE_WINDOW`
+/// remains. Without this, a document writing continuously (a new key every
+/// frame, never repeating) would keep resetting into "still within the
+/// window" forever and accumulate unboundedly.
+pub(crate) const STORAGE_BATCH_MAX_KEYS: usize = 64;
 
-/// Initial retry delay after the first persistent flush failure.
+/// Batches [`NetworkCmd::StorageStore`] writes to the same domain that arrive
+/// within [`STORAGE_DEBOUNCE_WINDOW`] of each other into a single
+/// `StorageEngine::write_batch` transaction. See the "Storage dispatch" doc
+/// comment above for the durability tradeoff this introduces and why it is
+/// scoped to non-credential local storage only.
 ///
-/// On each subsequent consecutive failure the delay doubles, up to
-/// [`STORAGE_FLUSH_BACKOFF_MAX`], preventing a CPU-spinning busy-loop when
-/// the underlying storage is unavailable (read-only filesystem, disk full).
-const STORAGE_FLUSH_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Maximum retry delay cap for the flush exponential-backoff strategy.
-///
-/// After repeated failures the backoff stabilises at 30 s — aggressive enough
-/// to avoid log flooding while still retrying regularly so that data is
-/// flushed as soon as the underlying fault is cleared.
-const STORAGE_FLUSH_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Per-domain dirty state buffered by the storage actor.
-///
-/// An entry is created on the first mutation for a domain (initialised from the
-/// current on-disk baseline) and removed after a successful flush.
-struct DomainEntry {
-    /// Merged view: on-disk baseline loaded at first mutation + all in-session mutations.
-    data: std::collections::HashMap<String, crate::core::types::Value>,
-    /// Wall-clock instant of the most recent mutation for this domain.
-    last_mutation: std::time::Instant,
-    /// Wall-clock instant of the *first* unflushed mutation for this domain.
-    ///
-    /// Unlike `last_mutation` (which is reset on every write), this is set once
-    /// when the entry is created and is never updated — it anchors the
-    /// [`STORAGE_HARD_DEADLINE`] timer that forces a flush even under a
-    /// continuous stream of rapid mutations.
-    first_mutation: std::time::Instant,
-    /// Current exponential-backoff interval applied after a flush failure.
-    ///
-    /// Starts at [`STORAGE_FLUSH_BACKOFF_BASE`] on the first failure and doubles
-    /// on each subsequent consecutive failure until capped at
-    /// [`STORAGE_FLUSH_BACKOFF_MAX`].  Entries with no prior failure have this
-    /// initialised to `STORAGE_FLUSH_BACKOFF_BASE` so the first failure
-    /// immediately applies a sensible delay without a zero-duration edge case.
-    flush_backoff: std::time::Duration,
-    /// Earliest instant at which a flush retry is permitted.
-    ///
-    /// `None` means no active cooldown — the domain is eligible to flush
-    /// according to the normal quiescence / hard-deadline rules.
-    /// `Some(t)` means the last flush attempt failed; do not retry before `t`.
-    next_retry_at: Option<std::time::Instant>,
+/// One instance is shared (via `Clone`, which shares the inner `Arc`) across
+/// every `StorageStore` dispatch for the lifetime of the network thread.
+#[derive(Clone)]
+pub(crate) struct StorageWriteDebouncer {
+    /// Per-domain (keyed by `ValidatedDomain::as_str()`, the SHA-256 hex
+    /// digest) buffer of not-yet-flushed writes. `HashMap<key, value>` so
+    /// that repeated writes to the same key within one window collapse to
+    /// last-write-wins instead of encrypting/inserting each one individually
+    /// when the batch is eventually committed.
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, crate::core::types::Value>>>>,
+    window: Duration,
+    max_keys: usize,
 }
 
-/// Core storage actor loop with injectable I/O functions.
-///
-/// Separating I/O from the debounce/coalescing logic makes the behaviour fully
-/// testable without touching the OS keyring or filesystem.
-///
-/// * `read_domain(domain)` — called once per domain (lazy, on first mutation)
-///   to load the on-disk baseline before applying in-session mutations.
-/// * `flush_domain(domain, data)` — called when a domain's quiescence window
-///   expires, or unconditionally at graceful shutdown.
-fn run_storage_actor_inner(
-    rx: std::sync::mpsc::Receiver<StorageCmd>,
-    debounce: std::time::Duration,
-    read_domain: impl Fn(
-        &str,
-    ) -> Result<
-        std::collections::HashMap<String, crate::core::types::Value>,
-        MizuError,
-    >,
-    flush_domain: impl Fn(
-        &str,
-        &std::collections::HashMap<String, crate::core::types::Value>,
-    ) -> Result<(), MizuError>,
-) {
-    use std::collections::HashMap;
-    use std::sync::mpsc::RecvTimeoutError;
-    use std::time::{Duration, Instant};
+impl StorageWriteDebouncer {
+    pub(crate) fn new() -> Self {
+        Self::with_params(STORAGE_DEBOUNCE_WINDOW, STORAGE_BATCH_MAX_KEYS)
+    }
 
-    // Pending write-behind cache: only domains with unflushed mutations.
-    let mut pending: HashMap<String, DomainEntry> = HashMap::new();
+    /// Like [`Self::new`], but with explicit window/threshold — used by tests
+    /// that need short, deterministic timing instead of waiting out the
+    /// production window.
+    pub(crate) fn with_params(window: Duration, max_keys: usize) -> Self {
+        Self {
+            pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            window,
+            max_keys,
+        }
+    }
 
-    loop {
-        // Sleep until the next domain is eligible to flush, or a command arrives.
-        //
-        // When a domain is in its backoff cooldown (next_retry_at is Some and
-        // has not yet elapsed), the loop must sleep until that cooldown expires
-        // rather than the normal quiescence/hard-deadline duration.  This is
-        // what breaks the busy-loop: a failed domain contributes a large sleep
-        // time instead of `Duration::from_millis(1)`.
-        let timeout = {
-            let now = Instant::now();
-            pending
-                .values()
-                .map(|e| {
-                    // If a backoff cooldown is active, sleep until it expires.
-                    if let Some(retry_at) = e.next_retry_at
-                        && now < retry_at
-                    {
-                        return retry_at.saturating_duration_since(now);
-                    }
-                    let since_last = now.saturating_duration_since(e.last_mutation);
-                    let since_first = now.saturating_duration_since(e.first_mutation);
-                    if since_last >= debounce || since_first >= STORAGE_HARD_DEADLINE {
-                        Duration::from_millis(1) // overdue — wake immediately
-                    } else {
-                        // Wake at whichever deadline fires first.
-                        let quiescence_remaining = debounce.saturating_sub(since_last);
-                        let hard_remaining = STORAGE_HARD_DEADLINE.saturating_sub(since_first);
-                        quiescence_remaining.min(hard_remaining)
-                    }
-                })
-                .min()
-                .unwrap_or(Duration::from_secs(1)) // idle: park for 1 s
-        };
-
-        match rx.recv_timeout(timeout) {
-            Ok(cmd) => {
-                // Lazy-init: load on-disk baseline on first mutation for this domain
-                // so subsequent mutations merge with (rather than overwrite) prior data.
-                let entry = pending.entry(cmd.domain.clone()).or_insert_with(|| {
-                    let data = read_domain(&cmd.domain).unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            domain = %cmd.domain,
-                            "storage actor: initial read failed; domain starts fresh"
-                        );
-                        HashMap::new()
-                    });
-                    let now = Instant::now();
-                    DomainEntry {
-                        data,
-                        last_mutation: now,
-                        first_mutation: now,
-                        flush_backoff: STORAGE_FLUSH_BACKOFF_BASE,
-                        next_retry_at: None,
-                    }
-                });
-                entry.data.insert(cmd.key, cmd.value);
-                entry.last_mutation = Instant::now();
-                // A new mutation clears any active backoff cooldown: fresh data
-                // deserves a fresh quiescence window, and the underlying I/O
-                // fault may have cleared between the last failure and now.
-                entry.next_retry_at = None;
-                entry.flush_backoff = STORAGE_FLUSH_BACKOFF_BASE;
+    /// Queues one `(key, value)` write for `domain`. Returns immediately —
+    /// the actual `redb` transaction happens later, on a spawned task, once
+    /// this domain's batch is flushed (by the debounce timer elapsing or by
+    /// hitting `max_keys`).
+    pub(crate) fn submit(
+        &self,
+        storage_pool: crate::core::storage::StoragePool,
+        domain: crate::core::storage::ValidatedDomain,
+        key: String,
+        value: crate::core::types::Value,
+    ) {
+        let domain_key = domain.as_str().to_string();
+        let mut should_spawn_timer = false;
+        let mut immediate_flush = None;
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = pending.entry(domain_key.clone()).or_default();
+            let was_empty = entry.is_empty();
+            entry.insert(key, value);
+            if entry.len() >= self.max_keys {
+                immediate_flush = Some(std::mem::take(entry));
+                pending.remove(&domain_key);
+            } else if was_empty {
+                should_spawn_timer = true;
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Graceful shutdown: flush every pending domain before exiting.
-                tracing::debug!(
-                    domains = pending.len(),
-                    "storage actor: channel closed, flushing all pending domains"
-                );
-                for (domain, entry) in &pending {
-                    if let Err(e) = flush_domain(domain, &entry.data) {
-                        tracing::warn!(
-                            error = %e,
-                            domain = %domain,
-                            "storage actor: shutdown flush failed"
-                        );
-                    }
-                }
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // Normal timer wakeup — fall through to the flush check below.
-            }
+            // else: batch already non-empty and below threshold — a timer
+            // from the first write into this batch is already scheduled and
+            // will pick up this write when it fires. No new timer needed.
         }
 
-        // Flush domains that are quiescent OR have exceeded the hard deadline,
-        // provided their backoff cooldown (if any) has also expired.
-        let now = Instant::now();
-        let ready: Vec<String> = pending
-            .iter()
-            .filter(|(_, e)| {
-                // Skip domains still within their backoff window.
-                if let Some(retry_at) = e.next_retry_at
-                    && now < retry_at
+        if let Some(records) = immediate_flush {
+            Self::spawn_flush(storage_pool, domain, records);
+        } else if should_spawn_timer {
+            let pending_arc = self.pending.clone();
+            let window = self.window;
+            tokio::spawn(async move {
+                tokio::time::sleep(window).await;
+                let records = {
+                    let mut pending = pending_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    pending.remove(&domain_key)
+                };
+                if let Some(records) = records
+                    && !records.is_empty()
                 {
-                    return false;
+                    Self::spawn_flush(storage_pool, domain, records);
                 }
-                let since_last = now.saturating_duration_since(e.last_mutation);
-                let since_first = now.saturating_duration_since(e.first_mutation);
-                since_last >= debounce || since_first >= STORAGE_HARD_DEADLINE
-            })
-            .map(|(d, _)| d.clone())
-            .collect();
-        for domain in ready {
-            if let Some(entry) = pending.remove(&domain)
-                && let Err(e) = flush_domain(&domain, &entry.data)
-            {
-                // Exponential backoff: use the current backoff interval as the
-                // next retry delay, then double it for the attempt after that.
-                // This prevents the CPU busy-loop that occurred when first_mutation
-                // exceeded STORAGE_HARD_DEADLINE (causing an immediate 1 ms wake).
-                let backoff = entry.flush_backoff;
-                let next_backoff = backoff.saturating_mul(2).min(STORAGE_FLUSH_BACKOFF_MAX);
-                let next_retry = now + backoff;
-                tracing::warn!(
-                    error = %e,
-                    domain = %domain,
-                    backoff_ms = backoff.as_millis(),
-                    "storage actor: flush failed; will retry after backoff"
-                );
-                // Preserve last_mutation and first_mutation unchanged — they
-                // reflect the timing of actual data mutations, not flush attempts.
-                pending.insert(
-                    domain,
-                    DomainEntry {
-                        data: entry.data,
-                        last_mutation: entry.last_mutation,
-                        first_mutation: entry.first_mutation,
-                        flush_backoff: next_backoff,
-                        next_retry_at: Some(next_retry),
-                    },
-                );
-            }
+            });
         }
     }
 
-    tracing::debug!("storage actor: shut down cleanly");
-}
-
-/// Entry-point for the storage actor thread.
-///
-/// Delegates to [`run_storage_actor_inner`] with the production I/O functions.
-/// See the block comment above for the write-behind cache design and the
-/// trade-off analysis against embedded KV stores.
-fn run_storage_actor(rx: std::sync::mpsc::Receiver<StorageCmd>) {
-    run_storage_actor_inner(
-        rx,
-        STORAGE_DEBOUNCE,
-        |domain| {
-            let validated = crate::core::storage::ValidatedDomain::from_raw(domain);
-            crate::core::storage::read_storage(&validated)
-        },
-        |domain, data| {
-            let validated = crate::core::storage::ValidatedDomain::from_raw(domain);
-            crate::core::storage::write_storage(&validated, data)
-        },
-    );
-}
-
-/// Spawns the storage actor on a dedicated OS thread and returns the sender
-/// half of its command channel.
-///
-/// The returned [`std::sync::mpsc::Sender`] uses an **unbounded** channel, so
-/// every `send()` call returns immediately regardless of how long the actor
-/// takes to complete any individual write.  This is the property that prevents
-/// storage I/O latency from starving the network dispatch loop.
-///
-/// FIFO delivery is a structural guarantee of [`std::sync::mpsc::channel`]:
-/// messages are dequeued in exactly the order they were enqueued, preserving
-/// the linearisability required for safe read-modify-write cycles.
-///
-/// If OS thread creation fails (resource exhaustion), the error is logged and
-/// the returned sender will silently discard all subsequent writes — graceful
-/// degradation that preserves network availability at the cost of storage
-/// durability.
-fn spawn_storage_actor() -> std::sync::mpsc::Sender<StorageCmd> {
-    let (storage_tx, storage_rx) = std::sync::mpsc::channel::<StorageCmd>();
-    if let Err(e) = std::thread::Builder::new()
-        .name("mizu-storage-actor".to_owned())
-        .spawn(move || run_storage_actor(storage_rx))
-    {
-        tracing::error!(
-            error = %e,
-            "failed to spawn storage actor thread; storage writes will be silently dropped"
-        );
+    /// Commits one batch as a single `redb` write transaction on the
+    /// blocking thread pool, so filesystem I/O never blocks the async
+    /// dispatch loop or the debounce timer tasks above.
+    fn spawn_flush(
+        storage_pool: crate::core::storage::StoragePool,
+        domain: crate::core::storage::ValidatedDomain,
+        records: std::collections::HashMap<String, crate::core::types::Value>,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let engine = match storage_pool.get_or_open(&domain) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        domain = %domain.as_str(),
+                        "storage batch flush: failed to open engine"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = engine.write_batch(records.iter().map(|(k, v)| (k.as_str(), v))) {
+                tracing::warn!(error = %e, domain = %domain.as_str(), "storage batch flush failed");
+            }
+        });
     }
-    storage_tx
 }
 
+
+/// Maximum time allowed to establish one HTTP/3 connection: the QUIC
+/// transport handshake (`Endpoint::connect(...).await`) plus the H3-layer
+/// setup (`h3::client::builder().build(...).await`, which exchanges the
+/// initial SETTINGS frames). A server that accepts the QUIC handshake but
+/// never completes the H3-level setup — or never responds at the transport
+/// level at all — would otherwise hang this call forever, holding its
+/// `MAX_CONCURRENT_FETCHES` permit indefinitely.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time allowed for one complete HTTP/3 request/response exchange
+/// once a connection is established: sending the request (HEADERS + body),
+/// and receiving the response HEADERS and all DATA frames. Guards against a
+/// server that completes the handshake but then never sends a response, or
+/// stalls mid-body.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// QUIC idle timeout: the transport closes a connection that has exchanged
+/// no packets for this long, even if the application never reports an
+/// error. Set on every client [`quinn::TransportConfig`] so a
+/// silently-stalled-but-still-"open" connection doesn't sit around
+/// indefinitely, and reused as [`H3ConnectionPool`]'s own idle-reap
+/// threshold (see [`H3ConnectionPool::make_room`]) so a pool entry whose
+/// underlying QUIC connection the transport has already closed for
+/// idleness doesn't linger in the map either.
+pub(crate) const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// QUIC keep-alive interval: how often a PING frame is sent on an otherwise
+/// idle connection to prevent NAT/firewall state from expiring and to keep
+/// [`QUIC_MAX_IDLE_TIMEOUT`] from firing on connections that are merely
+/// quiet, not dead. Must be well under `QUIC_MAX_IDLE_TIMEOUT`.
+pub(crate) const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum number of live per-domain HTTP/3 connections
+/// [`H3ConnectionPool`] retains at once. Reached only by a document that
+/// legitimately talks to many distinct domains; once at capacity, the
+/// least-recently-used connection is evicted to make room (see
+/// [`H3ConnectionPool::make_room`]) rather than growing the pool without
+/// bound.
+pub(crate) const MAX_POOL_SIZE: usize = 32;
 
 /// Thread-safe pool of live HTTP/3 connection handles, one per domain.
 ///
@@ -382,30 +257,124 @@ fn spawn_storage_actor() -> std::sync::mpsc::Sender<StorageCmd> {
 ///
 /// The outer pool `Mutex` is held across `endpoint.connect().await` only when
 /// no cached entry exists, serialising concurrent handshake attempts to the
-/// *same* domain to exactly one handshake.
+/// *same* domain to exactly one handshake. That await is bounded by
+/// [`CONNECT_TIMEOUT`], so a stalled handshake cannot hold the lock (or the
+/// caller's fetch-concurrency permit) forever.
 ///
 /// ## ALPN enforcement
 ///
-/// After the QUIC handshake, the negotiated ALPN is verified to be `mizu/3`.
-/// Because rustls is configured with `mizu/3` as the *sole* advertised ALPN,
-/// this check is redundant in practice but provides defence-in-depth.
+/// After the QUIC handshake, [`get_or_connect`](H3ConnectionPool::get_or_connect)
+/// reads back the negotiated ALPN (`quinn::Connection::handshake_data`,
+/// downcast to `quinn::crypto::rustls::HandshakeData`) and rejects the
+/// connection outright — before it is inserted into the pool or used for any
+/// application traffic — unless it is exactly [`MIZU_ALPN`]. See
+/// `verify_negotiated_alpn`.
+///
+/// This check is redundant *in the current configuration*: rustls's client
+/// enforces RFC 9001 for QUIC connections specifically (a QUIC client that
+/// offered a non-empty ALPN list aborts the handshake with
+/// `NoApplicationProtocol` if the server doesn't select one from it), and
+/// because the client offers `mizu/3` as its *sole* protocol, any protocol
+/// the server does select must be `mizu/3`. It is nonetheless kept as
+/// explicit, testable, application-level defence-in-depth — it does not rely
+/// on the QUIC-specific carve-out in rustls's ALPN handling continuing to
+/// behave this way, and it stays correct even if [`MIZU_ALPN`]'s call site
+/// ever configures more than one protocol.
 ///
 /// ## Dead-connection eviction
 ///
 /// If `send_request` fails with a network error the caller evicts the entry
 /// via [`H3ConnectionPool::evict`] and retries once, transparently replacing
-/// the stale connection.
+/// the stale connection. The pool additionally bounds itself to
+/// [`MAX_POOL_SIZE`] entries (LRU eviction) and reaps entries idle longer
+/// than [`QUIC_MAX_IDLE_TIMEOUT`] on next use — see
+/// [`H3ConnectionPool::make_room`].
 #[derive(Clone)]
 pub(crate) struct H3ConnectionPool {
-    connections: Arc<tokio::sync::Mutex<std::collections::HashMap<String, H3Client>>>,
+    connections: Arc<tokio::sync::Mutex<std::collections::HashMap<String, (H3Client, Instant)>>>,
+    /// QUIC+H3 handshake timeout for this pool instance. Always
+    /// [`CONNECT_TIMEOUT`] in production; overridable in tests (see
+    /// [`H3ConnectionPool::new_with_connect_timeout`]) so a test that
+    /// deliberately never completes the handshake doesn't have to wait out
+    /// the full production timeout to prove it fires.
+    connect_timeout: Duration,
+}
+
+/// Checks `handshake_data` — the value returned by
+/// `quinn::Connection::handshake_data()` right after a QUIC handshake
+/// completes — against [`MIZU_ALPN`], and rejects anything else: a missing
+/// value, a value of an unexpected concrete type, or a negotiated protocol
+/// (including "none negotiated") other than `mizu/3`.
+///
+/// Factored out of [`H3ConnectionPool::get_or_connect`] as a plain function
+/// over `Box<dyn Any>` (rather than inlined against a live
+/// `quinn::Connection`) so this rejection logic is unit-testable without
+/// spinning up a real QUIC server — see the "ALPN enforcement" section on
+/// [`H3ConnectionPool`]'s doc comment for why the check exists despite
+/// rustls already closing most of this gap on its own.
+fn verify_negotiated_alpn(
+    handshake_data: Option<Box<dyn std::any::Any>>,
+    domain: &str,
+) -> Result<(), MizuError> {
+    let negotiated = handshake_data
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol);
+    if negotiated.as_deref() == Some(MIZU_ALPN) {
+        return Ok(());
+    }
+    Err(MizuError::SecurityViolation(format!(
+        "ALPN mismatch connecting to {domain}: expected {:?}, server negotiated {:?}",
+        String::from_utf8_lossy(MIZU_ALPN),
+        negotiated
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .map(|s| s.into_owned()),
+    )))
 }
 
 impl H3ConnectionPool {
     pub(crate) fn new() -> Self {
+        Self::new_with_connect_timeout(CONNECT_TIMEOUT)
+    }
+
+    /// Like [`Self::new`], but with an explicit handshake timeout — used by
+    /// tests that need the *real* timeout code path to fire quickly rather
+    /// than waiting out [`CONNECT_TIMEOUT`].
+    pub(crate) fn new_with_connect_timeout(connect_timeout: Duration) -> Self {
         Self {
             connections: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            connect_timeout,
+        }
+    }
+
+    /// Drops entries idle longer than `max_idle`, then — if still at or over
+    /// `max_pool_size` — evicts the single least-recently-used entry, so a
+    /// caller about to insert one new entry never pushes the map over
+    /// `max_pool_size`.
+    ///
+    /// Generic over the stored value type (production always instantiates
+    /// `V = H3Client`) purely so the eviction *decision* logic can be
+    /// exercised directly by a unit test (`pool_never_exceeds_max_size`)
+    /// without constructing a live H3 connection — the production code path
+    /// and the test both call this exact function.
+    fn make_room<V>(
+        map: &mut std::collections::HashMap<String, (V, Instant)>,
+        now: Instant,
+        max_idle: Duration,
+        max_pool_size: usize,
+    ) {
+        map.retain(|_, (_, last_used)| now.duration_since(*last_used) < max_idle);
+        while map.len() >= max_pool_size {
+            let Some(lru_domain) = map
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&lru_domain);
         }
     }
 
@@ -418,23 +387,42 @@ impl H3ConnectionPool {
         domain: &str,
     ) -> Result<H3Client, MizuError> {
         let mut map = self.connections.lock().await;
-        if let Some(h3) = map.get(domain) {
+        let now = Instant::now();
+        if let Some((h3, last_used)) = map.get_mut(domain) {
+            *last_used = now;
             return Ok(h3.clone());
         }
-        // Guard held across await — at most one concurrent handshake per domain.
-        let quinn_conn = endpoint
-            .connect(addr, domain)
-            .map_err(|e| MizuError::Network(format!("Connect error: {e}")))?
-            .await
-            .map_err(|e| MizuError::Network(format!("Connection failed: {e}")))?;
+        Self::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
 
-        // rustls enforces ALPN at TLS handshake time: a server that does not
-        // negotiate `mizu/3` causes the handshake to fail before reaching here.
+        // Guard held across await — at most one concurrent handshake per
+        // domain. Bounded by `self.connect_timeout` so a server that never
+        // completes the QUIC or H3-level handshake cannot hold this lock (or
+        // the caller's fetch-concurrency permit) forever.
+        let (mut driver, sender) = tokio::time::timeout(self.connect_timeout, async {
+            let quinn_conn = endpoint
+                .connect(addr, domain)
+                .map_err(|e| MizuError::Network(format!("Connect error: {e}")))?
+                .await
+                .map_err(|e| MizuError::Network(format!("Connection failed: {e}")))?;
 
-        let (mut driver, sender) = h3::client::builder()
-            .build::<_, h3_quinn::OpenStreams, bytes::Bytes>(h3_quinn::Connection::new(quinn_conn))
-            .await
-            .map_err(|e| MizuError::Network(format!("H3 connection setup error: {e}")))?;
+            // Explicit post-handshake ALPN check — see the "ALPN enforcement"
+            // section on this struct's doc comment.
+            verify_negotiated_alpn(quinn_conn.handshake_data(), domain)?;
+
+            h3::client::builder()
+                .build::<_, h3_quinn::OpenStreams, bytes::Bytes>(h3_quinn::Connection::new(
+                    quinn_conn,
+                ))
+                .await
+                .map_err(|e| MizuError::Network(format!("H3 connection setup error: {e}")))
+        })
+        .await
+        .map_err(|_elapsed| {
+            MizuError::Network(format!(
+                "QUIC/H3 handshake to {domain} timed out after {:?}",
+                self.connect_timeout
+            ))
+        })??;
 
         // Drive connection-level frames (SETTINGS, GOAWAY) in a background
         // task so the network dispatch loop is never blocked on them.
@@ -445,7 +433,7 @@ impl H3ConnectionPool {
         });
 
         let h3_client = Arc::new(tokio::sync::Mutex::new(sender));
-        map.insert(domain.to_string(), h3_client.clone());
+        map.insert(domain.to_string(), (h3_client.clone(), Instant::now()));
         Ok(h3_client)
     }
 
@@ -486,11 +474,6 @@ pub fn spawn_network_thread(
     #[cfg(feature = "insecure-dev")] allow_insecure: bool,
 ) {
     std::thread::spawn(move || {
-        // The storage actor must outlive the network thread.  Spawn it before
-        // entering the Tokio runtime so its channel is ready before the first
-        // StorageStore command can arrive from the UI thread.
-        let storage_tx = spawn_storage_actor();
-
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -603,7 +586,40 @@ pub fn spawn_network_thread(
                     return;
                 }
             };
-            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_config)));
+            let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+
+            // Explicit transport config: without this, quinn's library
+            // defaults apply, which do not protect against an
+            // application-level stall on an otherwise-alive connection (the
+            // transport never notices the server just stopped talking).
+            // `max_idle_timeout` closes the connection once no packets have
+            // been exchanged for QUIC_MAX_IDLE_TIMEOUT; `keep_alive_interval`
+            // sends PING frames often enough that a merely-quiet (not dead)
+            // connection never trips it.
+            let idle_timeout: quinn::IdleTimeout = match QUIC_MAX_IDLE_TIMEOUT.try_into() {
+                Ok(t) => t,
+                Err(e) => {
+                    if tx
+                        .send(NetworkResult::Error(MizuError::Network(format!(
+                            "QUIC idle timeout config error: {e}"
+                        ))))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "UI channel closed before QUIC transport config error could be delivered"
+                        );
+                    }
+                    return;
+                }
+            };
+            let mut transport_config = quinn::TransportConfig::default();
+            transport_config
+                .max_idle_timeout(Some(idle_timeout))
+                .keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL));
+            client_config.transport_config(Arc::new(transport_config));
+
+            endpoint.set_default_client_config(client_config);
 
             // Semaphore: caps concurrent active fetches to MAX_CONCURRENT_FETCHES.
             // Permits are acquired *inside* each spawned task (option b), so the
@@ -614,6 +630,13 @@ pub fn spawn_network_thread(
             // HTTP/3 connection pool: reuses established QUIC connections across
             // fetches to the same domain, eliminating redundant TLS 1.3 handshakes.
             let pool = H3ConnectionPool::new();
+
+            // Pool of open per-domain encrypted storage engines; see the
+            // "Storage dispatch" block comment above.
+            let storage_pool = crate::core::storage::StoragePool::new();
+            // Debounces/batches `StorageStore` writes to the same domain;
+            // see the "Storage dispatch" block comment above.
+            let storage_debouncer = StorageWriteDebouncer::new();
 
             // Rebind as mutable so UnboundedReceiver::recv() can take &mut self.
             let mut rx = rx;
@@ -678,7 +701,7 @@ pub fn spawn_network_thread(
                             {
                                 Ok((Some(new_url), _)) => {
                                     if tx_clone
-                                        .send(NetworkResult::Redirect { new_url })
+                                        .send(NetworkResult::NavigationRedirect { new_url })
                                         .await
                                         .is_err()
                                     {
@@ -741,7 +764,7 @@ pub fn spawn_network_thread(
                                 Ok((Some(new_url), _)) => {
                                     tracing::debug!(url = %new_url, "navigation redirect");
                                     if tx_clone
-                                        .send(NetworkResult::Redirect { new_url })
+                                        .send(NetworkResult::NavigationRedirect { new_url })
                                         .await
                                         .is_err()
                                     {
@@ -896,7 +919,7 @@ pub fn spawn_network_thread(
                                     match parse_http_response(status, &headers, &body, &domain) {
                                         Ok(Some(new_url)) => {
                                             if tx_clone
-                                                .send(NetworkResult::Redirect { new_url })
+                                                .send(NetworkResult::NavigationRedirect { new_url })
                                                 .await
                                                 .is_err()
                                             {
@@ -966,22 +989,14 @@ pub fn spawn_network_thread(
                         );
                     }
                     NetworkCmd::StorageStore { domain, key, value } => {
-                        // Non-blocking forward to the storage actor.
-                        //
-                        // `std::sync::mpsc::Sender::send` on an unbounded channel
-                        // enqueues the message and returns immediately — storage I/O
-                        // latency has zero impact on how quickly the next command
-                        // (e.g. Fetch, FetchImage) is dispatched from this loop.
-                        //
-                        // Sequential FIFO processing inside the actor guarantees that
-                        // every read-modify-write cycle sees the result of all prior
-                        // writes for the same domain, eliminating lost-update races.
-                        if let Err(e) = storage_tx.send(StorageCmd { domain, key, value }) {
-                            tracing::warn!(
-                                error = %e,
-                                "storage actor unavailable; StorageStore dropped"
-                            );
-                        }
+                        // Debounced/batched write — see the "Storage
+                        // dispatch" block comment above for the durability
+                        // tradeoff this introduces. `ValidatedDomain::from_raw`
+                        // is cheap (one SHA-256 hash) so it's fine to do it
+                        // here on the dispatch loop rather than deferring it
+                        // into the blocking flush task.
+                        let validated = crate::core::storage::ValidatedDomain::from_raw(&domain);
+                        storage_debouncer.submit(storage_pool.clone(), validated, key, value);
                     }
                 }
             }
@@ -1213,59 +1228,77 @@ async fn do_h3_request(
         .body(())
         .map_err(|e| MizuError::Network(format!("Request build error: {e}")))?;
 
-    // Lock held only for the brief send_request call (sends the HEADERS frame).
-    // Once the RequestStream handle is returned the lock is released, so
-    // concurrent requests to the same domain are fully H3-multiplexed.
-    let mut stream = {
-        let mut sender = h3_client.lock().await;
-        sender
-            .send_request(req)
+    // The whole send/receive exchange — HEADERS, optional body, and the full
+    // response (HEADERS + all DATA frames) — is bounded by REQUEST_TIMEOUT.
+    // A server that completes the handshake (see H3ConnectionPool::get_or_connect
+    // for the connect-phase timeout) but then never ACKs, never sends a
+    // response, or stalls mid-body would otherwise hang this call — and the
+    // caller's fetch-concurrency permit — forever.
+    let exchange = async {
+        // Lock held only for the brief send_request call (sends the HEADERS
+        // frame). Once the RequestStream handle is returned the lock is
+        // released, so concurrent requests to the same domain are fully
+        // H3-multiplexed.
+        let mut stream = {
+            let mut sender = h3_client.lock().await;
+            sender
+                .send_request(req)
+                .await
+                .map_err(|e| MizuError::Network(format!("H3 send_request failed: {e}")))?
+        };
+
+        // Transmit the request payload (if any), then signal end of body.
+        if let Some(payload_bytes) = body {
+            stream
+                .send_data(payload_bytes)
+                .await
+                .map_err(|e| MizuError::Network(format!("H3 send_data failed: {e}")))?;
+        }
+        stream
+            .finish()
             .await
-            .map_err(|e| MizuError::Network(format!("H3 send_request failed: {e}")))?
+            .map_err(|e| MizuError::Network(format!("H3 stream finish failed: {e}")))?;
+
+        // Read the response HEADERS frame.
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|e| MizuError::Network(format!("H3 recv_response failed: {e}")))?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        // Read all DATA frames.  `recv_data()` returns `impl bytes::Buf`; we
+        // drain each chunk via `Buf::chunk()` + `Buf::advance()` to avoid
+        // allocating an intermediate owned buffer.  Accumulation is capped by
+        // MAX_RESPONSE_BODY_BYTES — see `check_response_body_budget`.
+        let mut resp_body: Vec<u8> = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|e| MizuError::Network(format!("H3 recv_data failed: {e}")))?
+        {
+            use bytes::Buf as _;
+            while chunk.has_remaining() {
+                let slice = chunk.chunk();
+                check_response_body_budget(resp_body.len(), slice.len())?;
+                resp_body.extend_from_slice(slice);
+                let len = slice.len();
+                chunk.advance(len);
+            }
+        }
+
+        Ok::<_, MizuError>((status, headers, resp_body))
     };
 
-    // Transmit the request payload (if any), then signal end of body.
-    if let Some(payload_bytes) = body {
-        stream
-            .send_data(payload_bytes)
-            .await
-            .map_err(|e| MizuError::Network(format!("H3 send_data failed: {e}")))?;
-    }
-    stream
-        .finish()
+    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
         .await
-        .map_err(|e| MizuError::Network(format!("H3 stream finish failed: {e}")))?;
-
-    // Read the response HEADERS frame.
-    let response = stream
-        .recv_response()
-        .await
-        .map_err(|e| MizuError::Network(format!("H3 recv_response failed: {e}")))?;
-
-    let status = response.status();
-    let headers = response.headers().clone();
-
-    // Read all DATA frames.  `recv_data()` returns `impl bytes::Buf`; we
-    // drain each chunk via `Buf::chunk()` + `Buf::advance()` to avoid
-    // allocating an intermediate owned buffer.  Accumulation is capped by
-    // MAX_RESPONSE_BODY_BYTES — see `check_response_body_budget`.
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(mut chunk) = stream
-        .recv_data()
-        .await
-        .map_err(|e| MizuError::Network(format!("H3 recv_data failed: {e}")))?
-    {
-        use bytes::Buf as _;
-        while chunk.has_remaining() {
-            let slice = chunk.chunk();
-            check_response_body_budget(body.len(), slice.len())?;
-            body.extend_from_slice(slice);
-            let len = slice.len();
-            chunk.advance(len);
-        }
-    }
-
-    Ok((status, headers, body))
+        .map_err(|_elapsed| {
+            MizuError::Network(format!(
+                "H3 request to {} timed out after {REQUEST_TIMEOUT:?}",
+                uri.domain
+            ))
+        })?
 }
 
 /// HTTP methods the Mizu runtime permits a vault token to authorise.
@@ -1455,6 +1488,72 @@ fn parse_http_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `rustls` certificate verifier that accepts anything — test-only,
+    /// never compiled into production (unlike the `insecure-dev`-gated
+    /// `LocalOrWebPkiVerifier`, which still validates non-local hosts).
+    /// Used by [`test_client_endpoint`] to build a real client TLS config so
+    /// tests can drive an actual QUIC handshake attempt against a local
+    /// listener without needing a certificate trusted by WebPKI.
+    #[derive(Debug)]
+    struct AcceptAnyCertVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Builds a client `Endpoint` with a real (test-only) TLS config —
+    /// `mizu/3` ALPN, certificate verification skipped — so `connect()`
+    /// actually attempts a QUIC handshake instead of failing synchronously
+    /// with "no default client config" the way a bare `Endpoint::client(...)`
+    /// does. Requires a crypto provider to already be installed (callers
+    /// already do this for other reasons, e.g. building the H3 pool).
+    fn test_client_endpoint() -> Endpoint {
+        let mut endpoint = Endpoint::client(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+            .expect("client endpoint must be creatable");
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertVerifier))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![MIZU_ALPN.to_vec()];
+        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_config)
+            .expect("test QuicClientConfig must build");
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_config)));
+        endpoint
+    }
 
     // — lossy UTF-8 body decoding (parse_body_value)
 
@@ -1693,377 +1792,244 @@ mod tests {
         );
     }
 
-    /// Verifies that `StorageStore` dispatch is non-blocking even when the
-    /// storage actor is artificially slow (200 ms per write).  A `Fetch`
-    /// inserted right after the store must not wait for the write to finish.
+    /// Verifies `StoragePool::write_record`'s own immediate-write guarantee:
+    /// no write-behind cache sits in front of it, so the value is visible to
+    /// a subsequent read with no artificial delay (no sleep between write
+    /// and read). RM-12: the production `NetworkCmd::StorageStore` dispatch
+    /// now goes through `StorageWriteDebouncer` instead of calling this
+    /// directly (see `storage_debounce_*` tests below) — `write_record`
+    /// itself is unchanged and remains available as the non-debounced,
+    /// immediate-write primitive.
     #[test]
-    fn test_storage_latency_does_not_starve_network() {
-        let (storage_tx, storage_rx) = std::sync::mpsc::channel::<StorageCmd>();
-        // Slow actor: sleeps 200 ms before acknowledging each command.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            while let Ok(_cmd) = storage_rx.recv() {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                let _ = done_tx.send(());
+    fn test_storage_store_writes_directly_with_no_delay() {
+        let tmp_dir = std::env::temp_dir().join("mizu_test_worker_direct_write");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("direct.enc");
+
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let _ = write_txn.open_table(crate::core::storage::STORAGE_TABLE).unwrap();
             }
-        });
-
-        let t0 = std::time::Instant::now();
-        storage_tx
-            .send(StorageCmd {
-                domain: "test.local".to_string(),
-                key: "k".to_string(),
-                value: crate::core::types::Value::Bool(true),
-            })
-            .expect("send must succeed");
-        let elapsed = t0.elapsed();
-
-        // The send must return in well under 50 ms — storage I/O is off the
-        // hot path, so the network dispatch loop is never stalled.
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "StorageStore send must be non-blocking, took {elapsed:?}"
+            write_txn.commit().unwrap();
+        }
+        let engine = std::sync::Arc::new(
+            crate::core::storage::StorageEngine::from_parts(db, [0x33u8; 32])
         );
 
-        // Confirm the actor does eventually process the command.
-        done_rx
-            .recv_timeout(std::time::Duration::from_millis(500))
-            .expect("storage actor must complete the write within 500 ms");
-    }
+        let pool = crate::core::storage::StoragePool::new();
+        let domain = crate::core::storage::ValidatedDomain::from_raw("direct-write-test.local");
+        pool.insert_for_test(&domain, engine.clone());
 
-    /// Verifies that the storage actor processes commands in FIFO order,
-    /// preserving the read-modify-write invariant for sequential writes.
-    #[test]
-    fn test_storage_actor_fifo_ordering() {
-        let (tx, rx) = std::sync::mpsc::channel::<StorageCmd>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            while let Ok(cmd) = rx.recv() {
-                let _ = result_tx.send(cmd.key.clone());
-            }
-        });
+        pool.write_record(&domain, "session_token", &crate::core::types::Value::from("abc123"))
+            .expect("write_record must succeed");
 
-        for i in 0..5u32 {
-            tx.send(StorageCmd {
-                domain: "d".to_string(),
-                key: format!("key_{i}"),
-                value: crate::core::types::Value::Int(i as i64),
-            })
-            .expect("send must succeed");
-        }
-        drop(tx);
-
-        let mut received = Vec::new();
-        for _ in 0..5 {
-            if let Ok(k) = result_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                received.push(k);
-            }
-        }
+        let data = engine.read_all().expect("read_all");
         assert_eq!(
-            received,
-            vec!["key_0", "key_1", "key_2", "key_3", "key_4"],
-            "storage actor must process commands in FIFO order"
+            data.get("session_token"),
+            Some(&crate::core::types::Value::from("abc123")),
+            "value must be readable immediately after write_record returns, with no debounce delay"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    /// Verifies that 50 rapid mutations to the same domain coalesce into at
-    /// most 2 disk flushes — write-amplification is O(1) per burst, not O(N).
-    #[test]
-    fn test_storage_coalescing_reduces_disk_writes() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
+    /// Builds a fresh temp-file-backed `redb`-based `StorageEngine`
+    /// (`write_batch_call_count()` starts at 0) for the `storage_debounce_*`
+    /// tests below. Returns the engine (wrapped in `Arc`, matching how
+    /// `StoragePool` stores it) and the temp directory, so callers can clean
+    /// up when done.
+    fn make_debounce_test_engine(
+        name: &str,
+    ) -> (std::sync::Arc<crate::core::storage::StorageEngine>, std::path::PathBuf) {
+        let tmp_dir = std::env::temp_dir().join(format!("mizu_test_storage_debounce_{name}"));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("test.enc");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let _ = write_txn.open_table(crate::core::storage::STORAGE_TABLE).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        let engine = std::sync::Arc::new(crate::core::storage::StorageEngine::from_parts(
+            db,
+            [0x55u8; 32],
+        ));
+        (engine, tmp_dir)
+    }
 
-        let flush_count = Arc::new(AtomicUsize::new(0));
-        let flush_count_clone = flush_count.clone();
+    /// RM-12 (a): several `StorageStore`-equivalent `submit` calls for the
+    /// same domain, issued back-to-back with no delay between them, must not
+    /// each open their own `redb` transaction — they must be coalesced into
+    /// one `write_batch` call once the debounce window elapses.
+    #[tokio::test]
+    async fn storage_debounce_batches_closely_spaced_writes_into_one_transaction() {
+        let (engine, tmp_dir) = make_debounce_test_engine("batch");
+        let pool = crate::core::storage::StoragePool::new();
+        let domain = crate::core::storage::ValidatedDomain::from_raw("debounce-batch-test.local");
+        pool.insert_for_test(&domain, engine.clone());
 
-        let (tx, rx) = std::sync::mpsc::channel::<StorageCmd>();
+        let window = Duration::from_millis(60);
+        let debouncer = StorageWriteDebouncer::with_params(window, 64);
 
-        // Short debounce (50 ms) so the test completes quickly.
-        let handle = std::thread::spawn(move || {
-            run_storage_actor_inner(
-                rx,
-                std::time::Duration::from_millis(50),
-                |_domain| Ok(std::collections::HashMap::new()),
-                move |_domain, _data| {
-                    flush_count_clone.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                },
+        for i in 0..5 {
+            debouncer.submit(
+                pool.clone(),
+                crate::core::storage::ValidatedDomain::from_raw("debounce-batch-test.local"),
+                format!("key_{i}"),
+                crate::core::types::Value::Int(i),
             );
-        });
-
-        // Send 50 mutations for the same domain in rapid succession.
-        for i in 0..50u32 {
-            tx.send(StorageCmd {
-                domain: "coalesce-test.local".to_string(),
-                key: format!("key_{i}"),
-                value: crate::core::types::Value::Int(i as i64),
-            })
-            .expect("send must succeed");
         }
 
-        // Wait well past the debounce window, then shut down.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        drop(tx);
-        handle.join().expect("actor thread must terminate");
-
-        let writes = flush_count.load(Ordering::SeqCst);
-        // 50 rapid mutations must coalesce into at most 2 flushes.
-        // (Ideally 1; allow 2 to tolerate OS scheduling variance.)
-        assert!(
-            writes <= 2,
-            "50 rapid mutations must coalesce into ≤ 2 disk flushes, got {writes}"
+        // Still within the debounce window: nothing should have been
+        // committed to redb yet.
+        assert_eq!(
+            engine.write_batch_call_count(),
+            0,
+            "writes must not be flushed before the debounce window elapses"
         );
-    }
 
-    /// Verifies that pending in-memory mutations are flushed on graceful
-    /// shutdown (channel drop), guaranteeing zero data loss on normal exit.
-    #[test]
-    fn test_storage_flush_on_shutdown() {
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
 
-        let captured: Arc<Mutex<Option<HashMap<String, crate::core::types::Value>>>> =
-            Arc::new(Mutex::new(None));
-        let captured_clone = captured.clone();
+        assert_eq!(
+            engine.write_batch_call_count(),
+            1,
+            "5 closely-spaced writes to the same domain must land in exactly 1 redb transaction, not 5"
+        );
 
-        let (tx, rx) = std::sync::mpsc::channel::<StorageCmd>();
-
-        // Very long debounce: only the shutdown path can trigger a flush.
-        let handle = std::thread::spawn(move || {
-            run_storage_actor_inner(
-                rx,
-                std::time::Duration::from_secs(60),
-                |_domain| Ok(HashMap::new()),
-                move |_domain, data| {
-                    *captured_clone.lock().unwrap_or_else(|p| p.into_inner()) = Some(data.clone());
-                    Ok(())
-                },
+        let data = engine.read_all().expect("read_all");
+        for i in 0..5 {
+            assert_eq!(
+                data.get(&format!("key_{i}")),
+                Some(&crate::core::types::Value::Int(i)),
+                "key_{i} must be persisted and readable after the batch flush"
             );
-        });
-
-        // Inject two mutations; the debounce window will never expire on its own.
-        tx.send(StorageCmd {
-            domain: "shutdown-test.local".to_string(),
-            key: "alpha".to_string(),
-            value: crate::core::types::Value::from("hello"),
-        })
-        .expect("send must succeed");
-        tx.send(StorageCmd {
-            domain: "shutdown-test.local".to_string(),
-            key: "beta".to_string(),
-            value: crate::core::types::Value::Int(99),
-        })
-        .expect("send must succeed");
-
-        // Allow the actor to receive both commands, then close the channel.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(tx); // triggers Disconnected → shutdown flush
-
-        handle
-            .join()
-            .expect("actor thread must terminate cleanly after flush");
-
-        let guard = captured.lock().unwrap_or_else(|p| p.into_inner());
-        let data = guard
-            .as_ref()
-            .expect("flush_domain must have been called on graceful shutdown");
-        assert_eq!(
-            data.get("alpha"),
-            Some(&crate::core::types::Value::from("hello")),
-            "alpha must survive graceful shutdown"
-        );
-        assert_eq!(
-            data.get("beta"),
-            Some(&crate::core::types::Value::Int(99)),
-            "beta must survive graceful shutdown"
-        );
-    }
-
-    /// Verifies that the hard deadline forces a flush even when mutations arrive
-    /// continuously at a rate that keeps resetting the quiescence window.
-    ///
-    /// Without `STORAGE_HARD_DEADLINE`, a write rate of one mutation per
-    /// (debounce - ε) ms would starve the flush indefinitely.
-    #[test]
-    fn test_hard_deadline_forces_flush_under_continuous_writes() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        let flush_count = Arc::new(AtomicUsize::new(0));
-        let flush_count_clone = flush_count.clone();
-
-        let (tx, rx) = std::sync::mpsc::channel::<StorageCmd>();
-
-        // Debounce = 200 ms, hard deadline = 300 ms.
-        // A write every 100 ms would keep resetting the quiescence clock forever.
-        // But the hard deadline at 300 ms forces at least one flush.
-        let hard_deadline = std::time::Duration::from_millis(300);
-        let debounce = std::time::Duration::from_millis(200);
-
-        let handle = std::thread::spawn(move || {
-            // Inject a custom hard deadline via the inner function's debounce parameter
-            // by exploiting that `run_storage_actor_inner` uses its own constant for
-            // the hard deadline.  Since STORAGE_HARD_DEADLINE is a crate constant, we
-            // verify the behaviour at the real production values by driving the actor
-            // with a debounce short enough that the real 3 s deadline governs.
-            //
-            // For test speed we call a minimal inline version that mirrors the logic.
-            use std::collections::HashMap;
-            use std::sync::mpsc::RecvTimeoutError;
-            use std::time::{Duration, Instant};
-
-            struct Entry {
-                data: HashMap<String, crate::core::types::Value>,
-                last_mutation: Instant,
-                first_mutation: Instant,
-            }
-
-            let mut pending: HashMap<String, Entry> = HashMap::new();
-            loop {
-                let timeout = {
-                    let now = Instant::now();
-                    pending
-                        .values()
-                        .map(|e| {
-                            let sl = now.saturating_duration_since(e.last_mutation);
-                            let sf = now.saturating_duration_since(e.first_mutation);
-                            if sl >= debounce || sf >= hard_deadline {
-                                Duration::from_millis(1)
-                            } else {
-                                debounce.saturating_sub(sl).min(hard_deadline.saturating_sub(sf))
-                            }
-                        })
-                        .min()
-                        .unwrap_or(Duration::from_secs(1))
-                };
-                match rx.recv_timeout(timeout) {
-                    Ok(cmd) => {
-                        let now = Instant::now();
-                        let e = pending.entry(cmd.domain.clone()).or_insert_with(|| Entry {
-                            data: HashMap::new(),
-                            last_mutation: now,
-                            first_mutation: now,
-                        });
-                        e.data.insert(cmd.key, cmd.value);
-                        e.last_mutation = Instant::now();
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        for (_, e) in &pending {
-                            flush_count_clone.fetch_add(1, Ordering::SeqCst);
-                            let _ = &e.data;
-                        }
-                        break;
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-                let now = Instant::now();
-                let ready: Vec<String> = pending
-                    .iter()
-                    .filter(|(_, e)| {
-                        let sl = now.saturating_duration_since(e.last_mutation);
-                        let sf = now.saturating_duration_since(e.first_mutation);
-                        sl >= debounce || sf >= hard_deadline
-                    })
-                    .map(|(d, _)| d.clone())
-                    .collect();
-                for domain in ready {
-                    if let Some(_) = pending.remove(&domain) {
-                        flush_count_clone.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            }
-        });
-
-        // Send one mutation every 80 ms — well under the 200 ms debounce window —
-        // for 500 ms total.  Without a hard deadline, no flush would occur during
-        // this window.  With hard_deadline=300 ms, at least one flush must fire.
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_millis(500) {
-            tx.send(StorageCmd {
-                domain: "continuous-write.local".to_string(),
-                key: "k".to_string(),
-                value: crate::core::types::Value::Int(1),
-            })
-            .expect("send must succeed");
-            std::thread::sleep(std::time::Duration::from_millis(80));
         }
-        drop(tx);
-        handle.join().expect("actor thread must terminate");
 
-        let flushes = flush_count.load(Ordering::SeqCst);
-        assert!(
-            flushes >= 1,
-            "hard deadline must force at least one flush under continuous writes, got {flushes}"
-        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
+    /// RM-12 (a)/(b): once `max_keys` distinct keys are buffered for a
+    /// domain, the batch must flush immediately rather than waiting out the
+    /// (here, deliberately long) debounce window — bounding worst-case
+    /// latency and memory under sustained writes.
+    #[tokio::test]
+    async fn storage_debounce_max_keys_forces_immediate_flush() {
+        let (engine, tmp_dir) = make_debounce_test_engine("maxkeys");
+        let pool = crate::core::storage::StoragePool::new();
+        let domain = crate::core::storage::ValidatedDomain::from_raw("debounce-maxkeys-test.local");
+        pool.insert_for_test(&domain, engine.clone());
 
-    /// BLOCKER 1 — Verifies that the storage actor backs off exponentially on
-    /// persistent flush failures instead of spinning at CPU 100%.
-    ///
-    /// Without the fix: the actor calls `flush_domain` at 1 ms intervals once
-    /// `first_mutation` exceeds `STORAGE_HARD_DEADLINE`, producing hundreds of
-    /// calls per second.
-    ///
-    /// With the fix: the first failure sets a `STORAGE_FLUSH_BACKOFF_BASE`
-    /// (500 ms) cooldown.  Over a 700 ms observation window the actor may call
-    /// `flush_domain` at most 3 times (at ~10 ms, ~510 ms, plus the shutdown
-    /// flush), never in a tight busy-loop.
-    #[test]
-    fn test_storage_backoff_on_persistent_flush_failure() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
+        // Window is long enough that this test would time out waiting for it
+        // — the flush must instead be triggered by hitting max_keys.
+        let debouncer = StorageWriteDebouncer::with_params(Duration::from_secs(30), 3);
 
-        let flush_count = Arc::new(AtomicUsize::new(0));
-        let flush_count_clone = flush_count.clone();
-
-        let (tx, rx) = std::sync::mpsc::channel::<StorageCmd>();
-
-        // Very short debounce (10 ms) so the first flush fires quickly.
-        let handle = std::thread::spawn(move || {
-            run_storage_actor_inner(
-                rx,
-                std::time::Duration::from_millis(10),
-                |_domain| Ok(std::collections::HashMap::new()),
-                move |_domain, _data| {
-                    flush_count_clone.fetch_add(1, Ordering::SeqCst);
-                    Err(MizuError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "simulated: disk full",
-                    )))
-                },
+        for i in 0..3 {
+            debouncer.submit(
+                pool.clone(),
+                crate::core::storage::ValidatedDomain::from_raw("debounce-maxkeys-test.local"),
+                format!("key_{i}"),
+                crate::core::types::Value::Int(i),
             );
-        });
+        }
 
-        // One mutation to enqueue the domain for flushing.
-        tx.send(StorageCmd {
-            domain: "backoff-test.local".to_string(),
-            key: "key".to_string(),
-            value: crate::core::types::Value::Bool(true),
-        })
-        .expect("send must succeed");
+        // Give the spawned spawn_blocking flush task a moment to run — it's
+        // triggered synchronously by the 3rd `submit` call, well before the
+        // 30s window would ever elapse.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Observe for 700 ms:
-        //   t≈10 ms  → 1st flush attempt → fails → backoff 500 ms → next_retry ≈ t+510 ms
-        //   t≈510 ms → 2nd flush attempt → fails → backoff 1 000 ms
-        //   t=700 ms → channel dropped   → shutdown flush → count++
-        // Total ≤ 3.  A busy-loop (the pre-fix behaviour) would produce ≥ 70 calls.
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        drop(tx);
-        handle.join().expect("actor thread must terminate cleanly");
-
-        let count = flush_count.load(Ordering::SeqCst);
-        assert!(
-            count <= 4,
-            "persistent flush failures must use exponential backoff, not busy-loop; \
-             got {count} flush calls in 700 ms (expected ≤ 4)"
+        assert_eq!(
+            engine.write_batch_call_count(),
+            1,
+            "hitting max_keys must force an immediate flush without waiting for the debounce window"
         );
+        let data = engine.read_all().expect("read_all");
+        assert_eq!(data.len(), 3, "all 3 keys must be persisted by the threshold-triggered flush");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// RM-12 (b): repeated writes to the *same* key within one debounce
+    /// window must collapse to last-write-wins and still land in a single
+    /// transaction — not one entry per write.
+    #[tokio::test]
+    async fn storage_debounce_same_key_last_write_wins() {
+        let (engine, tmp_dir) = make_debounce_test_engine("lastwrite");
+        let pool = crate::core::storage::StoragePool::new();
+        let domain = crate::core::storage::ValidatedDomain::from_raw("debounce-lastwrite-test.local");
+        pool.insert_for_test(&domain, engine.clone());
+
+        let window = Duration::from_millis(60);
+        let debouncer = StorageWriteDebouncer::with_params(window, 64);
+
+        for v in 1..=3 {
+            debouncer.submit(
+                pool.clone(),
+                crate::core::storage::ValidatedDomain::from_raw("debounce-lastwrite-test.local"),
+                "counter".to_string(),
+                crate::core::types::Value::Int(v),
+            );
+        }
+
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
+
+        assert_eq!(engine.write_batch_call_count(), 1);
+        let data = engine.read_all().expect("read_all");
+        assert_eq!(
+            data.get("counter"),
+            Some(&crate::core::types::Value::Int(3)),
+            "last write within the window must win"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// RM-12: writes to two different domains must not be merged into one
+    /// transaction — each domain gets its own independent batch/flush.
+    #[tokio::test]
+    async fn storage_debounce_batches_per_domain_independently() {
+        let (engine_a, tmp_a) = make_debounce_test_engine("domain_a");
+        let (engine_b, tmp_b) = make_debounce_test_engine("domain_b");
+        let pool = crate::core::storage::StoragePool::new();
+        let domain_a = crate::core::storage::ValidatedDomain::from_raw("debounce-domain-a.local");
+        let domain_b = crate::core::storage::ValidatedDomain::from_raw("debounce-domain-b.local");
+        pool.insert_for_test(&domain_a, engine_a.clone());
+        pool.insert_for_test(&domain_b, engine_b.clone());
+
+        let window = Duration::from_millis(60);
+        let debouncer = StorageWriteDebouncer::with_params(window, 64);
+
+        debouncer.submit(
+            pool.clone(),
+            crate::core::storage::ValidatedDomain::from_raw("debounce-domain-a.local"),
+            "a_key".to_string(),
+            crate::core::types::Value::from("a_value"),
+        );
+        debouncer.submit(
+            pool.clone(),
+            crate::core::storage::ValidatedDomain::from_raw("debounce-domain-b.local"),
+            "b_key".to_string(),
+            crate::core::types::Value::from("b_value"),
+        );
+
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
+
+        assert_eq!(engine_a.write_batch_call_count(), 1);
+        assert_eq!(engine_b.write_batch_call_count(), 1);
+        assert_eq!(
+            engine_a.read_all().unwrap().get("a_key"),
+            Some(&crate::core::types::Value::from("a_value"))
+        );
+        assert_eq!(
+            engine_b.read_all().unwrap().get("b_key"),
+            Some(&crate::core::types::Value::from("b_value"))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
     }
 
     /// BLOCKER 2 — Verifies that concurrent `get_or_connect` calls to the same
@@ -2076,6 +2042,15 @@ mod tests {
     ///   • No deadlock when multiple tasks race on the same domain.
     ///   • Failed connections are never inserted into the pool.
     ///   • The pool correctly reports 0 entries after all attempts fail.
+    ///
+    /// RM-05: this used to wrap `get_or_connect` in a manual
+    /// `tokio::time::timeout` from the test side, because production had no
+    /// timeout of its own — the call could otherwise hang indefinitely
+    /// against a non-responsive target. `get_or_connect` now enforces
+    /// `CONNECT_TIMEOUT` internally, so the test calls it directly (via a
+    /// short per-instance override so it stays fast) and that manual
+    /// workaround is gone — see `stalled_handshake_releases_permit_within_timeout`
+    /// for a test of the timeout firing itself.
     #[tokio::test]
     async fn test_h3_connection_pool_concurrent_safety_and_failed_eviction() {
         use std::sync::Arc;
@@ -2088,25 +2063,23 @@ mod tests {
                 .expect("client endpoint must be creatable"),
         );
 
-        let pool = Arc::new(H3ConnectionPool::new());
+        // Short override so the test stays fast; still exercises the real
+        // production timeout code path, not a test-side wrapper.
+        let short_timeout = std::time::Duration::from_millis(500);
+        let pool = Arc::new(H3ConnectionPool::new_with_connect_timeout(short_timeout));
 
         assert_eq!(pool.len().await, 0, "pool must be empty at construction");
 
-        // Use localhost:1 — no server is running, all connects fail at the
-        // QUIC handshake stage.  Short timeout keeps the test bounded.
+        // Use localhost:1 — no server is running, all connects fail (or, for
+        // a non-responsive target, time out) at the QUIC handshake stage.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let short_timeout = std::time::Duration::from_millis(500);
 
         let mut handles = Vec::new();
         for _ in 0..3 {
             let pool = pool.clone();
             let ep = endpoint.clone();
             handles.push(tokio::spawn(async move {
-                tokio::time::timeout(
-                    short_timeout,
-                    pool.get_or_connect(&ep, addr, "no-server.mizu.local"),
-                )
-                .await
+                pool.get_or_connect(&ep, addr, "no-server.mizu.local").await
             }));
         }
 
@@ -2118,6 +2091,149 @@ mod tests {
             pool.len().await,
             0,
             "failed connections must never be inserted into the H3 pool"
+        );
+    }
+
+    /// RM-05 — Verifies that a server which accepts the QUIC transport
+    /// connection (receives and reads every packet the client sends) but
+    /// never completes the application (H3) handshake causes
+    /// `get_or_connect` to fail with a timeout error — rather than hanging
+    /// forever — and that a semaphore permit held across the call, exactly
+    /// mirroring `spawn_network_thread`'s `MAX_CONCURRENT_FETCHES` discipline
+    /// (acquire before I/O, release via RAII when the task exits), is
+    /// released once the call returns.
+    #[tokio::test]
+    async fn stalled_handshake_releases_permit_within_timeout() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let _ = provider.install_default();
+
+        // A UDP socket that receives (and silently discards) every datagram
+        // sent to it — the "server" accepts the transport-level connection
+        // attempt (packets arrive, no ICMP port-unreachable) but never sends
+        // a single byte back, so the QUIC handshake never completes.
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("blackhole socket must bind");
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while blackhole.recv_from(&mut buf).await.is_ok() {
+                // Deliberately never reply.
+            }
+        });
+
+        // A real (not `#[cfg(insecure-dev)]`-gated) client TLS config, same
+        // shape production builds, so `connect()` actually attempts the QUIC
+        // handshake instead of failing synchronously with "no default client
+        // config" — the blackhole never gets far enough for certificate
+        // verification to matter, so accepting-anything here is fine.
+        let endpoint = test_client_endpoint();
+        // Short override so the test stays fast; still exercises the real
+        // CONNECT_TIMEOUT code path in get_or_connect, not a mock.
+        let pool = H3ConnectionPool::new_with_connect_timeout(Duration::from_millis(300));
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let sem_clone = semaphore.clone();
+
+        let start = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            // Same discipline as spawn_network_thread: acquire before I/O,
+            // hold across the call, release via RAII when this task exits.
+            let permit = sem_clone.acquire_owned().await.unwrap();
+            let _permit = permit;
+            pool.get_or_connect(&endpoint, blackhole_addr, "stalled.mizu.local")
+                .await
+        });
+
+        // The outer bound is generous relative to the pool's 300ms connect
+        // timeout — if the production fix regressed, this fires instead of
+        // the test hanging forever.
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect(
+                "get_or_connect must return well within the test's outer bound \
+                 — a stalled handshake must not hang forever",
+            )
+            .expect("task must not panic");
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(MizuError::Network(_)) => {}
+            Ok(_) => panic!("a stalled handshake must not succeed"),
+            Err(other) => panic!("expected a Network (timeout) error, got: {other:?}"),
+        }
+        // Sanity check that this actually exercised the timeout path (the
+        // connect attempt genuinely reached the QUIC handshake and hung
+        // there) rather than failing some other, instant way.
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected the 300ms connect_timeout to be what bounded this call, \
+             but it returned after only {elapsed:?} — likely failed for a \
+             different (non-timeout) reason"
+        );
+
+        // The permit was released when the spawned task exited (RAII drop
+        // of `_permit`), so a fresh acquire is immediately available.
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the semaphore permit must be released once the stalled connect times out"
+        );
+    }
+
+    /// RM-05 — Verifies `H3ConnectionPool::make_room` — the exact function
+    /// `get_or_connect` calls before inserting a new entry — never lets the
+    /// pool grow beyond `MAX_POOL_SIZE`, even when connecting to far more
+    /// distinct domains than the limit allows. Exercised directly on the
+    /// eviction *decision* logic (generic over the stored value, `()` here)
+    /// rather than through `get_or_connect`, since constructing `MAX_POOL_SIZE
+    /// + 1` genuine live H3 connections would require that many real servers;
+    /// this tests the identical code path production uses.
+    #[test]
+    fn pool_never_exceeds_max_size() {
+        let mut map: std::collections::HashMap<String, ((), Instant)> =
+            std::collections::HashMap::new();
+        let now = Instant::now();
+
+        for i in 0..(MAX_POOL_SIZE + 10) {
+            H3ConnectionPool::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
+            map.insert(format!("domain-{i}.example"), ((), now));
+            assert!(
+                map.len() <= MAX_POOL_SIZE,
+                "pool must never exceed MAX_POOL_SIZE ({MAX_POOL_SIZE}) while \
+                 inserting domain #{i}, got {}",
+                map.len()
+            );
+        }
+
+        assert_eq!(
+            map.len(),
+            MAX_POOL_SIZE,
+            "pool must be exactly at capacity after inserting more domains than it allows"
+        );
+    }
+
+    /// RM-05 — `make_room` must also reap entries idle longer than
+    /// `max_idle`, independent of the size cap.
+    #[test]
+    fn pool_reaps_idle_entries() {
+        let mut map: std::collections::HashMap<String, ((), Instant)> =
+            std::collections::HashMap::new();
+        let now = Instant::now();
+        let long_idle = now - Duration::from_secs(120);
+
+        map.insert("stale.example".to_string(), ((), long_idle));
+        map.insert("fresh.example".to_string(), ((), now));
+
+        H3ConnectionPool::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
+
+        assert!(
+            !map.contains_key("stale.example"),
+            "an entry idle longer than max_idle must be reaped"
+        );
+        assert!(
+            map.contains_key("fresh.example"),
+            "a recently-used entry must not be reaped"
         );
     }
 
@@ -2139,30 +2255,21 @@ mod tests {
 
         // Global store: user record that has both `name` and `email`.
         let mut store = crate::core::types::VariableStore::new();
-        let mut global_user = BTreeMap::new();
-        global_user.insert(
-            Arc::from("name"),
-            crate::core::types::Value::from("Alice"),
-        );
-        global_user.insert(
-            Arc::from("email"),
-            crate::core::types::Value::from("alice@example.com"),
-        );
+        let mut global_user = Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
+        global_user.push((Arc::from("name"), crate::core::types::Value::from("Alice")));
+        global_user.push((Arc::from("email"), crate::core::types::Value::from("alice@example.com")));
         store.set(
             "user",
-            crate::core::types::Value::Record(Arc::new(global_user)),
+            { global_user.sort_by(|a, b| a.0.cmp(&b.0)); crate::core::types::Value::Record(Arc::from(global_user)) },
         );
 
         // Overlay: user record that only has `name` — no `email` field.
-        let mut overlay_user = BTreeMap::new();
-        overlay_user.insert(
-            Arc::from("name"),
-            crate::core::types::Value::from("Bob"),
-        );
+        let mut overlay_user = Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
+        overlay_user.push((Arc::from("name"), crate::core::types::Value::from("Bob")));
         let mut overlay: HashMap<String, crate::core::types::Value> = HashMap::new();
         overlay.insert(
             "user".to_string(),
-            crate::core::types::Value::Record(Arc::new(overlay_user)),
+            { overlay_user.sort_by(|a, b| a.0.cmp(&b.0)); crate::core::types::Value::Record(Arc::from(overlay_user)) },
         );
 
         // Interpolating `{user.name}` should resolve from the overlay (Bob).
@@ -2366,6 +2473,51 @@ mod tests {
         assert_eq!(
             MIZU_ALPN, b"mizu/3",
             "MIZU_ALPN must be exactly b\"mizu/3\""
+        );
+    }
+
+    /// RM-11 — `verify_negotiated_alpn` must reject a server that completed
+    /// the QUIC handshake without ever negotiating an ALPN protocol at all
+    /// (the RFC 7301 gap the doc comment on `H3ConnectionPool` used to claim
+    /// was closed but wasn't), as well as a server that negotiated some
+    /// other protocol, and must accept only an exact `mizu/3` match.
+    #[test]
+    fn test_verify_negotiated_alpn_rejects_missing_or_wrong_protocol() {
+        let no_protocol: Box<dyn std::any::Any> = Box::new(quinn::crypto::rustls::HandshakeData {
+            protocol: None,
+            server_name: None,
+        });
+        let result = verify_negotiated_alpn(Some(no_protocol), "no-alpn.mizu.test");
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "a handshake that negotiated no ALPN protocol at all must be rejected: {result:?}"
+        );
+
+        let wrong_protocol: Box<dyn std::any::Any> =
+            Box::new(quinn::crypto::rustls::HandshakeData {
+                protocol: Some(b"h3".to_vec()),
+                server_name: None,
+            });
+        let result = verify_negotiated_alpn(Some(wrong_protocol), "wrong-alpn.mizu.test");
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "a handshake that negotiated a different ALPN protocol must be rejected: {result:?}"
+        );
+
+        let result = verify_negotiated_alpn(None, "no-handshake-data.mizu.test");
+        assert!(
+            matches!(result, Err(MizuError::SecurityViolation(_))),
+            "missing handshake data entirely must be rejected, not treated as trusted: {result:?}"
+        );
+
+        let correct_protocol: Box<dyn std::any::Any> =
+            Box::new(quinn::crypto::rustls::HandshakeData {
+                protocol: Some(MIZU_ALPN.to_vec()),
+                server_name: None,
+            });
+        assert!(
+            verify_negotiated_alpn(Some(correct_protocol), "ok.mizu.test").is_ok(),
+            "an exact mizu/3 match must be accepted"
         );
     }
 }
