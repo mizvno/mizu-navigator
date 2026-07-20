@@ -71,11 +71,16 @@ impl LogicWorker {
     pub(crate) const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     /// Spawns a permanent native thread executing the LogicWorker.
+    ///
+    /// Fails only if the OS refuses the thread/stack allocation (real
+    /// resource exhaustion) — propagated as [`MizuError::IoError`] instead of
+    /// panicking, so the caller can surface a real error instead of aborting
+    /// the process on an opaque message.
     pub fn spawn(
         rx: Receiver<UiEvent>,
         tx: Sender<Result<WorkerResponse, MizuError>>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::Builder::new()
+    ) -> Result<std::thread::JoinHandle<()>, MizuError> {
+        let handle = std::thread::Builder::new()
             .name("logic-worker".to_owned())
             .stack_size(Self::STACK_SIZE_BYTES)
             .spawn(move || {
@@ -93,8 +98,8 @@ impl LogicWorker {
                     tx,
                 };
                 worker.run_loop();
-            })
-            .expect("failed to spawn LogicWorker thread")
+            })?;
+        Ok(handle)
     }
 
     fn run_loop(&mut self) {
@@ -687,7 +692,7 @@ mod tests {
 
         let (tx_in, rx_in) = mpsc::channel::<UiEvent>();
         let (tx_out, rx_out) = mpsc::channel::<Result<WorkerResponse, MizuError>>();
-        let _handle = LogicWorker::spawn(rx_in, tx_out);
+        let _handle = LogicWorker::spawn(rx_in, tx_out).expect("logic worker thread must spawn");
 
         // 300-level deep chain: exceeds MAX_EVAL_DEPTH (256), same shape as
         // core::types::tests::eval_depth_guard /

@@ -181,7 +181,7 @@ impl MizuWindowManager {
 
         let (logic_tx, logic_worker_rx) = std::sync::mpsc::channel();
         let (logic_worker_tx, logic_rx) = std::sync::mpsc::channel();
-        crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx);
+        crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx)?;
 
         let mut font_cx = parley::FontContext::new();
         font_cx.collection.load_system_fonts();
