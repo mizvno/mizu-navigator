@@ -20,6 +20,7 @@ use crate::parser::logic::{
 use crate::parser::{EventBlock, MizuNode, StyleRules, UrlRegistry};
 use crate::render::inspector::log::{InspectorLog, NetOutcome};
 use crate::render::inspector::{InspectorState, InspectorTab};
+use crate::render::layout_bridge::EachExpansion;
 use crate::render::security::CapabilityPolicy;
 
 /// Visual category of a row, mapped to a colour by the paint pass.
@@ -104,6 +105,8 @@ pub struct InspectorSources<'a> {
     pub log: &'a InspectorLog,
     /// Instant of the most recent mutation per variable (drives value flash).
     pub recent_mutations: &'a FxHashMap<Symbol, Instant>,
+    /// Expansion metadata for lists, including budget truncation.
+    pub each_expansion: &'a EachExpansion,
 }
 
 /// Builds the row list for the active tab.
@@ -111,7 +114,7 @@ pub fn build_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row
     match state.tab {
         InspectorTab::Elements => elements_rows(src, state),
         InspectorTab::Style => style_rows(src, state),
-        InspectorTab::Logic => logic_rows(src),
+        InspectorTab::Logic => logic_rows(src, state),
         InspectorTab::Events => events_rows(src),
         InspectorTab::Network => network_rows(src),
     }
@@ -122,7 +125,7 @@ pub fn build_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compact one-line description of a DOM node.
-pub fn node_label(node: &MizuNode) -> String {
+pub fn node_label(node: &MizuNode, truncated_count: Option<usize>) -> String {
     let mut label = node.primitive.as_str().to_string();
     if let Some(id) = node.attributes.get("id") {
         label.push_str(&format!(" #{id}"));
@@ -146,6 +149,9 @@ pub fn node_label(node: &MizuNode) -> String {
         markers.push_str(" [submit]");
     }
     label.push_str(&markers);
+    if let Some(count) = truncated_count {
+        label.push_str(&format!(" [+{} hidden]", count));
+    }
     label
 }
 
@@ -171,9 +177,10 @@ fn elements_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row>
         } else {
             RowKind::Normal
         };
+        let truncated = src.each_expansion.truncated.get(&id).copied();
         rows.push(Row {
             indent: depth,
-            text: format!("{arrow}{}", node_label(node_ref.value())),
+            text: format!("{arrow}{}", node_label(node_ref.value(), truncated)),
             kind,
             node: Some(id),
             expandable: has_children,
@@ -285,8 +292,8 @@ fn style_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
     };
     let node = node_ref.value();
     let mut rows = Vec::new();
-
-    rows.push(Row::header(format!("SELECTED  {}", node_label(node))));
+    let truncated = src.each_expansion.truncated.get(&sel).copied();
+    rows.push(Row::header(format!("SELECTED  {}", node_label(node, truncated))));
 
     // ── Box metrics ──────────────────────────────────────────────────────
     if let Some(&t_id) = src.node_to_taffy_id.get(&sel)
@@ -368,8 +375,21 @@ fn fmt_value(v: &Value) -> String {
 /// How long a freshly-mutated variable stays highlighted in the Logic tab.
 const MUTATION_FLASH: std::time::Duration = std::time::Duration::from_millis(1500);
 
-fn logic_rows(src: &InspectorSources<'_>) -> Vec<Row> {
+fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
     let mut rows = Vec::new();
+    
+    // ── Information Flow ──────────────────────────────────────────────────
+    rows.push(Row::header("INFORMATION FLOW"));
+    if let Some((sources, sinks, violations)) = state.flow_metrics {
+        rows.push(Row::plain(
+            1,
+            format!("flow: {sources} sources, {sinks} sinks, {violations} violations"),
+            if violations == 0 { RowKind::Good } else { RowKind::Bad },
+        ));
+    } else {
+        rows.push(Row::plain(1, "flow metrics not available", RowKind::Dim));
+    }
+
     let interner = &src.store.interner;
     let now = Instant::now();
     let is_fresh = |sym: &Symbol| {
@@ -785,7 +805,7 @@ mod tests {
             iterator_context: None,
             conditional_classes: Vec::new(),
         };
-        let label = node_label(&node);
+        let label = node_label(&node, None);
         assert!(label.contains("button"));
         assert!(label.contains(".card"));
         assert!(label.contains("[click]"));

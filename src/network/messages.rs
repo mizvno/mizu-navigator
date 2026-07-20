@@ -51,7 +51,7 @@ pub struct NetworkRequest {
     /// Optional path parameter substituted into the endpoint's `{…}` placeholder.
     pub path_param: Option<String>,
     /// Variable name the response is bound to.
-    pub target_variable: String,
+    pub target_variable: Symbol,
 }
 
 /// Declarative runtime actions executed by the Main Thread.
@@ -72,7 +72,7 @@ pub enum RuntimeAction {
         /// Optional path parameter substituted into the endpoint's `{…}` placeholder.
         path_param: Option<String>,
         /// Variable name the response is bound to.
-        target_variable: String,
+        target_variable: Symbol,
     },
     /// A fully-resolved HTTP call with a concrete URL, produced by the
     /// `LogicWorker` after looking up the alias in the `UrlRegistry`.
@@ -87,7 +87,7 @@ pub enum RuntimeAction {
         /// actually reaches the wire.
         payload: Option<Value>,
         /// Variable name the response is bound to.
-        target_variable: String,
+        target_variable: Symbol,
     },
     /// Persists `key` → `value` to the current origin's encrypted local storage.
     StoreLocal {
@@ -106,7 +106,7 @@ pub enum RuntimeAction {
     /// Requests the current UNIX time (milliseconds) to be written to a variable.
     GetSystemTime {
         /// Variable name the timestamp is bound to.
-        target_variable: String,
+        target_variable: Symbol,
     },
     /// Requests a full document navigation.
     Navigate {
@@ -135,7 +135,7 @@ pub enum RuntimeAction {
 #[derive(Debug, Clone)]
 pub struct StateUpdate {
     /// `(name, new_value)` pairs for every variable mutated in the last cycle.
-    pub mutated_variables: Vec<(String, Value)>,
+    pub mutated_variables: Vec<(Symbol, Value)>,
 }
 
 /// Events sent from the UI to the LogicWorker.
@@ -160,7 +160,18 @@ pub enum UiEvent {
         /// Form field name → typed value, gathered from every `input` in the form.
         fields: FxHashMap<String, Value>,
     },
-    /// Updates a variable directly in the worker store (used by GetSystemTime).
+    /// Updates a variable in the worker store by name (used by network
+    /// responses and `GetSystemTime`).
+    ///
+    /// `name` is a resolved string, not a `Symbol`, deliberately: the
+    /// sender (UI thread or main-thread capability dispatch) and the
+    /// worker each own an independent clone of the frozen
+    /// [`crate::core::types::StringInterner`], so a `Symbol` minted by one
+    /// side after the parse phase has no defined meaning on the other's
+    /// clone. Sending the name lets the worker resolve it against its own
+    /// authoritative table via `VariableStore::set_runtime`, which silently
+    /// (and safely) drops names the document never declared, instead of
+    /// writing under a `Symbol` neither side can agree on.
     UpdateVariable {
         /// Name of the variable to update.
         name: String,

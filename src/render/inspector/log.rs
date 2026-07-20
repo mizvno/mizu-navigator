@@ -35,6 +35,8 @@ pub enum EventKind {
     Submit,
     /// A variable mutation was applied to the UI store.
     Mutation,
+    /// A layout operation had observable effects (e.g., expansion truncation).
+    Layout,
 }
 
 impl EventKind {
@@ -45,6 +47,7 @@ impl EventKind {
             EventKind::Timer => "timer ",
             EventKind::Submit => "submit",
             EventKind::Mutation => "set   ",
+            EventKind::Layout => "layout",
         }
     }
 }

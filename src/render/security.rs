@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use crate::core::errors::MizuError;
 use crate::core::storage::ValidatedDomain;
@@ -159,7 +159,7 @@ impl CapabilityPolicy {
 pub fn estimate_value_bytes(value: &Value) -> usize {
     match value {
         Value::String(s) => s.len(),
-        Value::Int(_) | Value::Float(_) => 8,
+        Value::Int(_) => 8,
         Value::Bool(_) => 1,
         Value::Null => 4,
         Value::List(items) => items.iter().map(estimate_value_bytes).sum(),
@@ -251,7 +251,7 @@ pub enum CapabilityOutcome {
 /// (gesture-activation check + DOM-node text extraction) and must **not**
 /// reach this function.  If one does, it is discarded with a warning.
 pub fn execute_capability_action(
-    _store: &mut VariableStore,
+    store: &mut VariableStore,
     network_tx: &tokio::sync::mpsc::UnboundedSender<crate::network::NetworkCmd>,
     logic_tx: &std::sync::mpsc::Sender<UiEvent>,
     chrome_url: &str,
@@ -282,10 +282,31 @@ pub fn execute_capability_action(
                 tracing::warn!(url = %url, "SecurityViolation: {reason}");
                 return CapabilityOutcome::Blocked(reason);
             }
+            // `NetworkCmd`/`NetworkResult` cross into the network worker
+            // thread, which holds no interner at all — so `target_var` must
+            // be the resolved name, not the Symbol. `target_variable` was
+            // interned at parse time (before freeze), so it is always
+            // present in this thread's own interner; resolving it here
+            // (rather than carrying the Symbol across threads) is what lets
+            // the eventual `NetworkResult` response be applied via
+            // `UiEvent::UpdateVariable` + `set_runtime` without either side
+            // needing to agree on a post-freeze Symbol ID.
+            let target_var = match store.interner.resolve(target_variable) {
+                Some(name) => name.to_string(),
+                None => {
+                    tracing::warn!(
+                        symbol = target_variable.0,
+                        "ResolvedCall target_variable not found in interner; dropping Fetch"
+                    );
+                    return CapabilityOutcome::Blocked(
+                        "internal error: unresolvable target variable".to_string(),
+                    );
+                }
+            };
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::Fetch {
                 method,
                 url,
-                target_var: target_variable,
+                target_var,
                 is_remote_origin: chrome_url.starts_with("mizu://"),
                 payload,
             }) {
@@ -324,11 +345,24 @@ pub fn execute_capability_action(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
             let time_ms = duration.as_millis() as i64;
-            if let Err(e) = logic_tx.send(UiEvent::UpdateVariable {
-                name: target_variable,
-                value: Value::Int(time_ms),
-            }) {
-                tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
+            // Resolve to a name for the same reason as ResolvedCall above:
+            // `UiEvent::UpdateVariable` carries a String precisely so the
+            // worker never has to trust a Symbol minted by this thread.
+            match store.interner.resolve(target_variable) {
+                Some(name) => {
+                    if let Err(e) = logic_tx.send(UiEvent::UpdateVariable {
+                        name: name.to_string(),
+                        value: Value::Int(time_ms),
+                    }) {
+                        tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        symbol = target_variable.0,
+                        "GetSystemTime target_variable not found in interner; dropping update"
+                    );
+                }
             }
             CapabilityOutcome::Dispatched
         }
@@ -701,6 +735,10 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
         let mut store = crate::core::types::VariableStore::new();
+        // `target_variable` must be a real interned symbol: execute_capability_action
+        // resolves it to a name (not a Symbol) before it crosses into the
+        // network worker thread, which holds no interner at all.
+        let target_variable = store.interner.get_or_intern("result");
         let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
 
         let payload = Value::String(Arc::from(r#"{"who":"mizu"}"#));
@@ -714,7 +752,7 @@ mod tests {
                 method: "POST".to_string(),
                 url: "mizu://example.com/api/v1/submit".to_string(),
                 payload: Some(payload.clone()),
-                target_variable: "result".to_string(),
+                target_variable,
             },
         );
 
@@ -722,6 +760,7 @@ mod tests {
             Ok(crate::network::NetworkCmd::Fetch {
                 method,
                 payload: sent,
+                target_var,
                 ..
             }) => {
                 assert_eq!(method, "POST");
@@ -730,8 +769,87 @@ mod tests {
                     Some(payload),
                     "POST payload must survive the ResolvedCall → Fetch dispatch"
                 );
+                assert_eq!(
+                    target_var, "result",
+                    "target_var must be the resolved variable name, not a stringified Symbol id"
+                );
             }
             other => panic!("expected NetworkCmd::Fetch, got {other:?}"),
         }
+    }
+
+    /// Regression guard for the `/* FIX SYMBOL */` bug: `target_var` sent to
+    /// the network worker must be the variable's actual name, never the
+    /// Symbol's raw numeric id stringified (e.g. "3").
+    #[test]
+    fn resolved_call_target_var_is_resolved_name_not_symbol_id() {
+        let (network_tx, mut network_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
+        let mut store = crate::core::types::VariableStore::new();
+        // Intern a few unrelated names first so this symbol's numeric id is
+        // guaranteed not to equal its name, ruling out a false pass.
+        store.interner.get_or_intern("a");
+        store.interner.get_or_intern("b");
+        let target_variable = store.interner.get_or_intern("weather_report");
+        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+
+        super::execute_capability_action(
+            &mut store,
+            &network_tx,
+            &logic_tx,
+            "mizu://example.com/index.mizu",
+            &mut policy,
+            crate::network::RuntimeAction::ResolvedCall {
+                method: "GET".to_string(),
+                url: "mizu://example.com/api/weather".to_string(),
+                payload: None,
+                target_variable,
+            },
+        );
+
+        match network_rx.try_recv() {
+            Ok(crate::network::NetworkCmd::Fetch { target_var, .. }) => {
+                assert_eq!(target_var, "weather_report");
+                assert_ne!(
+                    target_var,
+                    target_variable.0.to_string(),
+                    "target_var must not be the stringified Symbol id"
+                );
+            }
+            other => panic!("expected NetworkCmd::Fetch, got {other:?}"),
+        }
+    }
+
+    /// An unresolvable `target_variable` (a Symbol absent from this thread's
+    /// interner) must block the dispatch rather than send a meaningless
+    /// target name to the network worker.
+    #[test]
+    fn resolved_call_with_unresolvable_symbol_is_blocked() {
+        let (network_tx, mut network_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
+        let mut store = crate::core::types::VariableStore::new();
+        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+
+        let outcome = super::execute_capability_action(
+            &mut store,
+            &network_tx,
+            &logic_tx,
+            "mizu://example.com/index.mizu",
+            &mut policy,
+            crate::network::RuntimeAction::ResolvedCall {
+                method: "GET".to_string(),
+                url: "mizu://example.com/api/x".to_string(),
+                payload: None,
+                target_variable: crate::core::types::Symbol(0), // never interned
+            },
+        );
+
+        assert!(matches!(outcome, super::CapabilityOutcome::Blocked(_)));
+        assert!(
+            network_rx.try_recv().is_err(),
+            "no Fetch command must be sent for an unresolvable target_variable"
+        );
     }
 }

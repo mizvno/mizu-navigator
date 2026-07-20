@@ -1162,10 +1162,10 @@ mod tests {
         // Build store: items = [Record{"name":"A"}, Record{"name":"B"}]
         let mut store = crate::core::types::VariableStore::new();
         let make_record = |name: &str| -> Value {
-            let mut m: std::collections::BTreeMap<Arc<str>, Value> =
-                std::collections::BTreeMap::new();
-            m.insert(Arc::from("name"), Value::String(Arc::from(name)));
-            Value::Record(Arc::new(m))
+            let mut m: Vec<(Arc<str>, Value)> =
+                Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
+            m.push((Arc::from("name"), Value::String(Arc::from(name))));
+            { m.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(m)) }
         };
         store.set(
             "lista",

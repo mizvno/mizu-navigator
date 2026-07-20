@@ -110,6 +110,8 @@ pub struct InspectorState {
     pub max_scroll: f32,
     /// Last instant the Events tab countdown was refreshed (2 Hz throttle).
     pub last_events_refresh: std::time::Instant,
+    /// Flow metrics: (sources, sinks, violations).
+    pub flow_metrics: Option<(usize, usize, usize)>,
 }
 
 impl Default for InspectorState {
@@ -131,6 +133,7 @@ impl InspectorState {
             scroll: [0.0; 5],
             max_scroll: 0.0,
             last_events_refresh: std::time::Instant::now(),
+            flow_metrics: None,
         }
     }
 
