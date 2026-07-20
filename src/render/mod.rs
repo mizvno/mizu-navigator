@@ -1,4 +1,4 @@
-﻿//! Rendering and window management subsystem.
+//! Rendering and window management subsystem.
 
 /// Native Vello-based browser chrome (navigation bar).
 pub mod chrome_vello;
@@ -10,6 +10,9 @@ pub mod inspector;
 pub mod image_codec;
 /// Layout tree builder and translator.
 pub mod layout_bridge;
+/// Unified navigation policy — single choke point for all document-level
+/// navigation decisions (invariants N1–N5).
+pub mod navigation;
 /// Capability action dispatch and sandboxing utilities.
 // Security note: actions execute unconditionally; there is no per-document
 // permission model. Enforcement is at the transport layer (TLS-only QUIC).

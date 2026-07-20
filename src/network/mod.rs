@@ -1,4 +1,4 @@
-﻿/// Messages for UI thread isolation communication
+/// Messages for UI thread isolation communication
 pub mod messages;
 /// OpenNIC DNS resolver — forces all domain lookups through OpenNIC servers
 pub mod opennic;
@@ -101,8 +101,13 @@ pub enum NetworkResult {
         /// The raw `.mizu` source fetched from that URL.
         source: String,
     },
-    /// The server responded with a redirect
-    Redirect {
+    /// A `Navigate` request received a server redirect (3xx).
+    ///
+    /// **Provenance**: only emitted by the `Navigate` handler in the network
+    /// worker.  `Fetch`, `FetchImage`, and `NetworkRequest` **never** emit
+    /// this variant — they follow same-origin redirects internally or surface
+    /// failure through `FetchFailed` / `FetchImageFailed` (invariant N1).
+    NavigationRedirect {
         /// The redirect target URL to navigate to next.
         new_url: String,
     },

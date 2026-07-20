@@ -24,6 +24,7 @@ use crate::parser::logic::{ComputedBinding, MizuFunction, RootTimer, TimerInterv
 use crate::parser::{Action, EventBlock, MizuNode, MizuOverflow, Primitive, StyleRules};
 use crate::render::hit_test::hit_test;
 use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
+use crate::render::navigation::{NavigationInitiator, NavigationVerdict, check_navigation};
 use crate::render::security::{CapabilityPolicy, get_raw_domain};
 use crate::render::vello_pipeline::{PaintContext, paint_node};
 
@@ -247,8 +248,8 @@ impl MizuWindowManager {
         let ms = match interval {
             TimerInterval::Millis(ms) => *ms,
             TimerInterval::Variable(var_name) => match self.store.get(var_name).ok() {
-                Some(Value::Float(f)) => *f as u64,
-                Some(Value::Int(i)) => *i as u64,
+                
+                Some(Value::Int(i)) => (*i / crate::core::types::DECIMAL_SCALE) as u64,
                 _ => return None,
             },
         };
@@ -474,6 +475,23 @@ impl MizuWindowManager {
             &self.node_to_taffy_id,
             &self.each_expansion,
         )?;
+
+        for (node_id, &new_count) in &new_expansion.truncated {
+            let old_count = self.each_expansion.truncated.get(node_id).copied().unwrap_or(0);
+            if new_count != old_count {
+                let msg = format!("budget exceeded: clamped list to hide {} items", new_count);
+                self.inspector_log.push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
+                tracing::warn!("{}", msg);
+            }
+        }
+        for (node_id, &old_count) in &self.each_expansion.truncated {
+            if !new_expansion.truncated.contains_key(node_id) {
+                let msg = format!("budget restored: previously clamped {} items now visible", old_count);
+                self.inspector_log.push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
+                tracing::warn!("{}", msg);
+            }
+        }
+
         self.each_expansion = new_expansion;
 
         let dom = &self.dom;
@@ -579,7 +597,7 @@ impl MizuWindowManager {
                 url,
                 target_variable,
                 ..
-            } => Some((method.clone(), url.clone(), Some(target_variable.clone()))),
+            } => Some((method.clone(), url.clone(), Some(target_variable.0.to_string()))),
             RuntimeAction::StoreLocal { key, .. } => {
                 Some(("STORE".to_string(), key.clone(), None))
             }
@@ -632,6 +650,7 @@ impl MizuWindowManager {
             capability_policy: &self.capability_policy,
             log: &self.inspector_log,
             recent_mutations: &self.recent_mutations,
+            each_expansion: &self.each_expansion,
         }
     }
 }
@@ -925,6 +944,24 @@ fn handle_navigate_success(manager: &mut MizuWindowManager, url: String, source:
                 url.starts_with("mizu://"),
             ) {
                 Ok(dom) => {
+                    // Check Information Flow (Invariant F)
+                    match crate::parser::flow::check_information_flow(
+                        &dom,
+                        &new_root_timers,
+                        &logic_fns,
+                        &new_computed,
+                        &new_url_registry,
+                        &new_interner,
+                    ) {
+                        Ok(metrics) => {
+                            manager.inspector.flow_metrics = Some(metrics);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, "flow check error");
+                            return; // Reject document load
+                        }
+                    }
+
                     manager.url_registry = new_url_registry;
                     if let Err(e) = manager.reload_document(
                         dom,
@@ -966,6 +1003,11 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
             manager
                 .inspector_log
                 .complete_net(&target_var, NetOutcome::Ok, bytes);
+            // `UiEvent::UpdateVariable` carries the resolved name, not a
+            // Symbol: `target_var` already is that name (see the
+            // `/* FIX SYMBOL */` fix in `execute_capability_action`), and
+            // the worker resolves it against its own frozen interner via
+            // `set_runtime` — no interner lookup needed on this side at all.
             let _ = manager
                 .logic_tx
                 .send(crate::network::UiEvent::UpdateVariable {
@@ -1014,7 +1056,7 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
                 .complete_net(&url, NetOutcome::Ok, Some(source.len()));
             handle_navigate_success(manager, url, source);
         }
-        NetworkResult::Redirect { new_url } => {
+        NetworkResult::NavigationRedirect { new_url } => {
             manager
                 .inspector_log
                 .complete_latest_pending(NetOutcome::Redirect);
@@ -1022,16 +1064,27 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
                 tracing::debug!(
                     url = %new_url,
                     count = manager.redirect_count,
-                    "redirecting"
+                    "redirecting (through choke point)"
                 );
-                manager.chrome_state.url = new_url.clone();
-                manager.chrome_state.loading = true;
-                manager
-                    .inspector_log
-                    .push_net_start("NAV", &new_url, Some(new_url.clone()));
-                let _ = manager
-                    .network_tx
-                    .send(crate::network::NetworkCmd::Navigate { url: new_url });
+                // N2+N5: route through the single choke point so scheme,
+                // origin, gesture, and lifecycle checks all apply.
+                // The redirect inherits the initiator of the navigation
+                // chain — a user-gesture navigation that redirects
+                // cross-origin is still user agency.
+                //
+                // TODO: once navigation carries the original initiator
+                // through the redirect chain, wrap it here.  For now,
+                // redirects of top-level navigations always carry
+                // UserGesture because Navigate can only be reached
+                // through navigate_to_url (which is always either
+                // user-initiated or a same-origin logic action).
+                navigate_to_url(
+                    manager,
+                    new_url,
+                    NavigationInitiator::RedirectOf(Box::new(
+                        NavigationInitiator::UserGesture,
+                    )),
+                );
             } else {
                 tracing::error!(
                     limit = MAX_REDIRECTS,
@@ -1097,49 +1150,128 @@ fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::
     }
 }
 
-/// Triggers a navigation to `url`, handling protocol normalisation for both
-/// local-file (`file:///`) and network (`mizu://`) schemes.
+/// Triggers a navigation to `url`, enforcing the unified navigation policy.
 ///
-/// URLs with any other scheme (e.g. `http://`, `https://`) are ignored with a
-/// warning — Mizu only supports the `mizu://` network protocol.
-fn navigate_to_url(manager: &mut MizuWindowManager, url: String) {
+/// This is the **single choke point** (invariant N2) for all document-level
+/// navigation.  Every navigation — address bar, link click, `navigate`
+/// action from logic, redirect of a prior navigation — must pass through
+/// this function before any state change or `NetworkCmd::Navigate` is
+/// emitted.
+///
+/// The `initiator` records who/what triggered the navigation so the policy
+/// can enforce N3 (cross-origin without user gesture is blocked).
+///
+/// On a blocked verdict, the reason is logged to both `tracing::warn!` and
+/// the inspector Net panel (`BLOCKED` entry).  No state changes occur.
+///
+/// On an allowed verdict:
+/// - `chrome_state.url` is updated (N5: single mutation site).
+/// - `capability_policy` is reset for the new origin (N5).
+/// - The redirect chain counter is reset for non-redirect initiators.
+/// - `file://` documents are loaded directly; `mizu://` dispatches
+///   `NetworkCmd::Navigate` to the network worker.
+fn navigate_to_url(
+    manager: &mut MizuWindowManager,
+    url: String,
+    initiator: NavigationInitiator,
+) {
+    use crate::render::inspector::log::NetOutcome;
+
     // Reloading or navigating to the blank start page is a no-op: there is
     // nothing to fetch, and `about:` is not a routable scheme.
     if url == "about:blank" {
         manager.chrome_state.loading = false;
         return;
     }
-    // A fresh user/logic-initiated navigation starts a new redirect chain.
-    manager.reset_redirect_count();
-    let url = match resolve_navigate_url(&manager.chrome_state.url, &url) {
-        Some(u) => u,
-        None => {
+
+    // For file:// origins with relative paths, we still need resolve_navigate_url
+    // for sandbox enforcement (it does I/O via canonicalize).  check_navigation
+    // handles the pure policy, then we do the I/O-dependent resolution.
+    let resolved_url = if !url.contains("://") && manager.chrome_state.url.starts_with("file://") {
+        // check_navigation allows this at the policy level; now enforce sandbox.
+        match resolve_navigate_url(&manager.chrome_state.url, &url) {
+            Some(u) => u,
+            None => {
+                tracing::warn!(
+                    current = %manager.chrome_state.url,
+                    target = %url,
+                    "blocked: relative path escapes file:// sandbox"
+                );
+                manager.inspector_log.push_net_blocked(
+                    "NAV",
+                    &url,
+                    "relative path escapes file:// sandbox".to_string(),
+                );
+                manager.chrome_state.loading = false;
+                return;
+            }
+        }
+    } else if url.starts_with("file://") && manager.chrome_state.url.starts_with("file://") {
+        // Absolute file→file: sandbox check via resolve_navigate_url.
+        match resolve_navigate_url(&manager.chrome_state.url, &url) {
+            Some(u) => u,
+            None => {
+                tracing::warn!(
+                    current = %manager.chrome_state.url,
+                    target = %url,
+                    "blocked: file:// target escapes sandbox"
+                );
+                manager.inspector_log.push_net_blocked(
+                    "NAV",
+                    &url,
+                    "file:// target escapes sandbox".to_string(),
+                );
+                manager.chrome_state.loading = false;
+                return;
+            }
+        }
+    } else {
+        url.clone()
+    };
+
+    // N2: all navigation decisions go through the policy choke point.
+    match check_navigation(&manager.chrome_state.url, &resolved_url, &initiator) {
+        NavigationVerdict::Allow(target) => {
+            // N5: reset redirect chain for non-redirect initiators.
+            if !matches!(initiator, NavigationInitiator::RedirectOf(_)) {
+                manager.reset_redirect_count();
+            }
+
+            // N5: update chrome state and reset capability policy.
+            manager.chrome_state.url = target.clone();
+            manager.capability_policy = CapabilityPolicy::new(&target);
+
+            if target.starts_with("file://") {
+                if let Some(path) = target.strip_prefix("file:///")
+                    && let Ok(content) = std::fs::read_to_string(path)
+                {
+                    handle_navigate_success(manager, target, content);
+                }
+            } else if target.starts_with("mizu://") {
+                manager.chrome_state.loading = true;
+                manager
+                    .inspector_log
+                    .push_net_start("NAV", &target, Some(target.clone()));
+                // N2: this is the ONLY site that emits NetworkCmd::Navigate.
+                let _ = manager
+                    .network_tx
+                    .send(crate::network::NetworkCmd::Navigate { url: target });
+            }
+        }
+        NavigationVerdict::Block(reason) => {
             tracing::warn!(
                 current = %manager.chrome_state.url,
-                target = %url,
-                "blocked: remote document attempted file:// navigation"
+                target = %resolved_url,
+                reason = reason,
+                "navigation blocked by policy"
             );
-            return;
+            manager.inspector_log.push_net_blocked(
+                "NAV",
+                &resolved_url,
+                reason.to_string(),
+            );
+            manager.chrome_state.loading = false;
         }
-    };
-    manager.chrome_state.url = url.clone();
-    // Reset capability budget for the new origin on every navigation.
-    manager.capability_policy = CapabilityPolicy::new(&url);
-    if url.starts_with("file://") {
-        if let Some(path) = url.strip_prefix("file:///")
-            && let Ok(content) = std::fs::read_to_string(path)
-        {
-            handle_navigate_success(manager, url, content);
-        }
-    } else if url.starts_with("mizu://") {
-        manager
-            .inspector_log
-            .push_net_start("NAV", &url, Some(url.clone()));
-        let _ = manager
-            .network_tx
-            .send(crate::network::NetworkCmd::Navigate { url });
-    } else {
-        tracing::warn!(url = %url, "navigation to unrecognised scheme ignored");
     }
 }
 
@@ -1272,11 +1404,13 @@ pub fn run_window_loop(
             .collect();
         let computed = manager.computed_bindings.clone();
         let fns = manager.logic_fns.clone();
+        let reverse_index = crate::parser::logic::build_comp_reverse_index(&computed);
         crate::parser::logic::recompute_computed_bindings(
             &mut manager.store,
             &computed,
             &fns,
             &all_syms,
+            &reverse_index,
         );
         manager.store.state_machine.undo_log.clear();
     }
@@ -1485,7 +1619,11 @@ pub fn run_window_loop(
                                 tracing::debug!("reload button clicked");
                                 manager.chrome_state.loading = true;
                                 let url = manager.chrome_state.url.clone();
-                                navigate_to_url(&mut manager, url);
+                                navigate_to_url(
+                                    &mut manager,
+                                    url,
+                                    NavigationInitiator::UserGesture,
+                                );
                             }
                             ChromeHitZone::UrlBar => {
                                 let bar_left = url_text_left(logical_width);
@@ -1638,7 +1776,7 @@ pub fn run_window_loop(
                         if let Some(node_ref) = manager.dom.get(node_id) {
                             manager.inspector_log.push_event(
                                 crate::render::inspector::log::EventKind::Click,
-                                crate::render::inspector::model::node_label(node_ref.value()),
+                                crate::render::inspector::model::node_label(node_ref.value(), None),
                             );
                         }
                         // Mark user gesture before dispatching — clipboard actions in this
@@ -1691,12 +1829,20 @@ pub fn run_window_loop(
                         match action {
                             ChromeKeyAction::Navigate(url) => {
                                 manager.chrome_state.loading = true;
-                                navigate_to_url(&mut manager, url);
+                                navigate_to_url(
+                                    &mut manager,
+                                    url,
+                                    NavigationInitiator::UserGesture,
+                                );
                             }
                             ChromeKeyAction::Reload => {
                                 let url = manager.chrome_state.url.clone();
                                 manager.chrome_state.loading = true;
-                                navigate_to_url(&mut manager, url);
+                                navigate_to_url(
+                                    &mut manager,
+                                    url,
+                                    NavigationInitiator::UserGesture,
+                                );
                             }
                             ChromeKeyAction::Back => {
                                 tracing::debug!("back: history nyi");
@@ -2098,7 +2244,7 @@ pub fn run_window_loop(
                     // Expose scroll state to the logic store
                     manager.store.set(
                         "root_scroll_y",
-                        crate::core::types::Value::Float(manager.root_scroll_offset_y as f64),
+                        crate::core::types::Value::Int((manager.root_scroll_offset_y as f64 * crate::core::types::DECIMAL_SCALE as f64).round() as i64),
                     );
                 }
                 _ => {}
@@ -2119,13 +2265,13 @@ pub fn run_window_loop(
             while let Ok(res) = manager.logic_rx.try_recv() {
                 match res {
                     Ok(response) => {
-                        for (name, val) in response.state_update.mutated_variables {
+                        for (sym, val) in response.state_update.mutated_variables {
+                            let name_str = manager.store.interner.resolve(sym).unwrap_or("<unknown>");
                             manager.inspector_log.push_event(
                                 crate::render::inspector::log::EventKind::Mutation,
-                                format!("{name} = {val}"),
+                                format!("{name_str} = {val}"),
                             );
-                            let sym = manager.store.interner.get_or_intern(&name);
-                            manager.store.set(name, val);
+                            manager.store.state_machine.set_global(sym, val);
                             manager
                                 .recent_mutations
                                 .insert(sym, std::time::Instant::now());
@@ -2134,11 +2280,17 @@ pub fn run_window_loop(
                         }
                         for action in response.runtime_actions {
                             if let crate::network::RuntimeAction::Navigate { url } = &action {
-                                // Navigate actions must go through navigate_to_url so
-                                // chrome_state and the capability policy are updated.
+                                // N2+N3: Navigate actions go through the choke point;
+                                // capture the current gesture flag so cross-origin
+                                // logic-driven navigation is blocked without a click.
                                 manager.chrome_state.loading = true;
                                 let url = url.clone();
-                                navigate_to_url(&mut manager, url);
+                                let initiator = if manager.has_user_gesture {
+                                    NavigationInitiator::UserGesture
+                                } else {
+                                    NavigationInitiator::DocumentLogic
+                                };
+                                navigate_to_url(&mut manager, url, initiator);
                             } else if let crate::network::RuntimeAction::CopyToClipboard {
                                 node_id,
                             } = &action
