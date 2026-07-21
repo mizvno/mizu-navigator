@@ -159,6 +159,51 @@ pub enum MizuDimension {
     Percent(f32),
 }
 
+/// The three CSS-generic font families an author may request via
+/// `font-family`.
+///
+/// This is a **fixed allowlist**, not a denylist, and it is deliberately the
+/// entire vocabulary: no concrete family name (`"Comic Sans MS"`), no URL,
+/// no `@font-face`. A concrete family string resolved against the OS font
+/// directory would be a fingerprinting surface (which fonts are installed),
+/// and any path that loads a font from disk or network is a new I/O channel
+/// and parser attack surface — the same class of concern `image src`/N4/F1
+/// exist to prevent. The author picks a generic; the engine (via fontique's
+/// script-aware fallback — see `render::text_engine`) guarantees the glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MizuFontFamily {
+    /// Glyphs have plain stroke endings (e.g. Segoe UI, Arial). Default.
+    #[default]
+    SansSerif,
+    /// Glyphs have finishing strokes / serifed endings.
+    Serif,
+    /// All glyphs share the same fixed advance width.
+    Monospace,
+}
+
+/// `font-style` value: `normal` or `italic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MizuFontStyle {
+    /// Upright ("roman") style. Default.
+    #[default]
+    Normal,
+    /// Slanted style.
+    Italic,
+}
+
+/// `text-align` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MizuTextAlign {
+    /// Align content to the left edge.
+    Left,
+    /// Center each line.
+    Center,
+    /// Align content to the right edge.
+    Right,
+    /// Justify each line (except the last) by spacing out content.
+    Justify,
+}
+
 /// The parsed, validated style rules for a single Mizu class selector.
 ///
 /// All fields are `Option` — omitted properties remain `None` and will fall
@@ -212,6 +257,24 @@ pub struct StyleRules {
     pub border_width: Option<f32>,
     /// `border-color` — border color.
     pub border_color: Option<MizuColor>,
+
+    // ── Typography (ux-3) ─────────────────────────────────────────────────────
+    /// `font-family` — one of the three CSS generics (`sans-serif`, `serif`,
+    /// `monospace`). See [`MizuFontFamily`] for the security rationale for
+    /// why this is a fixed allowlist.
+    pub font_family: Option<MizuFontFamily>,
+    /// `font-weight` — `normal` (400), `bold` (700), or a bare numeric
+    /// weight in `100..=900`.
+    pub font_weight: Option<f32>,
+    /// `font-style` — `normal` or `italic`.
+    pub font_style: Option<MizuFontStyle>,
+    /// `text-align` — `left`, `center`, `right`, or `justify`.
+    pub text_align: Option<MizuTextAlign>,
+    /// `line-height` — a multiplier of the font size (e.g. `1.4`).
+    /// Defaults to `1.2` when unset (`render::text_engine`).
+    pub line_height: Option<f32>,
+    /// `text-decoration` — `none` or `underline`.
+    pub underline: Option<bool>,
 
     // ── Phase-11 layout mechanics ─────────────────────────────────────────────
     /// `overflow` — controls child clipping and scroll behaviour.
@@ -283,6 +346,25 @@ impl StyleRules {
         }
         if other.border_color.is_some() {
             self.border_color = other.border_color;
+        }
+
+        if other.font_family.is_some() {
+            self.font_family = other.font_family;
+        }
+        if other.font_weight.is_some() {
+            self.font_weight = other.font_weight;
+        }
+        if other.font_style.is_some() {
+            self.font_style = other.font_style;
+        }
+        if other.text_align.is_some() {
+            self.text_align = other.text_align;
+        }
+        if other.line_height.is_some() {
+            self.line_height = other.line_height;
+        }
+        if other.underline.is_some() {
+            self.underline = other.underline;
         }
 
         // Primitive overwrites
@@ -554,6 +636,55 @@ fn apply_property(
             rules.border_color = Some(parse_color(value, line_num)?);
         }
 
+        // ── Typography (ux-3) ──────────────────────────────────────────────────
+        "font-family" => {
+            rules.font_family = Some(parse_font_family(value, line_num)?);
+        }
+        "font-weight" => {
+            rules.font_weight = Some(parse_font_weight(value, line_num)?);
+        }
+        "font-style" => {
+            rules.font_style = Some(match value {
+                "normal" => MizuFontStyle::Normal,
+                "italic" => MizuFontStyle::Italic,
+                _ => {
+                    return Err(MizuError::ParseError(format!(
+                        "line {line_num}: invalid value `{value}` for `font-style`; \
+                         valid values: normal, italic"
+                    )));
+                }
+            });
+        }
+        "text-align" => {
+            rules.text_align = Some(match value {
+                "left" => MizuTextAlign::Left,
+                "center" => MizuTextAlign::Center,
+                "right" => MizuTextAlign::Right,
+                "justify" => MizuTextAlign::Justify,
+                _ => {
+                    return Err(MizuError::ParseError(format!(
+                        "line {line_num}: invalid value `{value}` for `text-align`; \
+                         valid values: left, center, right, justify"
+                    )));
+                }
+            });
+        }
+        "line-height" => {
+            rules.line_height = Some(parse_f32(value, key, line_num)?);
+        }
+        "text-decoration" => {
+            rules.underline = Some(match value {
+                "none" => false,
+                "underline" => true,
+                _ => {
+                    return Err(MizuError::ParseError(format!(
+                        "line {line_num}: invalid value `{value}` for `text-decoration`; \
+                         valid values: none, underline"
+                    )));
+                }
+            });
+        }
+
         // ── Phase-11: overflow & z-index ──────────────────────────────────────
         "overflow" => {
             rules.overflow = match value {
@@ -582,7 +713,8 @@ fn apply_property(
                 "flex" => Display::Flex,
                 _ => {
                     return Err(MizuError::ParseError(format!(
-                        "line {line_num}: display supporta solo: none, flex"
+                        "line {line_num}: invalid value `{value}` for `display`; \
+                         valid values: none, flex"
                     )));
                 }
             });
@@ -594,7 +726,8 @@ fn apply_property(
                 "line {line_num}: unknown style property `{unknown}`; \
                  valid properties: width, height, padding, margin, gap, \
                  direction, justify, align, background, background-image, background-size, color, \
-                 font-size, border-radius, border-width, border-color, overflow, z-index, display"
+                 font-size, border-radius, border-width, border-color, overflow, z-index, display, \
+                 font-family, font-weight, font-style, text-align, line-height, text-decoration"
             )));
         }
     }
@@ -804,6 +937,48 @@ fn parse_hex_byte(s: &str, token: &str, line_num: usize) -> Result<u8, MizuError
     })
 }
 
+/// Parses `font-family` against the fixed three-generic allowlist
+/// (`sans-serif`, `serif`, `monospace`). Accepts the value quoted or bare —
+/// either way, only those three exact tokens are ever accepted. See
+/// [`MizuFontFamily`] for the security rationale.
+fn parse_font_family(value: &str, line_num: usize) -> Result<MizuFontFamily, MizuError> {
+    match value.trim_matches('"') {
+        "sans-serif" => Ok(MizuFontFamily::SansSerif),
+        "serif" => Ok(MizuFontFamily::Serif),
+        "monospace" => Ok(MizuFontFamily::Monospace),
+        _ => Err(MizuError::ParseError(format!(
+            "line {line_num}: invalid value `{value}` for `font-family`; \
+             only the generic families `sans-serif`, `serif`, `monospace` are \
+             accepted — a concrete font name, URL, or @font-face is never a \
+             valid Mizu value (fixed allowlist, not a suggestion list)"
+        ))),
+    }
+}
+
+/// Parses `font-weight`: the keywords `normal` (400) / `bold` (700), or a
+/// bare numeric weight in the CSS range `100..=900` (e.g. `550`).
+fn parse_font_weight(value: &str, line_num: usize) -> Result<f32, MizuError> {
+    match value {
+        "normal" => Ok(400.0),
+        "bold" => Ok(700.0),
+        _ => {
+            let weight = value.parse::<f32>().map_err(|_| {
+                MizuError::ParseError(format!(
+                    "line {line_num}: invalid value `{value}` for `font-weight`; \
+                     valid values: normal, bold, or a number 100-900"
+                ))
+            })?;
+            if !(100.0..=900.0).contains(&weight) {
+                return Err(MizuError::ParseError(format!(
+                    "line {line_num}: invalid numeric `font-weight` value `{value}`; \
+                     must be between 100 and 900"
+                )));
+            }
+            Ok(weight)
+        }
+    }
+}
+
 /// Maps a Mizu `justify` value string to [`JustifyContent`].
 fn parse_justify_content(value: &str, line_num: usize) -> Result<JustifyContent, MizuError> {
     match value {
@@ -842,7 +1017,8 @@ fn parse_align_items(value: &str, line_num: usize) -> Result<AlignItems, MizuErr
 mod tests {
     use super::{
         AlignItems, Display, FlexDirection, JustifyContent, MizuBackground, MizuColor,
-        MizuDimension, MizuOverflow, parse_color, parse_style,
+        MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign, parse_color,
+        parse_style,
     };
     use crate::core::errors::MizuError;
 
@@ -1605,7 +1781,7 @@ mod tests {
         let block = "    .box\n        display block\n";
         let result = parse_style(block);
         assert!(
-            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("display supporta solo: none, flex")),
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("display") && msg.contains("none, flex")),
             "expected display error, got: {result:?}"
         );
     }
@@ -1631,5 +1807,243 @@ mod tests {
         let base_block = "    .base\n        display flex\n";
         let base_rules = parse_style(base_block).unwrap();
         assert_eq!(base_rules["base"].display, Some(Display::Flex));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Typography (ux-3)
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn font_family_sans_serif_parsed() {
+        let block = "    .label\n        font-family sans-serif\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_family, Some(MizuFontFamily::SansSerif));
+    }
+
+    #[test]
+    fn font_family_serif_parsed() {
+        let block = "    .label\n        font-family serif\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_family, Some(MizuFontFamily::Serif));
+    }
+
+    #[test]
+    fn font_family_monospace_parsed() {
+        let block = "    .label\n        font-family monospace\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_family, Some(MizuFontFamily::Monospace));
+    }
+
+    #[test]
+    fn font_family_quoted_generic_also_accepted() {
+        let block = "    .label\n        font-family \"serif\"\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_family, Some(MizuFontFamily::Serif));
+    }
+
+    // ── Security: font-family allowlist cannot be silently widened ──────────
+
+    #[test]
+    fn font_family_concrete_name_is_rejected() {
+        let block = "    .label\n        font-family \"Comic Sans MS\"\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("font-family")),
+            "a concrete font family name must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn font_family_url_is_rejected() {
+        let block = "    .label\n        font-family \"http://evil/font.woff\"\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("font-family")),
+            "a URL must never be accepted as a font-family value, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn font_family_bare_word_outside_allowlist_is_rejected() {
+        let block = "    .label\n        font-family Arial\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(_))),
+            "only the three generics may parse, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn font_weight_normal_parsed() {
+        let block = "    .label\n        font-weight normal\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_weight, Some(400.0));
+    }
+
+    #[test]
+    fn font_weight_bold_parsed() {
+        let block = "    .label\n        font-weight bold\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_weight, Some(700.0));
+    }
+
+    #[test]
+    fn font_weight_numeric_parsed() {
+        let block = "    .label\n        font-weight 550\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_weight, Some(550.0));
+    }
+
+    #[test]
+    fn font_weight_out_of_range_is_rejected() {
+        let block = "    .label\n        font-weight 1500\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("font-weight")),
+            "expected font-weight range error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn font_weight_garbage_is_rejected() {
+        let block = "    .label\n        font-weight chunky\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("font-weight")),
+            "expected font-weight error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn font_style_italic_parsed() {
+        let block = "    .label\n        font-style italic\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_style, Some(MizuFontStyle::Italic));
+    }
+
+    #[test]
+    fn font_style_normal_parsed() {
+        let block = "    .label\n        font-style normal\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].font_style, Some(MizuFontStyle::Normal));
+    }
+
+    #[test]
+    fn font_style_invalid_is_rejected() {
+        let block = "    .label\n        font-style slanted\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("font-style")),
+            "expected font-style error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn text_align_center_parsed() {
+        let block = "    .label\n        text-align center\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].text_align, Some(MizuTextAlign::Center));
+    }
+
+    #[test]
+    fn text_align_all_valid_values_parsed() {
+        for (value, expected) in [
+            ("left", MizuTextAlign::Left),
+            ("center", MizuTextAlign::Center),
+            ("right", MizuTextAlign::Right),
+            ("justify", MizuTextAlign::Justify),
+        ] {
+            let block = format!("    .label\n        text-align {value}\n");
+            let rules = parse_style(&block).unwrap();
+            assert_eq!(rules["label"].text_align, Some(expected));
+        }
+    }
+
+    #[test]
+    fn text_align_invalid_is_rejected() {
+        let block = "    .label\n        text-align middle\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("text-align")),
+            "expected text-align error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn line_height_multiplier_parsed() {
+        let block = "    .label\n        line-height 1.4\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["label"].line_height, Some(1.4));
+    }
+
+    #[test]
+    fn line_height_default_is_unset() {
+        let block = "    .label\n        color #000000\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(
+            rules["label"].line_height, None,
+            "line-height must be None when unset; the 1.2 default lives in text_engine"
+        );
+    }
+
+    #[test]
+    fn text_decoration_underline_parsed() {
+        let block = "    .link\n        text-decoration underline\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["link"].underline, Some(true));
+    }
+
+    #[test]
+    fn text_decoration_none_parsed() {
+        let block = "    .link\n        text-decoration none\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["link"].underline, Some(false));
+    }
+
+    #[test]
+    fn text_decoration_invalid_is_rejected() {
+        let block = "    .link\n        text-decoration wavy\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("text-decoration")),
+            "expected text-decoration error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn typography_properties_merge_like_others() {
+        let base = "    .base\n        font-weight bold\n        text-align center\n";
+        let override_block = "    .active\n        font-weight normal\n";
+        let base_rules = parse_style(base).unwrap();
+        let override_rules = parse_style(override_block).unwrap();
+        let merged = base_rules["base"].clone().merge(override_rules["active"].clone());
+        assert_eq!(merged.font_weight, Some(400.0), "override must win");
+        assert_eq!(
+            merged.text_align,
+            Some(MizuTextAlign::Center),
+            "unset fields in the override must not clobber the base"
+        );
+    }
+
+    #[test]
+    fn error_unknown_property_message_lists_typography_properties() {
+        // Keep the unknown-property error message in sync with the new
+        // properties — a stale list is a paper cut that misleads authors.
+        let block = "    .box\n        color-scheme dark\n";
+        let result = parse_style(block);
+        let msg = result.unwrap_err().to_string();
+        for prop in [
+            "font-family",
+            "font-weight",
+            "font-style",
+            "text-align",
+            "line-height",
+            "text-decoration",
+        ] {
+            assert!(
+                msg.contains(prop),
+                "unknown-property error must list `{prop}`, got: {msg}"
+            );
+        }
     }
 }

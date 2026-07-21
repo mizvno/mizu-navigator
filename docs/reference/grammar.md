@@ -229,6 +229,12 @@ property_line  = SP+ property_key SP+ property_value ;
 | `overflow` | `visible` \| `hidden` \| `scroll` |
 | `z-index` | signed integer |
 | `display` | `none` \| `flex` |
+| `font-family` | `sans-serif` \| `serif` \| `monospace` (fixed 3-generic allowlist — see below) |
+| `font-weight` | `normal` \| `bold` \| a bare number `100`–`900` |
+| `font-style` | `normal` \| `italic` |
+| `text-align` | `left` \| `center` \| `right` \| `justify` |
+| `line-height` | bare number (multiplier of font size; default `1.2`) |
+| `text-decoration` | `none` \| `underline` |
 
 **Constraints:**
 
@@ -236,6 +242,17 @@ property_line  = SP+ property_key SP+ property_value ;
 - `background-image` with `://` in the value is `ParseError` (absolute URLs forbidden).
 - Selectors appear at baseline indent; properties must be indented deeper.
 - Unknown property keys produce `ParseError`.
+- **`font-family` is a fixed allowlist, not a suggestion list.** Only the
+  three CSS generics parse; a concrete family name (`"Comic Sans MS"`), a
+  URL, or anything resembling `@font-face` is a hard `ParseError`. This is
+  deliberate: an arbitrary family string resolved against the OS font
+  directory is a fingerprinting surface (which fonts are installed), and any
+  path that loads a font from disk or network is a new I/O channel and
+  parser attack surface — the same class of concern as the `image src`
+  media-alias guard (N4/F1). The author picks a generic; the engine
+  guarantees the glyphs via script-aware system font fallback (fontique) —
+  see `render::text_engine`'s module doc for the coverage bar and the
+  System-only vs. hybrid-bundle determinism decision.
 
 ---
 
