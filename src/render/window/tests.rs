@@ -90,7 +90,7 @@
     #[test]
     fn redirect_counter_allows_up_to_max_then_stops() {
         let mut manager = make_minimal_manager();
-        for hop in 1..=MAX_REDIRECTS {
+        for hop in 1..=*MAX_REDIRECTS {
             assert!(
                 manager.register_redirect(),
                 "redirect hop {hop} should be permitted (<= MAX_REDIRECTS)"
@@ -99,14 +99,14 @@
         assert!(
             !manager.register_redirect(),
             "redirect hop {} must be refused (exceeds MAX_REDIRECTS)",
-            MAX_REDIRECTS + 1
+            *MAX_REDIRECTS + 1
         );
     }
 
     #[test]
     fn redirect_counter_reset_clears_budget() {
         let mut manager = make_minimal_manager();
-        for _ in 0..MAX_REDIRECTS {
+        for _ in 0..*MAX_REDIRECTS {
             assert!(manager.register_redirect());
         }
         assert!(

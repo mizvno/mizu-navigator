@@ -14,7 +14,12 @@ const PERMITTED_HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE
 ///
 /// Server-provided `EXP` values beyond `now + MAX_TOKEN_TTL_SECS` are capped,
 /// preventing indefinitely-lived tokens.
-const MAX_TOKEN_TTL_SECS: u64 = 86_400; // 24 hours
+///
+/// An unmeasured starting value, overridable for a single run via
+/// `MIZU_MAX_TOKEN_TTL_SECS` (see the module doc on [`crate::core::config`]).
+static MAX_TOKEN_TTL_SECS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    crate::core::config::env_override("MIZU_MAX_TOKEN_TTL_SECS", 86_400) // 24 hours
+});
 
 /// Loads the vault entry for `domain`, verifies it has not expired, and checks
 /// that `method` is within scope.
@@ -95,7 +100,7 @@ pub(super) fn process_mizu_auth_set(value: &str, domain: &str) -> Result<(), Miz
         .elapsed()
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let exp = raw_exp.min(now.saturating_add(MAX_TOKEN_TTL_SECS));
+    let exp = raw_exp.min(now.saturating_add(*MAX_TOKEN_TTL_SECS));
 
     if exp <= now {
         return Err(MizuError::SecurityViolation(

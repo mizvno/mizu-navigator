@@ -928,7 +928,7 @@
         // This avoids building a deep recursive tree that would overflow the call
         // stack in debug mode before the instruction limit is ever reached.
         let mut sm = StateMachine::new();
-        sm.instruction_count = MAX_INSTRUCTIONS;
+        sm.instruction_count = *MAX_INSTRUCTIONS;
 
         let interner = crate::core::types::StringInterner::new();
         let fns = FxHashMap::default();
@@ -955,7 +955,7 @@
         store.state_machine.set_global(x_sym, Value::Int(0));
 
         // First action — must succeed even if counter was near-exhausted from a prior call.
-        store.state_machine.instruction_count = MAX_INSTRUCTIONS - 1;
+        store.state_machine.instruction_count = *MAX_INSTRUCTIONS - 1;
         let action1 = Action::Assign {
             target: "x".to_string(),
             expr: Expr::Literal(Value::Int(1)),
@@ -1864,7 +1864,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         // to blow up the per-reaction instruction budget at runtime (see
         // `MAX_COMP_BINDINGS`'s docs in `core::types` and `formal/MizuFormal/Budget.lean`'s
         // `T1_shipped_capped`).
-        let too_many = crate::core::types::MAX_COMP_BINDINGS + 1;
+        let too_many = *crate::core::types::MAX_COMP_BINDINGS + 1;
         let mut src = String::new();
         for i in 0..too_many {
             src.push_str(&format!("    comp c{i} = {i}\n"));
@@ -1881,7 +1881,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
     fn test_comp_binding_cap_allows_exactly_the_limit() {
         // The cap must reject documents *above* the limit without rejecting
         // documents that declare exactly MAX_COMP_BINDINGS comps.
-        let at_limit = crate::core::types::MAX_COMP_BINDINGS;
+        let at_limit = *crate::core::types::MAX_COMP_BINDINGS;
         let mut src = String::new();
         for i in 0..at_limit {
             src.push_str(&format!("    comp c{i} = {i}\n"));

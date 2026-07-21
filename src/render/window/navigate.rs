@@ -336,7 +336,7 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                 );
             } else {
                 tracing::error!(
-                    limit = MAX_REDIRECTS,
+                    limit = *MAX_REDIRECTS,
                     "redirect limit exceeded; aborting navigation"
                 );
                 manager.chrome_state.loading = false;

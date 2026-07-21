@@ -710,20 +710,21 @@
             std::collections::HashMap::new();
         let now = Instant::now();
 
-        for i in 0..(MAX_POOL_SIZE + 10) {
-            H3ConnectionPool::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
+        for i in 0..(*MAX_POOL_SIZE + 10) {
+            H3ConnectionPool::make_room(&mut map, now, *QUIC_MAX_IDLE_TIMEOUT, *MAX_POOL_SIZE);
             map.insert(format!("domain-{i}.example"), ((), now));
             assert!(
-                map.len() <= MAX_POOL_SIZE,
-                "pool must never exceed MAX_POOL_SIZE ({MAX_POOL_SIZE}) while \
+                map.len() <= *MAX_POOL_SIZE,
+                "pool must never exceed MAX_POOL_SIZE ({}) while \
                  inserting domain #{i}, got {}",
+                *MAX_POOL_SIZE,
                 map.len()
             );
         }
 
         assert_eq!(
             map.len(),
-            MAX_POOL_SIZE,
+            *MAX_POOL_SIZE,
             "pool must be exactly at capacity after inserting more domains than it allows"
         );
     }
@@ -740,7 +741,7 @@
         map.insert("stale.example".to_string(), ((), long_idle));
         map.insert("fresh.example".to_string(), ((), now));
 
-        H3ConnectionPool::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
+        H3ConnectionPool::make_room(&mut map, now, *QUIC_MAX_IDLE_TIMEOUT, *MAX_POOL_SIZE);
 
         assert!(
             !map.contains_key("stale.example"),

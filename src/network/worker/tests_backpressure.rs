@@ -9,10 +9,10 @@
     /// channel must be full and `try_send` must fail — no unbounded allocation.
     #[tokio::test]
     async fn test_network_to_ui_backpressure_sustained_flood() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<NetworkResult>(MAX_UI_CHANNEL_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<NetworkResult>(*MAX_UI_CHANNEL_CAPACITY);
 
         // Fill the channel to capacity — every try_send up to the limit must succeed.
-        for i in 0..MAX_UI_CHANNEL_CAPACITY {
+        for i in 0..*MAX_UI_CHANNEL_CAPACITY {
             tx.try_send(NetworkResult::Error(MizuError::Network(format!("msg {i}"))))
                 .unwrap_or_else(|_| panic!("try_send must succeed for slot {i}"));
         }
@@ -23,7 +23,8 @@
         )));
         assert!(
             overflow.is_err(),
-            "channel must reject messages beyond MAX_UI_CHANNEL_CAPACITY={MAX_UI_CHANNEL_CAPACITY}"
+            "channel must reject messages beyond MAX_UI_CHANNEL_CAPACITY={}",
+            *MAX_UI_CHANNEL_CAPACITY
         );
 
         // Drain and verify exactly MAX_UI_CHANNEL_CAPACITY messages were buffered.
@@ -32,7 +33,7 @@
             count += 1;
         }
         assert_eq!(
-            count, MAX_UI_CHANNEL_CAPACITY,
+            count, *MAX_UI_CHANNEL_CAPACITY,
             "exactly MAX_UI_CHANNEL_CAPACITY messages must have been buffered"
         );
     }
@@ -43,7 +44,7 @@
     async fn test_concurrent_fetch_throttling_limits() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(*MAX_CONCURRENT_FETCHES));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
 
@@ -71,9 +72,10 @@
 
         let observed_peak = peak.load(Ordering::SeqCst);
         assert!(
-            observed_peak <= MAX_CONCURRENT_FETCHES,
+            observed_peak <= *MAX_CONCURRENT_FETCHES,
             "peak concurrent fetches ({observed_peak}) must not exceed \
-             MAX_CONCURRENT_FETCHES ({MAX_CONCURRENT_FETCHES})"
+             MAX_CONCURRENT_FETCHES ({})",
+            *MAX_CONCURRENT_FETCHES
         );
         // Confirm all 50 tasks eventually ran (semaphore is not permanently exhausted).
         assert_eq!(
@@ -87,10 +89,10 @@
     /// unblocked as soon as the UI drains messages via `try_recv`.
     #[tokio::test]
     async fn test_backpressure_graceful_recovery() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<NetworkResult>(MAX_UI_CHANNEL_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<NetworkResult>(*MAX_UI_CHANNEL_CAPACITY);
 
         // Fill the channel to capacity so the next send will block.
-        for i in 0..MAX_UI_CHANNEL_CAPACITY {
+        for i in 0..*MAX_UI_CHANNEL_CAPACITY {
             tx.try_send(NetworkResult::Error(MizuError::Network(format!(
                 "fill {i}"
             ))))
@@ -116,7 +118,7 @@
             drained += 1;
         }
         assert_eq!(
-            drained, MAX_UI_CHANNEL_CAPACITY,
+            drained, *MAX_UI_CHANNEL_CAPACITY,
             "all buffered messages must be drained"
         );
 

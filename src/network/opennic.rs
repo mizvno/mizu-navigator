@@ -146,7 +146,8 @@ pub struct MizuDnsResolver {
 }
 
 /// Mizu protocol port used on every `mizu://` server.
-pub const MIZU_PORT: u16 = 7399;
+pub static MIZU_PORT: std::sync::LazyLock<u16> =
+    std::sync::LazyLock::new(|| crate::core::config::CONFIG.mizu_port);
 
 
 /// Builds [`NameServerConfig`] entries for the given server list.
@@ -519,7 +520,7 @@ mod tests {
         // Secondary pool: returns a canned address immediately.
         let secondary_succeeds = std::future::ready(Ok::<SocketAddr, _>(SocketAddr::from((
             [9, 9, 9, 9],
-            MIZU_PORT,
+            *MIZU_PORT,
         ))));
 
         let result = resolve_with_pool_fallback(primary_fails, secondary_succeeds).await;
@@ -530,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap(),
-            SocketAddr::from(([9, 9, 9, 9], MIZU_PORT)),
+            SocketAddr::from(([9, 9, 9, 9], *MIZU_PORT)),
             "result must come from the secondary pool after primary failure"
         );
     }
@@ -551,7 +552,7 @@ mod tests {
             std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(dns_err)));
         let secondary_would_succeed = std::future::ready(Ok::<SocketAddr, _>(SocketAddr::from((
             [1, 1, 1, 1],
-            MIZU_PORT,
+            *MIZU_PORT,
         ))));
 
         let result = resolve_with_pool_fallback(primary_nxdomain, secondary_would_succeed).await;

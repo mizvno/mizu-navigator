@@ -2,7 +2,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::core::errors::MizuError;
 use crate::parser::logic::{Expr, MizuFunction, apply_binop, check_type, type_name};
@@ -30,7 +30,15 @@ use super::value::Value;
 /// invariant held, a tight ~1 ns/instruction loop bounds worst-case
 /// execution to roughly 20 000 × 1 ns = 20 µs of *actual* work, not just
 /// 20 000 AST-node visits — well inside any UI frame budget.
-pub const MAX_INSTRUCTIONS: u64 = 20_000;
+///
+/// An unmeasured starting value (see the module doc on
+/// [`crate::core::config`]), overridable for a single run via the
+/// `MIZU_MAX_INSTRUCTIONS` environment variable. Note: `formal/MizuFormal/Budget.lean`'s
+/// `T1_reaction_bound` theorem prices a reaction in terms of this constant's
+/// *default* value — overriding it at runtime does not invalidate anything
+/// already running, but the proof no longer describes the overridden run.
+pub static MAX_INSTRUCTIONS: LazyLock<u64> =
+    LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_INSTRUCTIONS", 20_000));
 
 /// Maximum number of `comp` (computed/derived variable) bindings a single
 /// document may declare.
@@ -59,7 +67,11 @@ pub const MAX_INSTRUCTIONS: u64 = 20_000;
 /// bindings, so there is no existing corpus of legitimate high-comp-count
 /// documents to calibrate against. Revisit this constant if real usage
 /// demonstrates a legitimate need for more.
-pub const MAX_COMP_BINDINGS: usize = 500;
+///
+/// Overridable for a single run via `MIZU_MAX_COMP_BINDINGS` (see the module
+/// doc on [`crate::core::config`]).
+pub static MAX_COMP_BINDINGS: LazyLock<usize> =
+    LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_COMP_BINDINGS", 500));
 
 /// Maximum recursion depth for [`StateMachine::evaluate`].
 ///
@@ -359,7 +371,7 @@ impl StateMachine {
         interner: &StringInterner,
     ) -> Result<Value, MizuError> {
         self.instruction_count += 1;
-        if self.instruction_count > MAX_INSTRUCTIONS {
+        if self.instruction_count > *MAX_INSTRUCTIONS {
             return Err(MizuError::Timeout);
         }
         self.eval_depth += 1;
@@ -507,7 +519,7 @@ impl StateMachine {
                         // large lists from bypassing MAX_INSTRUCTIONS via unmetered CPU work.
                         self.instruction_count =
                             self.instruction_count.saturating_add(list.len() as u64);
-                        if self.instruction_count > MAX_INSTRUCTIONS {
+                        if self.instruction_count > *MAX_INSTRUCTIONS {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
@@ -547,7 +559,7 @@ impl StateMachine {
                         };
                         self.instruction_count =
                             self.instruction_count.saturating_add(list.len() as u64);
-                        if self.instruction_count > MAX_INSTRUCTIONS {
+                        if self.instruction_count > *MAX_INSTRUCTIONS {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
@@ -620,7 +632,7 @@ impl StateMachine {
                         let sorting_cost = (n as u64).saturating_mul(log2_n as u64);
                         self.instruction_count =
                             self.instruction_count.saturating_add(sorting_cost);
-                        if self.instruction_count > MAX_INSTRUCTIONS {
+                        if self.instruction_count > *MAX_INSTRUCTIONS {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {

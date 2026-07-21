@@ -25,7 +25,13 @@ pub type EachIterationOverrides = HashMap<EgoNodeId, taffy::prelude::NodeId>;
 /// performs O(data) allocation or CPU work must draw from an explicit,
 /// named budget. This constant sits at the same order as MAX_INSTRUCTIONS
 /// so the expression cliff and the layout cliff coincide.
-pub const MAX_SYNTHETIC_LAYOUT_NODES: usize = 20_000;
+///
+/// An unmeasured starting value, overridable for a single run via
+/// `MIZU_MAX_SYNTHETIC_LAYOUT_NODES` (see the module doc on
+/// [`crate::core::config`]).
+pub static MAX_SYNTHETIC_LAYOUT_NODES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    crate::core::config::env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", 20_000)
+});
 
 /// One entry per list element: `(row_container_taffy_id, override_map)`.
 pub type EachGroupEntries = Vec<(taffy::prelude::NodeId, EachIterationOverrides)>;
@@ -79,7 +85,7 @@ pub fn expand_each_nodes(
 
     // ── Step 2: build the new expansion ───────────────────────────────────
     let mut expansion = EachExpansion::default();
-    let mut remaining_budget = MAX_SYNTHETIC_LAYOUT_NODES;
+    let mut remaining_budget = *MAX_SYNTHETIC_LAYOUT_NODES;
 
     // Collect Each-node metadata without holding tree borrows.
     let each_nodes: Vec<(EgoNodeId, String)> = dom
@@ -510,7 +516,7 @@ mod tests {
     fn each_huge_list_clamped_to_budget() {
         let mut interner = StringInterner::new();
         let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
-        let store = setup_test_store(vec![Value::Bool(true); MAX_SYNTHETIC_LAYOUT_NODES + 100]);
+        let store = setup_test_store(vec![Value::Bool(true); *MAX_SYNTHETIC_LAYOUT_NODES + 100]);
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
@@ -523,7 +529,7 @@ mod tests {
         let each_node = dom.root().children().next().unwrap().id();
         let truncated = expansion.truncated.get(&each_node).copied().unwrap_or(0);
         assert!(truncated > 0, "Huge list must be truncated");
-        assert_eq!(expansion.groups.get(&each_node).unwrap().len() + truncated, MAX_SYNTHETIC_LAYOUT_NODES + 100);
+        assert_eq!(expansion.groups.get(&each_node).unwrap().len() + truncated, *MAX_SYNTHETIC_LAYOUT_NODES + 100);
     }
 
     #[test]

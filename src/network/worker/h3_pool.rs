@@ -1,6 +1,6 @@
 //! `H3ConnectionPool`, ALPN verification, connect/request timeouts.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use quinn::Endpoint;
@@ -19,14 +19,16 @@ type H3Client = Arc<tokio::sync::Mutex<H3Sender>>;
 /// never completes the H3-level setup — or never responds at the transport
 /// level at all — would otherwise hang this call forever, holding its
 /// `MAX_CONCURRENT_FETCHES` permit indefinitely.
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) static CONNECT_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(crate::core::config::CONFIG.connect_timeout_secs));
 
 /// Maximum time allowed for one complete HTTP/3 request/response exchange
 /// once a connection is established: sending the request (HEADERS + body),
 /// and receiving the response HEADERS and all DATA frames. Guards against a
 /// server that completes the handshake but then never sends a response, or
 /// stalls mid-body.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) static REQUEST_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(crate::core::config::CONFIG.request_timeout_secs));
 
 /// QUIC idle timeout: the transport closes a connection that has exchanged
 /// no packets for this long, even if the application never reports an
@@ -36,13 +38,16 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// threshold (see [`H3ConnectionPool::make_room`]) so a pool entry whose
 /// underlying QUIC connection the transport has already closed for
 /// idleness doesn't linger in the map either.
-pub(crate) const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) static QUIC_MAX_IDLE_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(crate::core::config::CONFIG.quic_max_idle_timeout_secs));
 
 /// QUIC keep-alive interval: how often a PING frame is sent on an otherwise
 /// idle connection to prevent NAT/firewall state from expiring and to keep
 /// [`QUIC_MAX_IDLE_TIMEOUT`] from firing on connections that are merely
 /// quiet, not dead. Must be well under `QUIC_MAX_IDLE_TIMEOUT`.
-pub(crate) const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) static QUIC_KEEP_ALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(crate::core::config::CONFIG.quic_keep_alive_interval_secs)
+});
 
 /// Maximum number of live per-domain HTTP/3 connections
 /// [`H3ConnectionPool`] retains at once. Reached only by a document that
@@ -50,7 +55,8 @@ pub(crate) const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// least-recently-used connection is evicted to make room (see
 /// [`H3ConnectionPool::make_room`]) rather than growing the pool without
 /// bound.
-pub(crate) const MAX_POOL_SIZE: usize = 32;
+pub(crate) static MAX_POOL_SIZE: LazyLock<usize> =
+    LazyLock::new(|| crate::core::config::CONFIG.max_pool_size);
 
 /// Thread-safe pool of live HTTP/3 connection handles, one per domain.
 ///
@@ -144,7 +150,7 @@ pub(super) fn verify_negotiated_alpn(
 
 impl H3ConnectionPool {
     pub(crate) fn new() -> Self {
-        Self::new_with_connect_timeout(CONNECT_TIMEOUT)
+        Self::new_with_connect_timeout(*CONNECT_TIMEOUT)
     }
 
     /// Like [`Self::new`], but with an explicit handshake timeout — used by
@@ -202,7 +208,7 @@ impl H3ConnectionPool {
             *last_used = now;
             return Ok(h3.clone());
         }
-        Self::make_room(&mut map, now, QUIC_MAX_IDLE_TIMEOUT, MAX_POOL_SIZE);
+        Self::make_room(&mut map, now, *QUIC_MAX_IDLE_TIMEOUT, *MAX_POOL_SIZE);
 
         // Guard held across await — at most one concurrent handshake per
         // domain. Bounded by `self.connect_timeout` so a server that never

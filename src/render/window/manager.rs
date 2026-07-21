@@ -2,7 +2,7 @@
 
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::render::chrome_vello::ChromeState;
 use ego_tree::{NodeId as EgoNodeId, Tree};
@@ -24,7 +24,8 @@ use crate::render::security::CapabilityPolicy;
 /// user-initiated navigation before the chain is aborted.  Prevents a hostile
 /// or misconfigured server from trapping the client in an infinite redirect
 /// loop.
-pub(super) const MAX_REDIRECTS: u32 = 10;
+pub(super) static MAX_REDIRECTS: LazyLock<u32> =
+    LazyLock::new(|| crate::core::config::CONFIG.max_redirects);
 
 /// Encapsulates the application state, DOM, and Layout definitions.
 pub struct MizuWindowManager {
@@ -161,7 +162,7 @@ impl MizuWindowManager {
 
         let (network_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (tx, network_rx) =
-            tokio::sync::mpsc::channel(crate::network::worker::MAX_UI_CHANNEL_CAPACITY);
+            tokio::sync::mpsc::channel(*crate::network::worker::MAX_UI_CHANNEL_CAPACITY);
         crate::network::worker::spawn_network_thread(
             rx,
             tx,
@@ -571,7 +572,7 @@ impl MizuWindowManager {
     /// case the caller must stop re-navigating.
     pub fn register_redirect(&mut self) -> bool {
         self.redirect_count += 1;
-        self.redirect_count <= MAX_REDIRECTS
+        self.redirect_count <= *MAX_REDIRECTS
     }
 
     /// Executes a declarative capability action, recording network-visible

@@ -47,6 +47,7 @@ pub(crate) use h3_pool::{
 pub(crate) use storage_debounce::StorageWriteDebouncer;
 pub(crate) use tls::is_local_host;
 #[cfg(test)]
+#[allow(unused_imports)] // only used by a test gated on not(feature = "insecure-dev")
 pub(crate) use tls::INSECURE_DEV_ACTIVE;
 
 use auth::parse_http_response;
@@ -74,12 +75,14 @@ pub(crate) const MIZU_ALPN: &[u8] = b"mizu/3";
 /// Maximum number of [`NetworkResult`] messages buffered between the network
 /// worker and the UI event loop.  When the channel is full, async tasks suspend
 /// on `.send().await` rather than allocating unbounded memory.
-pub(crate) const MAX_UI_CHANNEL_CAPACITY: usize = 32;
+pub(crate) static MAX_UI_CHANNEL_CAPACITY: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| crate::core::config::CONFIG.max_ui_channel_capacity);
 
 /// Maximum number of fetch operations executing concurrently inside the Tokio
 /// runtime.  Tasks acquire a semaphore permit before performing any I/O and
 /// park until a permit is released.
-pub(crate) const MAX_CONCURRENT_FETCHES: usize = 16;
+pub(crate) static MAX_CONCURRENT_FETCHES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| crate::core::config::CONFIG.max_concurrent_fetches);
 /// Spawns the background network thread and initialises the QUIC endpoint.
 ///
 /// `allow_insecure`: when `true`, TLS certificate verification is skipped
@@ -213,7 +216,7 @@ pub fn spawn_network_thread(
             // been exchanged for QUIC_MAX_IDLE_TIMEOUT; `keep_alive_interval`
             // sends PING frames often enough that a merely-quiet (not dead)
             // connection never trips it.
-            let idle_timeout: quinn::IdleTimeout = match QUIC_MAX_IDLE_TIMEOUT.try_into() {
+            let idle_timeout: quinn::IdleTimeout = match (*QUIC_MAX_IDLE_TIMEOUT).try_into() {
                 Ok(t) => t,
                 Err(e) => {
                     if tx
@@ -233,7 +236,7 @@ pub fn spawn_network_thread(
             let mut transport_config = quinn::TransportConfig::default();
             transport_config
                 .max_idle_timeout(Some(idle_timeout))
-                .keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL));
+                .keep_alive_interval(Some(*QUIC_KEEP_ALIVE_INTERVAL));
             client_config.transport_config(Arc::new(transport_config));
 
             endpoint.set_default_client_config(client_config);
@@ -242,7 +245,7 @@ pub fn spawn_network_thread(
             // Permits are acquired *inside* each spawned task (option b), so the
             // dispatch loop itself never blocks — StorageStore and other cheap
             // commands are always dispatched immediately.
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES));
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(*MAX_CONCURRENT_FETCHES));
 
             // HTTP/3 connection pool: reuses established QUIC connections across
             // fetches to the same domain, eliminating redundant TLS 1.3 handshakes.

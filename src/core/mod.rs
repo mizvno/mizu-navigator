@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod config;
 pub mod errors;
 pub mod storage;
 pub mod types;

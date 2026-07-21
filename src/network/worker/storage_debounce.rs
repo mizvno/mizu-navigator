@@ -1,6 +1,6 @@
 //! `StorageWriteDebouncer` (S2 invariant).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -54,14 +54,17 @@ use std::time::Duration;
 /// 100–250ms range suggested for this kind of UI-driven debounce: long enough
 /// to coalesce a burst of per-keystroke/per-frame writes, short enough that
 /// the durability window above stays unnoticeable in practice.
-pub(crate) const STORAGE_DEBOUNCE_WINDOW: Duration = Duration::from_millis(150);
+pub(crate) static STORAGE_DEBOUNCE_WINDOW: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_millis(crate::core::config::CONFIG.storage_debounce_window_ms)
+});
 
 /// Maximum number of distinct keys buffered for one domain before a flush is
 /// forced immediately, regardless of how much of `STORAGE_DEBOUNCE_WINDOW`
 /// remains. Without this, a document writing continuously (a new key every
 /// frame, never repeating) would keep resetting into "still within the
 /// window" forever and accumulate unboundedly.
-pub(crate) const STORAGE_BATCH_MAX_KEYS: usize = 64;
+pub(crate) static STORAGE_BATCH_MAX_KEYS: LazyLock<usize> =
+    LazyLock::new(|| crate::core::config::CONFIG.storage_batch_max_keys);
 
 /// Batches [`NetworkCmd::StorageStore`] writes to the same domain that arrive
 /// within [`STORAGE_DEBOUNCE_WINDOW`] of each other into a single
@@ -85,7 +88,7 @@ pub(crate) struct StorageWriteDebouncer {
 
 impl StorageWriteDebouncer {
     pub(crate) fn new() -> Self {
-        Self::with_params(STORAGE_DEBOUNCE_WINDOW, STORAGE_BATCH_MAX_KEYS)
+        Self::with_params(*STORAGE_DEBOUNCE_WINDOW, *STORAGE_BATCH_MAX_KEYS)
     }
 
     /// Like [`Self::new`], but with explicit window/threshold — used by tests

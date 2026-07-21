@@ -178,7 +178,7 @@ pub(crate) fn apply_binop(
         (BinOp::Add, Value::String(l), Value::String(r)) => {
             let concat_cost = (l.len() as u64).saturating_add(r.len() as u64);
             *instruction_count = instruction_count.saturating_add(concat_cost);
-            if *instruction_count > crate::core::types::MAX_INSTRUCTIONS {
+            if *instruction_count > *crate::core::types::MAX_INSTRUCTIONS {
                 return Err(MizuError::Timeout);
             }
             Ok(Value::String(std::sync::Arc::from(

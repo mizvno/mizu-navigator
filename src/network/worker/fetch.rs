@@ -127,7 +127,7 @@ pub(super) async fn handle_fetch_raw(
     let addr = crate::network::opennic::resolve_domain(
         dns,
         &uri.domain,
-        crate::network::opennic::MIZU_PORT,
+        *crate::network::opennic::MIZU_PORT,
     )
     .await?;
 
@@ -297,12 +297,12 @@ pub(super) async fn do_h3_request(
         Ok::<_, MizuError>((status, headers, resp_body))
     };
 
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+    tokio::time::timeout(*REQUEST_TIMEOUT, exchange)
         .await
         .map_err(|_elapsed| {
             MizuError::Network(format!(
-                "H3 request to {} timed out after {REQUEST_TIMEOUT:?}",
-                uri.domain
+                "H3 request to {} timed out after {:?}",
+                uri.domain, *REQUEST_TIMEOUT
             ))
         })?
 }

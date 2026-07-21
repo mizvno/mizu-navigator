@@ -44,6 +44,24 @@ read-only and shows both what the document *declared* and what it is *doing*:
 Event and network logs are always on (bounded ring buffers), so the inspector
 can be opened after a problem and still show its history.
 
+## Configuration
+
+Operational settings (network timeouts, connection pool size, storage write
+batching, redirect budget, the QUIC port) can be tuned via an optional TOML
+file — `%APPDATA%\mizu\config.toml` on Windows, `$XDG_CONFIG_HOME/mizu/config.toml`
+(or `~/.config/mizu/config.toml`) on Linux/macOS. No file, or a file that only
+sets some fields, is fine — anything unset keeps its built-in default. See
+the field list and defaults in the doc comment at the top of
+`src/core/config.rs`.
+
+A handful of evaluator/layout budget constants whose starting values were
+picked as reasonable guesses rather than measured — not the security-critical
+ones — can be overridden for a single run via `MIZU_*` environment variables
+(e.g. `MIZU_MAX_COMP_BINDINGS=2000 cargo run -- ./big.mizu`); see the same
+doc comment for the full list. Neither mechanism can touch the fixed
+security invariants (`MAX_EVAL_DEPTH`, storage quotas, image/response-body
+limits, ...) — see `SECURITY-INVARIANTS.md`.
+
 ## Insecure mode (local server only)
 
 This is for development only, to talk to a local Mizu server without a CA-signed certificate. The TLS bypass applies **only to local hosts** (`localhost` / `127.0.0.1`); for any remote host `--allow-insecure` has no effect and certificate verification stays on.

@@ -18,8 +18,16 @@ use super::lexer::{Cursor, Token, assert_cursor_empty, leading_spaces, lex};
 /// Maximum nesting depth for `parse_expr` recursive descent.
 ///
 /// Prevents stack overflow on pathological input (e.g. 300 nested parentheses).
-/// No legitimate Mizu expression comes close to this limit.
-const MAX_PARSE_DEPTH: u32 = 256;
+/// No legitimate Mizu expression comes close to this limit. Deliberately
+/// independent from [`crate::core::types::MAX_EVAL_DEPTH`] (which stays
+/// fixed, see `SECURITY-INVARIANTS.md`'s E1) — that's the actual runtime
+/// enforcement; this is only a parse-time convenience check, so raising it
+/// via override does not weaken the eval-depth guard.
+///
+/// An unmeasured starting value, overridable for a single run via
+/// `MIZU_MAX_PARSE_DEPTH` (see the module doc on [`crate::core::config`]).
+static MAX_PARSE_DEPTH: std::sync::LazyLock<u32> =
+    std::sync::LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_PARSE_DEPTH", 256));
 
 ///
 /// `min_bp` is the minimum binding power the caller is willing to absorb —
@@ -32,10 +40,11 @@ pub(super) fn parse_expr(
     depth: u32,
     interner: &mut StringInterner,
 ) -> Result<Expr, MizuError> {
-    if depth > MAX_PARSE_DEPTH {
-        return Err(MizuError::ParseError(
-            "expression nesting too deep (max 256 levels)".to_owned(),
-        ));
+    if depth > *MAX_PARSE_DEPTH {
+        return Err(MizuError::ParseError(format!(
+            "expression nesting too deep (max {} levels)",
+            *MAX_PARSE_DEPTH
+        )));
     }
     // ── Null denotation (prefix / atoms) ────────────────────────────────
     let mut lhs = match cursor.next() {

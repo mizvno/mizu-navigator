@@ -13,7 +13,11 @@ use super::manager::MizuWindowManager;
 
 /// Maximum number of bytes a single input field accepts from typing or
 /// pasting.  Prevents unbounded memory growth from key-repeat or a huge paste.
-const INPUT_MAX_BYTES: usize = 4096;
+///
+/// An unmeasured starting value, overridable for a single run via
+/// `MIZU_INPUT_MAX_BYTES` (see the module doc on [`crate::core::config`]).
+static INPUT_MAX_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| crate::core::config::env_override("MIZU_INPUT_MAX_BYTES", 4096));
 
 /// Appends the printable characters of `text` to `buf`, respecting
 /// [`INPUT_MAX_BYTES`].  Control characters are dropped.  Returns `true` if at
@@ -21,7 +25,7 @@ const INPUT_MAX_BYTES: usize = 4096;
 pub(super) fn push_input_text(buf: &mut String, text: &str) -> bool {
     let mut changed = false;
     for c in text.chars().filter(|c| !c.is_control()) {
-        if buf.len() + c.len_utf8() > INPUT_MAX_BYTES {
+        if buf.len() + c.len_utf8() > *INPUT_MAX_BYTES {
             break;
         }
         buf.push(c);
