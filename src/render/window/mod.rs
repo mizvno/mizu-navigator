@@ -9,6 +9,7 @@
 //! * [`focus`] — keyboard focus order (Tab/Shift-Tab) and click/submit
 //!   event resolution shared between the mouse click handler and keyboard
 //!   activation.
+//! * [`history`] — in-memory session history (Back/Forward) stack.
 //! * [`event_loop`] — `run_window_loop`, the Winit event loop itself.
 //!
 //! Every item that was previously a direct member of this module is
@@ -19,6 +20,7 @@
 
 mod event_loop;
 mod focus;
+mod history;
 mod input;
 mod manager;
 mod navigate;

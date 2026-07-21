@@ -32,7 +32,7 @@ use super::input::{
     push_input_text,
 };
 use super::manager::MizuWindowManager;
-use super::navigate::{navigate_to_url, process_network_result};
+use super::navigate::{navigate_back, navigate_forward, navigate_to_url, process_network_result};
 
 /// Connects the rendering manager to the Winit event loop.
 ///
@@ -320,7 +320,10 @@ pub fn run_window_loop(
                         );
                         match zone {
                             ChromeHitZone::BackButton => {
-                                tracing::debug!("back button clicked (history nyi)");
+                                navigate_back(&mut manager);
+                            }
+                            ChromeHitZone::ForwardButton => {
+                                navigate_forward(&mut manager);
                             }
                             ChromeHitZone::ReloadButton => {
                                 tracing::debug!("reload button clicked");
@@ -513,6 +516,24 @@ pub fn run_window_loop(
                         return;
                     }
 
+                    // ── Alt+Left / Alt+Right: history Back/Forward, regardless
+                    // of focus (the platform-standard shortcuts) ──────────────
+                    if manager.modifiers.alt_key() {
+                        match key_event.logical_key {
+                            winit::keyboard::Key::Named(NamedKey::ArrowLeft) => {
+                                navigate_back(&mut manager);
+                                window.request_redraw();
+                                return;
+                            }
+                            winit::keyboard::Key::Named(NamedKey::ArrowRight) => {
+                                navigate_forward(&mut manager);
+                                window.request_redraw();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // ── Chrome URL bar has focus — route all keys there ───────
                     if manager.chrome_state.focused {
                         let action = {
@@ -542,7 +563,7 @@ pub fn run_window_loop(
                                 );
                             }
                             ChromeKeyAction::Back => {
-                                tracing::debug!("back: history nyi");
+                                navigate_back(&mut manager);
                             }
                             ChromeKeyAction::Copy => {
                                 if let Some(text) = manager.chrome_state.copy_text()
@@ -913,6 +934,8 @@ pub fn run_window_loop(
                     // ── Layer 2: Chrome bar (always on top) ──────────────────
                     {
                         let cs = &manager.chrome_state;
+                        let can_go_back = manager.history.can_go_back();
+                        let can_go_forward = manager.history.can_go_forward();
                         let fc = &mut manager.font_cx;
                         let lc = &mut manager.layout_cx;
                         paint_chrome(
@@ -923,6 +946,8 @@ pub fn run_window_loop(
                             elapsed_ms,
                             fc,
                             lc,
+                            can_go_back,
+                            can_go_forward,
                         );
                     }
 

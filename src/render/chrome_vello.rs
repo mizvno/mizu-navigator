@@ -28,7 +28,8 @@ const BTN_H: f32 = 20.0;
 const BTN_W: f32 = 24.0;
 const BACK_X: f32 = 4.0;
 const RELOAD_X: f32 = 32.0;
-const URL_BAR_X: f32 = 60.0;
+const FORWARD_X: f32 = 60.0;
+const URL_BAR_X: f32 = 88.0;
 const URL_BAR_Y: f32 = 3.0;
 const URL_BAR_H: f32 = 22.0;
 /// Width reserved for the status indicator on the right.
@@ -43,6 +44,11 @@ const CHROME_FONT_SIZE: f32 = 12.0;
 const BAR_BG: Color = Color::rgba8(43, 43, 43, 255);
 const BTN_BG: Color = Color::rgba8(60, 60, 60, 255);
 const BTN_TEXT_COLOR: Color = Color::rgba8(220, 220, 220, 255);
+/// Button background when disabled (empty back/forward stack) — same hue,
+/// lower alpha, so the affordance visibly reads as inert.
+const BTN_BG_DISABLED: Color = Color::rgba8(60, 60, 60, 120);
+/// Button glyph color when disabled.
+const BTN_TEXT_COLOR_DISABLED: Color = Color::rgba8(220, 220, 220, 100);
 const URL_BG: Color = Color::rgba8(30, 30, 30, 255);
 const URL_BORDER_IDLE: Color = Color::rgba8(80, 80, 80, 255);
 const URL_BORDER_FOC: Color = crate::render::FOCUS_RING_COLOR;
@@ -77,6 +83,8 @@ pub enum ChromeHitZone {
     BackButton,
     /// The "reload" button.
     ReloadButton,
+    /// The "go forward" button.
+    ForwardButton,
     /// The URL text input area.
     UrlBar,
     /// Any other part of the chrome bar (background).
@@ -90,7 +98,7 @@ pub enum ChromeKeyAction {
     Navigate(String),
     /// Trigger a page reload.
     Reload,
-    /// Go back (not yet implemented — history NYI).
+    /// Go back one entry in session history.
     Back,
     /// Copy the selected text to the clipboard (caller handles clipboard).
     Copy,
@@ -427,6 +435,9 @@ pub fn chrome_hit_zone(x: f32, y: f32, window_width: f32) -> ChromeHitZone {
     if (RELOAD_X..RELOAD_X + BTN_W).contains(&x) && (BTN_Y..BTN_Y + BTN_H).contains(&y) {
         return ChromeHitZone::ReloadButton;
     }
+    if (FORWARD_X..FORWARD_X + BTN_W).contains(&x) && (BTN_Y..BTN_Y + BTN_H).contains(&y) {
+        return ChromeHitZone::ForwardButton;
+    }
     let url_bar_right = (window_width - STATUS_W).max(URL_BAR_X + 10.0);
     if x >= URL_BAR_X && x < url_bar_right && (URL_BAR_Y..URL_BAR_Y + URL_BAR_H).contains(&y) {
         return ChromeHitZone::UrlBar;
@@ -553,12 +564,49 @@ fn draw_text_layout(
     }
 }
 
+/// Paints a single square nav button (Back/Forward) at logical X `x`
+/// containing the centered glyph `label`. When `enabled` is `false`, both the
+/// button background and glyph render at reduced alpha — the dimmed
+/// affordance signals the button is inert (empty back/forward stack); the
+/// caller is responsible for actually ignoring clicks on it (`window::history`
+/// already makes a Back/Forward step a no-op when its stack is empty, so
+/// this dimming is purely visual confirmation, not the enforcement point).
+#[allow(clippy::too_many_arguments)]
+fn paint_nav_button(
+    scene: &mut Scene,
+    x: f32,
+    label: &str,
+    enabled: bool,
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
+    transform: Affine,
+) {
+    let (bg, text_color) = if enabled {
+        (BTN_BG, BTN_TEXT_COLOR)
+    } else {
+        (BTN_BG_DISABLED, BTN_TEXT_COLOR_DISABLED)
+    };
+    let rect = RoundedRect::new(
+        x as f64,
+        BTN_Y as f64,
+        (x + BTN_W) as f64,
+        (BTN_Y + BTN_H) as f64,
+        3.0,
+    );
+    scene.fill(Fill::NonZero, transform, bg, None, &rect);
+    let layout = build_chrome_text_layout(label, font_cx, layout_cx);
+    let text_x = x + (BTN_W - layout.width()) / 2.0;
+    let text_y = BTN_Y + (BTN_H - layout.height()) / 2.0;
+    draw_text_layout(scene, &layout, text_x, text_y, text_color, transform);
+}
+
 // ── Main paint function ───────────────────────────────────────────────────────
 
 /// Renders the browser chrome bar into `scene`.
 ///
 /// All coordinates are **logical pixels**. `transform` should be
 /// `Affine::scale(dpi_scale)` so the chrome scales on high-DPI displays.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_chrome(
     scene: &mut Scene,
     state: &ChromeState,
@@ -567,31 +615,15 @@ pub fn paint_chrome(
     elapsed_ms: u64,
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
+    can_go_back: bool,
+    can_go_forward: bool,
 ) {
     // ── Bar background ────────────────────────────────────────────────────────
     let bar_rect = Rect::new(0.0, 0.0, window_width as f64, CHROME_HEIGHT as f64);
     scene.fill(Fill::NonZero, transform, BAR_BG, None, &bar_rect);
 
-    // ── Back button ───────────────────────────────────────────────────────────
-    let back_rect = RoundedRect::new(
-        BACK_X as f64,
-        BTN_Y as f64,
-        (BACK_X + BTN_W) as f64,
-        (BTN_Y + BTN_H) as f64,
-        3.0,
-    );
-    scene.fill(Fill::NonZero, transform, BTN_BG, None, &back_rect);
-    let back_layout = build_chrome_text_layout("←", font_cx, layout_cx);
-    let btn_text_x = BACK_X + (BTN_W - back_layout.width()) / 2.0;
-    let btn_text_y = BTN_Y + (BTN_H - back_layout.height()) / 2.0;
-    draw_text_layout(
-        scene,
-        &back_layout,
-        btn_text_x,
-        btn_text_y,
-        BTN_TEXT_COLOR,
-        transform,
-    );
+    // ── Back button (dimmed + inert when the back stack is empty) ────────────
+    paint_nav_button(scene, BACK_X, "←", can_go_back, font_cx, layout_cx, transform);
 
     // ── Reload button ─────────────────────────────────────────────────────────
     let reload_rect = RoundedRect::new(
@@ -611,6 +643,17 @@ pub fn paint_chrome(
         btn2_text_x,
         btn2_text_y,
         BTN_TEXT_COLOR,
+        transform,
+    );
+
+    // ── Forward button (dimmed + inert when the forward stack is empty) ─────
+    paint_nav_button(
+        scene,
+        FORWARD_X,
+        "→",
+        can_go_forward,
+        font_cx,
+        layout_cx,
         transform,
     );
 
@@ -824,6 +867,14 @@ mod tests {
     }
 
     #[test]
+    fn chrome_hit_zone_forward_button() {
+        assert_eq!(
+            chrome_hit_zone(65.0, 10.0, 800.0),
+            ChromeHitZone::ForwardButton
+        );
+    }
+
+    #[test]
     fn chrome_hit_zone_url_bar() {
         assert_eq!(chrome_hit_zone(200.0, 10.0, 800.0), ChromeHitZone::UrlBar);
     }
@@ -837,10 +888,20 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hit_zone_background_between_buttons_and_bar() {
-        // x = 57 is between the Reload button end (56) and URL bar start (60)
+    fn chrome_hit_zone_background_between_reload_and_forward() {
+        // x = 57 is between the Reload button end (56) and Forward button
+        // start (60).
         assert_eq!(
             chrome_hit_zone(57.0, 10.0, 800.0),
+            ChromeHitZone::Background
+        );
+    }
+
+    #[test]
+    fn chrome_hit_zone_background_between_forward_and_url_bar() {
+        // x = 85 is between the Forward button end (84) and URL bar start (88).
+        assert_eq!(
+            chrome_hit_zone(85.0, 10.0, 800.0),
             ChromeHitZone::Background
         );
     }

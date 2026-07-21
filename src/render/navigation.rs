@@ -56,6 +56,13 @@ pub enum NavigationInitiator {
     /// a user-gesture navigation that redirects cross-origin is still user
     /// agency → allowed.
     RedirectOf(Box<NavigationInitiator>),
+    /// A Back/Forward history step (button click or `Alt+Left`/`Alt+Right`).
+    /// The user clicking Back/Forward is itself a user gesture, so this
+    /// carries agency exactly like [`Self::UserGesture`] under N3 — the
+    /// distinct variant exists so callers (`window::history`) can tell a
+    /// history restoration apart from a fresh navigation without adding a
+    /// second, ungated navigation path.
+    HistoryStep,
 }
 
 /// The policy verdict on a proposed navigation.
@@ -87,6 +94,7 @@ fn has_user_agency(initiator: &NavigationInitiator) -> bool {
         NavigationInitiator::UserGesture => true,
         NavigationInitiator::DocumentLogic => false,
         NavigationInitiator::RedirectOf(inner) => has_user_agency(inner),
+        NavigationInitiator::HistoryStep => true,
     }
 }
 
@@ -509,5 +517,26 @@ mod tests {
         assert!(!has_user_agency(&NavigationInitiator::RedirectOf(
             Box::new(NavigationInitiator::DocumentLogic)
         )));
+    }
+
+    // --- ux-4: history steps carry agency (N3) ---
+
+    #[test]
+    fn history_step_has_user_agency() {
+        // A Back/Forward click is itself a user gesture (ux-4).
+        assert!(has_user_agency(&NavigationInitiator::HistoryStep));
+    }
+
+    #[test]
+    fn history_step_cross_origin_allowed() {
+        let v = check_navigation(
+            "mizu://a.com/page",
+            "mizu://b.com/page",
+            &NavigationInitiator::HistoryStep,
+        );
+        assert!(
+            matches!(v, NavigationVerdict::Allow(_)),
+            "a history step must carry the same cross-origin agency as UserGesture: {v:?}"
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::render::navigation::{NavigationInitiator, NavigationVerdict, check_na
 use crate::render::security::CapabilityPolicy;
 
 use super::AssetSlot;
+use super::history::HistoryEntry;
 use super::manager::{MAX_REDIRECTS, MizuWindowManager};
 
 /// Resolves and validates a navigation URL given the current document's URL.
@@ -223,6 +224,15 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                         tracing::error!(error = ?e, "document reload error");
                     } else {
                         tracing::debug!("document reloaded");
+                        // ux-4: restore scroll position after a history
+                        // (Back/Forward) step. `reload_document` always
+                        // resets `root_scroll_offset_y` to 0.0 first, so this
+                        // must run after it. A `None` here (the overwhelming
+                        // majority of navigations, which aren't history
+                        // steps) is a no-op.
+                        if let Some(scroll_y) = manager.pending_scroll_restore.take() {
+                            manager.root_scroll_offset_y = scroll_y;
+                        }
                     }
                 }
                 Err(e) => {
@@ -424,7 +434,12 @@ pub(super) fn navigate_to_url(
     url: String,
     initiator: NavigationInitiator,
 ) {
-    
+    // ux-4: a pending scroll restore only ever belongs to the history step
+    // that set it. Any other navigation (fresh, logic, redirect) starting
+    // here must not inherit a stale value from an earlier, unrelated step.
+    if !matches!(initiator, NavigationInitiator::HistoryStep) {
+        manager.pending_scroll_restore = None;
+    }
 
     // Reloading or navigating to the blank start page is a no-op: there is
     // nothing to fetch, and `about:` is not a routable scheme.
@@ -486,6 +501,22 @@ pub(super) fn navigate_to_url(
                 manager.reset_redirect_count();
             }
 
+            // ux-4: record the page being left, unless this navigation IS a
+            // history step (back/forward restoring a prior entry) or a
+            // mid-chain redirect continuation of one — those must not also
+            // push a fresh history entry. This runs through the exact same
+            // Allow branch as every other navigation, so history can never
+            // become a choke-point bypass (N2).
+            if !matches!(
+                initiator,
+                NavigationInitiator::HistoryStep | NavigationInitiator::RedirectOf(_)
+            ) {
+                manager.history.record_navigation(HistoryEntry {
+                    url: manager.chrome_state.url.clone(),
+                    scroll_y: manager.root_scroll_offset_y,
+                });
+            }
+
             // N5: update chrome state and reset capability policy.
             manager.chrome_state.url = target.clone();
             manager.capability_policy = CapabilityPolicy::new(&target);
@@ -520,6 +551,45 @@ pub(super) fn navigate_to_url(
                 reason.to_string(),
             );
             manager.chrome_state.loading = false;
+            // A blocked history step must not leave a stale scroll restore
+            // hanging around for some later, unrelated navigation.
+            manager.pending_scroll_restore = None;
         }
     }
+}
+
+/// Steps back one entry in session history (the chrome Back button /
+/// `Alt+Left`). A no-op when the back stack is empty — clicking a disabled
+/// Back button fires no navigation.
+///
+/// Like every top-level navigation, this goes through [`navigate_to_url`]
+/// (N2) with [`NavigationInitiator::HistoryStep`] — a Back/Forward click is a
+/// real user gesture (N3), but the step must still pass through the single
+/// choke point for scheme/origin/lifecycle handling (N4/N5) rather than
+/// swapping `chrome_state.url` directly.
+pub(super) fn navigate_back(manager: &mut MizuWindowManager) {
+    let leaving = HistoryEntry {
+        url: manager.chrome_state.url.clone(),
+        scroll_y: manager.root_scroll_offset_y,
+    };
+    let Some(target) = manager.history.go_back(leaving) else {
+        return;
+    };
+    manager.pending_scroll_restore = Some(target.scroll_y);
+    navigate_to_url(manager, target.url, NavigationInitiator::HistoryStep);
+}
+
+/// Steps forward one entry in session history (the chrome Forward button /
+/// `Alt+Right`). Symmetric to [`navigate_back`]; a no-op when the forward
+/// stack is empty.
+pub(super) fn navigate_forward(manager: &mut MizuWindowManager) {
+    let leaving = HistoryEntry {
+        url: manager.chrome_state.url.clone(),
+        scroll_y: manager.root_scroll_offset_y,
+    };
+    let Some(target) = manager.history.go_forward(leaving) else {
+        return;
+    };
+    manager.pending_scroll_restore = Some(target.scroll_y);
+    navigate_to_url(manager, target.url, NavigationInitiator::HistoryStep);
 }

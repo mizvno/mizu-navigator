@@ -18,6 +18,7 @@ use crate::render::chrome_vello::CHROME_HEIGHT;
 use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
 use crate::render::security::get_raw_domain;
 use super::AssetSlot;
+use super::history::HistoryStack;
 use crate::render::security::CapabilityPolicy;
 
 /// Maximum number of consecutive server redirects honoured for a single
@@ -133,6 +134,14 @@ pub struct MizuWindowManager {
     /// inspector's Logic tab to flash freshly-changed values.  Bounded by the
     /// interner size (entries are overwritten, never accumulated).
     pub recent_mutations: FxHashMap<Symbol, std::time::Instant>,
+    /// In-memory session history (Back/Forward stacks). See `window::history`.
+    pub history: HistoryStack,
+    /// Scroll offset to restore once the in-flight history navigation's
+    /// document finishes loading. Set by `navigate_back`/`navigate_forward`,
+    /// consumed (and cleared) in `handle_navigate_success`; also cleared on
+    /// any non-history navigation and on a blocked verdict so a failed or
+    /// unrelated navigation can never apply a stale restore.
+    pub pending_scroll_restore: Option<f32>,
 }
 
 impl MizuWindowManager {
@@ -222,6 +231,8 @@ impl MizuWindowManager {
             inspector: crate::render::inspector::InspectorState::new(),
             inspector_log: crate::render::inspector::log::InspectorLog::new(),
             recent_mutations: FxHashMap::default(),
+            history: HistoryStack::default(),
+            pending_scroll_restore: None,
         };
 
         manager.rebuild_node_mappings();

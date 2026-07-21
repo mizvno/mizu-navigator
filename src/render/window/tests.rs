@@ -529,3 +529,140 @@
             other => panic!("expected UiEvent::Click, got: {other:?}"),
         }
     }
+
+    // --- History (ux-4): Back/Forward must route through N2 -----------------
+
+    #[test]
+    fn history_back_step_routes_through_navigation_choke_point() {
+        // Security regression: a Back step must not swap `chrome_state.url`
+        // directly. It must go through `navigate_to_url`'s Allow branch,
+        // which — among other N5 lifecycle resets — always installs a fresh
+        // `CapabilityPolicy`. We plant a sentinel in the current policy and
+        // confirm it is gone after the Back step: that's only possible if
+        // the real choke point ran, not a bypass.
+        let mut manager = make_minimal_manager();
+        manager.chrome_state.url = "mizu://current.example/page".to_string();
+        manager
+            .history
+            .record_navigation(super::history::HistoryEntry {
+                url: "mizu://previous.example/page".to_string(),
+                scroll_y: 77.0,
+            });
+        assert!(manager.history.can_go_back());
+
+        manager.capability_policy.bytes_stored = 123_456;
+
+        navigate_back(&mut manager);
+
+        assert_eq!(
+            manager.chrome_state.url, "mizu://previous.example/page",
+            "Back must navigate to the popped history entry"
+        );
+        assert_eq!(
+            manager.capability_policy.bytes_stored, 0,
+            "capability_policy must have been freshly reset by navigate_to_url's \
+             Allow branch (N5) — a direct URL swap bypassing the choke point \
+             would have left the sentinel value untouched"
+        );
+        assert!(
+            !manager.history.can_go_back(),
+            "the popped entry must be gone from the back stack"
+        );
+        assert!(
+            manager.history.can_go_forward(),
+            "the page left behind must now be on the forward stack"
+        );
+    }
+
+    #[test]
+    fn history_forward_step_routes_through_navigation_choke_point() {
+        let mut manager = make_minimal_manager();
+        manager.chrome_state.url = "mizu://current.example/page".to_string();
+        manager
+            .history
+            .record_navigation(super::history::HistoryEntry {
+                url: "mizu://previous.example/page".to_string(),
+                scroll_y: 0.0,
+            });
+        navigate_back(&mut manager);
+        assert!(manager.history.can_go_forward());
+
+        manager.capability_policy.bytes_stored = 999;
+        navigate_forward(&mut manager);
+
+        assert_eq!(manager.chrome_state.url, "mizu://current.example/page");
+        assert_eq!(
+            manager.capability_policy.bytes_stored, 0,
+            "Forward must also route through the choke point's N5 reset"
+        );
+    }
+
+    #[test]
+    fn history_back_with_empty_stack_fires_no_navigation() {
+        // Disabled-button behavior: clicking Back with an empty back stack
+        // must be a guaranteed no-op, not merely "unlikely to do anything".
+        let mut manager = make_minimal_manager();
+        assert!(!manager.history.can_go_back());
+        manager.chrome_state.url = "mizu://only-page.example/".to_string();
+        manager.capability_policy.bytes_stored = 42;
+
+        navigate_back(&mut manager);
+
+        assert_eq!(
+            manager.chrome_state.url, "mizu://only-page.example/",
+            "URL must be unchanged when back stack is empty"
+        );
+        assert_eq!(
+            manager.capability_policy.bytes_stored, 42,
+            "capability_policy must be untouched — no navigation occurred at all"
+        );
+        assert!(!manager.history.can_go_forward());
+    }
+
+    #[test]
+    fn history_forward_with_empty_stack_fires_no_navigation() {
+        let mut manager = make_minimal_manager();
+        assert!(!manager.history.can_go_forward());
+        manager.chrome_state.url = "mizu://only-page.example/".to_string();
+        manager.capability_policy.bytes_stored = 42;
+
+        navigate_forward(&mut manager);
+
+        assert_eq!(manager.chrome_state.url, "mizu://only-page.example/");
+        assert_eq!(manager.capability_policy.bytes_stored, 42);
+    }
+
+    #[test]
+    fn fresh_navigation_after_back_clears_forward_stack() {
+        // A -> B -> C, back to B, then a fresh navigation to D from B must
+        // clear the forward stack (standard browser semantics).
+        let mut manager = make_minimal_manager();
+        manager.chrome_state.url = "mizu://a.example/".to_string();
+        navigate_to_url(
+            &mut manager,
+            "mizu://b.example/".to_string(),
+            crate::render::navigation::NavigationInitiator::UserGesture,
+        );
+        navigate_to_url(
+            &mut manager,
+            "mizu://c.example/".to_string(),
+            crate::render::navigation::NavigationInitiator::UserGesture,
+        );
+        assert_eq!(manager.chrome_state.url, "mizu://c.example/");
+
+        navigate_back(&mut manager);
+        assert_eq!(manager.chrome_state.url, "mizu://b.example/");
+        assert!(manager.history.can_go_forward());
+
+        navigate_to_url(
+            &mut manager,
+            "mizu://d.example/".to_string(),
+            crate::render::navigation::NavigationInitiator::UserGesture,
+        );
+        assert_eq!(manager.chrome_state.url, "mizu://d.example/");
+        assert!(
+            !manager.history.can_go_forward(),
+            "a fresh navigation must clear the forward stack"
+        );
+        assert!(manager.history.can_go_back());
+    }
