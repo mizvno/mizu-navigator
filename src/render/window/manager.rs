@@ -19,6 +19,7 @@ use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
 use crate::render::security::get_raw_domain;
 use super::AssetSlot;
 use super::history::HistoryStack;
+use crate::render::preferences::UserPreferences;
 use crate::render::security::CapabilityPolicy;
 
 /// Maximum number of consecutive server redirects honoured for a single
@@ -142,6 +143,11 @@ pub struct MizuWindowManager {
     /// any non-history navigation and on a blocked verdict so a failed or
     /// unrelated navigation can never apply a stale restore.
     pub pending_scroll_restore: Option<f32>,
+    /// Detected OS appearance/accessibility preferences (ux-5): light/dark
+    /// is real (from `winit::window::Theme`); high-contrast/reduced-motion
+    /// are always `false` today — see `render::preferences`'s module doc.
+    /// Read by the chrome paint path to choose a `ChromePalette`.
+    pub preferences: UserPreferences,
 }
 
 impl MizuWindowManager {
@@ -233,6 +239,7 @@ impl MizuWindowManager {
             recent_mutations: FxHashMap::default(),
             history: HistoryStack::default(),
             pending_scroll_restore: None,
+            preferences: UserPreferences::default(),
         };
 
         manager.rebuild_node_mappings();

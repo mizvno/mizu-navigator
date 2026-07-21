@@ -22,6 +22,7 @@ use crate::render::chrome_vello::{
 };
 use crate::render::hit_test::hit_test;
 use crate::render::navigation::NavigationInitiator;
+use crate::render::preferences::ChromePalette;
 use crate::render::vello_pipeline::{PaintContext, paint_node};
 
 use crate::render::accessibility::{MizuUserEvent, build_a11y_tree, resolve_ego_id};
@@ -143,6 +144,12 @@ pub fn run_window_loop(
             .map_err(|e| MizuError::ParseError(format!("Failed to build window: {e}")))?,
     );
 
+    // ux-5: real light/dark detection. `None` (platform doesn't report a
+    // theme) keeps the `UserPreferences::default()` scheme already set.
+    if let Some(theme) = window.theme() {
+        manager.preferences.color_scheme = theme.into();
+    }
+
     // Delivers accesskit's initial-tree/action/deactivation events through
     // the same `Event::UserEvent` channel as everything else in this loop —
     // no separate thread, no separate handler wiring.
@@ -198,6 +205,11 @@ pub fn run_window_loop(
             match window_event {
                 WindowEvent::CloseRequested => {
                     elwt.exit();
+                }
+                WindowEvent::ThemeChanged(theme) => {
+                    // ux-5: chrome re-themes live when the OS scheme changes.
+                    manager.preferences.color_scheme = (*theme).into();
+                    window.request_redraw();
                 }
                 WindowEvent::Resized(physical_size) => {
                     if physical_size.width > 0 && physical_size.height > 0 {
@@ -936,6 +948,7 @@ pub fn run_window_loop(
                         let cs = &manager.chrome_state;
                         let can_go_back = manager.history.can_go_back();
                         let can_go_forward = manager.history.can_go_forward();
+                        let palette = ChromePalette::for_preferences(&manager.preferences);
                         let fc = &mut manager.font_cx;
                         let lc = &mut manager.layout_cx;
                         paint_chrome(
@@ -948,6 +961,7 @@ pub fn run_window_loop(
                             lc,
                             can_go_back,
                             can_go_forward,
+                            &palette,
                         );
                     }
 

@@ -18,6 +18,8 @@ use vello::{
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use crate::render::preferences::ChromePalette;
+
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
 /// Height of the chrome bar in logical pixels.
@@ -40,22 +42,11 @@ const URL_TEXT_PAD: f32 = 4.0;
 const CHROME_FONT_SIZE: f32 = 12.0;
 
 // ── Palette ───────────────────────────────────────────────────────────────────
-
-const BAR_BG: Color = Color::rgba8(43, 43, 43, 255);
-const BTN_BG: Color = Color::rgba8(60, 60, 60, 255);
-const BTN_TEXT_COLOR: Color = Color::rgba8(220, 220, 220, 255);
-/// Button background when disabled (empty back/forward stack) — same hue,
-/// lower alpha, so the affordance visibly reads as inert.
-const BTN_BG_DISABLED: Color = Color::rgba8(60, 60, 60, 120);
-/// Button glyph color when disabled.
-const BTN_TEXT_COLOR_DISABLED: Color = Color::rgba8(220, 220, 220, 100);
-const URL_BG: Color = Color::rgba8(30, 30, 30, 255);
-const URL_BORDER_IDLE: Color = Color::rgba8(80, 80, 80, 255);
-const URL_BORDER_FOC: Color = crate::render::FOCUS_RING_COLOR;
-const URL_TEXT_COLOR: Color = Color::rgba8(204, 204, 204, 255);
-const CURSOR_COLOR: Color = Color::rgba8(255, 255, 255, 255);
-const SELECT_COLOR: Color = Color::rgba8(74, 144, 217, 120);
-const OK_DOT_COLOR: Color = Color::rgba8(76, 175, 80, 255);
+//
+// The chrome's colors are no longer fixed constants (ux-5): they come from a
+// `ChromePalette` chosen by `render::preferences::ChromePalette::for_preferences`
+// from the caller's detected `UserPreferences` (light/dark, forced on
+// high-contrast), passed into `paint_chrome` on every frame.
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -519,7 +510,12 @@ fn build_chrome_text_layout(
     let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
     builder.push_default(StyleProperty::FontFamily(font_family));
     builder.push_default(StyleProperty::FontSize(CHROME_FONT_SIZE));
-    builder.push_default(StyleProperty::Brush(URL_TEXT_COLOR));
+    // Placeholder brush: this layout is used both for measurement
+    // (`url_cursor_x`/`url_cursor_from_x`, never painted) and for painting
+    // via `draw_text_layout`, which always applies its own explicit `color`
+    // argument at draw time — so the actual on-screen color is never this
+    // one, and it doesn't need to be theme-aware.
+    builder.push_default(StyleProperty::Brush(Color::rgba8(204, 204, 204, 255)));
     builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(1.0)));
     let mut layout = builder.build(text);
     layout.break_all_lines(None);
@@ -577,14 +573,15 @@ fn paint_nav_button(
     x: f32,
     label: &str,
     enabled: bool,
+    palette: &ChromePalette,
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
     transform: Affine,
 ) {
     let (bg, text_color) = if enabled {
-        (BTN_BG, BTN_TEXT_COLOR)
+        (palette.btn_bg, palette.btn_text)
     } else {
-        (BTN_BG_DISABLED, BTN_TEXT_COLOR_DISABLED)
+        (palette.btn_bg_disabled, palette.btn_text_disabled)
     };
     let rect = RoundedRect::new(
         x as f64,
@@ -617,13 +614,16 @@ pub fn paint_chrome(
     layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
     can_go_back: bool,
     can_go_forward: bool,
+    palette: &ChromePalette,
 ) {
     // ── Bar background ────────────────────────────────────────────────────────
     let bar_rect = Rect::new(0.0, 0.0, window_width as f64, CHROME_HEIGHT as f64);
-    scene.fill(Fill::NonZero, transform, BAR_BG, None, &bar_rect);
+    scene.fill(Fill::NonZero, transform, palette.bar_bg, None, &bar_rect);
 
     // ── Back button (dimmed + inert when the back stack is empty) ────────────
-    paint_nav_button(scene, BACK_X, "←", can_go_back, font_cx, layout_cx, transform);
+    paint_nav_button(
+        scene, BACK_X, "←", can_go_back, palette, font_cx, layout_cx, transform,
+    );
 
     // ── Reload button ─────────────────────────────────────────────────────────
     let reload_rect = RoundedRect::new(
@@ -633,7 +633,7 @@ pub fn paint_chrome(
         (BTN_Y + BTN_H) as f64,
         3.0,
     );
-    scene.fill(Fill::NonZero, transform, BTN_BG, None, &reload_rect);
+    scene.fill(Fill::NonZero, transform, palette.btn_bg, None, &reload_rect);
     let reload_layout = build_chrome_text_layout("↻", font_cx, layout_cx);
     let btn2_text_x = RELOAD_X + (BTN_W - reload_layout.width()) / 2.0;
     let btn2_text_y = BTN_Y + (BTN_H - reload_layout.height()) / 2.0;
@@ -642,7 +642,7 @@ pub fn paint_chrome(
         &reload_layout,
         btn2_text_x,
         btn2_text_y,
-        BTN_TEXT_COLOR,
+        palette.btn_text,
         transform,
     );
 
@@ -652,6 +652,7 @@ pub fn paint_chrome(
         FORWARD_X,
         "→",
         can_go_forward,
+        palette,
         font_cx,
         layout_cx,
         transform,
@@ -666,13 +667,13 @@ pub fn paint_chrome(
         (URL_BAR_Y + URL_BAR_H) as f64,
         4.0,
     );
-    scene.fill(Fill::NonZero, transform, URL_BG, None, &url_bar_rect);
+    scene.fill(Fill::NonZero, transform, palette.url_bg, None, &url_bar_rect);
 
     // Border (thicker / brighter when focused)
     let border_color = if state.focused {
-        URL_BORDER_FOC
+        palette.url_border_focused
     } else {
-        URL_BORDER_IDLE
+        palette.url_border_idle
     };
     let border_stroke = Stroke::new(1.0);
     scene.stroke(&border_stroke, transform, border_color, None, &url_bar_rect);
@@ -707,7 +708,7 @@ pub fn paint_chrome(
             (text_left + x1) as f64,
             (URL_BAR_Y + URL_BAR_H) as f64,
         );
-        scene.fill(Fill::NonZero, transform, SELECT_COLOR, None, &sel_rect);
+        scene.fill(Fill::NonZero, transform, palette.select, None, &sel_rect);
     }
 
     // URL text
@@ -718,7 +719,7 @@ pub fn paint_chrome(
             &url_layout,
             text_left,
             text_top,
-            URL_TEXT_COLOR,
+            palette.url_text,
             transform,
         );
     }
@@ -733,7 +734,7 @@ pub fn paint_chrome(
             (cursor_x + 1.5) as f64,
             (URL_BAR_Y + URL_BAR_H - 3.0) as f64,
         );
-        scene.fill(Fill::NonZero, transform, CURSOR_COLOR, None, &cursor_rect);
+        scene.fill(Fill::NonZero, transform, palette.cursor, None, &cursor_rect);
     }
 
     scene.pop_layer(); // end URL bar clip
@@ -755,7 +756,7 @@ pub fn paint_chrome(
         // Request continuous redraw (caller checks chrome_state.loading)
     } else {
         let ok_dot = Circle::new((indicator_cx as f64, indicator_cy as f64), 5.0);
-        scene.fill(Fill::NonZero, transform, OK_DOT_COLOR, None, &ok_dot);
+        scene.fill(Fill::NonZero, transform, palette.ok_dot, None, &ok_dot);
     }
 }
 

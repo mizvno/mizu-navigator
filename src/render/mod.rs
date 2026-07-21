@@ -21,6 +21,9 @@ pub mod layout_bridge;
 /// Unified navigation policy — single choke point for all document-level
 /// navigation decisions (invariants N1–N5).
 pub mod navigation;
+/// User preference detection (light/dark, high-contrast, reduced-motion)
+/// and the theme-aware chrome palette.
+pub mod preferences;
 /// Capability action dispatch and sandboxing utilities.
 // Security note: actions execute unconditionally; there is no per-document
 // permission model. Enforcement is at the transport layer (TLS-only QUIC).
