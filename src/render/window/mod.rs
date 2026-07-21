@@ -6,6 +6,9 @@
 //! * [`manager`] — `MizuWindowManager` and its lifecycle/state methods.
 //! * [`navigate`] — URL resolution and navigation/network-result handling.
 //! * [`input`] — form submission and clipboard/text-extraction helpers.
+//! * [`focus`] — keyboard focus order (Tab/Shift-Tab) and click/submit
+//!   event resolution shared between the mouse click handler and keyboard
+//!   activation.
 //! * [`event_loop`] — `run_window_loop`, the Winit event loop itself.
 //!
 //! Every item that was previously a direct member of this module is
@@ -15,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod event_loop;
+mod focus;
 mod input;
 mod manager;
 mod navigate;

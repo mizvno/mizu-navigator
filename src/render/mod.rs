@@ -1,5 +1,10 @@
 //! Rendering and window management subsystem.
 
+/// Accent color for focus indication, shared between the chrome URL bar's
+/// focused-state border and the DOM keyboard-focus ring so the two read as
+/// the same visual language.
+pub(crate) const FOCUS_RING_COLOR: vello::peniko::Color = vello::peniko::Color::rgba8(85, 153, 255, 255);
+
 /// Native Vello-based browser chrome (navigation bar).
 pub mod chrome_vello;
 /// Spatial hit-testing for input events.

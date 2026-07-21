@@ -439,6 +439,27 @@ pub fn paint_node(
             scene.stroke(&stroke, ctx.transform, &brush, None, &shape);
         }
 
+        // ── Keyboard focus ring ────────────────────────────────────────────
+        // A 2px ring, inset 1px from the node's own border, in the same
+        // accent color as the chrome URL bar's focused-state border
+        // (`crate::render::FOCUS_RING_COLOR`) — legible against both the
+        // chrome's dark palette and an arbitrary document background.
+        if Some(node_id) == ctx.focused_node {
+            const FOCUS_RING_WIDTH: f64 = 2.0;
+            const FOCUS_RING_INSET: f64 = 1.0;
+            let ring_rect = Rect::new(
+                rect.x0 + FOCUS_RING_INSET,
+                rect.y0 + FOCUS_RING_INSET,
+                rect.x1 - FOCUS_RING_INSET,
+                rect.y1 - FOCUS_RING_INSET,
+            );
+            let ring_shape =
+                ring_rect.to_rounded_rect((border_radius.unwrap_or(0.0) as f64 - FOCUS_RING_INSET).max(0.0));
+            let stroke = Stroke::new(FOCUS_RING_WIDTH);
+            let brush = vello::peniko::Brush::Solid(crate::render::FOCUS_RING_COLOR);
+            scene.stroke(&stroke, ctx.transform, &brush, None, &ring_shape);
+        }
+
         drawn_count += 1;
     }
 

@@ -336,3 +336,196 @@
         .expect("clipboard copy with gesture must succeed");
         assert_eq!(text, "Copy me!");
     }
+
+    // --- Keyboard focus order / activation tests (ux-1) ---------------------
+
+    fn click_event_block() -> crate::parser::EventBlock {
+        crate::parser::EventBlock::Click {
+            action: crate::parser::Action::Assign {
+                target: "clicked".to_string(),
+                expr: crate::parser::Expr::Literal(crate::core::types::Value::Bool(true)),
+            },
+        }
+    }
+
+    fn window_node() -> MizuNode {
+        MizuNode {
+            primitive: Primitive::Window,
+            attributes: HashMap::new(),
+            events: HashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn plain_box_node() -> MizuNode {
+        MizuNode {
+            primitive: Primitive::Box,
+            attributes: HashMap::new(),
+            events: HashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn clickable_box_node() -> MizuNode {
+        let mut events = HashMap::new();
+        events.insert("click".to_string(), click_event_block());
+        MizuNode {
+            primitive: Primitive::Box,
+            attributes: HashMap::new(),
+            events,
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn input_node(name: &str) -> MizuNode {
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), name.to_string());
+        MizuNode {
+            primitive: Primitive::Input,
+            attributes: attrs,
+            events: HashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn button_node() -> MizuNode {
+        let mut events = HashMap::new();
+        events.insert("click".to_string(), click_event_block());
+        MizuNode {
+            primitive: Primitive::Button,
+            attributes: HashMap::new(),
+            events,
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn focusable_nodes_in_order_excludes_plain_includes_click_box() {
+        // window -> [plain box, clickable box, input, button] in document order.
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+
+        let plain_id = manager.dom.root_mut().append(plain_box_node()).id();
+        let click_box_id = manager.dom.root_mut().append(clickable_box_node()).id();
+        let input_id = manager.dom.root_mut().append(input_node("a")).id();
+        let button_id = manager.dom.root_mut().append(button_node()).id();
+        manager.rebuild_node_mappings();
+
+        let order = manager.focusable_nodes_in_order();
+        assert!(
+            !order.contains(&plain_id),
+            "a plain box with no click/submit event must not be focusable"
+        );
+        assert_eq!(
+            order,
+            vec![click_box_id, input_id, button_id],
+            "focusable nodes must appear in document (pre-order) order, \
+             including a non-button/input box that carries a click event"
+        );
+    }
+
+    #[test]
+    fn tab_advances_and_wraps_shift_tab_reverses() {
+        // window -> [input a, input b, input c]
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+
+        let a = manager.dom.root_mut().append(input_node("a")).id();
+        let b = manager.dom.root_mut().append(input_node("b")).id();
+        let c = manager.dom.root_mut().append(input_node("c")).id();
+        manager.rebuild_node_mappings();
+
+        // Nothing focused: Tab focuses the first, Shift-Tab focuses the last.
+        assert_eq!(manager.next_focus_target(false), Some(a));
+        assert_eq!(manager.next_focus_target(true), Some(c));
+
+        // Forward advance a -> b -> c -> wraps to a.
+        manager.focused_node = Some(a);
+        assert_eq!(manager.next_focus_target(false), Some(b));
+        manager.focused_node = Some(b);
+        assert_eq!(manager.next_focus_target(false), Some(c));
+        manager.focused_node = Some(c);
+        assert_eq!(
+            manager.next_focus_target(false),
+            Some(a),
+            "Tab from the last focusable node must wrap to the first"
+        );
+
+        // Shift-Tab reverses: a -> wraps to c.
+        manager.focused_node = Some(a);
+        assert_eq!(
+            manager.next_focus_target(true),
+            Some(c),
+            "Shift-Tab from the first focusable node must wrap to the last"
+        );
+        manager.focused_node = Some(c);
+        assert_eq!(manager.next_focus_target(true), Some(b));
+    }
+
+    #[test]
+    fn dispatch_click_gesture_sets_gesture_and_emits_single_click() {
+        // Security regression (MNT ux-1 guardrail): keyboard activation of a
+        // focused button must reuse the exact mouse-click gesture sequence —
+        // `has_user_gesture = true` plus exactly one `UiEvent::Click` for that
+        // node, no more, no less. The keyboard Enter/Space handler in
+        // event_loop.rs calls this same `dispatch_click_gesture` helper, so
+        // pinning its behavior here pins keyboard activation as well.
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+
+        let button_id = manager.dom.root_mut().append(button_node()).id();
+        manager.rebuild_node_mappings();
+
+        // Replace the real logic channel with a test channel so the emitted
+        // UiEvent can be observed directly.
+        let (test_tx, test_rx) = std::sync::mpsc::channel();
+        manager.logic_tx = test_tx;
+        manager.has_user_gesture = false;
+
+        let dispatched = dispatch_click_gesture(&mut manager, button_id);
+        assert!(dispatched, "dispatch must succeed for a live DOM node");
+        assert!(
+            manager.has_user_gesture,
+            "keyboard activation must set has_user_gesture, exactly like a mouse click"
+        );
+
+        let events: Vec<_> = test_rx.try_iter().collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one UiEvent must be emitted, got: {events:?}"
+        );
+        match &events[0] {
+            crate::network::UiEvent::Click { node_id } => {
+                let expected_u32 = *manager.node_id_to_u32.get(&button_id).unwrap();
+                assert_eq!(*node_id, expected_u32);
+            }
+            other => panic!("expected UiEvent::Click, got: {other:?}"),
+        }
+    }

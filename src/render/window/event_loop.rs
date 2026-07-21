@@ -24,7 +24,11 @@ use crate::render::hit_test::hit_test;
 use crate::render::navigation::NavigationInitiator;
 use crate::render::vello_pipeline::{PaintContext, paint_node};
 
-use super::input::{apply_clipboard_action, dispatch_form_submit, find_form_submitter, push_input_text};
+use super::focus::find_click_and_submit;
+use super::input::{
+    apply_clipboard_action, dispatch_click_gesture, dispatch_form_submit, find_form_submitter,
+    push_input_text,
+};
 use super::manager::MizuWindowManager;
 use super::navigate::{navigate_to_url, process_network_result};
 
@@ -462,18 +466,8 @@ pub fn run_window_loop(
                     }
 
                     if let Some(node_id) = action_node_id
-                        && let Some(&u32_id) = manager.node_id_to_u32.get(&node_id)
+                        && dispatch_click_gesture(&mut manager, node_id)
                     {
-                        if let Some(node_ref) = manager.dom.get(node_id) {
-                            manager.inspector_log.push_event(
-                                crate::render::inspector::log::EventKind::Click,
-                                crate::render::inspector::model::node_label(node_ref.value(), None),
-                            );
-                        }
-                        // Mark user gesture before dispatching — clipboard actions in this
-                        // response batch are therefore authorised.
-                        manager.has_user_gesture = true;
-                        let _ = manager.logic_tx.send(UiEvent::Click { node_id: u32_id });
                         window.request_redraw();
                     }
 
@@ -565,19 +559,42 @@ pub fn run_window_loop(
                         return;
                     }
 
-                    // ── A DOM input has focus — route text-editing keys to it ──
+                    // ── Tab / Shift-Tab: advance keyboard focus through the DOM ──
+                    // Document order is the tab order; Mizu has no `tabindex`.
+                    if let winit::keyboard::Key::Named(NamedKey::Tab) = key_event.logical_key {
+                        let backward = manager.modifiers.shift_key();
+                        if let Some(next) = manager.next_focus_target(backward)
+                            && manager.focused_node != Some(next)
+                        {
+                            if let Some(prev) = manager.focused_node {
+                                manager.mark_text_dirty(prev);
+                            }
+                            manager.mark_text_dirty(next);
+                            manager.focused_node = Some(next);
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+
+                    // ── A DOM node has focus — route editing/activation keys to it ──
                     if let Some(focus_id) = manager.focused_node
                         && let Some(&input_u32) = manager.node_id_to_u32.get(&focus_id)
                     {
+                        let is_input = manager
+                            .dom
+                            .get(focus_id)
+                            .map(|n| n.value().primitive == crate::parser::Primitive::Input)
+                            .unwrap_or(false);
+
                         match &key_event.logical_key {
                             winit::keyboard::Key::Named(NamedKey::Escape) => {
-                                // Blur the input; Escape only exits the app
-                                // when nothing is focused.
+                                // Blur the focused node; Escape only exits the
+                                // app / closes pickers when nothing is focused.
                                 manager.focused_node = None;
                                 manager.mark_text_dirty(focus_id);
                                 window.request_redraw();
                             }
-                            winit::keyboard::Key::Named(NamedKey::Backspace) => {
+                            winit::keyboard::Key::Named(NamedKey::Backspace) if is_input => {
                                 if let Some(buf) = manager.local_inputs.get_mut(&input_u32)
                                     && buf.pop().is_some()
                                 {
@@ -585,7 +602,7 @@ pub fn run_window_loop(
                                     window.request_redraw();
                                 }
                             }
-                            winit::keyboard::Key::Named(NamedKey::Enter) => {
+                            winit::keyboard::Key::Named(NamedKey::Enter) if is_input => {
                                 // Enter submits the enclosing form, exactly
                                 // like clicking its submit button.
                                 if let Some(submitter) =
@@ -595,7 +612,34 @@ pub fn run_window_loop(
                                     window.request_redraw();
                                 }
                             }
-                            _ => {
+                            winit::keyboard::Key::Named(NamedKey::Enter | NamedKey::Space)
+                                if !is_input =>
+                            {
+                                // Activate the focused button/clickable node —
+                                // the same ancestor walk and gesture dispatch
+                                // the mouse click handler uses (SECURITY: this
+                                // is not a second gesture path, it is the same
+                                // `dispatch_click_gesture`/`dispatch_form_submit`
+                                // helpers the click handler calls, anchored at
+                                // the focused node instead of a hit-test result).
+                                let (action_node_id, submit_node_id) =
+                                    find_click_and_submit(&manager.dom, focus_id);
+                                let mut redraw = false;
+                                if let Some(node_id) = action_node_id
+                                    && dispatch_click_gesture(&mut manager, node_id)
+                                {
+                                    redraw = true;
+                                }
+                                if let Some(submit_id) = submit_node_id
+                                    && dispatch_form_submit(&mut manager, submit_id)
+                                {
+                                    redraw = true;
+                                }
+                                if redraw {
+                                    window.request_redraw();
+                                }
+                            }
+                            _ if is_input => {
                                 let is_paste = manager.modifiers.control_key()
                                     && matches!(
                                         &key_event.logical_key,
@@ -628,6 +672,7 @@ pub fn run_window_loop(
                                     }
                                 }
                             }
+                            _ => {}
                         }
                         return;
                     }

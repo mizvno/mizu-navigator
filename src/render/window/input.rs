@@ -92,6 +92,29 @@ pub(super) fn find_form_submitter(
         .map(|d| d.id())
 }
 
+/// Dispatches a click gesture for `node_id` — the exact user-gesture
+/// sequence the mouse click handler uses (`has_user_gesture = true`, then a
+/// single `UiEvent::Click`). Shared by the mouse click handler and keyboard
+/// activation (Enter/Space) so the two are observationally identical: same
+/// gesture flag, same single event. Returns `true` if dispatched (`node_id`
+/// must have a u32 mapping, which every live DOM node has).
+pub(super) fn dispatch_click_gesture(manager: &mut MizuWindowManager, node_id: EgoNodeId) -> bool {
+    let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) else {
+        return false;
+    };
+    if let Some(node_ref) = manager.dom.get(node_id) {
+        manager.inspector_log.push_event(
+            crate::render::inspector::log::EventKind::Click,
+            crate::render::inspector::model::node_label(node_ref.value(), None),
+        );
+    }
+    // Mark user gesture before dispatching — clipboard actions in this
+    // response batch are therefore authorised.
+    manager.has_user_gesture = true;
+    let _ = manager.logic_tx.send(UiEvent::Click { node_id: u32_id });
+    true
+}
+
 /// Dispatches a form submission triggered by `submitter` (a node carrying a
 /// `submit` event): gathers the enclosing form's fields from the live input
 /// buffers and forwards them to the logic worker together with the
