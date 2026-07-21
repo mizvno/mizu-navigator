@@ -1374,6 +1374,44 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         );
     }
 
+    #[test]
+    fn parse_action_parenthesized_verb_case_sensitivity_bypass_is_error() {
+        // MNT-01 follow-up: `get(alias) -> var`, `Get(alias) -> var`, and
+        // `gEt(alias) -> var` must all be rejected — only the exact-case
+        // `GET(alias) -> var` form is valid. Use a populated registry so the
+        // alias itself can't be the rejection reason.
+        use crate::parser::urls::{EndpointKind, UrlEndpoint, UrlRegistry};
+        let mut registry: UrlRegistry = rustc_hash::FxHashMap::default();
+        let mut interner = StringInterner::new();
+        let sym = interner.get_or_intern("alias");
+        registry.insert(
+            sym,
+            UrlEndpoint {
+                kind: EndpointKind::Api,
+                raw_target: "/api/alias".to_string(),
+            },
+        );
+
+        for variant in ["get(alias) -> var", "Get(alias) -> var", "gEt(alias) -> var"] {
+            let err = parse_action_with_urls(variant, &mut interner, Some(&registry)).unwrap_err();
+            assert!(
+                matches!(err, MizuError::ParseError(ref msg) if msg.contains("lowercase") && msg.to_ascii_lowercase().contains("get")),
+                "expected ParseError about lowercase get for {variant:?}, got: {err:?}"
+            );
+        }
+
+        // Exact-uppercase form must still parse successfully.
+        let action =
+            parse_action_with_urls("GET(alias) -> var", &mut interner, Some(&registry)).unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall {
+                method: NetworkMethod::Get,
+                ..
+            }
+        ));
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // NetworkMethod — as_str round-trip
     // ────────────────────────────────────────────────────────────────────────

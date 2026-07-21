@@ -942,16 +942,17 @@ pub fn parse_action_with_urls(
     }
 
     // ── Detect uppercase HTTP verb built-ins: GET(...), POST(...), etc. ──
-    let upper = action_trimmed.to_ascii_uppercase();
-    let network_method = if upper.starts_with("GET(") {
+    // Matched on exact case: the parenthesized call form is intended to be
+    // as case-sensitive as the legacy space-separated form rejected below.
+    let network_method = if action_trimmed.starts_with("GET(") {
         Some(NetworkMethod::Get)
-    } else if upper.starts_with("POST(") {
+    } else if action_trimmed.starts_with("POST(") {
         Some(NetworkMethod::Post)
-    } else if upper.starts_with("PUT(") {
+    } else if action_trimmed.starts_with("PUT(") {
         Some(NetworkMethod::Put)
-    } else if upper.starts_with("DELETE(") {
+    } else if action_trimmed.starts_with("DELETE(") {
         Some(NetworkMethod::Delete)
-    } else if upper.starts_with("QUERY(") {
+    } else if action_trimmed.starts_with("QUERY(") {
         Some(NetworkMethod::Query)
     } else {
         None
@@ -961,6 +962,23 @@ pub fn parse_action_with_urls(
         let verb_len = method.as_str().len(); // "GET".len() == 3
         let rest = &action_trimmed[verb_len..]; // starts at `(`
         return parse_network_call(method, rest, interner, url_registry);
+    }
+
+    // A verb that matches case-insensitively but not exactly (e.g. `get(...)`,
+    // `Get(...)`, `gEt(...)`) is the same case-sensitivity bypass as the
+    // legacy lowercase space-separated form below — reject with the same
+    // error wording rather than silently falling through as an unrecognized
+    // action.
+    let upper = action_trimmed.to_ascii_uppercase();
+    for verb in &["GET(", "POST(", "PUT(", "DELETE(", "QUERY("] {
+        if upper.starts_with(verb) {
+            let verb_name = &verb[..verb.len() - 1]; // strip trailing '('
+            let typed = &action_trimmed[..verb_name.len()];
+            return Err(MizuError::ParseError(format!(
+                "lowercase `{typed}` is not a valid action; \
+                 use the uppercase registry form: {verb_name}(alias) -> var"
+            )));
+        }
     }
 
     // Lowercase HTTP verbs (`get url -> var`) are intentionally rejected.
