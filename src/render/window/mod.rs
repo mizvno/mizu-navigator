@@ -28,4 +28,5 @@ mod tests;
 pub use crate::render::image_codec::{AnimatedImage, AssetSlot, Frame, decode_image_bytes};
 pub use event_loop::run_window_loop;
 pub use manager::MizuWindowManager;
+pub(crate) use focus::is_focusable;
 pub(crate) use navigate::chrome_url_to_file_sandbox_base;

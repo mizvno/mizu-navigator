@@ -5,6 +5,9 @@
 /// the same visual language.
 pub(crate) const FOCUS_RING_COLOR: vello::peniko::Color = vello::peniko::Color::rgba8(85, 153, 255, 255);
 
+/// Read-only accessibility tree (accesskit), derived from the same DOM the
+/// renderer paints.
+pub mod accessibility;
 /// Native Vello-based browser chrome (navigation bar).
 pub mod chrome_vello;
 /// Spatial hit-testing for input events.

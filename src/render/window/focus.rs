@@ -10,7 +10,12 @@ use super::manager::MizuWindowManager;
 /// A node is keyboard-focusable iff it is an `input`, a `button`, or any node
 /// carrying a `click`/`submit` event handler. Document order is the tab
 /// order — Mizu has no `tabindex`.
-fn is_focusable(node: &MizuNode) -> bool {
+///
+/// `pub(crate)`: also reused by `render::accessibility` so the accesskit
+/// tree marks exactly the same nodes actionable (`Action::Focus`/`Default`)
+/// as ux-1's Tab order reaches — one definition, not a second copy that
+/// could drift.
+pub(crate) fn is_focusable(node: &MizuNode) -> bool {
     matches!(node.primitive, Primitive::Input | Primitive::Button)
         || node.events.contains_key("click")
         || node.events.contains_key("submit")

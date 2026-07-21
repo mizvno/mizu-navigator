@@ -21,6 +21,11 @@ taffy = "0.5"
 
 ego-tree = "0.10"
 winit = "0.29"
+# Pinned to the last accesskit_winit line compatible with winit 0.29
+# (0.20+ requires winit 0.30's ActiveEventLoop API). Do not bump without
+# also bumping winit — see UX-REMEDIATION-ROADMAP.md ux-2.
+accesskit = "0.13"
+accesskit_winit = "0.19"
 vello = "0.1.0"
 parley = { version = "0.10.0", features = ["complex-scripts"] }
 pollster = "0.3"

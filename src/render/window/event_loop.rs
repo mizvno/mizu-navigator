@@ -24,6 +24,8 @@ use crate::render::hit_test::hit_test;
 use crate::render::navigation::NavigationInitiator;
 use crate::render::vello_pipeline::{PaintContext, paint_node};
 
+use crate::render::accessibility::{MizuUserEvent, build_a11y_tree, resolve_ego_id};
+
 use super::focus::find_click_and_submit;
 use super::input::{
     apply_clipboard_action, dispatch_click_gesture, dispatch_form_submit, find_form_submitter,
@@ -50,10 +52,12 @@ pub fn run_window_loop(
     computed_bindings: Vec<ComputedBinding>,
     root_timers: Vec<RootTimer>,
 ) -> Result<(), MizuError> {
-    let event_loop = winit::event_loop::EventLoopBuilder::<()>::with_user_event()
+    let event_loop = winit::event_loop::EventLoopBuilder::<MizuUserEvent>::with_user_event()
         .build()
         .map_err(|e| MizuError::ParseError(e.to_string()))?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+    // Must be created before `event_loop.run(...)` consumes `event_loop` by value.
+    let accesskit_proxy = event_loop.create_proxy();
 
     let mut manager = MizuWindowManager::new(
         dom,
@@ -139,6 +143,11 @@ pub fn run_window_loop(
             .map_err(|e| MizuError::ParseError(format!("Failed to build window: {e}")))?,
     );
 
+    // Delivers accesskit's initial-tree/action/deactivation events through
+    // the same `Event::UserEvent` channel as everything else in this loop —
+    // no separate thread, no separate handler wiring.
+    let mut a11y_adapter = accesskit_winit::Adapter::with_event_loop_proxy(&window, accesskit_proxy);
+
     let initial_size = window.inner_size();
     let scale_factor = window.scale_factor();
     let logical_width = initial_size.width as f64 / scale_factor;
@@ -183,6 +192,9 @@ pub fn run_window_loop(
                 Some(w) => w.clone(),
                 None => return,
             };
+            // Must run before this window event is handled below (accesskit
+            // needs to observe focus/IME/etc. changes as they happen).
+            a11y_adapter.process_event(&window, window_event);
             match window_event {
                 WindowEvent::CloseRequested => {
                     elwt.exit();
@@ -817,6 +829,19 @@ pub fn run_window_loop(
                         return;
                     }
 
+                    // Piggyback on the same frame coalescing the renderer
+                    // already has — one accessibility tree rebuild per
+                    // actual redraw, not per state change, so a per-frame
+                    // timer document can't spam the AT.
+                    a11y_adapter.update_if_active(|| {
+                        build_a11y_tree(
+                            &manager.dom,
+                            &manager.node_id_to_u32,
+                            manager.focused_node,
+                            &manager.store,
+                        )
+                    });
+
                     let device = &render_cx.devices[surface.dev_id].device;
                     let queue = &render_cx.devices[surface.dev_id].queue;
 
@@ -1253,6 +1278,61 @@ pub fn run_window_loop(
                 elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
             } else {
                 elwt.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            }
+        } else if let Event::UserEvent(MizuUserEvent::Accesskit(ak_event)) = event {
+            match ak_event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    a11y_adapter.update_if_active(|| {
+                        build_a11y_tree(
+                            &manager.dom,
+                            &manager.node_id_to_u32,
+                            manager.focused_node,
+                            &manager.store,
+                        )
+                    });
+                }
+                accesskit_winit::WindowEvent::ActionRequested(request) => {
+                    // SECURITY (ux-2 guardrail): an AT-initiated action is a
+                    // real user gesture — route it through the *same*
+                    // gesture-gated dispatch keyboard activation (ux-1) uses,
+                    // never a second path into the evaluator.
+                    let Some(ego_id) = resolve_ego_id(&manager.u32_to_node_id, request.target)
+                    else {
+                        return;
+                    };
+                    let mut redraw = false;
+                    match request.action {
+                        accesskit::Action::Focus => {
+                            if manager.focused_node != Some(ego_id) {
+                                if let Some(prev) = manager.focused_node {
+                                    manager.mark_text_dirty(prev);
+                                }
+                                manager.mark_text_dirty(ego_id);
+                                manager.focused_node = Some(ego_id);
+                                redraw = true;
+                            }
+                        }
+                        accesskit::Action::Default => {
+                            let (action_node_id, submit_node_id) =
+                                find_click_and_submit(&manager.dom, ego_id);
+                            if let Some(node_id) = action_node_id
+                                && dispatch_click_gesture(&mut manager, node_id)
+                            {
+                                redraw = true;
+                            }
+                            if let Some(submit_id) = submit_node_id
+                                && dispatch_form_submit(&mut manager, submit_id)
+                            {
+                                redraw = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if redraw && let Some(window) = manager.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
             }
         }
     });
