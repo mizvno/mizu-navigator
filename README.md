@@ -2,11 +2,6 @@
 
 Mizu reads a `.mizu` file and draws it in a native window.
 
-**New to the language?** The full tutorial lives in
-[docs/tutorial/index.html](docs/tutorial/index.html) — open it in any browser.
-It covers every block (`urls`, `logic`, `style`, `layout`), events, forms,
-timers, networking, and the F12 inspector, with a one-page reference at the end.
-
 ## Requirements
 
 - [Rust and Cargo](https://rustup.rs/)
