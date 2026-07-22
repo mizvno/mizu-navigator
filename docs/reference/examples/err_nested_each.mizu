@@ -1,0 +1,7 @@
+logic
+    items = null
+layout
+    window "Nested each"
+        each item in items
+            each sub in item
+                text "nested"

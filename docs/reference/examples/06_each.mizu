@@ -1,0 +1,6 @@
+logic
+    todos = null
+layout
+    window "To-do List"
+        each todo in todos
+            text "{todo.title}"

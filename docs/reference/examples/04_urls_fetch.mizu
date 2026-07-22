@@ -1,0 +1,8 @@
+urls
+    api items_api /api/v1/items
+logic
+    items = null
+layout
+    window "Item List"
+        button "Load Items" click -> GET(items_api) -> items
+        text "{items}"

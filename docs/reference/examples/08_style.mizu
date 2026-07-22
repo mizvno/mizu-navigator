@@ -1,0 +1,11 @@
+style
+    window
+        background #1a1a2e
+        color #eaeaea
+    .card
+        padding 20
+        border-radius 8
+layout
+    window "Styled App"
+        box class card
+            text "Styled content"

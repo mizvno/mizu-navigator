@@ -1,0 +1,3 @@
+layout
+    window "Absolute img"
+        image src "https://example.com/logo.png"

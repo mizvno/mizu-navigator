@@ -1,0 +1,6 @@
+logic
+    count = 0
+layout
+    window "Counter"
+        text "{count}"
+        button "Increment" click -> count = count + 1

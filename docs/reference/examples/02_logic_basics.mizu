@@ -1,0 +1,7 @@
+logic
+    greeting = "Hello, world!"
+    count = 0
+    double(x: num) : x * 2
+layout
+    window "Logic Demo"
+        text "{greeting}"

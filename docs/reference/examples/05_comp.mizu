@@ -1,0 +1,9 @@
+logic
+    price = 10
+    qty = 3
+    comp total = price * qty
+    comp vat = total * 0.22
+layout
+    window "Invoice"
+        text "Total: {total}"
+        button "Add item" click -> qty = qty + 1
