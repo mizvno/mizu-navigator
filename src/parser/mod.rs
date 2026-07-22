@@ -66,6 +66,6 @@ pub use logic_worker::LogicWorker;
 pub use splitter::{Origin, ParsedSource, split_source, split_source_with_origin};
 pub use style::{
     MizuColor, MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign,
-    StyleRules, parse_style,
+    StyleRules, StyleVariant, VariantCondition, parse_style, parse_style_with_variants,
 };
 pub use urls::{EndpointKind, UrlEndpoint, UrlRegistry, parse_urls};

@@ -45,6 +45,7 @@ use super::navigate::{navigate_back, navigate_forward, navigate_to_url, process_
 pub fn run_window_loop(
     dom: Tree<MizuNode>,
     style_rules: HashMap<String, StyleRules>,
+    style_variants: Vec<crate::parser::style::StyleVariant>,
     logic_fns: FxHashMap<Symbol, MizuFunction>,
     interner: StringInterner,
     url_registry: crate::parser::UrlRegistry,
@@ -63,6 +64,7 @@ pub fn run_window_loop(
     let mut manager = MizuWindowManager::new(
         dom,
         style_rules,
+        style_variants,
         logic_fns,
         #[cfg(feature = "insecure-dev")]
         allow_insecure,
@@ -920,6 +922,11 @@ pub fn run_window_loop(
                             taffy: &manager.taffy,
                             node_to_taffy_id: &manager.node_to_taffy_id,
                             style_rules: &manager.style_rules,
+                            style_variants: &manager.style_variants,
+                            render_env: crate::render::responsive::RenderEnvironment {
+                                viewport: manager.viewport_size,
+                                color_scheme: manager.preferences.color_scheme,
+                            },
                             font_cx: &mut manager.font_cx,
                             layout_cx: &mut manager.layout_cx,
                             transform: dom_transform,
@@ -1153,6 +1160,10 @@ pub fn run_window_loop(
 
                             let old_dims = manager.text_dimensions.get(&node_id).copied();
 
+                            let render_env = crate::render::responsive::RenderEnvironment {
+                                viewport: manager.viewport_size,
+                                color_scheme: manager.preferences.color_scheme,
+                            };
                             if let Some((new_dims, layout)) =
                                 crate::render::text_engine::calculate_node_text(
                                     node_id,
@@ -1165,6 +1176,8 @@ pub fn run_window_loop(
                                     &manager.local_inputs,
                                     &manager.node_id_to_u32,
                                     manager.focused_node,
+                                    &manager.style_variants,
+                                    &render_env,
                                 )
                             {
                                 manager.text_layouts.insert(node_id, layout);

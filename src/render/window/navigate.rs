@@ -165,16 +165,16 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
             } else {
                 Vec::new()
             };
-            let style_rules = if !blocks.style_block.trim().is_empty() {
-                match crate::parser::style::parse_style(&blocks.style_block) {
+            let (style_rules, style_variants) = if !blocks.style_block.trim().is_empty() {
+                match crate::parser::style::parse_style_with_variants(&blocks.style_block) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error = ?e, "style parse error during navigation");
-                        HashMap::new()
+                        (HashMap::new(), Vec::new())
                     }
                 }
             } else {
-                HashMap::new()
+                (HashMap::new(), Vec::new())
             };
             let new_url_registry = if !blocks.urls_block.trim().is_empty() {
                 match crate::parser::urls::parse_urls(&blocks.urls_block, &mut new_interner) {
@@ -216,6 +216,7 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                     if let Err(e) = manager.reload_document(
                         dom,
                         style_rules,
+                        style_variants,
                         logic_fns,
                         new_interner,
                         new_computed,
@@ -370,6 +371,10 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                 .insert(url.clone(), AssetSlot::Ready(image));
             let mut new_taffy = taffy::TaffyTree::new();
             let mut new_node_map = HashMap::new();
+            let env = crate::render::responsive::RenderEnvironment {
+                viewport: manager.viewport_size,
+                color_scheme: manager.preferences.color_scheme,
+            };
             match crate::render::layout_bridge::build_taffy_tree(
                 manager.dom.root(),
                 &manager.style_rules,
@@ -377,6 +382,8 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                 &mut new_node_map,
                 &manager.image_cache,
                 &manager.chrome_state.url,
+                &manager.style_variants,
+                &env,
             ) {
                 Ok(new_root) => {
                     manager.taffy = new_taffy;

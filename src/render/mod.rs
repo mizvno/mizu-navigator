@@ -24,6 +24,9 @@ pub mod navigation;
 /// User preference detection (light/dark, high-contrast, reduced-motion)
 /// and the theme-aware chrome palette.
 pub mod preferences;
+/// Responsive layout: viewport units and window-width/color-scheme style
+/// variants (ux-6). See `docs/design/responsive.md`.
+pub mod responsive;
 /// Capability action dispatch and sandboxing utilities.
 // Security note: actions execute unconditionally; there is no per-document
 // permission model. Enforcement is at the transport layer (TLS-only QUIC).

@@ -13,9 +13,11 @@ use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
 use crate::network::{ReloadPayload, RuntimeAction, UiEvent, WorkerResponse};
 use crate::parser::logic::{ComputedBinding, MizuFunction, RootTimer, TimerInterval};
+use crate::parser::style::StyleVariant;
 use crate::parser::{Action, EventBlock, MizuNode, StyleRules};
 use crate::render::chrome_vello::CHROME_HEIGHT;
 use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
+use crate::render::responsive::{RenderEnvironment, ViewportSize};
 use crate::render::security::get_raw_domain;
 use super::AssetSlot;
 use super::history::HistoryStack;
@@ -37,6 +39,15 @@ pub struct MizuWindowManager {
     pub dom: Tree<MizuNode>,
     /// The active CSS rules map.
     pub style_rules: HashMap<String, StyleRules>,
+    /// Breakpoint/color-scheme style variants (ux-6) — see
+    /// `docs/design/responsive.md`. Resolved against `viewport_size` and
+    /// `preferences.color_scheme` on every taffy-tree (re)build.
+    pub style_variants: Vec<StyleVariant>,
+    /// The content viewport size (window size, `height` excluding the chrome
+    /// bar) last used to build `taffy`. Updated by `resize_viewport`; feeds
+    /// `vw`/`vh`/`vmin`/`vmax` resolution and `@min-width`/`@max-width`
+    /// variant selection.
+    pub viewport_size: ViewportSize,
     /// The taffy layout engine instance.
     pub taffy: TaffyTree<EgoNodeId>,
     /// Mapping of DOM Node IDs to Taffy Node IDs.
@@ -158,6 +169,7 @@ impl MizuWindowManager {
     pub fn new(
         dom: Tree<MizuNode>,
         style_rules: HashMap<String, StyleRules>,
+        style_variants: Vec<StyleVariant>,
         logic_fns: FxHashMap<Symbol, MizuFunction>,
         #[cfg(feature = "insecure-dev")] allow_insecure: bool,
     ) -> Result<Self, MizuError> {
@@ -166,6 +178,18 @@ impl MizuWindowManager {
 
         let empty_cache = HashMap::new();
         let default_chrome_url = "mizu://localhost/index.mizu";
+        // Placeholder viewport: the real window doesn't exist yet at this
+        // point in startup. `resize_viewport` rebuilds the taffy tree's
+        // styles against the real size as soon as the window is created
+        // (see `event_loop::run_window_loop`), so this is superseded within
+        // the same startup sequence, before the first frame ever paints.
+        let initial_env = RenderEnvironment {
+            viewport: ViewportSize {
+                width: 800.0,
+                height: 600.0 - CHROME_HEIGHT,
+            },
+            color_scheme: UserPreferences::default().color_scheme,
+        };
         let root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
             dom.root(),
             &style_rules,
@@ -173,6 +197,8 @@ impl MizuWindowManager {
             &mut node_to_taffy_id,
             &empty_cache,
             default_chrome_url,
+            &style_variants,
+            &initial_env,
         )?;
 
         let (network_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
@@ -196,6 +222,8 @@ impl MizuWindowManager {
             window: None,
             dom,
             style_rules,
+            style_variants,
+            viewport_size: initial_env.viewport,
             taffy,
             node_to_taffy_id,
             root_taffy_id,
@@ -384,10 +412,12 @@ impl MizuWindowManager {
     }
 
     /// Reloads the document completely, resetting layout and logic state.
+    #[allow(clippy::too_many_arguments)]
     pub fn reload_document(
         &mut self,
         dom: Tree<MizuNode>,
         style_rules: HashMap<String, StyleRules>,
+        style_variants: Vec<StyleVariant>,
         logic_fns: FxHashMap<Symbol, MizuFunction>,
         interner: StringInterner,
         computed_bindings: Vec<ComputedBinding>,
@@ -400,6 +430,10 @@ impl MizuWindowManager {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy_id = HashMap::new();
 
+        let env = RenderEnvironment {
+            viewport: self.viewport_size,
+            color_scheme: self.preferences.color_scheme,
+        };
         let root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
             dom.root(),
             &style_rules,
@@ -407,10 +441,13 @@ impl MizuWindowManager {
             &mut node_to_taffy_id,
             &self.image_cache,
             &self.chrome_state.url,
+            &style_variants,
+            &env,
         )?;
 
         self.dom = dom;
         self.style_rules = style_rules;
+        self.style_variants = style_variants;
         self.logic_fns = logic_fns;
         self.computed_bindings = computed_bindings;
         self.taffy = taffy;
@@ -468,6 +505,51 @@ impl MizuWindowManager {
             height: AvailableSpace::MaxContent,
         };
 
+        // ux-6: re-resolve breakpoint/color-scheme variants and vw/vh/vmin/
+        // vmax dimensions against the new content viewport before laying
+        // out. This rebuilds the taffy tree's *styles* (not the DOM/logic
+        // state) — the same construction `reload_document` uses, so a
+        // resize's responsive re-styling is exactly as correct as a fresh
+        // document load, just without re-parsing anything. Bounded by the
+        // same ≥16ms debounce this function is already only called behind
+        // (see `window::event_loop`'s `WindowEvent::Resized` handler) — "not
+        // on every resize pixel", per the design memo.
+        self.viewport_size = ViewportSize {
+            width,
+            height: content_height,
+        };
+        let env = RenderEnvironment {
+            viewport: self.viewport_size,
+            color_scheme: self.preferences.color_scheme,
+        };
+        let mut new_taffy = TaffyTree::new();
+        let mut new_node_to_taffy_id = HashMap::new();
+        let new_root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
+            self.dom.root(),
+            &self.style_rules,
+            &mut new_taffy,
+            &mut new_node_to_taffy_id,
+            &self.image_cache,
+            &self.chrome_state.url,
+            &self.style_variants,
+            &env,
+        )?;
+        self.taffy = new_taffy;
+        self.node_to_taffy_id = new_node_to_taffy_id;
+        self.root_taffy_id = new_root_taffy_id;
+        // The rebuilt tree has fresh synthetic-node bookkeeping — the old
+        // each-expansion's `groups`/`original_children`/`all_synthetic_ids`
+        // reference taffy node ids that no longer exist in `self.taffy`, so
+        // they must not be reused (`expand_each_nodes`'s "restore the
+        // previous expansion" step would otherwise operate on stale/
+        // possibly-reused ids). `truncated` is keyed by `EgoNodeId`, which
+        // *is* still meaningful, and is kept so the budget-change log below
+        // compares against the real previous count instead of always
+        // reading 0 (which would log a spurious "budget exceeded" on every
+        // resize of a document with any truncated list).
+        let prev_truncated = std::mem::take(&mut self.each_expansion.truncated);
+        self.each_expansion = EachExpansion::default();
+
         if let Ok(mut style) = self.taffy.style(self.root_taffy_id).cloned() {
             style.min_size.height = taffy::style::Dimension::Length(content_height);
             style.size.height = taffy::style::Dimension::Auto;
@@ -486,14 +568,14 @@ impl MizuWindowManager {
         )?;
 
         for (node_id, &new_count) in &new_expansion.truncated {
-            let old_count = self.each_expansion.truncated.get(node_id).copied().unwrap_or(0);
+            let old_count = prev_truncated.get(node_id).copied().unwrap_or(0);
             if new_count != old_count {
                 let msg = format!("budget exceeded: clamped list to hide {} items", new_count);
                 self.inspector_log.push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
                 tracing::warn!("{}", msg);
             }
         }
-        for (node_id, &old_count) in &self.each_expansion.truncated {
+        for (node_id, &old_count) in &prev_truncated {
             if !new_expansion.truncated.contains_key(node_id) {
                 let msg = format!("budget restored: previously clamped {} items now visible", old_count);
                 self.inspector_log.push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
@@ -505,6 +587,11 @@ impl MizuWindowManager {
 
         let dom = &self.dom;
         let style_rules = &self.style_rules;
+        let style_variants = &self.style_variants;
+        let render_env = RenderEnvironment {
+            viewport: self.viewport_size,
+            color_scheme: self.preferences.color_scheme,
+        };
         let font_cx = &mut self.font_cx;
         let layout_cx = &mut self.layout_cx;
         let store = &self.store;
@@ -548,6 +635,8 @@ impl MizuWindowManager {
                                 local_inputs,
                                 node_id_to_u32,
                                 focused_input,
+                                style_variants,
+                                &render_env,
                             )
                         {
                             text_dimensions.insert(node_id, dims);

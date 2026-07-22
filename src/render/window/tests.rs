@@ -35,6 +35,7 @@
         let mut manager = MizuWindowManager::new(
             tree,
             styles,
+            Vec::new(),
             FxHashMap::default(),
             #[cfg(feature = "insecure-dev")]
             false,
@@ -80,6 +81,7 @@
         MizuWindowManager::new(
             tree,
             styles,
+            Vec::new(),
             FxHashMap::default(),
             #[cfg(feature = "insecure-dev")]
             false,
@@ -411,6 +413,7 @@
         let mut manager = MizuWindowManager::new(
             tree,
             HashMap::new(),
+            Vec::new(),
             FxHashMap::default(),
             #[cfg(feature = "insecure-dev")]
             false,
@@ -443,6 +446,7 @@
         let mut manager = MizuWindowManager::new(
             tree,
             HashMap::new(),
+            Vec::new(),
             FxHashMap::default(),
             #[cfg(feature = "insecure-dev")]
             false,
@@ -493,6 +497,7 @@
         let mut manager = MizuWindowManager::new(
             tree,
             HashMap::new(),
+            Vec::new(),
             FxHashMap::default(),
             #[cfg(feature = "insecure-dev")]
             false,

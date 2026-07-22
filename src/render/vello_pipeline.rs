@@ -52,6 +52,12 @@ pub struct PaintContext<'a> {
     pub node_to_taffy_id: &'a HashMap<EgoNodeId, taffy::prelude::NodeId>,
     /// Active CSS styles.
     pub style_rules: &'a HashMap<String, StyleRules>,
+    /// Breakpoint/color-scheme style variants (ux-6). Empty for callers that
+    /// don't need responsive behavior (e.g. tests).
+    pub style_variants: &'a [crate::parser::style::StyleVariant],
+    /// Current window-width/color-scheme snapshot variants are resolved
+    /// against (ux-6).
+    pub render_env: crate::render::responsive::RenderEnvironment,
     /// Parley font context.
     pub font_cx: &'a mut parley::FontContext,
     /// Parley layout context.
@@ -167,14 +173,27 @@ pub fn paint_node(
 
     // ── Resolve style properties for this node ────────────────────────────────
     let mut merged = StyleRules::default();
-    if let Some(tag_rules) = ctx.style_rules.get(mizu_node.primitive.as_str()) {
+    let tag_name = mizu_node.primitive.as_str();
+    if let Some(tag_rules) = ctx.style_rules.get(tag_name) {
         merged = merged.merge(tag_rules.clone());
     }
-    if let Some(class_attr) = mizu_node.attributes.get("class")
+    let class_attr = mizu_node.attributes.get("class").map(String::as_str);
+    if let Some(class_attr) = class_attr
         && let Some(rules) = ctx.style_rules.get(class_attr)
     {
         merged = merged.merge(rules.clone());
     }
+    // ux-6: breakpoint/color-scheme variants, applied last (after both
+    // bases), in source declaration order — see docs/design/responsive.md.
+    let variant_selectors: &[&str] = match class_attr {
+        Some(c) => &[tag_name, c],
+        None => &[tag_name],
+    };
+    merged = merged.merge(crate::render::responsive::resolve_matching_variants(
+        ctx.style_variants,
+        variant_selectors,
+        &ctx.render_env,
+    ));
 
     // ── Evaluate conditional classes ──────────────────────────────────────
     // Evaluate each condition in-place using the existing StateMachine, injecting
@@ -1140,6 +1159,14 @@ mod tests {
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
             style_rules: &style_rules,
+            style_variants: &[],
+            render_env: crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
             font_cx: &mut font_cx,
             layout_cx: &mut layout_cx,
             transform: Affine::IDENTITY,
@@ -1284,6 +1311,14 @@ mod tests {
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
             style_rules: &style_rules,
+            style_variants: &[],
+            render_env: crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
             font_cx: &mut font_cx,
             layout_cx: &mut layout_cx,
             transform: Affine::IDENTITY,
@@ -1662,6 +1697,14 @@ mod tests {
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
             style_rules: &style_rules,
+            style_variants: &[],
+            render_env: crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
             font_cx: &mut font_cx,
             layout_cx: &mut layout_cx,
             transform: vello::kurbo::Affine::IDENTITY,
@@ -1762,6 +1805,14 @@ mod tests {
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
             style_rules: &style_rules,
+            style_variants: &[],
+            render_env: crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
             font_cx: &mut font_cx,
             layout_cx: &mut layout_cx,
             transform: vello::kurbo::Affine::IDENTITY,

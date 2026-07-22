@@ -212,6 +212,10 @@ fn fmt_dimension(d: &crate::parser::MizuDimension) -> String {
     match d {
         crate::parser::MizuDimension::Pixels(v) => format!("{v}"),
         crate::parser::MizuDimension::Percent(v) => format!("{v}%"),
+        crate::parser::MizuDimension::ViewportWidth(v) => format!("{v}vw"),
+        crate::parser::MizuDimension::ViewportHeight(v) => format!("{v}vh"),
+        crate::parser::MizuDimension::ViewportMin(v) => format!("{v}vmin"),
+        crate::parser::MizuDimension::ViewportMax(v) => format!("{v}vmax"),
     }
 }
 

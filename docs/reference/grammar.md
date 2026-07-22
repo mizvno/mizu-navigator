@@ -203,20 +203,38 @@ interval         = integer "ms"
 **Implementing source:** `src/parser/style.rs` — `parse_style`
 
 ```ebnf
-style_block    = { style_rule } ;
-style_rule     = selector NL { property_line NL } ;
-selector       = class_selector | tag_selector ;
-class_selector = "." ident ;
-tag_selector   = "window" | "box" | "text" | "button"
-               | "input"  | "image" | "markdown" ;
-property_line  = SP+ property_key SP+ property_value ;
+style_block       = { style_rule } ;
+style_rule        = selector_line NL { property_line NL } ;
+selector_line     = selector { SP+ variant_condition } ;
+selector          = class_selector | tag_selector ;
+class_selector    = "." ident ;
+tag_selector      = "window" | "box" | "text" | "button"
+                  | "input"  | "image" | "markdown" ;
+variant_condition = "@min-width" SP+ integer
+                  | "@max-width" SP+ integer
+                  | "@dark"
+                  | "@light" ;
+property_line     = SP+ property_key SP+ property_value ;
 ```
+
+**Breakpoint / color-scheme variants (ux-6):** a selector line may carry one
+or more trailing `variant_condition`s, e.g. `.sidebar @max-width 599`. All
+conditions on a line combine with **AND** (`.card @min-width 600 @max-width
+900` — a range). A conditioned rule set is merged over the selector's base
+rules only when every condition currently holds, evaluated against the
+active window width / color scheme, in source declaration order (later
+variants win ties — same rule as every other overlay in this grammar).
+`@dark`/`@light` and `@min-width`/`@max-width` are one grammar production,
+not two: see `docs/design/responsive.md` for the full design (including why
+container queries and an `@media`-style block were rejected) and
+`render::responsive` for the implementation. Thresholds are bare pixel
+integers (no unit suffix), matching every other pixel-valued property.
 
 **Property table:**
 
 | Key | Value form |
 |-----|-----------|
-| `width`, `height`, `padding`, `margin`, `gap` | `<number>` or `<number>%` |
+| `width`, `height`, `padding`, `margin`, `gap` | `<number>`, `<number>%`, or `<number>vw`\|`vh`\|`vmin`\|`vmax` (ux-6) |
 | `direction` | `row` \| `column` |
 | `justify` | `start` \| `end` \| `center` \| `space-between` \| `space-around` \| `space-evenly` \| `stretch` |
 | `align` | `start` \| `end` \| `center` \| `stretch` \| `baseline` |
@@ -253,6 +271,20 @@ property_line  = SP+ property_key SP+ property_value ;
   guarantees the glyphs via script-aware system font fallback (fontique) —
   see `render::text_engine`'s module doc for the coverage bar and the
   System-only vs. hybrid-bundle determinism decision.
+- **Viewport units (ux-6):** `vw`/`vh` are a percentage of the document's
+  content viewport — the window size, with `vh` excluding the chrome bar's
+  height (space the document never paints into). `vmin`/`vmax` are the
+  smaller/larger of the two. Resolved once per layout pass from the current
+  window size (a plain input, never a layout output) — see
+  `render::responsive` and `docs/design/responsive.md`.
+- **A selector line's `@`-conditions are not the same mechanism as a
+  layout-block `class X if <expr>` conditional class.** The latter is
+  gated by document logic (a `StateMachine`-evaluated expression) and
+  attaches an *extra class* to one node; the former is gated by environment
+  state (window width, OS color scheme) and selects among a selector's own
+  rule sets. Both ultimately go through `StyleRules::merge`, but they are
+  deliberately separate axes — environment state must never flow into the
+  expression evaluator (S1/F1).
 
 ---
 

@@ -14,7 +14,9 @@ use std::path::Path;
 use mizu::core::errors::MizuError;
 use mizu::core::types::StringInterner;
 use mizu::parser::logic::{parse_computed_with_functions, parse_root_timers};
-use mizu::parser::{parse_layout_with_urls, parse_logic, parse_style, parse_urls, split_source};
+use mizu::parser::{
+    parse_layout_with_urls, parse_logic, parse_style_with_variants, parse_urls, split_source,
+};
 use mizu::render::run_window_loop;
 use tracing_subscriber::EnvFilter;
 
@@ -123,8 +125,8 @@ fn run() -> Result<(), MizuError> {
         parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns)?;
     let root_timers = parse_root_timers(&parsed.logic_block, &mut interner)?;
 
-    // Phase 3: Parse styles
-    let style_rules = parse_style(&parsed.style_block)?;
+    // Phase 3: Parse styles (base rules + ux-6 breakpoint/scheme variants)
+    let (style_rules, style_variants) = parse_style_with_variants(&parsed.style_block)?;
 
     // Phase 5: Assemble arena DOM.  The registry enables compile-time media
     // guards and resolves `image src "alias"` to absolute URLs.
@@ -139,6 +141,7 @@ fn run() -> Result<(), MizuError> {
     run_window_loop(
         dom_tree,
         style_rules,
+        style_variants,
         logic_fns,
         interner,
         url_registry,

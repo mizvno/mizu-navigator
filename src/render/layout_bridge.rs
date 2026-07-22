@@ -2,8 +2,10 @@
 
 use crate::core::errors::MizuError;
 use crate::core::types::{Value, VariableStore};
-use crate::parser::{MizuDimension, MizuNode, MizuOverflow, Primitive, StyleRules};
+use crate::parser::style::StyleVariant;
+use crate::parser::{MizuNode, MizuOverflow, Primitive, StyleRules};
 use crate::render::image_codec::AssetSlot;
+use crate::render::responsive::{RenderEnvironment, ResolvedDimension, ViewportSize, resolve_dimension, resolve_matching_variants};
 use ego_tree::{NodeId as EgoNodeId, NodeRef, Tree};
 use std::collections::HashMap;
 use taffy::{
@@ -268,31 +270,51 @@ fn clone_taffy_subtree(
     Ok(synth_id)
 }
 
+/// Converts a resolved dimension into a Taffy `Dimension`.
+fn to_taffy_dimension(resolved: ResolvedDimension) -> taffy::style::Dimension {
+    match resolved {
+        ResolvedDimension::Pixels(px) => taffy::style::Dimension::Length(px),
+        ResolvedDimension::Percent(pct) => taffy::style::Dimension::Percent(pct / 100.0),
+    }
+}
+
+/// Converts a resolved dimension into a Taffy `LengthPercentage` (padding/gap).
+fn to_taffy_length_percentage(resolved: ResolvedDimension) -> taffy::style::LengthPercentage {
+    match resolved {
+        ResolvedDimension::Pixels(px) => taffy::style::LengthPercentage::Length(px),
+        ResolvedDimension::Percent(pct) => taffy::style::LengthPercentage::Percent(pct / 100.0),
+    }
+}
+
+/// Converts a resolved dimension into a Taffy `LengthPercentageAuto` (margin).
+fn to_taffy_length_percentage_auto(
+    resolved: ResolvedDimension,
+) -> taffy::style::LengthPercentageAuto {
+    match resolved {
+        ResolvedDimension::Pixels(px) => taffy::style::LengthPercentageAuto::Length(px),
+        ResolvedDimension::Percent(pct) => taffy::style::LengthPercentageAuto::Percent(pct / 100.0),
+    }
+}
+
 /// Translates Mizu custom StyleRules into Native Taffy styles.
 /// Converts percentage values (0.0 to 100.0) into fractions (0.0 to 1.0).
-pub fn translate_style(rules: &StyleRules) -> Style {
+/// `viewport` resolves any `vw`/`vh`/`vmin`/`vmax` dimensions (ux-6) against
+/// the current content viewport before handing off to Taffy, which only
+/// ever sees pixels or (parent-relative) percent.
+pub fn translate_style(rules: &StyleRules, viewport: ViewportSize) -> Style {
     let mut style = Style::default();
 
     // 1. width / height
     if let Some(dim) = &rules.width {
-        style.size.width = match dim {
-            MizuDimension::Pixels(px) => taffy::style::Dimension::Length(*px),
-            MizuDimension::Percent(pct) => taffy::style::Dimension::Percent(pct / 100.0),
-        };
+        style.size.width = to_taffy_dimension(resolve_dimension(dim, viewport));
     }
     if let Some(dim) = &rules.height {
-        style.size.height = match dim {
-            MizuDimension::Pixels(px) => taffy::style::Dimension::Length(*px),
-            MizuDimension::Percent(pct) => taffy::style::Dimension::Percent(pct / 100.0),
-        };
+        style.size.height = to_taffy_dimension(resolve_dimension(dim, viewport));
     }
 
     // 2. padding
     if let Some(dim) = &rules.padding {
-        let taffy_val = match dim {
-            MizuDimension::Pixels(px) => taffy::style::LengthPercentage::Length(*px),
-            MizuDimension::Percent(pct) => taffy::style::LengthPercentage::Percent(pct / 100.0),
-        };
+        let taffy_val = to_taffy_length_percentage(resolve_dimension(dim, viewport));
         style.padding = taffy::geometry::Rect {
             left: taffy_val,
             right: taffy_val,
@@ -303,10 +325,7 @@ pub fn translate_style(rules: &StyleRules) -> Style {
 
     // 3. margin
     if let Some(dim) = &rules.margin {
-        let taffy_val = match dim {
-            MizuDimension::Pixels(px) => taffy::style::LengthPercentageAuto::Length(*px),
-            MizuDimension::Percent(pct) => taffy::style::LengthPercentageAuto::Percent(pct / 100.0),
-        };
+        let taffy_val = to_taffy_length_percentage_auto(resolve_dimension(dim, viewport));
         style.margin = taffy::geometry::Rect {
             left: taffy_val,
             right: taffy_val,
@@ -317,10 +336,7 @@ pub fn translate_style(rules: &StyleRules) -> Style {
 
     // 4. gap
     if let Some(dim) = &rules.gap {
-        let taffy_val = match dim {
-            MizuDimension::Pixels(px) => taffy::style::LengthPercentage::Length(*px),
-            MizuDimension::Percent(pct) => taffy::style::LengthPercentage::Percent(pct / 100.0),
-        };
+        let taffy_val = to_taffy_length_percentage(resolve_dimension(dim, viewport));
         style.gap = taffy::geometry::Size {
             width: taffy_val,
             height: taffy_val,
@@ -369,6 +385,11 @@ pub fn translate_style(rules: &StyleRules) -> Style {
 }
 
 /// Recursively traverses the DOM tree bottom-up to build the Taffy tree layout.
+///
+/// `variants`/`env` resolve ux-6 breakpoint/color-scheme style variants —
+/// pass `&[]` and a default `RenderEnvironment` for callers that don't need
+/// responsive behavior (e.g. tests).
+#[allow(clippy::too_many_arguments)]
 pub fn build_taffy_tree(
     node: NodeRef<MizuNode>,
     style_rules_map: &HashMap<String, StyleRules>,
@@ -376,6 +397,8 @@ pub fn build_taffy_tree(
     node_to_taffy_id: &mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
     image_cache: &HashMap<String, AssetSlot>,
     chrome_url: &str,
+    variants: &[StyleVariant],
+    env: &RenderEnvironment,
 ) -> Result<taffy::prelude::NodeId, MizuError> {
     let mut children_ids = Vec::new();
     for child in node.children() {
@@ -386,6 +409,8 @@ pub fn build_taffy_tree(
             node_to_taffy_id,
             image_cache,
             chrome_url,
+            variants,
+            env,
         )?;
         children_ids.push(child_id);
     }
@@ -400,13 +425,22 @@ pub fn build_taffy_tree(
     }
 
     // 2. Class styles
-    if let Some(class_attr) = mizu_node.attributes.get("class")
+    let class_attr = mizu_node.attributes.get("class").map(String::as_str);
+    if let Some(class_attr) = class_attr
         && let Some(class_rules) = style_rules_map.get(class_attr)
     {
         merged_rules = merged_rules.merge(class_rules.clone());
     }
 
-    let mut style = translate_style(&merged_rules);
+    // 3. Breakpoint / color-scheme variants (ux-6) — applied last, after both
+    // bases, in source declaration order (see docs/design/responsive.md).
+    let selectors: &[&str] = match class_attr {
+        Some(c) => &[tag_name, c],
+        None => &[tag_name],
+    };
+    merged_rules = merged_rules.merge(resolve_matching_variants(variants, selectors, env));
+
+    let mut style = translate_style(&merged_rules, env.viewport);
 
     if mizu_node.primitive == Primitive::Window {
         style.size = Size {
@@ -484,7 +518,94 @@ mod tests {
     use super::*;
     use crate::core::types::{Value, VariableStore, StringInterner};
     use crate::parser::layout::parse_layout;
+    use crate::parser::style::parse_style_with_variants;
+    use crate::render::preferences::ColorScheme;
     use std::sync::Arc;
+
+    /// L1 regression (ux-6): a breakpoint toggling must never change the
+    /// synthetic/Taffy node count. A breakpoint selects among rule sets — it
+    /// does not duplicate subtrees — so `MAX_SYNTHETIC_LAYOUT_NODES`
+    /// (invariant L1) is structurally unaffected by resizing across a
+    /// threshold. This drives `build_taffy_tree` directly at two window
+    /// widths straddling the same document's breakpoint and asserts the
+    /// resulting Taffy node count (one node per DOM node, by construction)
+    /// is identical either side.
+    #[test]
+    fn breakpoint_toggle_does_not_change_node_count() {
+        let style = r"
+    .box
+        width 240
+    .box @max-width 599
+        width 100%
+        direction column
+";
+        let (style_rules, variants) = parse_style_with_variants(style).unwrap();
+        assert_eq!(variants.len(), 1, "fixture must define exactly one variant");
+
+        let mut interner = StringInterner::new();
+        let dom = parse_layout(
+            "window\n    box class box\n        box class box\n        box class box\n",
+            &mut interner,
+        )
+        .unwrap();
+        let image_cache = HashMap::new();
+
+        let narrow_env = RenderEnvironment {
+            viewport: ViewportSize {
+                width: 400.0,
+                height: 800.0,
+            },
+            color_scheme: ColorScheme::Dark,
+        };
+        let wide_env = RenderEnvironment {
+            viewport: ViewportSize {
+                width: 1200.0,
+                height: 800.0,
+            },
+            color_scheme: ColorScheme::Dark,
+        };
+
+        let mut narrow_taffy = TaffyTree::new();
+        let mut narrow_map = HashMap::new();
+        build_taffy_tree(
+            dom.root(),
+            &style_rules,
+            &mut narrow_taffy,
+            &mut narrow_map,
+            &image_cache,
+            "mizu://test/index.mizu",
+            &variants,
+            &narrow_env,
+        )
+        .unwrap();
+
+        let mut wide_taffy = TaffyTree::new();
+        let mut wide_map = HashMap::new();
+        build_taffy_tree(
+            dom.root(),
+            &style_rules,
+            &mut wide_taffy,
+            &mut wide_map,
+            &image_cache,
+            "mizu://test/index.mizu",
+            &variants,
+            &wide_env,
+        )
+        .unwrap();
+
+        assert_eq!(
+            narrow_map.len(),
+            wide_map.len(),
+            "node count (one Taffy node per DOM node) must be identical on \
+             either side of the breakpoint — a breakpoint selects a rule \
+             set, it must never duplicate a subtree"
+        );
+        assert_eq!(
+            narrow_map.len(),
+            dom.nodes().count(),
+            "sanity: build_taffy_tree must create exactly one Taffy node per DOM node"
+        );
+    }
 
     fn setup_test_store(items: Vec<Value>) -> VariableStore {
         let interner = StringInterner::new();

@@ -148,15 +148,61 @@ pub enum MizuOverflow {
 /// A dimension value used for `width`, `height`, `padding`, `margin`, and
 /// `gap` properties.
 ///
-/// Mizu supports two forms:
+/// Mizu supports these forms:
 /// * **Pixels** — a bare number, e.g. `padding 20`.
-/// * **Percent** — a number followed by `%`, e.g. `width 50%`.
+/// * **Percent** — a number followed by `%`, e.g. `width 50%`, relative to
+///   the parent container.
+/// * **Viewport units** (ux-6) — `vw`/`vh`/`vmin`/`vmax`, e.g. `width 50vw`,
+///   relative to the document's content viewport (the window, minus the
+///   chrome bar for `vh`) rather than the parent. Resolved in
+///   `render::layout_bridge` against the current window size — see
+///   `docs/design/responsive.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MizuDimension {
     /// A fixed pixel value.
     Pixels(f32),
     /// A percentage of the parent dimension.
     Percent(f32),
+    /// A percentage of the viewport width (`vw`).
+    ViewportWidth(f32),
+    /// A percentage of the viewport height (`vh`).
+    ViewportHeight(f32),
+    /// A percentage of the smaller viewport dimension (`vmin`).
+    ViewportMin(f32),
+    /// A percentage of the larger viewport dimension (`vmax`).
+    ViewportMax(f32),
+}
+
+/// A single condition gating a [`StyleVariant`] — see `docs/design/responsive.md`.
+///
+/// Deliberately render-context-agnostic (no dependency on `render::preferences`
+/// from the parser layer): `Dark`/`Light` are bare markers the render side
+/// compares against its own `ColorScheme`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VariantCondition {
+    /// Matches when the document content viewport width is `>=` this value.
+    MinWidth(f32),
+    /// Matches when the document content viewport width is `<=` this value.
+    MaxWidth(f32),
+    /// Matches when the active color scheme is dark.
+    Dark,
+    /// Matches when the active color scheme is light.
+    Light,
+}
+
+/// A style rule set gated by one or more [`VariantCondition`]s, e.g.
+/// `.sidebar @max-width 599`. All conditions must hold (AND) for `rules` to
+/// be merged over the base rules for `selector` — see
+/// `docs/design/responsive.md` for the full resolution/merge order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyleVariant {
+    /// The tag or class name this variant applies to (without the leading
+    /// `.` for class selectors — same convention as the base rules map's keys).
+    pub selector: String,
+    /// All conditions that must hold (AND) for `rules` to apply.
+    pub conditions: Vec<VariantCondition>,
+    /// The properties to merge over the base rules when `conditions` hold.
+    pub rules: StyleRules,
 }
 
 /// The three CSS-generic font families an author may request via
@@ -214,7 +260,7 @@ pub enum MizuTextAlign {
 /// The three Taffy fields (`direction`, `justify`, `align`) use Taffy's own
 /// enums directly so that the values can be moved into a `taffy::style::Style`
 /// struct without any conversion layer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StyleRules {
     // ── Layout dimensions ────────────────────────────────────────────────────
     /// `width` property.
@@ -412,9 +458,27 @@ impl StyleRules {
 /// assert!(rules.contains_key("card"));
 /// ```
 pub fn parse_style(style_content: &str) -> Result<HashMap<String, StyleRules>, MizuError> {
+    parse_style_with_variants(style_content).map(|(base, _variants)| base)
+}
+
+/// Like [`parse_style`], but also returns the document's `@min-width` /
+/// `@max-width` / `@dark` / `@light` variant rule sets (ux-6) — see
+/// `docs/design/responsive.md`. `parse_style` is a thin wrapper over this
+/// function that discards the variants, kept as the stable, back-compatible
+/// entry point for callers that only need base rules.
+///
+/// # Errors
+///
+/// Same conditions as [`parse_style`], plus: an unrecognised `@`-condition
+/// token, or a `@min-width`/`@max-width` missing its numeric argument.
+pub fn parse_style_with_variants(
+    style_content: &str,
+) -> Result<(HashMap<String, StyleRules>, Vec<StyleVariant>), MizuError> {
     let mut result: HashMap<String, StyleRules> = HashMap::new();
+    let mut variants: Vec<StyleVariant> = Vec::new();
     let mut baseline: Option<usize> = None;
     let mut current_class: Option<String> = None;
+    let mut current_conditions: Vec<VariantCondition> = Vec::new();
     let mut current_rules = StyleRules::default();
     // Accumulates non-structural (property-level) errors so all mistakes in a
     // block are reported in one pass rather than stopping at the first bad line.
@@ -469,13 +533,28 @@ pub fn parse_style(style_content: &str) -> Result<HashMap<String, StyleRules>, M
 
         // ── Root-level line (class selector) ──────────────────────────────────
         if indent == base {
-            // Flush the previous class into the result map.
+            // Flush the previous class/variant into the result.
             if let Some(name) = current_class.take() {
-                result.insert(name, current_rules);
+                if current_conditions.is_empty() {
+                    result.insert(name, current_rules);
+                } else {
+                    variants.push(StyleVariant {
+                        selector: name,
+                        conditions: std::mem::take(&mut current_conditions),
+                        rules: current_rules,
+                    });
+                }
                 current_rules = StyleRules::default();
             }
 
-            let mut selector_name = trimmed.to_owned();
+            // The selector is the first whitespace-separated token; any
+            // remaining tokens are `@condition`s gating this rule set
+            // (ux-6) — e.g. `.sidebar @max-width 599` or `.card @dark`.
+            let mut token_iter = trimmed.split_whitespace();
+            let selector_token = token_iter.next().unwrap_or("");
+            let condition_tokens: Vec<&str> = token_iter.collect();
+
+            let mut selector_name = selector_token.to_owned();
             if let Some(stripped) = selector_name.strip_prefix('.') {
                 selector_name = stripped.to_owned();
                 if selector_name.is_empty() {
@@ -495,14 +574,7 @@ pub fn parse_style(style_content: &str) -> Result<HashMap<String, StyleRules>, M
                 }
             }
 
-            // Selectors must not contain spaces (multi-token selectors are not
-            // supported in Mizu V1).
-            if selector_name.contains(' ') {
-                return Err(MizuError::ParseError(format!(
-                    "line {line_num}: selector `{selector_name}` must not contain spaces"
-                )));
-            }
-
+            current_conditions = parse_variant_conditions(&condition_tokens, line_num)?;
             current_class = Some(selector_name);
 
         // ── Property line (indent > base) ─────────────────────────────────────
@@ -547,16 +619,73 @@ pub fn parse_style(style_content: &str) -> Result<HashMap<String, StyleRules>, M
         }
     }
 
-    // Flush the last class.
+    // Flush the last class/variant.
     if let Some(name) = current_class {
-        result.insert(name, current_rules);
+        if current_conditions.is_empty() {
+            result.insert(name, current_rules);
+        } else {
+            variants.push(StyleVariant {
+                selector: name,
+                conditions: current_conditions,
+                rules: current_rules,
+            });
+        }
     }
 
     match prop_errors.len() {
-        0 => Ok(result),
+        0 => Ok((result, variants)),
         1 => Err(prop_errors.remove(0)),
         _ => Err(MizuError::MultipleErrors(prop_errors)),
     }
+}
+
+/// Parses the `@condition` tokens trailing a selector (ux-6) — e.g.
+/// `["@max-width", "600"]` or `["@dark"]`. Empty input is valid (an
+/// unconditioned selector) and yields an empty `Vec`.
+fn parse_variant_conditions(
+    tokens: &[&str],
+    line_num: usize,
+) -> Result<Vec<VariantCondition>, MizuError> {
+    let mut conditions = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "@dark" => {
+                conditions.push(VariantCondition::Dark);
+                i += 1;
+            }
+            "@light" => {
+                conditions.push(VariantCondition::Light);
+                i += 1;
+            }
+            kw @ ("@min-width" | "@max-width") => {
+                let value = tokens.get(i + 1).ok_or_else(|| {
+                    MizuError::ParseError(format!(
+                        "line {line_num}: `{kw}` requires a pixel value, e.g. `{kw} 600`"
+                    ))
+                })?;
+                let px = value.parse::<f32>().map_err(|_| {
+                    MizuError::ParseError(format!(
+                        "line {line_num}: invalid value `{value}` for `{kw}`; \
+                         expected a number, e.g. `600`"
+                    ))
+                })?;
+                conditions.push(if kw == "@min-width" {
+                    VariantCondition::MinWidth(px)
+                } else {
+                    VariantCondition::MaxWidth(px)
+                });
+                i += 2;
+            }
+            other => {
+                return Err(MizuError::ParseError(format!(
+                    "line {line_num}: unknown variant condition `{other}`; \
+                     valid: @min-width N, @max-width N, @dark, @light"
+                )));
+            }
+        }
+    }
+    Ok(conditions)
 }
 
 
@@ -747,16 +876,39 @@ fn leading_spaces(line: &str) -> usize {
 /// Parses a [`MizuDimension`] from a token that is either a plain `f32`
 /// (pixels) or an `f32` followed immediately by `%` (percent).
 fn parse_dimension(token: &str, prop: &str, line_num: usize) -> Result<MizuDimension, MizuError> {
-    if let Some(pct_str) = token.strip_suffix('%') {
-        pct_str
-            .parse::<f32>()
-            .map(MizuDimension::Percent)
-            .map_err(|_| {
-                MizuError::ParseError(format!(
-                    "line {line_num}: invalid percentage `{token}` for `{prop}`; \
+    // Order matters only in that each suffix must be tried before falling
+    // through to the bare-pixel case; the four viewport suffixes are
+    // mutually exclusive (none is a suffix of another) so their relative
+    // order doesn't matter.
+    let unit_error = |unit: &str, token: &str| {
+        MizuError::ParseError(format!(
+            "line {line_num}: invalid `{unit}` value `{token}` for `{prop}`; \
+             expected a number followed by `{unit}`, e.g. `50{unit}`"
+        ))
+    };
+    if let Some(v) = token.strip_suffix('%') {
+        v.parse::<f32>().map(MizuDimension::Percent).map_err(|_| {
+            MizuError::ParseError(format!(
+                "line {line_num}: invalid percentage `{token}` for `{prop}`; \
                  expected a number followed by `%`, e.g. `50%`"
-                ))
-            })
+            ))
+        })
+    } else if let Some(v) = token.strip_suffix("vmin") {
+        v.parse::<f32>()
+            .map(MizuDimension::ViewportMin)
+            .map_err(|_| unit_error("vmin", token))
+    } else if let Some(v) = token.strip_suffix("vmax") {
+        v.parse::<f32>()
+            .map(MizuDimension::ViewportMax)
+            .map_err(|_| unit_error("vmax", token))
+    } else if let Some(v) = token.strip_suffix("vw") {
+        v.parse::<f32>()
+            .map(MizuDimension::ViewportWidth)
+            .map_err(|_| unit_error("vw", token))
+    } else if let Some(v) = token.strip_suffix("vh") {
+        v.parse::<f32>()
+            .map(MizuDimension::ViewportHeight)
+            .map_err(|_| unit_error("vh", token))
     } else {
         token
             .parse::<f32>()
@@ -1017,8 +1169,8 @@ fn parse_align_items(value: &str, line_num: usize) -> Result<AlignItems, MizuErr
 mod tests {
     use super::{
         AlignItems, Display, FlexDirection, JustifyContent, MizuBackground, MizuColor,
-        MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign, parse_color,
-        parse_style,
+        MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign, VariantCondition,
+        parse_color, parse_style, parse_style_with_variants,
     };
     use crate::core::errors::MizuError;
 
@@ -2045,5 +2197,176 @@ mod tests {
                 "unknown-property error must list `{prop}`, got: {msg}"
             );
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Viewport units (ux-6)
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn viewport_width_unit_parsed() {
+        let block = "    .box\n        width 50vw\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["box"].width, Some(MizuDimension::ViewportWidth(50.0)));
+    }
+
+    #[test]
+    fn viewport_height_unit_parsed() {
+        let block = "    .box\n        height 100vh\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["box"].height, Some(MizuDimension::ViewportHeight(100.0)));
+    }
+
+    #[test]
+    fn viewport_min_unit_parsed() {
+        let block = "    .box\n        width 10vmin\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["box"].width, Some(MizuDimension::ViewportMin(10.0)));
+    }
+
+    #[test]
+    fn viewport_max_unit_parsed() {
+        let block = "    .box\n        width 10vmax\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["box"].width, Some(MizuDimension::ViewportMax(10.0)));
+    }
+
+    #[test]
+    fn viewport_unit_applies_to_padding_margin_gap_too() {
+        let block = "\
+    .box
+        padding 2vw
+        margin 3vh
+        gap 1vmin
+";
+        let rules = parse_style(block).unwrap();
+        let b = &rules["box"];
+        assert_eq!(b.padding, Some(MizuDimension::ViewportWidth(2.0)));
+        assert_eq!(b.margin, Some(MizuDimension::ViewportHeight(3.0)));
+        assert_eq!(b.gap, Some(MizuDimension::ViewportMin(1.0)));
+    }
+
+    #[test]
+    fn viewport_unit_malformed_value_is_rejected() {
+        let block = "    .box\n        width abcvw\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("vw")),
+            "expected a vw-specific error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn plain_pixel_and_percent_still_parse_unaffected_by_unit_suffixes() {
+        // Regression: adding vw/vh/vmin/vmax suffix stripping must not
+        // disturb the existing bare-number and `%` parsing paths.
+        let block = "\
+    .box
+        width 100
+        height 50%
+";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(rules["box"].width, Some(MizuDimension::Pixels(100.0)));
+        assert_eq!(rules["box"].height, Some(MizuDimension::Percent(50.0)));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Breakpoint / color-scheme variants (ux-6): parsing
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn variant_min_width_parsed_as_separate_entry() {
+        let style = r"
+    .sidebar
+        width 240
+    .sidebar @min-width 600
+        width 300
+";
+        let (base, variants) = parse_style_with_variants(style).unwrap();
+        assert_eq!(base["sidebar"].width, Some(MizuDimension::Pixels(240.0)));
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].selector, "sidebar");
+        assert_eq!(variants[0].conditions, vec![VariantCondition::MinWidth(600.0)]);
+        assert_eq!(variants[0].rules.width, Some(MizuDimension::Pixels(300.0)));
+    }
+
+    #[test]
+    fn variant_max_width_parsed() {
+        let style = "    .box @max-width 599\n        direction column\n";
+        let (base, variants) = parse_style_with_variants(style).unwrap();
+        assert!(base.is_empty(), "a purely-conditioned selector must not appear in the base map");
+        assert_eq!(variants[0].conditions, vec![VariantCondition::MaxWidth(599.0)]);
+    }
+
+    #[test]
+    fn variant_dark_and_light_parsed() {
+        let style = r"
+    .card @dark
+        background #000000
+    .card @light
+        background #ffffff
+";
+        let (_base, variants) = parse_style_with_variants(style).unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].conditions, vec![VariantCondition::Dark]);
+        assert_eq!(variants[1].conditions, vec![VariantCondition::Light]);
+    }
+
+    #[test]
+    fn variant_combined_conditions_and_combined() {
+        let style = "    .banner @min-width 600 @max-width 900\n        display flex\n";
+        let (_base, variants) = parse_style_with_variants(style).unwrap();
+        assert_eq!(
+            variants[0].conditions,
+            vec![
+                VariantCondition::MinWidth(600.0),
+                VariantCondition::MaxWidth(900.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn variant_unknown_condition_is_rejected() {
+        let style = "    .box @huge\n        width 100\n";
+        let result = parse_style_with_variants(style);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("unknown variant condition")),
+            "expected unknown-variant-condition error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn variant_min_width_missing_value_is_rejected() {
+        let style = "    .box @min-width\n        width 100\n";
+        let result = parse_style_with_variants(style);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("@min-width")),
+            "expected a message naming @min-width, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn variant_min_width_non_numeric_value_is_rejected() {
+        let style = "    .box @min-width wide\n        width 100\n";
+        let result = parse_style_with_variants(style);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(_))),
+            "expected a ParseError for a non-numeric @min-width value, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn plain_parse_style_ignores_variants_but_keeps_base_unaffected() {
+        // parse_style (the back-compat wrapper) must behave identically to
+        // before ux-6 for documents that don't use variants, and must not
+        // error out just because OTHER selectors in the same stylesheet do.
+        let style = r"
+    .box
+        width 100
+    .box @dark
+        width 200
+";
+        let rules = parse_style(style).unwrap();
+        assert_eq!(rules["box"].width, Some(MizuDimension::Pixels(100.0)));
     }
 }

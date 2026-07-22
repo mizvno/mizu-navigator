@@ -85,6 +85,8 @@ pub fn calculate_node_text(
     local_inputs: &rustc_hash::FxHashMap<u32, String>,
     node_id_to_u32: &HashMap<EgoNodeId, u32>,
     focused_input: Option<EgoNodeId>,
+    style_variants: &[crate::parser::style::StyleVariant],
+    render_env: &crate::render::responsive::RenderEnvironment,
 ) -> Option<((f32, f32), parley::Layout<vello::peniko::Color>)> {
     let node_ref = dom.get(node_id)?;
     let mizu_node = node_ref.value();
@@ -124,14 +126,27 @@ pub fn calculate_node_text(
     let mut text_color = vello::peniko::Color::WHITE;
 
     let mut merged = StyleRules::default();
-    if let Some(tag_rules) = style_rules.get(mizu_node.primitive.as_str()) {
+    let tag_name = mizu_node.primitive.as_str();
+    if let Some(tag_rules) = style_rules.get(tag_name) {
         merged = merged.merge(tag_rules.clone());
     }
-    if let Some(class_attr) = mizu_node.attributes.get("class")
+    let class_attr = mizu_node.attributes.get("class").map(String::as_str);
+    if let Some(class_attr) = class_attr
         && let Some(rules) = style_rules.get(class_attr)
     {
         merged = merged.merge(rules.clone());
     }
+    // ux-6: breakpoint/color-scheme variants, applied last (after both
+    // bases), in source declaration order — see docs/design/responsive.md.
+    let variant_selectors: &[&str] = match class_attr {
+        Some(c) => &[tag_name, c],
+        None => &[tag_name],
+    };
+    merged = merged.merge(crate::render::responsive::resolve_matching_variants(
+        style_variants,
+        variant_selectors,
+        render_env,
+    ));
 
     if let Some(fs) = merged.font_size {
         font_size = fs;
@@ -299,6 +314,14 @@ mod tests {
                 &local_inputs,
                 &node_id_to_u32,
                 None,
+                &[],
+                &crate::render::responsive::RenderEnvironment {
+                    viewport: crate::render::responsive::ViewportSize {
+                        width: 800.0,
+                        height: 600.0,
+                    },
+                    color_scheme: crate::render::preferences::ColorScheme::Dark,
+                },
             ) else {
                 failures.push(format!("{label}: calculate_node_text returned None"));
                 continue;
@@ -375,11 +398,113 @@ mod tests {
                 &local_inputs,
                 &node_id_to_u32,
                 None,
+                &[],
+                &crate::render::responsive::RenderEnvironment {
+                    viewport: crate::render::responsive::ViewportSize {
+                        width: 800.0,
+                        height: 600.0,
+                    },
+                    color_scheme: crate::render::preferences::ColorScheme::Dark,
+                },
             );
             assert!(
                 result.is_some(),
                 "{generic:?}: expected a layout to be produced"
             );
         }
+    }
+
+    #[test]
+    fn color_scheme_variant_reaches_calculate_node_text() {
+        // Integration check for the ux-6 wiring itself (the StyleRules-level
+        // merge is already covered by render::responsive's own tests): a
+        // `@dark`/`@light` variant changing `font-size` must actually change
+        // the layout `calculate_node_text` produces — proving the variant
+        // resolution reaches this paint-time call, not just build_taffy_tree.
+        use crate::parser::style::parse_style_with_variants;
+
+        let style = r"
+    .label
+        font-size 16
+    .label @dark
+        font-size 40
+    .label @light
+        font-size 12
+";
+        let (style_rules, style_variants) = parse_style_with_variants(style).unwrap();
+
+        let mut attrs = StdHashMap::new();
+        attrs.insert("content".to_string(), "Hi".to_string());
+        attrs.insert("class".to_string(), "label".to_string());
+        let node = MizuNode {
+            primitive: Primitive::Text,
+            attributes: attrs,
+            events: StdHashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        };
+        let tree = Tree::new(node);
+        let node_id = tree.root().id();
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+
+        let viewport = crate::render::responsive::ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let dark_env = crate::render::responsive::RenderEnvironment {
+            viewport,
+            color_scheme: crate::render::preferences::ColorScheme::Dark,
+        };
+        let light_env = crate::render::responsive::RenderEnvironment {
+            viewport,
+            color_scheme: crate::render::preferences::ColorScheme::Light,
+        };
+
+        let (dark_dims, _) = calculate_node_text(
+            node_id,
+            &tree,
+            &style_rules,
+            &mut font_cx,
+            &mut layout_cx,
+            &store,
+            None,
+            &local_inputs,
+            &node_id_to_u32,
+            None,
+            &style_variants,
+            &dark_env,
+        )
+        .expect("dark: expected a layout");
+
+        let (light_dims, _) = calculate_node_text(
+            node_id,
+            &tree,
+            &style_rules,
+            &mut font_cx,
+            &mut layout_cx,
+            &store,
+            None,
+            &local_inputs,
+            &node_id_to_u32,
+            None,
+            &style_variants,
+            &light_env,
+        )
+        .expect("light: expected a layout");
+
+        assert!(
+            dark_dims.1 > light_dims.1,
+            "the @dark variant's larger font-size (40 vs 12) must produce a \
+             taller layout: dark height={}, light height={}",
+            dark_dims.1,
+            light_dims.1
+        );
     }
 }
