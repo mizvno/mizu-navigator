@@ -237,8 +237,8 @@ fn style_props(rules: &StyleRules) -> Vec<String> {
     if let Some(v) = &rules.gap {
         out.push(format!("gap: {}", fmt_dimension(v)));
     }
-    if let Some(v) = &rules.direction {
-        out.push(format!("direction: {v:?}").to_lowercase());
+    if let Some(v) = &rules.flex_direction {
+        out.push(format!("flex-direction: {v:?}").to_lowercase());
     }
     if let Some(v) = &rules.justify {
         out.push(format!("justify: {v:?}").to_lowercase());

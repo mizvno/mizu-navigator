@@ -525,7 +525,15 @@ pub(super) fn navigate_to_url(
             }
 
             // N5: update chrome state and reset capability policy.
-            manager.chrome_state.url = target.clone();
+            // ux-7: the *displayed*/current-URL string is sanitized of bidi
+            // override/isolate control characters (docs/design/bidi.md §4)
+            // — a document-driven navigation must not be able to plant one
+            // into the address bar any more than typing one can
+            // (chrome_vello.rs's `insert_text` is the other choke point).
+            // `target` itself (used below for the actual fetch/read) is
+            // left untouched — only what becomes `chrome_state.url` is
+            // sanitized.
+            manager.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
             manager.capability_policy = CapabilityPolicy::new(&target);
 
             if target.starts_with("file://") {

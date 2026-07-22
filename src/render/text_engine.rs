@@ -159,7 +159,7 @@ pub fn calculate_node_text(
         text_color = vello::peniko::Color::rgba8(text_color.r, text_color.g, text_color.b, 120);
     }
 
-    let text_to_draw = if mizu_node.primitive == Primitive::Input {
+    let mut text_to_draw = if mizu_node.primitive == Primitive::Input {
         raw_text
     } else {
         store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
@@ -167,6 +167,17 @@ pub fn calculate_node_text(
             _ => format!("{{error: {}}}", e),
         })
     };
+
+    // ux-7: resolved once per node via `dir` attribute inheritance.
+    let dir = crate::render::bidi::resolve_direction(node_ref);
+    // An explicit `dir="ltr"`/`dir="rtl"` prepends a zero-width strong mark
+    // so parley's own (always-running) bidi auto-detection resolves to the
+    // declared direction instead of whatever the text's first strong
+    // character would otherwise imply — parley 0.10 has no public base-
+    // direction override; see docs/design/bidi.md and render::bidi's doc.
+    if let Some(mark) = dir.prepend_mark() {
+        text_to_draw.insert(0, mark);
+    }
 
     let mut builder = layout_cx.ranged_builder(font_cx, &text_to_draw, 1.0, true);
 
@@ -224,11 +235,19 @@ pub fn calculate_node_text(
     layout.break_all_lines(max_advance);
 
     if let Some(text_align) = merged.text_align {
+        // `Start`/`End` (ux-7) resolve to Left/Right by the node's resolved
+        // `dir` — Start is the left edge under LTR, the right edge under
+        // RTL; End is the mirror. See docs/design/bidi.md.
+        let is_rtl = dir.is_rtl_for_layout();
         let alignment = match text_align {
             MizuTextAlign::Left => parley::layout::Alignment::Left,
             MizuTextAlign::Center => parley::layout::Alignment::Center,
             MizuTextAlign::Right => parley::layout::Alignment::Right,
             MizuTextAlign::Justify => parley::layout::Alignment::Justify,
+            MizuTextAlign::Start if is_rtl => parley::layout::Alignment::Right,
+            MizuTextAlign::Start => parley::layout::Alignment::Left,
+            MizuTextAlign::End if is_rtl => parley::layout::Alignment::Left,
+            MizuTextAlign::End => parley::layout::Alignment::Right,
         };
         layout.align(alignment, parley::layout::AlignmentOptions::default());
     }
@@ -505,6 +524,198 @@ mod tests {
              taller layout: dark height={}, light height={}",
             dark_dims.1,
             light_dims.1
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Bidi/RTL (ux-7)
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn text_node_with_dir(content: &str, class: &str, dir: Option<&str>) -> MizuNode {
+        let mut attrs = StdHashMap::new();
+        attrs.insert("content".to_string(), content.to_string());
+        attrs.insert("class".to_string(), class.to_string());
+        if let Some(d) = dir {
+            attrs.insert("dir".to_string(), d.to_string());
+        }
+        MizuNode {
+            primitive: Primitive::Text,
+            attributes: attrs,
+            events: StdHashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn no_op_render_env() -> crate::render::responsive::RenderEnvironment {
+        crate::render::responsive::RenderEnvironment {
+            viewport: crate::render::responsive::ViewportSize {
+                width: 800.0,
+                height: 600.0,
+            },
+            color_scheme: crate::render::preferences::ColorScheme::Dark,
+        }
+    }
+
+    #[test]
+    fn mixed_bidi_line_shapes_into_multiple_runs_without_error() {
+        // Verifies parley's own (always-running — see the module doc and
+        // docs/design/bidi.md) bidi reordering actually engages for a known
+        // mixed-direction fixture: "Hello " (Latin) + "שלום" (Hebrew) +
+        // " World" (Latin). A single-direction run would collapse to one
+        // GlyphRun; a correctly bidi-processed line splits into multiple
+        // runs at the direction boundaries.
+        let node = text_node_with_dir("Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} World", "label", None);
+        let tree = Tree::new(node);
+        let node_id = tree.root().id();
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+        let style_rules: HashMap<String, StyleRules> = HashMap::new();
+
+        let (_dims, layout) = calculate_node_text(
+            node_id,
+            &tree,
+            &style_rules,
+            &mut font_cx,
+            &mut layout_cx,
+            &store,
+            None,
+            &local_inputs,
+            &node_id_to_u32,
+            None,
+            &[],
+            &no_op_render_env(),
+        )
+        .expect("mixed bidi text must still produce a layout");
+
+        let mut run_count = 0;
+        for line in layout.lines() {
+            for item in line.items() {
+                if matches!(item, parley::layout::PositionedLayoutItem::GlyphRun(_)) {
+                    run_count += 1;
+                }
+            }
+        }
+        assert!(
+            run_count > 1,
+            "a mixed Latin/Hebrew line must split into more than one \
+             direction-run (proof bidi processing engaged), got {run_count}"
+        );
+    }
+
+    #[test]
+    fn explicit_dir_reaches_calculate_node_text_via_dom_attribute_inheritance() {
+        // End-to-end: a `dir="rtl"` layout attribute (not just a directly
+        // constructed ResolvedDirection) reaches calculate_node_text through
+        // render::bidi::resolve_direction's ancestor walk, and produces a
+        // layout without erroring for right-to-left content.
+        let mut tree = Tree::new(MizuNode {
+            primitive: Primitive::Window,
+            attributes: {
+                let mut a = StdHashMap::new();
+                a.insert("dir".to_string(), "rtl".to_string());
+                a
+            },
+            events: StdHashMap::new(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        });
+        let node_id = tree
+            .root_mut()
+            .append(text_node_with_dir("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", "label", None))
+            .id();
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+        let style_rules: HashMap<String, StyleRules> = HashMap::new();
+
+        let result = calculate_node_text(
+            node_id,
+            &tree,
+            &style_rules,
+            &mut font_cx,
+            &mut layout_cx,
+            &store,
+            None,
+            &local_inputs,
+            &node_id_to_u32,
+            None,
+            &[],
+            &no_op_render_env(),
+        );
+        assert!(
+            result.is_some(),
+            "an inherited dir=\"rtl\" must not prevent a layout from being produced"
+        );
+    }
+
+    #[test]
+    fn text_align_start_resolves_opposite_edges_under_ltr_and_rtl() {
+        // `text-align: start` must place short content at the *left* under
+        // a `dir="ltr"`-resolved node and the *right* under `dir="rtl"` —
+        // observed via the first glyph run's horizontal offset within a
+        // much wider available width (so the difference is unambiguous).
+        let mut style_rules: HashMap<String, StyleRules> = HashMap::new();
+        let mut rules = StyleRules::default();
+        rules.text_align = Some(crate::parser::MizuTextAlign::Start);
+        style_rules.insert("label".to_string(), rules);
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+        let env = no_op_render_env();
+
+        let mut first_glyph_x = |dir: Option<&str>| -> f32 {
+            let tree = Tree::new(text_node_with_dir("Hi", "label", dir));
+            let node_id = tree.root().id();
+            let (_dims, layout) = calculate_node_text(
+                node_id,
+                &tree,
+                &style_rules,
+                &mut font_cx,
+                &mut layout_cx,
+                &store,
+                Some(400.0),
+                &local_inputs,
+                &node_id_to_u32,
+                None,
+                &[],
+                &env,
+            )
+            .expect("expected a layout");
+            for line in layout.lines() {
+                for item in line.items() {
+                    if let parley::layout::PositionedLayoutItem::GlyphRun(run) = item {
+                        if let Some(g) = run.positioned_glyphs().next() {
+                            return g.x;
+                        }
+                    }
+                }
+            }
+            0.0
+        };
+
+        let ltr_x = first_glyph_x(Some("ltr"));
+        let rtl_x = first_glyph_x(Some("rtl"));
+        assert!(
+            rtl_x > ltr_x + 100.0,
+            "`text-align: start` must render far to the right under RTL \
+             compared to LTR within a 400px box; ltr_x={ltr_x}, rtl_x={rtl_x}"
         );
     }
 }

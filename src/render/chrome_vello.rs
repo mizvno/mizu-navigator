@@ -151,7 +151,15 @@ impl ChromeState {
     // ── Text mutation ─────────────────────────────────────────────────────────
 
     /// Inserts `text` at the cursor, replacing any active selection.
+    ///
+    /// The single choke point for anything entering the URL bar's text
+    /// (typed characters and paste both call this) — bidi
+    /// override/embedding/isolate control characters are stripped here
+    /// (ux-7 anti-spoofing policy, `docs/design/bidi.md` §4) so neither
+    /// path can plant one, and so cursor byte-offset math never has to
+    /// reconcile a stripped display string against an unstripped buffer.
     pub fn insert_text(&mut self, text: &str) {
+        let text = crate::render::bidi::strip_bidi_overrides(text);
         // Delete selection first if any
         if let Some((lo, hi)) = self.selection_range()
             && lo < hi
@@ -161,7 +169,7 @@ impl ChromeState {
             self.selection = None;
         }
         let cursor = self.cursor.min(self.url.len());
-        self.url.insert_str(cursor, text);
+        self.url.insert_str(cursor, &text);
         self.cursor = cursor + text.len();
         self.selection = None;
     }
@@ -801,6 +809,51 @@ mod tests {
         s.insert_text("X");
         assert_eq!(s.url, "aXb");
         assert_eq!(s.cursor, 2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Bidi anti-spoofing (ux-7): insert_text is the single choke point both
+    // typed characters and paste go through — see docs/design/bidi.md §4.
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_text_strips_rlo_override_character() {
+        // Security regression: U+202E (Right-to-Left Override) must never
+        // enter the URL bar's buffer — typing or pasting it must not be able
+        // to visually disguise a domain.
+        let mut s = make_state("");
+        s.insert_text("evil\u{202E}gnp.exe");
+        assert!(
+            !s.url.contains('\u{202E}'),
+            "RLO must be stripped, got: {:?}",
+            s.url
+        );
+        assert_eq!(s.url, "evilgnp.exe");
+    }
+
+    #[test]
+    fn insert_text_strips_bidi_isolates_too() {
+        let mut s = make_state("");
+        s.insert_text("a\u{2066}b\u{2069}c");
+        assert_eq!(s.url, "abc");
+    }
+
+    #[test]
+    fn insert_text_leaves_clean_urls_untouched() {
+        let mut s = make_state("");
+        s.insert_text("mizu://example.com/page");
+        assert_eq!(s.url, "mizu://example.com/page");
+    }
+
+    #[test]
+    fn paste_text_also_strips_bidi_overrides() {
+        // paste_text -> insert_text, so it inherits the same choke point;
+        // pinned separately since paste is a distinct entry point a user
+        // (or a malicious clipboard source) could exploit independently of
+        // typing.
+        let mut s = make_state("");
+        s.paste_text("safe\u{202E}evil.com");
+        assert!(!s.url.contains('\u{202E}'));
     }
 
     #[test]

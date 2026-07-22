@@ -4,6 +4,7 @@ use crate::core::errors::MizuError;
 use crate::core::types::{Value, VariableStore};
 use crate::parser::style::StyleVariant;
 use crate::parser::{MizuNode, MizuOverflow, Primitive, StyleRules};
+use crate::render::bidi::{ResolvedDirection, resolve_direction};
 use crate::render::image_codec::AssetSlot;
 use crate::render::responsive::{RenderEnvironment, ResolvedDimension, ViewportSize, resolve_dimension, resolve_matching_variants};
 use ego_tree::{NodeId as EgoNodeId, NodeRef, Tree};
@@ -11,7 +12,7 @@ use std::collections::HashMap;
 use taffy::{
     TaffyTree,
     geometry::Size,
-    style::{Overflow, Style},
+    style::{FlexDirection, Overflow, Style},
 };
 
 
@@ -300,9 +301,13 @@ fn to_taffy_length_percentage_auto(
 /// Converts percentage values (0.0 to 100.0) into fractions (0.0 to 1.0).
 /// `viewport` resolves any `vw`/`vh`/`vmin`/`vmax` dimensions (ux-6) against
 /// the current content viewport before handing off to Taffy, which only
-/// ever sees pixels or (parent-relative) percent.
-pub fn translate_style(rules: &StyleRules, viewport: ViewportSize) -> Style {
+/// ever sees pixels or (parent-relative) percent. `dir` (ux-7) resolves
+/// `margin-inline-*`/`padding-inline-*` to a physical left/right side and
+/// mirrors a `row` flex container to `RowReverse` under RTL — see
+/// `docs/design/bidi.md`.
+pub fn translate_style(rules: &StyleRules, viewport: ViewportSize, dir: ResolvedDirection) -> Style {
     let mut style = Style::default();
+    let is_rtl = dir.is_rtl_for_layout();
 
     // 1. width / height
     if let Some(dim) = &rules.width {
@@ -322,6 +327,24 @@ pub fn translate_style(rules: &StyleRules, viewport: ViewportSize) -> Style {
             bottom: taffy_val,
         };
     }
+    // `padding-inline-start`/`-end` (ux-7) override just one physical side
+    // of whatever the uniform `padding` above set.
+    if let Some(dim) = &rules.padding_inline_start {
+        let v = to_taffy_length_percentage(resolve_dimension(dim, viewport));
+        if is_rtl {
+            style.padding.right = v;
+        } else {
+            style.padding.left = v;
+        }
+    }
+    if let Some(dim) = &rules.padding_inline_end {
+        let v = to_taffy_length_percentage(resolve_dimension(dim, viewport));
+        if is_rtl {
+            style.padding.left = v;
+        } else {
+            style.padding.right = v;
+        }
+    }
 
     // 3. margin
     if let Some(dim) = &rules.margin {
@@ -332,6 +355,23 @@ pub fn translate_style(rules: &StyleRules, viewport: ViewportSize) -> Style {
             top: taffy_val,
             bottom: taffy_val,
         };
+    }
+    // `margin-inline-start`/`-end` (ux-7) — same override rule as padding.
+    if let Some(dim) = &rules.margin_inline_start {
+        let v = to_taffy_length_percentage_auto(resolve_dimension(dim, viewport));
+        if is_rtl {
+            style.margin.right = v;
+        } else {
+            style.margin.left = v;
+        }
+    }
+    if let Some(dim) = &rules.margin_inline_end {
+        let v = to_taffy_length_percentage_auto(resolve_dimension(dim, viewport));
+        if is_rtl {
+            style.margin.left = v;
+        } else {
+            style.margin.right = v;
+        }
     }
 
     // 4. gap
@@ -344,8 +384,17 @@ pub fn translate_style(rules: &StyleRules, viewport: ViewportSize) -> Style {
     }
 
     // 5. flex properties
-    if let Some(dir) = rules.direction {
-        style.flex_direction = dir;
+    if let Some(flex_dir) = rules.flex_direction {
+        // ux-7: a `row` container mirrors under RTL — `column` is a
+        // vertical axis and unaffected by horizontal text direction. The
+        // author-facing grammar only ever produces `Row`/`Column` (see
+        // `parser::style::apply_property`), so this is the only
+        // substitution needed; see `docs/design/bidi.md` §2.
+        style.flex_direction = if is_rtl && flex_dir == FlexDirection::Row {
+            FlexDirection::RowReverse
+        } else {
+            flex_dir
+        };
     }
     if let Some(justify) = rules.justify {
         style.justify_content = Some(justify);
@@ -440,7 +489,10 @@ pub fn build_taffy_tree(
     };
     merged_rules = merged_rules.merge(resolve_matching_variants(variants, selectors, env));
 
-    let mut style = translate_style(&merged_rules, env.viewport);
+    // ux-7: resolved once per node via `dir` attribute inheritance (an
+    // O(depth) ancestor walk — see `render::bidi`'s doc for the cost class).
+    let dir = resolve_direction(node);
+    let mut style = translate_style(&merged_rules, env.viewport, dir);
 
     if mizu_node.primitive == Primitive::Window {
         style.size = Size {
@@ -537,7 +589,7 @@ mod tests {
         width 240
     .box @max-width 599
         width 100%
-        direction column
+        flex-direction column
 ";
         let (style_rules, variants) = parse_style_with_variants(style).unwrap();
         assert_eq!(variants.len(), 1, "fixture must define exactly one variant");
@@ -676,5 +728,165 @@ mod tests {
                 assert_eq!(total_nodes, base_node_count, "Taffy arena should not grow across repeated expansions");
             }
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Bidi/RTL logical properties + flex mirroring (ux-7)
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn margin_inline_start_resolves_left_under_ltr_right_under_rtl() {
+        let vp = ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut rules = StyleRules::default();
+        rules.margin_inline_start = Some(crate::parser::MizuDimension::Pixels(10.0));
+        rules.margin_inline_end = Some(crate::parser::MizuDimension::Pixels(20.0));
+
+        let ltr_style = translate_style(&rules, vp, ResolvedDirection::Ltr);
+        assert_eq!(
+            ltr_style.margin.left,
+            taffy::style::LengthPercentageAuto::Length(10.0),
+            "margin-inline-start must resolve to the left edge under LTR"
+        );
+        assert_eq!(
+            ltr_style.margin.right,
+            taffy::style::LengthPercentageAuto::Length(20.0),
+            "margin-inline-end must resolve to the right edge under LTR"
+        );
+
+        let rtl_style = translate_style(&rules, vp, ResolvedDirection::Rtl);
+        assert_eq!(
+            rtl_style.margin.right,
+            taffy::style::LengthPercentageAuto::Length(10.0),
+            "margin-inline-start must resolve to the right edge under RTL"
+        );
+        assert_eq!(
+            rtl_style.margin.left,
+            taffy::style::LengthPercentageAuto::Length(20.0),
+            "margin-inline-end must resolve to the left edge under RTL"
+        );
+    }
+
+    #[test]
+    fn padding_inline_start_resolves_left_under_ltr_right_under_rtl() {
+        let vp = ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut rules = StyleRules::default();
+        rules.padding_inline_start = Some(crate::parser::MizuDimension::Pixels(5.0));
+
+        let ltr_style = translate_style(&rules, vp, ResolvedDirection::Ltr);
+        assert_eq!(ltr_style.padding.left, taffy::style::LengthPercentage::Length(5.0));
+        assert_eq!(ltr_style.padding.right, taffy::style::LengthPercentage::Length(0.0));
+
+        let rtl_style = translate_style(&rules, vp, ResolvedDirection::Rtl);
+        assert_eq!(rtl_style.padding.right, taffy::style::LengthPercentage::Length(5.0));
+        assert_eq!(rtl_style.padding.left, taffy::style::LengthPercentage::Length(0.0));
+    }
+
+    #[test]
+    fn logical_inline_properties_override_only_their_own_side_of_uniform_margin() {
+        // A uniform `margin` sets all four sides; `margin-inline-start`
+        // overrides only the resolved-left side, leaving top/bottom (and
+        // the untouched inline-end side) at the uniform value.
+        let vp = ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut rules = StyleRules::default();
+        rules.margin = Some(crate::parser::MizuDimension::Pixels(8.0));
+        rules.margin_inline_start = Some(crate::parser::MizuDimension::Pixels(30.0));
+
+        let style = translate_style(&rules, vp, ResolvedDirection::Ltr);
+        assert_eq!(style.margin.left, taffy::style::LengthPercentageAuto::Length(30.0));
+        assert_eq!(style.margin.right, taffy::style::LengthPercentageAuto::Length(8.0));
+        assert_eq!(style.margin.top, taffy::style::LengthPercentageAuto::Length(8.0));
+        assert_eq!(style.margin.bottom, taffy::style::LengthPercentageAuto::Length(8.0));
+    }
+
+    #[test]
+    fn flex_row_mirrors_to_row_reverse_under_rtl() {
+        let vp = ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut rules = StyleRules::default();
+        rules.flex_direction = Some(FlexDirection::Row);
+
+        let ltr_style = translate_style(&rules, vp, ResolvedDirection::Ltr);
+        assert_eq!(ltr_style.flex_direction, FlexDirection::Row);
+
+        let rtl_style = translate_style(&rules, vp, ResolvedDirection::Rtl);
+        assert_eq!(
+            rtl_style.flex_direction,
+            FlexDirection::RowReverse,
+            "a row container must mirror to RowReverse under resolved RTL"
+        );
+    }
+
+    #[test]
+    fn flex_column_is_unaffected_by_rtl() {
+        let vp = ViewportSize {
+            width: 800.0,
+            height: 600.0,
+        };
+        let mut rules = StyleRules::default();
+        rules.flex_direction = Some(FlexDirection::Column);
+
+        let rtl_style = translate_style(&rules, vp, ResolvedDirection::Rtl);
+        assert_eq!(
+            rtl_style.flex_direction,
+            FlexDirection::Column,
+            "column is a vertical axis and must not mirror under RTL"
+        );
+    }
+
+    #[test]
+    fn build_taffy_tree_resolves_dir_attribute_inheritance_for_mirroring() {
+        // End-to-end: a `dir="rtl"` layout attribute on a node reaches
+        // build_taffy_tree's flex-direction mirroring, via resolve_direction's
+        // ancestor walk — not just translate_style's unit-level behavior.
+        let mut interner = StringInterner::new();
+        let dom = parse_layout(
+            "window dir=rtl\n    box class row\n",
+            &mut interner,
+        )
+        .unwrap();
+        let style = "    .row\n        flex-direction row\n";
+        let (style_rules, variants) = parse_style_with_variants(style).unwrap();
+        let image_cache = HashMap::new();
+        let env = RenderEnvironment {
+            viewport: ViewportSize {
+                width: 800.0,
+                height: 600.0,
+            },
+            color_scheme: ColorScheme::Dark,
+        };
+
+        let mut taffy = TaffyTree::new();
+        let mut node_map = HashMap::new();
+        build_taffy_tree(
+            dom.root(),
+            &style_rules,
+            &mut taffy,
+            &mut node_map,
+            &image_cache,
+            "mizu://test/index.mizu",
+            &variants,
+            &env,
+        )
+        .unwrap();
+
+        let row_node_id = dom.root().children().next().unwrap().id();
+        let row_taffy_id = *node_map.get(&row_node_id).unwrap();
+        let resolved_style = taffy.style(row_taffy_id).unwrap();
+        assert_eq!(
+            resolved_style.flex_direction,
+            FlexDirection::RowReverse,
+            "the window's dir=\"rtl\" must inherit down to the row box and mirror it"
+        );
     }
 }

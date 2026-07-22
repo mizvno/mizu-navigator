@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 const START_PAGE: &str = r#"style
   window
     background #0f1115
-    direction column
+    flex-direction column
     align center
     justify center
     gap 10

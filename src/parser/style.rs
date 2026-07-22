@@ -248,6 +248,14 @@ pub enum MizuTextAlign {
     Right,
     /// Justify each line (except the last) by spacing out content.
     Justify,
+    /// Align to the start of the inline direction — the left edge under
+    /// LTR, the right edge under RTL (ux-7; see `docs/design/bidi.md`).
+    /// Resolved to `Left`/`Right` at paint time by the node's resolved
+    /// `dir`; `render::bidi::resolve_direction`.
+    Start,
+    /// The mirror of [`Self::Start`] — the right edge under LTR, the left
+    /// edge under RTL.
+    End,
 }
 
 /// The parsed, validated style rules for a single Mizu class selector.
@@ -273,11 +281,27 @@ pub struct StyleRules {
     pub margin: Option<MizuDimension>,
     /// Flex/grid `gap` property.
     pub gap: Option<MizuDimension>,
+    /// `margin-inline-start` (ux-7) — the left edge under LTR, the right
+    /// edge under RTL. Overrides just that one side of the uniform
+    /// `margin` value, if both are set. See `docs/design/bidi.md`.
+    pub margin_inline_start: Option<MizuDimension>,
+    /// `margin-inline-end` — the mirror of [`Self::margin_inline_start`].
+    pub margin_inline_end: Option<MizuDimension>,
+    /// `padding-inline-start` (ux-7) — same resolution rule as
+    /// [`Self::margin_inline_start`], for `padding`.
+    pub padding_inline_start: Option<MizuDimension>,
+    /// `padding-inline-end` — the mirror of [`Self::padding_inline_start`].
+    pub padding_inline_end: Option<MizuDimension>,
 
     // ── Taffy flex properties ─────────────────────────────────────────────────
-    /// `direction` — maps to [`taffy::style::FlexDirection`].
-    /// Valid values: `row`, `column`.
-    pub direction: Option<FlexDirection>,
+    /// `flex-direction` (renamed from `direction` in ux-7 — the old name
+    /// collided with CSS's unrelated `direction: ltr|rtl` property; see
+    /// `docs/design/bidi.md` §3). Maps to [`taffy::style::FlexDirection`].
+    /// Valid author-facing values: `row`, `column`. Under a resolved RTL
+    /// direction, `row` is internally translated to `FlexDirection::RowReverse`
+    /// (`render::layout_bridge::translate_style`) — the author-facing
+    /// vocabulary is unaffected.
+    pub flex_direction: Option<FlexDirection>,
     /// `justify` — maps to [`taffy::style::JustifyContent`].
     /// Valid values: `start`, `end`, `center`, `space-between`,
     /// `space-around`, `space-evenly`, `stretch`.
@@ -358,9 +382,21 @@ impl StyleRules {
         if other.gap.is_some() {
             self.gap = other.gap;
         }
+        if other.margin_inline_start.is_some() {
+            self.margin_inline_start = other.margin_inline_start;
+        }
+        if other.margin_inline_end.is_some() {
+            self.margin_inline_end = other.margin_inline_end;
+        }
+        if other.padding_inline_start.is_some() {
+            self.padding_inline_start = other.padding_inline_start;
+        }
+        if other.padding_inline_end.is_some() {
+            self.padding_inline_end = other.padding_inline_end;
+        }
 
-        if other.direction.is_some() {
-            self.direction = other.direction;
+        if other.flex_direction.is_some() {
+            self.flex_direction = other.flex_direction;
         }
         if other.justify.is_some() {
             self.justify = other.justify;
@@ -703,19 +739,38 @@ fn apply_property(
         "padding" => rules.padding = Some(parse_dimension(value, key, line_num)?),
         "margin" => rules.margin = Some(parse_dimension(value, key, line_num)?),
         "gap" => rules.gap = Some(parse_dimension(value, key, line_num)?),
+        "margin-inline-start" => {
+            rules.margin_inline_start = Some(parse_dimension(value, key, line_num)?);
+        }
+        "margin-inline-end" => {
+            rules.margin_inline_end = Some(parse_dimension(value, key, line_num)?);
+        }
+        "padding-inline-start" => {
+            rules.padding_inline_start = Some(parse_dimension(value, key, line_num)?);
+        }
+        "padding-inline-end" => {
+            rules.padding_inline_end = Some(parse_dimension(value, key, line_num)?);
+        }
 
         // ── Taffy flex properties ─────────────────────────────────────────────
-        "direction" => {
-            rules.direction = Some(match value {
+        "flex-direction" => {
+            rules.flex_direction = Some(match value {
                 "row" => FlexDirection::Row,
                 "column" => FlexDirection::Column,
                 _ => {
                     return Err(MizuError::ParseError(format!(
-                        "line {line_num}: invalid value `{value}` for `direction`; \
+                        "line {line_num}: invalid value `{value}` for `flex-direction`; \
                          must be `row` or `column`"
                     )));
                 }
             });
+        }
+        "direction" => {
+            return Err(MizuError::ParseError(format!(
+                "line {line_num}: `direction` was renamed to `flex-direction` \
+                 (it collided with CSS's unrelated `direction: ltr|rtl`); \
+                 use `flex-direction row` or `flex-direction column`"
+            )));
         }
         "justify" => rules.justify = Some(parse_justify_content(value, line_num)?),
         "align" => rules.align = Some(parse_align_items(value, line_num)?),
@@ -790,10 +845,12 @@ fn apply_property(
                 "center" => MizuTextAlign::Center,
                 "right" => MizuTextAlign::Right,
                 "justify" => MizuTextAlign::Justify,
+                "start" => MizuTextAlign::Start,
+                "end" => MizuTextAlign::End,
                 _ => {
                     return Err(MizuError::ParseError(format!(
                         "line {line_num}: invalid value `{value}` for `text-align`; \
-                         valid values: left, center, right, justify"
+                         valid values: left, center, right, justify, start, end"
                     )));
                 }
             });
@@ -854,7 +911,8 @@ fn apply_property(
             return Err(MizuError::ParseError(format!(
                 "line {line_num}: unknown style property `{unknown}`; \
                  valid properties: width, height, padding, margin, gap, \
-                 direction, justify, align, background, background-image, background-size, color, \
+                 margin-inline-start, margin-inline-end, padding-inline-start, padding-inline-end, \
+                 flex-direction, justify, align, background, background-image, background-size, color, \
                  font-size, border-radius, border-width, border-color, overflow, z-index, display, \
                  font-family, font-weight, font-style, text-align, line-height, text-decoration"
             )));
@@ -1322,17 +1380,30 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn direction_row() {
-        let block = "    .flex\n        direction row\n";
+    fn flex_direction_row() {
+        let block = "    .flex\n        flex-direction row\n";
         let rules = parse_style(block).unwrap();
-        assert_eq!(rules["flex"].direction, Some(FlexDirection::Row));
+        assert_eq!(rules["flex"].flex_direction, Some(FlexDirection::Row));
     }
 
     #[test]
-    fn direction_column() {
-        let block = "    .flex\n        direction column\n";
+    fn flex_direction_column() {
+        let block = "    .flex\n        flex-direction column\n";
         let rules = parse_style(block).unwrap();
-        assert_eq!(rules["flex"].direction, Some(FlexDirection::Column));
+        assert_eq!(rules["flex"].flex_direction, Some(FlexDirection::Column));
+    }
+
+    #[test]
+    fn direction_is_rejected_with_a_helpful_rename_message() {
+        // The old `direction` name is retired (renamed to `flex-direction`,
+        // ux-7) — it must not silently fall through to "unknown property";
+        // it gets its own actionable error.
+        let block = "    .flex\n        direction row\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("renamed to `flex-direction`")),
+            "expected a rename-specific error, got: {result:?}"
+        );
     }
 
     #[test]
@@ -1442,7 +1513,7 @@ mod tests {
         background #ffffff
         border-radius 8
     .button
-        direction row
+        flex-direction row
         justify center
         align stretch
         background #0077cc
@@ -1469,7 +1540,7 @@ mod tests {
 
         // .button
         let btn = &rules["button"];
-        assert_eq!(btn.direction, Some(FlexDirection::Row));
+        assert_eq!(btn.flex_direction, Some(FlexDirection::Row));
         assert_eq!(btn.justify, Some(JustifyContent::Center));
         assert_eq!(btn.align, Some(AlignItems::Stretch));
         assert_eq!(
@@ -2292,7 +2363,7 @@ mod tests {
 
     #[test]
     fn variant_max_width_parsed() {
-        let style = "    .box @max-width 599\n        direction column\n";
+        let style = "    .box @max-width 599\n        flex-direction column\n";
         let (base, variants) = parse_style_with_variants(style).unwrap();
         assert!(base.is_empty(), "a purely-conditioned selector must not appear in the base map");
         assert_eq!(variants[0].conditions, vec![VariantCondition::MaxWidth(599.0)]);

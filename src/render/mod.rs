@@ -5,6 +5,9 @@
 /// the same visual language.
 pub(crate) const FOCUS_RING_COLOR: vello::peniko::Color = vello::peniko::Color::rgba8(85, 153, 255, 255);
 
+/// Bidirectional text direction resolution + URL-bar anti-spoofing
+/// sanitization (ux-7). See `docs/design/bidi.md`.
+pub mod bidi;
 /// Read-only accessibility tree (accesskit), derived from the same DOM the
 /// renderer paints.
 pub mod accessibility;

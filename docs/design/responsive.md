@@ -121,11 +121,11 @@ Example:
 ```
 .sidebar
     width 240
-    direction column
+    flex-direction column
 
 .sidebar @max-width 599
     width 100%
-    direction row
+    flex-direction row
 ```
 
 - Multiple conditions on one selector line combine with **AND**

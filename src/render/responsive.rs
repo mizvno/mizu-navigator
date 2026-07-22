@@ -218,9 +218,9 @@ mod tests {
     fn resizing_across_the_threshold_flips_the_variant() {
         let style = r"
     .panel
-        direction column
+        flex-direction column
     .panel @min-width 600
-        direction row
+        flex-direction row
 ";
         let (base, variants) = parse_style_with_variants(style).unwrap();
 
@@ -235,9 +235,9 @@ mod tests {
                 .clone()
                 .merge(resolve_matching_variants(&variants, &["panel"], &e));
             assert_eq!(
-                resolved.direction,
+                resolved.flex_direction,
                 Some(expected),
-                "at width {width}, expected direction {expected:?}"
+                "at width {width}, expected flex-direction {expected:?}"
             );
         }
     }

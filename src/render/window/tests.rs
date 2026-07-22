@@ -671,3 +671,28 @@
         );
         assert!(manager.history.can_go_back());
     }
+
+    // --- Bidi anti-spoofing (ux-7): programmatic chrome_state.url assignment ---
+
+    #[test]
+    fn navigate_to_url_strips_bidi_overrides_from_displayed_url() {
+        // Security regression: a document-driven navigation (e.g. a
+        // `navigate` action whose target happens to contain a bidi
+        // override character) must not be able to plant one into the
+        // address bar's display any more than typing one can
+        // (chrome_vello.rs's insert_text is the other choke point).
+        let mut manager = make_minimal_manager();
+        manager.chrome_state.url = "mizu://start.example/".to_string();
+
+        navigate_to_url(
+            &mut manager,
+            "mizu://evil\u{202E}gnp.example/".to_string(),
+            crate::render::navigation::NavigationInitiator::UserGesture,
+        );
+
+        assert!(
+            !manager.chrome_state.url.contains('\u{202E}'),
+            "the displayed URL must never contain an RLO override character, got: {:?}",
+            manager.chrome_state.url
+        );
+    }

@@ -235,7 +235,8 @@ integers (no unit suffix), matching every other pixel-valued property.
 | Key | Value form |
 |-----|-----------|
 | `width`, `height`, `padding`, `margin`, `gap` | `<number>`, `<number>%`, or `<number>vw`\|`vh`\|`vmin`\|`vmax` (ux-6) |
-| `direction` | `row` \| `column` |
+| `margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end` | same forms as `margin`/`padding` (ux-7; logical — resolve to the physical left/right edge by the node's resolved `dir`, see below) |
+| `flex-direction` | `row` \| `column` (renamed from `direction` in ux-7 — the old name collided with CSS's unrelated `direction: ltr\|rtl`; `direction` now produces a `ParseError` naming the rename) |
 | `justify` | `start` \| `end` \| `center` \| `space-between` \| `space-around` \| `space-evenly` \| `stretch` |
 | `align` | `start` \| `end` \| `center` \| `stretch` \| `baseline` |
 | `background` | `#rgb` \| `#rrggbb` \| `#rrggbbaa` \| `rgba(r,g,b,a)` \| `linear-gradient(Adeg, #col1, #col2)` |
@@ -250,7 +251,7 @@ integers (no unit suffix), matching every other pixel-valued property.
 | `font-family` | `sans-serif` \| `serif` \| `monospace` (fixed 3-generic allowlist — see below) |
 | `font-weight` | `normal` \| `bold` \| a bare number `100`–`900` |
 | `font-style` | `normal` \| `italic` |
-| `text-align` | `left` \| `center` \| `right` \| `justify` |
+| `text-align` | `left` \| `center` \| `right` \| `justify` \| `start` \| `end` (`start`/`end` added in ux-7 — logical, resolve to left/right by resolved `dir`) |
 | `line-height` | bare number (multiplier of font size; default `1.2`) |
 | `text-decoration` | `none` \| `underline` |
 
@@ -285,6 +286,22 @@ integers (no unit suffix), matching every other pixel-valued property.
   rule sets. Both ultimately go through `StyleRules::merge`, but they are
   deliberately separate axes — environment state must never flow into the
   expression evaluator (S1/F1).
+- **`direction` was renamed to `flex-direction` (ux-7).** The old name is
+  rejected with a `ParseError` naming the replacement. This freed `direction`
+  for its usual CSS meaning (text/base direction), which Mizu expresses
+  instead as the `dir` layout attribute (§6) — not a style property, since it
+  affects text shaping and logical-property resolution, not just layout.
+- **Logical properties (`margin-inline-start/end`, `padding-inline-start/end`,
+  `text-align: start/end`) resolve to a physical left/right edge using the
+  node's resolved `dir`**, not the raw attribute value on that node — `auto`
+  resolves via ancestor inheritance, defaulting to LTR (left) when no
+  ancestor sets an explicit direction. A `row` `flex-direction` on an
+  RTL-resolved node is silently mirrored to Taffy's `RowReverse`, so item
+  order in markup stays document-order while the visual direction flips.
+  See `docs/design/bidi.md` for the full design and the two-tier policy for
+  bidi control characters (document text is shaped as-is via parley's
+  built-in UBA reordering; the URL bar strips override/isolate characters at
+  every mutation site as an anti-spoofing measure).
 
 ---
 
@@ -347,6 +364,7 @@ conditional_class
 - `bind` attribute → `ParseError` (removed).
 - `download -> alias` → `ParseError`; use `click -> download(alias)`.
 - `every <interval>` → `ParseError` (node-local timers removed).
+- **`dir` attribute (ux-7):** any node may carry `dir="ltr"` \| `"rtl"` \| `"auto"`; any other value is `ParseError`. Resolution walks the node then its ancestors (HTML-like inheritance) until an explicit `ltr`/`rtl` is found; `auto`/unset continues the walk; no ancestor found defaults to `auto`. `auto` behaves as LTR for layout mirroring but still lets text shaping auto-detect direction per UAX#9. See `docs/design/bidi.md` and `render::bidi::resolve_direction`.
 
 ---
 

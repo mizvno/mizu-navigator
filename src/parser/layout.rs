@@ -169,7 +169,7 @@ fn parse_quoted_string(s: &str) -> Result<(String, &str), MizuError> {
 ///
 /// The list is intentionally conservative — it excludes ambiguous words like
 /// `type` or `width` that could legitimately be Mizu variable names.
-const LAYOUT_ATTR_KEYWORDS: &[&str] = &["class", "id", "src", "href", "alt"];
+const LAYOUT_ATTR_KEYWORDS: &[&str] = &["class", "id", "src", "href", "alt", "dir"];
 
 /// Scans `action_str` for layout attribute keywords appearing as complete
 /// whitespace-delimited words.  Returns the first offending keyword if found.
@@ -310,6 +310,17 @@ fn parse_attributes_and_events(
         } else {
             value
         };
+
+        // `dir` (ux-7): base text/layout direction, inherited down the
+        // tree — see `render::bidi` and `docs/design/bidi.md`. Validated
+        // here (fail-secure allowlist, matching every other small-fixed-set
+        // attribute/property in this codebase) rather than accepted as a
+        // free-form string like `href`/`alt`.
+        if key == "dir" && !matches!(final_value.as_str(), "ltr" | "rtl" | "auto") {
+            return Err(MizuError::ParseError(format!(
+                "invalid value `{final_value}` for `dir`; must be `ltr`, `rtl`, or `auto`"
+            )));
+        }
 
         attrs.insert(key.to_string(), final_value);
         s = rest_s;
