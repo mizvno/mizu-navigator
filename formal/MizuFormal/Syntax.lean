@@ -34,6 +34,14 @@ runtime: every `Symbol` in a run is drawn from the (finite) set occurring in
 the `Doc`, the store, or the events. -/
 abbrev Symbol := Nat
 
+/-- Types — mirrors `parser::logic::ValueType` (`logic.rs::ValueType`), added in Phase A. -/
+inductive Ty where
+  | num | str | bool
+  | list     : Ty → Ty
+  | record   : List (String × Ty) → Ty  -- closed row, canonically sorted
+  | nullable : Ty → Ty
+  deriving Repr, BEq
+
 /-- Runtime values.  Mirrors `core::types::Value`, which has no
 floating-point variant of its own to mirror (`FIDELITY.md` §V1), and
 `Record` as an association list rather than a `BTreeMap` (`FIDELITY.md`
@@ -96,10 +104,10 @@ inductive Action where
   deriving Repr, Inhabited
 
 /-- A compiled function — mirrors `MizuFunction` (`logic.rs::MizuFunction`).
-Type annotations on parameters are omitted (`FIDELITY.md` §A2, and T4 in
-`RESULTS.md`). -/
+Type annotations on parameters are now mandatory (`FIDELITY.md` §A2, and T4 in
+`RESULTS.md`), modeled by the `Ty` field. -/
 structure FunDef where
-  params : List Symbol
+  params : List (Symbol × Ty)
   body   : Expr
   deriving Repr, Inhabited
 

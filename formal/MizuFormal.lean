@@ -4,3 +4,4 @@ import MizuFormal.Layout
 import MizuFormal.Flow
 import MizuFormal.Budget
 import MizuFormal.NonInterference
+import MizuFormal.Types
