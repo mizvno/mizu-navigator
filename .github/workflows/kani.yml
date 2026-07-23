@@ -1,0 +1,25 @@
+name: Kani Verification
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Kani
+        run: cargo install --locked kani-verifier
+
+      - name: Setup Kani
+        run: cargo kani setup
+
+      - name: Run Kani Proofs
+        run: cargo kani --workspace
