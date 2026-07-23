@@ -48,6 +48,7 @@
 
 pub mod flow;
 pub mod layout;
+pub mod typecheck;
 pub mod logic;
 /// Thread logic worker for isolated logic and event execution
 pub mod logic_worker;

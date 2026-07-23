@@ -1,4 +1,4 @@
-﻿//! # `errors` — Unified Error Taxonomy for the Mizu Compiler & Runtime
+//! # `errors` — Unified Error Taxonomy for the Mizu Compiler & Runtime
 //!
 //! This module is the single source of truth for every failure mode that the
 //! Mizu toolchain can encounter.  All subsystems — the parser, the type-checker,
@@ -52,18 +52,22 @@ pub enum MizuError {
 
     /// A semantic type mismatch detected during type-checking or evaluation.
     ///
-    /// Both `expected` and `found` are static type-name strings (e.g., `"num"`,
-    /// `"bool"`, `"list"`) sourced from [`crate::parser::logic::type_name`] and
-    /// compile-time string literals.  Using `&'static str` instead of `String`
-    /// makes every error-path construction allocation-free — critical for a
-    /// runtime that must remain responsive even under adversarial inputs.
+    /// Both `expected` and `found` are type-name strings (e.g., `"num"`,
+    /// `"bool"`, `"list<num>"`). `found` is sourced from [`crate::parser::logic::type_name`] and
+    /// is a static string literal, while `expected` can be a dynamically formatted type like `"list<num>"`.
     #[error("type error: expected `{expected}`, found `{found}`")]
     TypeError {
         /// The Mizu type name that was required in this position.
-        expected: &'static str,
+        expected: String,
         /// The Mizu type name actually produced by evaluation.
         found: &'static str,
     },
+
+    /// A static load-time type error detected during whole-document type checking.
+    ///
+    /// The inner [`String`] contains a human-readable description of the error.
+    #[error("static type error: {0}")]
+    StaticTypeError(String),
 
     /// A variable was referenced in an expression but was never bound in the
     /// enclosing scope.
@@ -147,7 +151,7 @@ mod tests {
     #[test]
     fn type_error_formats_expected_and_found() {
         let err = MizuError::TypeError {
-            expected: "num",
+            expected: "num".to_string(),
             found: "bool",
         };
         assert_eq!(err.to_string(), "type error: expected `num`, found `bool`");
@@ -156,7 +160,7 @@ mod tests {
     #[test]
     fn type_error_fields_are_accessible() {
         let err = MizuError::TypeError {
-            expected: "string",
+            expected: "string".to_string(),
             found: "list",
         };
         if let MizuError::TypeError { expected, found } = err {
