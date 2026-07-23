@@ -2,7 +2,7 @@
     use super::manager::*;
     use super::navigate::*;
     use crate::core::errors::MizuError;
-    use crate::core::types::{StringInterner, Symbol, VariableStore};
+    use crate::core::types::VariableStore;
     use crate::parser::MizuDimension;
     use crate::parser::{MizuNode, Primitive, StyleRules};
     use crate::render::chrome_vello::CHROME_HEIGHT;

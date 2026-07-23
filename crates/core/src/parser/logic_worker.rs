@@ -4,8 +4,8 @@
 
 use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value, VariableStore};
-use crate::network::RuntimeAction;
-use crate::network::messages::{StateUpdate, UiEvent, WorkerResponse};
+use crate::messages::RuntimeAction;
+use crate::messages::{StateUpdate, UiEvent, WorkerResponse};
 use crate::parser::logic::{
     ComputedBinding, CompReverseIndex, build_comp_reverse_index, path_param_ok,
     recompute_computed_bindings,
@@ -33,7 +33,7 @@ pub struct LogicWorker {
     pub document_domain: String,
     /// Computed (derived) variable bindings in topological order.
     pub computed_vars: Vec<ComputedBinding>,
-    /// Reverse index (symbol → dependent binding indices) over `computed_vars`,
+    /// Reverse index (symbol â†’ dependent binding indices) over `computed_vars`,
     /// rebuilt once whenever `computed_vars` is (re)loaded so
     /// `recompute_computed_bindings` never has to scan every binding per event.
     pub computed_reverse_index: CompReverseIndex,
@@ -45,7 +45,7 @@ pub struct LogicWorker {
 
 impl LogicWorker {
     /// Explicit stack size for the dedicated evaluator thread, overriding the
-    /// platform default (commonly ~1 MiB on Windows, ~2–8 MiB on Linux/macOS
+    /// platform default (commonly ~1 MiB on Windows, ~2â€“8 MiB on Linux/macOS
     /// depending on `ulimit`/pthread defaults).
     ///
     /// `evaluate`/`evaluate_impl` recurse up to `MAX_EVAL_DEPTH` (256) levels
@@ -65,15 +65,15 @@ impl LogicWorker {
     ///
     /// 16 MiB is ~4x the measured debug floor and ~64x the measured release
     /// floor, and matches the value `cross_function_composition_depth_guard`'s
-    /// sibling test (`eval_depth_guard`) already relies on as proven-safe —
+    /// sibling test (`eval_depth_guard`) already relies on as proven-safe â€”
     /// a large margin against interpreter changes, platform stack-frame
     /// layout differences, and future growth of `evaluate_impl`'s frame size.
-    pub(crate) const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+    pub const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     /// Spawns a permanent native thread executing the LogicWorker.
     ///
     /// Fails only if the OS refuses the thread/stack allocation (real
-    /// resource exhaustion) — propagated as [`MizuError::IoError`] instead of
+    /// resource exhaustion) â€” propagated as [`MizuError::IoError`] instead of
     /// panicking, so the caller can surface a real error instead of aborting
     /// the process on an opaque message.
     pub fn spawn(
@@ -116,7 +116,7 @@ impl LogicWorker {
                     self.store = VariableStore::new();
                     // `payload.interner` is a frozen clone of the UI-thread interner.
                     // Clone now preserves `frozen = true`, so both threads share the
-                    // same immutable Symbol(u32) → String mapping after this point.
+                    // same immutable Symbol(u32) â†’ String mapping after this point.
                     self.store.interner = payload.interner;
                     // `initial_variables` are from the UI thread's global store; every
                     // name is guaranteed to be in the frozen interner already, so
@@ -226,7 +226,7 @@ impl LogicWorker {
                     // other side has no defined meaning here. set_runtime
                     // resolves the name against this worker's own frozen
                     // table and silently drops it if the document never
-                    // declared it — the frozen interner is never grown by
+                    // declared it â€” the frozen interner is never grown by
                     // network-response-driven names.
                     self.store.set_runtime(&name, value);
                     self.recompute_after_mutation();
@@ -249,13 +249,13 @@ impl LogicWorker {
             }
         }
         self.store.state_machine.undo_log.clear();
-        // Resolve NetworkCall → ResolvedCall and DownloadAlias → DownloadMedia.
+        // Resolve NetworkCall â†’ ResolvedCall and DownloadAlias â†’ DownloadMedia.
         let document_domain = &self.document_domain;
         let url_registry = &self.url_registry;
         let raw_actions = std::mem::take(&mut self.store.state_machine.accumulated_actions);
         let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
         // Unresolved aliases surface a readable error in the call's bound
-        // variable instead of silently dropping the action — the user must
+        // variable instead of silently dropping the action â€” the user must
         // see *why* nothing happened.
         let mut alias_errors: Vec<(String, Value)> = Vec::new();
         for action in raw_actions {
@@ -359,13 +359,13 @@ impl LogicWorker {
 /// * `Media` endpoints: uses `raw_target` as-is (already an absolute `mizu://`
 ///   URL).
 ///
-/// If `path_param` is `Some` and the URL contains a `{…}` placeholder, the
+/// If `path_param` is `Some` and the URL contains a `{â€¦}` placeholder, the
 /// first placeholder is replaced with the percent-encoded param value. Otherwise the
 /// encoded param is appended after a `/`. Note: only the first placeholder is replaced;
-/// a second `{…}` is left literal (this is the intended behavior).
+/// a second `{â€¦}` is left literal (this is the intended behavior).
 ///
 /// `path_param` is re-validated against the same gate as `execute_action` in
-/// `logic.rs` before it is ever substituted into the URL — this is the last
+/// `logic.rs` before it is ever substituted into the URL â€” this is the last
 /// consumption point before the value leaves the process, so it must not be
 /// possible to reach this function with an unvalidated `path_param` via a
 /// different code path.
@@ -405,7 +405,7 @@ pub(crate) fn resolve_endpoint_url(
         }
         let pp = &encoded;
 
-        // Replace the first `{…}` placeholder if present, otherwise append.
+        // Replace the first `{â€¦}` placeholder if present, otherwise append.
         if let Some(open) = base_url.find('{')
             && let Some(rel_close) = base_url[open..].find('}')
         {
@@ -632,10 +632,10 @@ mod tests {
     /// End-to-end regression test for the stack-size fix in
     /// `LogicWorker::spawn`: drives a real `LogicWorker` background thread
     /// (spawned exactly as production does, via `LogicWorker::spawn`) through
-    /// a 300-level-deep expression — the same shape used by
+    /// a 300-level-deep expression â€” the same shape used by
     /// `core::types::tests::eval_depth_guard` and
     /// `cross_function_composition_depth_guard`, deep enough to exceed
-    /// `MAX_EVAL_DEPTH` (256) — and asserts the worker returns the controlled
+    /// `MAX_EVAL_DEPTH` (256) â€” and asserts the worker returns the controlled
     /// "evaluation nesting too deep" error rather than the process crashing
     /// with a native stack overflow.
     ///
@@ -644,7 +644,7 @@ mod tests {
     /// builds (see `STACK_SIZE_BYTES`'s doc comment for the measurement that
     /// proved it). Because a real stack overflow aborts the whole process and
     /// cannot be caught with `catch_unwind`, this test re-execs the test
-    /// binary as a child process and inspects its exit status — mirroring
+    /// binary as a child process and inspects its exit status â€” mirroring
     /// `cross_function_composition_depth_guard` in `core::types`.
     #[test]
     fn logic_worker_thread_survives_max_eval_depth_without_native_crash() {
@@ -686,7 +686,7 @@ mod tests {
     /// worker responds with the expected controlled error instead of the
     /// process crashing.
     fn run_logic_worker_depth_guard_child(ok_marker: &str) {
-        use crate::network::messages::{ReloadPayload, UiEvent};
+        use crate::messages::{ReloadPayload, UiEvent};
         use crate::parser::logic::{BinOp, Expr};
         use std::sync::mpsc;
 
@@ -739,7 +739,7 @@ mod tests {
                 println!("{ok_marker}");
             }
             // Also acceptable: the instruction budget could in principle be
-            // exhausted first depending on constant tuning — still a clean,
+            // exhausted first depending on constant tuning â€” still a clean,
             // bounded error, not a crash.
             Ok(Err(MizuError::Timeout)) => {
                 println!("{ok_marker}");

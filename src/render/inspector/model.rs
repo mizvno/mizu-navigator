@@ -476,10 +476,7 @@ fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
                     .iter()
                     .map(|(p, ty)| {
                         let pname = interner.resolve(*p).unwrap_or("?");
-                        match ty {
-                            Some(t) => format!("{pname}: {}", t.as_str()),
-                            None => pname.to_string(),
-                        }
+                        format!("{pname}: {}", ty)
                     })
                     .collect();
                 format!("{name}({})", params.join(", "))

@@ -2,12 +2,12 @@
 //!
 //! Two distinct mechanisms, deliberately kept separate:
 //!
-//! * **Operational settings** ([`MizuConfig`]) — network timeouts, pool
+//! * **Operational settings** ([`MizuConfig`]) â€” network timeouts, pool
 //!   sizes, storage debounce, redirect budget, the QUIC port. These are
 //!   loaded once from an optional TOML file (see [`config_path`]) and are
 //!   safe to expose: none of them weaken a security invariant, they only
 //!   tune how the client behaves on a given network/machine.
-//! * **Experimental budget overrides** ([`env_override`]) — a handful of
+//! * **Experimental budget overrides** ([`env_override`]) â€” a handful of
 //!   constants whose own doc comments admit they are unmeasured starting
 //!   guesses, not derived limits (`MAX_COMP_BINDINGS`, `MAX_INSTRUCTIONS`,
 //!   `MAX_SYNTHETIC_LAYOUT_NODES`, `INPUT_MAX_BYTES`, `MAX_PARSE_DEPTH`,
@@ -16,17 +16,17 @@
 //!   `config.toml`, so they never look like a supported, persisted setting.
 //!
 //! **What is never configurable, by either mechanism:** `MAX_EVAL_DEPTH`
-//! (paired with `LogicWorker::STACK_SIZE_BYTES` by a measurement in RM-14 —
+//! (paired with `LogicWorker::STACK_SIZE_BYTES` by a measurement in RM-14 â€”
 //! changing one without the other breaks the proof that the depth guard
 //! fires before a native stack overflow), the storage quotas, response-body
 //! and image decode limits, `MAX_JSON_DEPTH` (tied to `MAX_EVAL_DEPTH` by
-//! design), and `DECIMAL_SCALE` (not a limit — the fixed-point numeric
+//! design), and `DECIMAL_SCALE` (not a limit â€” the fixed-point numeric
 //! format; changing it would silently corrupt already-stored data). See
 //! `SECURITY-INVARIANTS.md`.
 //!
-//! ## `config.toml` — every field, with its default
+//! ## `config.toml` â€” every field, with its default
 //!
-//! Missing entirely, or missing individual fields, is fine — anything not
+//! Missing entirely, or missing individual fields, is fine â€” anything not
 //! set keeps the value shown here.
 //!
 //! ```toml
@@ -43,11 +43,11 @@
 //! mizu_port = 7399
 //! ```
 //!
-//! ## Experimental overrides — environment variables, not `config.toml`
+//! ## Experimental overrides â€” environment variables, not `config.toml`
 //!
 //! `MIZU_MAX_COMP_BINDINGS`, `MIZU_MAX_INSTRUCTIONS`,
 //! `MIZU_MAX_SYNTHETIC_LAYOUT_NODES`, `MIZU_INPUT_MAX_BYTES`,
-//! `MIZU_MAX_PARSE_DEPTH`, `MIZU_MAX_TOKEN_TTL_SECS` — e.g.
+//! `MIZU_MAX_PARSE_DEPTH`, `MIZU_MAX_TOKEN_TTL_SECS` â€” e.g.
 //! `MIZU_MAX_COMP_BINDINGS=2000 cargo run -- ./big.mizu`. An unset or
 //! unparseable value falls back to the default silently logged via
 //! `tracing::warn!`.
@@ -59,22 +59,22 @@ use serde::Deserialize;
 
 /// Operational settings, loadable from `config.toml`. Every field has a
 /// default matching this project's original hardcoded constant, so a
-/// missing file — or a file that only sets some fields — changes nothing
+/// missing file â€” or a file that only sets some fields â€” changes nothing
 /// else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub(crate) struct MizuConfig {
-    pub(crate) connect_timeout_secs: u64,
-    pub(crate) request_timeout_secs: u64,
-    pub(crate) quic_max_idle_timeout_secs: u64,
-    pub(crate) quic_keep_alive_interval_secs: u64,
-    pub(crate) max_pool_size: usize,
-    pub(crate) max_ui_channel_capacity: usize,
-    pub(crate) max_concurrent_fetches: usize,
-    pub(crate) storage_debounce_window_ms: u64,
-    pub(crate) storage_batch_max_keys: usize,
-    pub(crate) max_redirects: u32,
-    pub(crate) mizu_port: u16,
+pub struct MizuConfig {
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub quic_max_idle_timeout_secs: u64,
+    pub quic_keep_alive_interval_secs: u64,
+    pub max_pool_size: usize,
+    pub max_ui_channel_capacity: usize,
+    pub max_concurrent_fetches: usize,
+    pub storage_debounce_window_ms: u64,
+    pub storage_batch_max_keys: usize,
+    pub max_redirects: u32,
+    pub mizu_port: u16,
 }
 
 impl Default for MizuConfig {
@@ -144,23 +144,23 @@ fn load() -> MizuConfig {
 }
 
 /// Process-wide operational settings, loaded once on first access.
-pub(crate) static CONFIG: LazyLock<MizuConfig> = LazyLock::new(load);
+pub static CONFIG: LazyLock<MizuConfig> = LazyLock::new(load);
 
 /// Reads a `MIZU_*` environment-variable override for one of the
 /// experimental budget constants described in the module doc comment above.
 /// Falls back to `default` when the variable is unset or fails to parse
 /// (logging a warning in the latter case, so a typo doesn't silently pick
 /// the wrong value).
-pub(crate) fn env_override<T>(var: &str, default: T) -> T
+pub fn env_override<T>(var_name: &str, default: T) -> T
 where
     T: std::str::FromStr + Copy,
 {
-    resolve_override(var, std::env::var(var).ok(), default)
+    resolve_override(var_name, std::env::var(var_name).ok(), default)
 }
 
 /// The pure decision behind [`env_override`], factored out so it's testable
 /// without mutating the real process environment (which would need
-/// `unsafe { std::env::set_var(..) }` — forbidden crate-wide).
+/// `unsafe { std::env::set_var(..) }` â€” forbidden crate-wide).
 fn resolve_override<T>(var: &str, raw: Option<String>, default: T) -> T
 where
     T: std::str::FromStr + Copy,

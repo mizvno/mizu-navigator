@@ -9,12 +9,7 @@
 //! validates shape and type consistency, while `flow.rs` validates information
 //! taint.
 //!
-//! ## Escape Hatch
-//!
-//! Unannotated parameters yield an implicit "dynamic" type (`None` in `Env`).
-//! Operations on this type never fail statically in Phase B. This ensures
-//! full backward compatibility with unannotated `.mizu` documents.
-//! // REMOVED IN PHASE D
+
 
 use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
@@ -44,7 +39,7 @@ pub fn check_types(
     for func in functions.values() {
         let mut local_env = global_env.clone();
         for (sym, ty_ann) in &func.params {
-            local_env.insert(*sym, ty_ann.clone());
+            local_env.insert(*sym, Some(ty_ann.clone()));
         }
         infer(&func.body, &local_env, functions, interner)?;
     }
@@ -260,11 +255,6 @@ mod tests {
         assert!(check_logic_string(src).is_ok());
     }
 
-    #[test]
-    fn unannotated_param_accepted() {
-        let src = "f(x) : x.some_field + 1";
-        assert!(check_logic_string(src).is_ok());
-    }
 
     #[test]
     fn missing_field_on_record_rejected() {
@@ -283,13 +273,182 @@ mod tests {
         assert!(matches!(err, MizuError::StaticTypeError(_)));
     }
 
-    #[test]
-    fn mixed_params_accepted_and_checked() {
-        let src = "f(x: num, y) : x + y";
-        assert!(check_logic_string(src).is_ok());
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::core::types::{Value, Symbol};
+    use crate::parser::logic::eval::check_type;
+
+    fn any_value_type(depth: usize) -> ValueType {
+        if depth == 0 {
+            match kani::any::<u8>() % 3 {
+                0 => ValueType::Num,
+                1 => ValueType::Str,
+                _ => ValueType::Bool,
+            }
+        } else {
+            match kani::any::<u8>() % 6 {
+                0 => ValueType::Num,
+                1 => ValueType::Str,
+                2 => ValueType::Bool,
+                3 => ValueType::List(Box::new(any_value_type(depth - 1))),
+                4 => {
+                    let mut fields = Vec::new();
+                    if kani::any::<bool>() {
+                        fields.push((Symbol(kani::any()), any_value_type(depth - 1)));
+                    }
+                    ValueType::Record(fields)
+                }
+                _ => ValueType::Nullable(Box::new(any_value_type(depth - 1))),
+            }
+        }
+    }
+
+    fn any_value(depth: usize) -> Value {
+        if depth == 0 {
+            match kani::any::<u8>() % 4 {
+                0 => Value::Null,
+                1 => Value::Bool(kani::any()),
+                2 => Value::Int(kani::any()),
+                _ => Value::String(String::new()),
+            }
+        } else {
+            match kani::any::<u8>() % 6 {
+                0 => Value::Null,
+                1 => Value::Bool(kani::any()),
+                2 => Value::Int(kani::any()),
+                3 => Value::String(String::new()),
+                4 => {
+                    let mut list = Vec::new();
+                    if kani::any::<bool>() {
+                        list.push(any_value(depth - 1));
+                    }
+                    Value::List(list)
+                }
+                _ => {
+                    let mut fields = Vec::new();
+                    if kani::any::<bool>() {
+                        fields.push((Symbol(kani::any()), any_value(depth - 1)));
+                    }
+                    Value::Record(fields)
+                }
+            }
+        }
+    }
+
+    fn any_expr(depth: usize) -> Expr {
+        if depth == 0 {
+            match kani::any::<u8>() % 2 {
+                0 => Expr::Literal(any_value(0)),
+                _ => Expr::Variable(Symbol(kani::any())),
+            }
+        } else {
+            match kani::any::<u8>() % 8 {
+                0 => Expr::Literal(any_value(depth - 1)),
+                1 => Expr::Variable(Symbol(kani::any())),
+                2 => Expr::BinaryOp {
+                    left: Box::new(any_expr(depth - 1)),
+                    op: match kani::any::<u8>() % 4 {
+                        0 => BinOp::Add,
+                        1 => BinOp::Eq,
+                        2 => BinOp::And,
+                        _ => BinOp::Lt,
+                    },
+                    right: Box::new(any_expr(depth - 1)),
+                },
+                3 => Expr::Let {
+                    name: Symbol(kani::any()),
+                    value: Box::new(any_expr(depth - 1)),
+                    body: Box::new(any_expr(depth - 1)),
+                },
+                4 => Expr::Not(Box::new(any_expr(depth - 1))),
+                5 => Expr::IfElse {
+                    condition: Box::new(any_expr(depth - 1)),
+                    then_expr: Box::new(any_expr(depth - 1)),
+                    else_expr: Box::new(any_expr(depth - 1)),
+                },
+                6 => Expr::FieldAccess {
+                    base: Box::new(any_expr(depth - 1)),
+                    field: String::new(),
+                },
+                _ => Expr::FunctionCall {
+                    name: Symbol(kani::any()),
+                    args: {
+                        let mut args = Vec::new();
+                        if kani::any::<bool>() {
+                            args.push(any_expr(depth - 1));
+                        }
+                        args
+                    },
+                },
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn infer_does_not_panic() {
+        let expr = any_expr(2);
+        let interner = crate::core::types::StringInterner::new();
+        let env = Env::default();
+        let fns = FxHashMap::default();
+        let _ = infer(&expr, &env, &fns, &interner);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn static_dynamic_agreement() {
+        let val = any_value(2);
+        let _ty = any_value_type(2);
+        let expr = Expr::Literal(val.clone());
+        let interner = crate::core::types::StringInterner::new();
+        let env = Env::default();
+        let fns = FxHashMap::default();
         
-        // x is a num, so accessing a field on it fails
-        let src2 = "f(x: num, y) : x.f + y";
-        assert!(check_logic_string(src2).is_err());
+        if let Ok(Some(inferred_ty)) = infer(&expr, &env, &fns, &interner) {
+            let result = check_type(&val, &inferred_ty, "f", "p");
+            kani::assert(result.is_ok(), "Dynamic check_type rejected what static infer accepted");
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn model_agreement_02_logic_basics() {
+        let mut interner = crate::core::types::StringInterner::new();
+        let env = Env::default();
+        let fns = FxHashMap::default();
+
+        let sym_double = interner.intern("double");
+        let sym_x = interner.intern("x");
+
+        let greeting_expr = Expr::Literal(Value::String("Hello, world!".to_string()));
+        let t1 = infer(&greeting_expr, &env, &fns, &interner).unwrap().unwrap();
+        kani::assert(matches!(t1, ValueType::Str), "Expected Str");
+
+        let count_expr = Expr::Literal(Value::Int(0));
+        let t2 = infer(&count_expr, &env, &fns, &interner).unwrap().unwrap();
+        kani::assert(matches!(t2, ValueType::Num), "Expected Num");
+
+        let double_body = Expr::BinaryOp {
+            left: Box::new(Expr::Variable(sym_x)),
+            op: BinOp::Mul,
+            right: Box::new(Expr::Literal(Value::Int(2))),
+        };
+        let mut double_env = Env::default();
+        double_env.insert(sym_x, Some(ValueType::Num));
+        
+        let t3 = infer(&double_body, &double_env, &fns, &interner).unwrap().unwrap();
+        kani::assert(matches!(t3, ValueType::Num), "Expected Num");
+
+        let call_empty = Expr::FunctionCall { name: sym_double, args: vec![] };
+        let mut fns_map = FxHashMap::default();
+        fns_map.insert(sym_double, MizuFunction {
+            params: vec![(sym_x, ValueType::Num)],
+            body: double_body.clone(),
+        });
+        let t4 = infer(&call_empty, &env, &fns_map, &interner);
+        kani::assert(t4.is_err(), "Expected type mismatch error for arity");
     }
 }

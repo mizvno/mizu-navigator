@@ -32,7 +32,7 @@ use thiserror::Error;
 /// # Examples
 ///
 /// ```
-/// use mizu::core::errors::MizuError;
+/// use mizu_core::core::errors::MizuError;
 ///
 /// fn lookup(name: &str) -> Result<(), MizuError> {
 ///     Err(MizuError::VariableNotFound(name.to_owned()))

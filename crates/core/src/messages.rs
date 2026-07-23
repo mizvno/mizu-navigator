@@ -1,4 +1,4 @@
-//! # `messages` — Unified Communication Channel and Events
+//! # `messages` â€” Unified Communication Channel and Events
 
 #![forbid(unsafe_code)]
 
@@ -16,13 +16,13 @@ pub struct ReloadPayload {
     /// Click action mappings, keyed by the u32 id of the triggering node.
     pub click_actions: HashMap<u32, Action>,
     /// Submit action mappings, keyed by the u32 id of the node carrying the
-    /// `submit -> …` event (typically a `button type "submit"`).
+    /// `submit -> â€¦` event (typically a `button type "submit"`).
     pub submit_actions: HashMap<u32, Action>,
     /// Actions of root-level `timer <interval> -> <action>` declarations from
     /// the `logic` block, in declaration order.  Fired via
     /// [`UiEvent::RootTimer`] with the matching index.
     pub root_timer_actions: Vec<Action>,
-    /// Frozen name ↔ symbol table shared between the UI thread and the worker.
+    /// Frozen name â†” symbol table shared between the UI thread and the worker.
     pub interner: StringInterner,
     /// Non-null global variables at reload time, as `(name, value)` pairs.
     pub initial_variables: Vec<(String, Value)>,
@@ -39,7 +39,7 @@ pub struct ReloadPayload {
     pub computed_bindings: Vec<crate::parser::logic::ComputedBinding>,
 }
 
-/// A compile-time–validated HTTP network request produced by `GET(…)` / `POST(…)` / etc.
+/// A compile-timeâ€“validated HTTP network request produced by `GET(â€¦)` / `POST(â€¦)` / etc.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkRequest {
     /// Interned symbol (as a raw `u32`) of the endpoint alias to resolve.
@@ -48,7 +48,7 @@ pub struct NetworkRequest {
     pub method: NetworkMethod,
     /// Optional JSON-serialisable request body (POST / PUT / QUERY).
     pub payload: Option<Value>,
-    /// Optional path parameter substituted into the endpoint's `{…}` placeholder.
+    /// Optional path parameter substituted into the endpoint's `{â€¦}` placeholder.
     pub path_param: Option<String>,
     /// Variable name the response is bound to.
     pub target_variable: Symbol,
@@ -59,7 +59,7 @@ pub struct NetworkRequest {
 pub enum RuntimeAction {
     /// No-op placeholder (e.g. an unresolved alias, or a discarded action).
     None,
-    /// Compile-time–validated HTTP call (unresolved alias form).
+    /// Compile-timeâ€“validated HTTP call (unresolved alias form).
     /// The `LogicWorker` resolves the alias in `send_response` and converts this
     /// into [`RuntimeAction::ResolvedCall`] before forwarding to the main thread.
     NetworkCall {
@@ -69,7 +69,7 @@ pub enum RuntimeAction {
         endpoint_symbol: u32,
         /// Optional JSON-serialisable request body (POST / PUT / QUERY).
         payload: Option<Value>,
-        /// Optional path parameter substituted into the endpoint's `{…}` placeholder.
+        /// Optional path parameter substituted into the endpoint's `{â€¦}` placeholder.
         path_param: Option<String>,
         /// Variable name the response is bound to.
         target_variable: Symbol,
@@ -78,7 +78,7 @@ pub enum RuntimeAction {
     /// `LogicWorker` after looking up the alias in the `UrlRegistry`.
     /// The main-thread capability watchdog dispatches this as `NetworkCmd::Fetch`.
     ResolvedCall {
-        /// Uppercase HTTP method (`"GET"`, `"POST"`, …).
+        /// Uppercase HTTP method (`"GET"`, `"POST"`, â€¦).
         method: String,
         /// Fully-resolved `mizu://` target URL.
         url: String,
@@ -89,7 +89,7 @@ pub enum RuntimeAction {
         /// Variable name the response is bound to.
         target_variable: Symbol,
     },
-    /// Persists `key` → `value` to the current origin's encrypted local storage.
+    /// Persists `key` â†’ `value` to the current origin's encrypted local storage.
     StoreLocal {
         /// The storage key.
         key: String,
@@ -123,8 +123,8 @@ pub enum RuntimeAction {
     /// Download request carrying an unresolved compile-time alias.
     ///
     /// Produced by the `download(alias)` built-in in the evaluator.
-    /// The `LogicWorker` resolves the alias → URL in `send_response` before
-    /// forwarding to the main thread (same pattern as `NetworkCall` → `ResolvedCall`).
+    /// The `LogicWorker` resolves the alias â†’ URL in `send_response` before
+    /// forwarding to the main thread (same pattern as `NetworkCall` â†’ `ResolvedCall`).
     DownloadAlias {
         /// Interned symbol (as a raw `u32`) of the media endpoint alias.
         endpoint_symbol: u32,
@@ -141,23 +141,23 @@ pub struct StateUpdate {
 /// Events sent from the UI to the LogicWorker.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// A click landed on a node carrying a `click -> …` action.
+    /// A click landed on a node carrying a `click -> â€¦` action.
     Click {
         /// u32 id of the clicked node.
         node_id: u32,
     },
-    /// A root-level `timer …` declared in the `logic` block fired.
+    /// A root-level `timer â€¦` declared in the `logic` block fired.
     RootTimer {
         /// Index into [`ReloadPayload::root_timer_actions`].
         index: u32,
     },
     /// Aggregated submission of a form: sends all fields in a single atomic transaction.
     SubmitForm {
-        /// u32 id of the node whose `submit -> …` action triggered the
+        /// u32 id of the node whose `submit -> â€¦` action triggered the
         /// submission (the submit button), used to look up the action to
         /// execute after the `$form` record has been populated.
         submitter_node_id: u32,
-        /// Form field name → typed value, gathered from every `input` in the form.
+        /// Form field name â†’ typed value, gathered from every `input` in the form.
         fields: FxHashMap<String, Value>,
     },
     /// Updates a variable in the worker store by name (used by network

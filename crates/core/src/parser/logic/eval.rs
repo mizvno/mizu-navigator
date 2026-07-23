@@ -55,7 +55,7 @@ pub fn execute_action(
             store
                 .state_machine
                 .accumulated_actions
-                .push(crate::network::RuntimeAction::Navigate { url: url_str });
+                .push(crate::messages::RuntimeAction::Navigate { url: url_str });
             Ok(true)
         }
         Action::NetworkCall {
@@ -99,7 +99,7 @@ pub fn execute_action(
             };
             let target_variable = store.interner.get_or_intern(target_var);
             store.state_machine.accumulated_actions.push(
-                crate::network::RuntimeAction::NetworkCall {
+                crate::messages::RuntimeAction::NetworkCall {
                     method: method.clone(),
                     endpoint_symbol: alias_sym.0,
                     payload: payload_val,
@@ -214,7 +214,7 @@ pub(crate) fn apply_binop(
 
         // Type mismatch
         (_, l, _) => Err(MizuError::TypeError {
-            expected: "compatible operand types",
+            expected: "compatible operand types".to_string(),
             found: type_name(&l),
         }),
     }
@@ -232,32 +232,124 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
     }
 }
 
-/// Verifies that a runtime argument value matches the declared parameter type.
-///
-/// `None` means the parameter has no type annotation — any value is accepted.
 pub(crate) fn check_type(
     val: &Value,
-    expected: Option<&ValueType>,
+    expected: &ValueType,
     func_name: &str,
     param_name: &str,
 ) -> Result<(), MizuError> {
-    let Some(expected) = expected else {
-        return Ok(());
+    let ok = match (val, expected) {
+        (Value::Int(_), ValueType::Num) => true,
+        (Value::String(_), ValueType::Str) => true,
+        (Value::Bool(_), ValueType::Bool) => true,
+        (Value::List(items), ValueType::List(inner)) => {
+            let mut all_ok = true;
+            for item in items.iter() {
+                if check_type(item, inner, func_name, param_name).is_err() {
+                    all_ok = false;
+                    break;
+                }
+            }
+            all_ok
+        }
+        (Value::Record(fields), ValueType::Record(expected_fields)) => {
+            let mut all_ok = true;
+            if fields.len() != expected_fields.len() {
+                all_ok = false;
+            } else {
+                for ((found_name, found_val), (exp_name, exp_type)) in fields.iter().zip(expected_fields.iter()) {
+                    if found_name.as_ref() != exp_name.as_ref() {
+                        all_ok = false;
+                        break;
+                    }
+                    if check_type(found_val, exp_type, func_name, param_name).is_err() {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            all_ok
+        }
+        (Value::Null, ValueType::Nullable(_)) => true,
+        (v, ValueType::Nullable(inner)) => check_type(v, inner, func_name, param_name).is_ok(),
+        _ => false,
     };
-    let ok = matches!(
-        (val, expected),
-        (Value::Int(_), ValueType::Num)
-            
-            | (Value::String(_), ValueType::Str)
-            | (Value::Bool(_), ValueType::Bool)
-            | (Value::List(_), ValueType::List)
-    );
     if !ok {
         return Err(MizuError::TypeError {
-            expected: expected.as_str(),
+            expected: expected.to_string(),
             found: type_name(val),
         });
     }
     let _ = (func_name, param_name);
     Ok(())
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_value_type(depth: usize) -> ValueType {
+        if depth == 0 {
+            match kani::any::<u8>() % 3 {
+                0 => ValueType::Num,
+                1 => ValueType::Str,
+                _ => ValueType::Bool,
+            }
+        } else {
+            match kani::any::<u8>() % 6 {
+                0 => ValueType::Num,
+                1 => ValueType::Str,
+                2 => ValueType::Bool,
+                3 => ValueType::List(Box::new(any_value_type(depth - 1))),
+                4 => {
+                    let mut fields = Vec::new();
+                    if kani::any::<bool>() {
+                        fields.push((crate::core::types::Symbol(kani::any()), any_value_type(depth - 1)));
+                    }
+                    ValueType::Record(fields)
+                }
+                _ => ValueType::Nullable(Box::new(any_value_type(depth - 1))),
+            }
+        }
+    }
+
+    fn any_value(depth: usize) -> Value {
+        if depth == 0 {
+            match kani::any::<u8>() % 4 {
+                0 => Value::Null,
+                1 => Value::Bool(kani::any()),
+                2 => Value::Int(kani::any()),
+                _ => Value::String(String::new()),
+            }
+        } else {
+            match kani::any::<u8>() % 6 {
+                0 => Value::Null,
+                1 => Value::Bool(kani::any()),
+                2 => Value::Int(kani::any()),
+                3 => Value::String(String::new()),
+                4 => {
+                    let mut list = Vec::new();
+                    if kani::any::<bool>() {
+                        list.push(any_value(depth - 1));
+                    }
+                    Value::List(list)
+                }
+                _ => {
+                    let mut fields = Vec::new();
+                    if kani::any::<bool>() {
+                        fields.push((crate::core::types::Symbol(kani::any()), any_value(depth - 1)));
+                    }
+                    Value::Record(fields)
+                }
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn check_type_does_not_panic() {
+        let val = any_value(2);
+        let ty = any_value_type(2);
+        let _ = check_type(&val, &ty, "f", "p");
+    }
 }

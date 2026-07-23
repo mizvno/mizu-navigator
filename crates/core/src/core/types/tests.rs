@@ -3,7 +3,7 @@
         variant_weight, Symbol,
     };
     use crate::core::errors::MizuError;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
 
@@ -972,7 +972,7 @@
 
     #[test]
     fn get_system_time_bare_variable_queues_correct_target() {
-        use crate::network::RuntimeAction;
+        use crate::messages::RuntimeAction;
         use crate::parser::logic::Expr;
         let mut store = VariableStore::new();
         let target_sym = store.interner.get_or_intern("elapsed");
@@ -1230,7 +1230,7 @@
     /// from this process's point of view) crashing.
     fn run_cross_function_composition_child(ok_marker: &'static str) {
         use crate::parser::logic_worker::LogicWorker;
-        use rustc_hash::FxHashMap;
+
 
         let handle = std::thread::Builder::new()
             .stack_size(LogicWorker::STACK_SIZE_BYTES)
@@ -1262,7 +1262,7 @@
             };
         }
         let func = MizuFunction {
-            params: vec![(param, None)],
+            params: vec![(param, crate::parser::logic::ValueType::Num)],
             body,
         };
         let mut functions = FxHashMap::default();

@@ -6,8 +6,7 @@ use crate::core::types::{Symbol, Value};
 
 /// The type annotation on a Mizu function parameter or binding.
 ///
-/// Only the four concrete types that `check_type` can actually enforce are
-/// represented. Parameters without an annotation use `None` at the call site
+/// Parameters without an annotation use `None` at the call site
 /// and accept any runtime value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
@@ -17,19 +16,32 @@ pub enum ValueType {
     Str,
     /// Corresponds to the `bool` keyword — maps to [`Value::Bool`].
     Bool,
-    /// Corresponds to the `list` keyword — matches any [`Value::List`] at runtime.
-    List,
+    /// Corresponds to the `list` keyword — matches any [`Value::List`] of the inner type.
+    List(Box<ValueType>),
+    /// Corresponds to the `record` keyword. Fields are canonicalized to sorted-by-name order at construction time.
+    Record(Vec<(std::sync::Arc<str>, ValueType)>),
+    /// Corresponds to the `?` suffix — explicitly nullable.
+    Nullable(Box<ValueType>),
 }
 
-impl ValueType {
-    /// Returns the Mizu source-language keyword for this type.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+impl std::fmt::Display for ValueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValueType::Num => "num",
-            ValueType::Str => "string",
-            ValueType::Bool => "bool",
-            ValueType::List => "list",
+            ValueType::Num => write!(f, "num"),
+            ValueType::Str => write!(f, "string"),
+            ValueType::Bool => write!(f, "bool"),
+            ValueType::List(inner) => write!(f, "list<{}>", inner),
+            ValueType::Record(fields) => {
+                write!(f, "record{{")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", name, ty)?;
+                }
+                write!(f, "}}")
+            }
+            ValueType::Nullable(inner) => write!(f, "{}?", inner),
         }
     }
 }
@@ -240,10 +252,9 @@ pub enum Action {
 /// used freely by [`evaluate`] without risk of infinite recursion.
 #[derive(Debug, Clone)]
 pub struct MizuFunction {
-    /// Ordered list of `(parameter_symbol, optional_type_annotation)` pairs.
-    /// `None` means the parameter is untyped — any runtime value is accepted.
+    /// Ordered list of `(parameter_symbol, type_annotation)` pairs.
     /// The symbol is pre-interned — no string allocation at call time.
-    pub params: Vec<(Symbol, Option<ValueType>)>,
+    pub params: Vec<(Symbol, ValueType)>,
     /// The function body expression (may be a chain of [`Expr::Let`] nodes
     /// for multi-line functions, with the return value at the innermost body).
     pub body: Expr,

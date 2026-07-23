@@ -111,7 +111,7 @@ pub struct StateMachine {
     /// Capability actions (network calls, storage writes, navigation, …)
     /// queued by the current action/expression evaluation, drained by the
     /// caller after execution completes.
-    pub accumulated_actions: Vec<crate::network::RuntimeAction>,
+    pub accumulated_actions: Vec<crate::messages::RuntimeAction>,
     /// `(symbol, previous_value)` pairs recorded by [`Self::set_global`],
     /// enabling rollback on error and diffing to find mutated variables.
     pub undo_log: Vec<(Symbol, Value)>,
@@ -433,7 +433,7 @@ impl StateMachine {
                             }
                         };
                         self.accumulated_actions
-                            .push(crate::network::RuntimeAction::CopyToClipboard { node_id });
+                            .push(crate::messages::RuntimeAction::CopyToClipboard { node_id });
                         return Ok(Value::Bool(true));
                     }
                     "get_system_time" => {
@@ -470,7 +470,7 @@ impl StateMachine {
                             ));
                         }
                         self.accumulated_actions.push(
-                            crate::network::RuntimeAction::GetSystemTime {
+                            crate::messages::RuntimeAction::GetSystemTime {
                                 target_variable,
                             },
                         );
@@ -494,7 +494,7 @@ impl StateMachine {
                         };
                         let value = self.evaluate(&args[1], frame_pointer, functions, interner)?;
                         self.accumulated_actions
-                            .push(crate::network::RuntimeAction::StoreLocal {
+                            .push(crate::messages::RuntimeAction::StoreLocal {
                                 key: key_str,
                                 value,
                             });
@@ -510,7 +510,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list",
+                                    expected: "list".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -526,7 +526,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string",
+                                    expected: "string".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -552,7 +552,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list",
+                                    expected: "list".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -566,7 +566,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string",
+                                    expected: "string".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -592,7 +592,7 @@ impl StateMachine {
                             )),
                         };
                         self.accumulated_actions.push(
-                            crate::network::RuntimeAction::DownloadAlias {
+                            crate::messages::RuntimeAction::DownloadAlias {
                                 endpoint_symbol: alias_sym.0,
                             },
                         );
@@ -618,7 +618,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list",
+                                    expected: "list".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -639,7 +639,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string",
+                                    expected: "string".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -648,7 +648,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string",
+                                    expected: "string".to_string(),
                                     found: type_name(&other),
                                 });
                             }
@@ -699,7 +699,7 @@ impl StateMachine {
                 for ((param_sym, expected_type), arg_val) in func.params.iter().zip(evaluated_args)
                 {
                     let param_name = interner.resolve(*param_sym).unwrap_or("<unknown>");
-                    check_type(&arg_val, expected_type.as_ref(), resolved_name, param_name)?;
+                    check_type(&arg_val, expected_type, resolved_name, param_name)?;
                     self.push_local(*param_sym, arg_val);
                 }
 
@@ -723,7 +723,7 @@ impl StateMachine {
                 match val {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
                     other => Err(crate::core::errors::MizuError::TypeError {
-                        expected: "bool",
+                        expected: "bool".to_string(),
                         found: type_name(&other),
                     }),
                 }
@@ -743,7 +743,7 @@ impl StateMachine {
                         self.evaluate(else_expr, frame_pointer, functions, interner)
                     }
                     other => Err(crate::core::errors::MizuError::TypeError {
-                        expected: "bool",
+                        expected: "bool".to_string(),
                         found: type_name(&other),
                     }),
                 }
@@ -752,7 +752,7 @@ impl StateMachine {
                 let base_val = self.evaluate(base, frame_pointer, functions, interner)?;
                 if !matches!(base_val, Value::Record(_)) {
                     return Err(MizuError::TypeError {
-                        expected: "record",
+                        expected: "record".to_string(),
                         found: type_name(&base_val),
                     });
                 }

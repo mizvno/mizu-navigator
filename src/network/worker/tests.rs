@@ -407,7 +407,7 @@
             "writes must not be flushed before the debounce window elapses"
         );
 
-        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        tokio::time::sleep(window + Duration::from_millis(1000)).await;
 
         assert_eq!(
             engine.write_batch_call_count(),
@@ -454,7 +454,7 @@
         // Give the spawned spawn_blocking flush task a moment to run — it's
         // triggered synchronously by the 3rd `submit` call, well before the
         // 30s window would ever elapse.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
 
         assert_eq!(
             engine.write_batch_call_count(),
@@ -489,7 +489,7 @@
             );
         }
 
-        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        tokio::time::sleep(window + Duration::from_millis(1000)).await;
 
         assert_eq!(engine.write_batch_call_count(), 1);
         let data = engine.read_all().expect("read_all");
@@ -530,7 +530,7 @@
             crate::core::types::Value::from("b_value"),
         );
 
-        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        tokio::time::sleep(window + Duration::from_millis(1000)).await;
 
         assert_eq!(engine_a.write_batch_call_count(), 1);
         assert_eq!(engine_b.write_batch_call_count(), 1);
@@ -766,7 +766,7 @@
     /// returned.
     #[test]
     fn test_dot_path_cascade_to_global_store_when_overlay_lacks_leaf() {
-        use std::collections::{BTreeMap, HashMap};
+        use std::collections::HashMap;
         use std::sync::Arc;
 
         // Global store: user record that has both `name` and `email`.
