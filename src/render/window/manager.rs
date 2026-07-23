@@ -446,6 +446,20 @@ impl MizuWindowManager {
         )?;
 
         self.dom = dom;
+        // Keep the OS window title in sync with the newly loaded document's
+        // `window "..."` title attribute (falls back to the same default
+        // used at startup, matching `render::window::event_loop`).
+        if let Some(window) = self.window.as_ref() {
+            let title = self
+                .dom
+                .root()
+                .value()
+                .attributes
+                .get("title")
+                .cloned()
+                .unwrap_or_else(|| "Mizu Application".to_string());
+            window.set_title(&title);
+        }
         self.style_rules = style_rules;
         self.style_variants = style_variants;
         self.logic_fns = logic_fns;
