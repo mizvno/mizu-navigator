@@ -25,6 +25,6 @@ A sibling follow-up using Kani/Creusot will prove the **code**: that the shipped
 * **Prose**: The flow checker evaluates soundness-over-completeness. It may reject safe documents through over-approximation (e.g., unused variable writes), adopting an "extra dependencies harmless" philosophy similar to the `comp` logic. However, it will never accept an unsafe document.
 
 ### T4 — Type soundness
-* **Status**: Open (Honestly Scoped)
-* **Prose**: Type soundness (progress and preservation) is currently inexpressible. The type system predicate is too weak: `Record` and `Null` remain untyped, and function parameters are unannotated.
-* **Unblocking**: This theorem is deferred until the partial type system is strengthened with explicit typing rules for collections and parameter annotations.
+* **Status**: Partial (Blueprint Only)
+* **Prose**: Type soundness (progress and preservation) is modeled via the type system predicate `ValHasType` and environment conformance `storeConforms`. However, the full mutual induction is currently deferred. Per-constructor preservation is established (e.g., `evalE_preservation_lit`, `evalE_preservation_var`), and `T4_type_soundness_lit` acts as a blueprint for the complete theorem.
+* **Unblocking**: The partial type system was strengthened with explicit typing rules and parameter annotations. Full mutual induction remains deferred pending deeper list/record proof extensions.

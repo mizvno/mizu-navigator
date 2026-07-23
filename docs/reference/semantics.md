@@ -1,4 +1,4 @@
-﻿# Mizu Language Semantics
+# Mizu Language Semantics
 
 > **Status:** July 2026.  This document describes **decided, implemented** behavior
 > extracted from the authoritative sources.  Items marked ⚠ are edge cases that
@@ -29,6 +29,7 @@
 14. [Layout Semantics](#14-layout-semantics)
 15. [Termination Story](#15-termination-story)
 16. [Capability and Flow Model](#16-capability-and-flow-model)
+17. [Load-time Verification Pipeline](#17-load-time-verification-pipeline)
 
 ---
 
@@ -421,3 +422,12 @@ See **`SECURITY-INVARIANTS.md`** for normative detail.  Summary:
 - **Information-flow:** untrusted data (network responses, form inputs) reaches the store via `set_runtime` (which respects the frozen interner and discards undeclared names).  It cannot flow into `path_param` or `navigate` without an explicit assignment action that a document author consciously writes.
 - **Imports:** local-file only; network-origin documents cannot import files.
 - **`file://` asset references** in remote documents are `ParseError`.
+
+---
+
+## 17. Load-time Verification Pipeline
+
+Before a document is accepted, it passes through sequential verification passes (implemented in `src/render/window/navigate.rs` and `src/parser/logic.rs`):
+1. **`check_dag`** (during `parse_logic`): Enforces an acyclic function call graph to guarantee bounded evaluation.
+2. **`check_types`** (`parser::typecheck::check_types`): Validates static type soundness, enforcing that all type constraints and parameter annotations are satisfied.
+3. **`check_information_flow`** (`parser::flow::check_information_flow`): Executes after the static type checker succeeds, ensuring untrusted sources do not flow to sensitive sinks without proper gating.

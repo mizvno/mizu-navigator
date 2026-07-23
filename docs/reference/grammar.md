@@ -1,4 +1,4 @@
-﻿# Mizu Language Grammar
+# Mizu Language Grammar
 
 > **Status:** Extracted from authoritative parser sources — July 2026.
 > Every production is annotated with the implementing Rust source file and
@@ -172,9 +172,12 @@ body_lines       = { SP+ ident "=" expr NL }
                    SP+ expr NL ;
 
 param_list       = [ param { "," param } ] ;
-param            = ident [ ":" type_annotation ] ;
-type_annotation  = "num" | "number" | "string" | "str"
-                 | "bool" | "boolean" | "list" ;
+param            = ident ":" type_annotation ;
+type_annotation  = "num" | "number" | "string" | "str" | "bool" | "boolean"
+                 | "list" "<" type_annotation ">"
+                 | "record" "{" [ record_fields ] "}"
+                 | type_annotation "?" ;
+record_fields    = ident ":" type_annotation { "," ident ":" type_annotation } ;
 
 comp_binding     = SP+ "comp" SP+ ident "=" expr NL ;
 

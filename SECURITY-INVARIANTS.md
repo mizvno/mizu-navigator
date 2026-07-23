@@ -231,6 +231,10 @@ Two-point lattice: **Clean** / **Tainted**.
   taint-propagation through functions and comps until stable.  Because
   the graph is acyclic and finite, convergence is guaranteed.
 
+### Checker Independence
+
+The static type-checking pass and the information-flow checker operate on verified-independent lattices; there is no interaction between them. The flow checker's soundness does not rely on any properties proved by the type system.
+
 ### Gates
 
 Gates *discharge* taint.  Taint that reaches a sink without passing through a

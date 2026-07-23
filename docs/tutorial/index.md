@@ -1,4 +1,4 @@
-﻿# Mizu Tutorial
+# Mizu Tutorial
 
 A progressive, hands-on introduction to writing Mizu documents.  Every
 code block below is a complete, runnable `.mizu` fragment; they are all
@@ -122,7 +122,7 @@ layout
 
 - `greeting = "Hello, world!"` — a variable (zero-argument function).
 - `count = 0` — another variable, initial value `0`.
-- `double(x: num) : x * 2` — a pure function with one typed parameter.
+- `double(x: num) : x * 2` — a pure function with one typed parameter. **Note: Type annotations on function parameters are mandatory.** The supported types are: `num` (or `number`), `string` (or `str`), `bool` (or `boolean`), `list<T>`, `record{k: T, ...}`, and optional variants like `T?`.
 - `{greeting}` — string interpolation in text content.
 
 ---

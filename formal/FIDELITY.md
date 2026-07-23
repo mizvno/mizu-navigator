@@ -26,7 +26,6 @@ The model explicitly instrumented evaluation with instruction budgets (`MAX_INST
 ### 4. Values and Types
 * **No Floating-Point Variant**: `Value` (`core::types::Value`) has no `Float` variant to begin with — JSON numbers (integer or floating-point alike) are converted to the fixed-point `Value::Int` (scaled by `DECIMAL_SCALE`), and non-exact division produces a runtime error rather than a float result. This is not a case of the model omitting something the Rust type has; `Val` (the Lean model's value type) has no `.float` constructor because `Value` never had one in this version of the code either.
 * **Record Representation**: `Record` is modeled as an association list rather than a `BTreeMap`.
-* **Type Annotations**: Type annotations on parameters are omitted from the model since the current type predicate is too weak to provide progress/preservation (see T4 in RESULTS.md).
 
 ### 5. Divergences in Flow Checker Execution
 The Rust `check_information_flow` (`flow.rs`) iterates `while changed` to the least fixpoint. The model instead iterates a syntactic bound (`#functions + #comps + #actions + 1`) and then explicitly checks stability.
@@ -44,3 +43,11 @@ The Rust `check_information_flow` (`flow.rs`) iterates `while changed` to the le
 
 ---
 *No proofs in the `formal/` development rely on unstated assumptions outside this ledger. To bridge this gap computationally, `Kani` and `Creusot` should verify the corresponding Rust kernel functions.*
+
+### Trusted Kernels
+
+The following Rust components represent the "kernel" of the trusted base. While their logic is modeled, their implementation correctness must be verified directly against the Rust code. We do not currently attempt to prove Rust type-level properties around the async runtime itself, thread isolation, or resource lifetimes within the Lean 4 model, as those are handled by the Rust compiler.
+
+1. **`core::types::eval::check_type` (Phase A) & `parser::typecheck::infer` (Phase B/D)**: Kani harnesses (`kani_proofs` modules) exist in the source code to prove no-panics, static/dynamic agreement, and model agreement against `Differential.lean`. However, these are currently infeasible to verify iteratively on Windows developer machines due to Kani lacking native Windows support. They must be executed via CI or WSL environments.
+2. **Flow Checker**: The `check_information_flow` logic is verified against the `Flow.lean` model (see `ROADMAP.md`). As with Phase A/B, Kani verification for these functions is currently unsupported on native Windows and must be run via Linux-based CI or WSL.
+3. **Type System Enforcement**: The static type system is enforced at load time by `parser::typecheck::check_types` and dynamically evaluated by `core::types::eval::check_type`. This enforcement is modeled and proved in Lean via `evalE_preservation_lit`, `evalE_preservation_var`, and the `T4_type_soundness_lit` blueprint.
