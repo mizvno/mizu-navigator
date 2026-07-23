@@ -1,2 +1,3 @@
 layout
     window "Hello, Mizu!"
+        text "Hello, Mizu!"

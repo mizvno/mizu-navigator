@@ -394,10 +394,17 @@ fn parse_primitive_and_attrs(
         .map_err(|e| MizuError::ParseError(format!("line {line_num}: {e}")))?;
 
     // For Text nodes, store inline text directly in "content" attribute (no child node).
+    // For Window, inline text sets the OS window title (not visible page content) —
+    // an explicit `title="..."` attribute, if present, wins over the positional form.
     // For other primitives, the inline_text is returned to the caller which will create a child.
     let child_inline_text = if primitive == Primitive::Text {
         if let Some(text) = inline_text {
             attributes.insert("content".to_string(), text);
+        }
+        None
+    } else if primitive == Primitive::Window {
+        if let Some(text) = inline_text {
+            attributes.entry("title".to_string()).or_insert(text);
         }
         None
     } else {
@@ -996,20 +1003,19 @@ mod tests {
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let root = tree.root();
         assert_eq!(root.value().primitive, Primitive::Window);
-        // "Mizu App" is now a child Text node
-        let window_text_child = root
-            .children()
-            .find(|n| n.value().primitive == Primitive::Text);
+        // "Mizu App" sets the OS window title attribute, not a visible child node.
         assert_eq!(
-            window_text_child
-                .and_then(|n| n.value().attributes.get("content"))
-                .map(|s| s.as_str()),
+            root.value().attributes.get("title").map(|s| s.as_str()),
             Some("Mizu App")
         );
+        assert!(
+            !root
+                .children()
+                .any(|n| n.value().primitive == Primitive::Text),
+            "window's inline text must not create a visible child Text node"
+        );
 
-        let mut children = root
-            .children()
-            .filter(|n| n.value().primitive != Primitive::Text);
+        let mut children = root.children();
         let box_node = children.next().unwrap();
         assert_eq!(box_node.value().primitive, Primitive::Box);
         assert_eq!(
@@ -1047,6 +1053,29 @@ mod tests {
             Some(&EventBlock::Click {
                 action: parse_action("Redirect(\"/home\")", &mut StringInterner::new()).unwrap()
             })
+        );
+    }
+
+    #[test]
+    fn window_inline_text_sets_title_attribute_and_no_visible_child() {
+        let layout = "\n    window \"Hello, Mizu!\"\n";
+        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
+        let root = tree.root();
+        assert_eq!(
+            root.value().attributes.get("title").map(|s| s.as_str()),
+            Some("Hello, Mizu!")
+        );
+        assert_eq!(root.children().count(), 0);
+    }
+
+    #[test]
+    fn window_explicit_title_attribute_wins_over_inline_text() {
+        let layout = "\n    window \"Positional\" title \"Explicit\"\n";
+        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
+        let root = tree.root();
+        assert_eq!(
+            root.value().attributes.get("title").map(|s| s.as_str()),
+            Some("Explicit")
         );
     }
 

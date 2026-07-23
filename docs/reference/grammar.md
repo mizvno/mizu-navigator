@@ -354,6 +354,15 @@ conditional_class
 **Constraints:**
 
 - First non-empty line must be `window`; other roots produce `ParseError`.
+- **`window`'s inline text is the one exception to `inline_text` becoming a
+  visible child node.** For every other primitive, `box "..."`, `button
+  "..."`, `text "..."`, etc., the quoted string is sugar for an implicit
+  child `text` node. `window "..."`, instead, sets the OS window `title`
+  attribute directly and produces **no** child node — it is metadata about
+  the window, not page content. An explicit `title="..."` attribute, if also
+  given, takes precedence over the positional string. A bare `window "X"`
+  with no other children therefore opens a window titled `X` with a blank
+  page — add an explicit `text`/`box` child for visible content.
 - `each` inside another `each` is `ParseError`.
 - Absolute URLs (`mizu://`, `http://`, `https://`) in `image src` → `ParseError`, unconditionally (regardless of whether a `urls` registry was supplied).
 - `image src` starting with `file://` is `ParseError` when the document is remote-origin (`is_remote_origin = true`).

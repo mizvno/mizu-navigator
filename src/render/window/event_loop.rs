@@ -133,6 +133,9 @@ pub fn run_window_loop(
         ));
     }
 
+    // `window "..."`'s inline text is stored here as the `title` attribute
+    // (parser::layout::parse_primitive_and_attrs) — it sets the OS window
+    // title only and is never rendered as page content.
     let title = root_node
         .attributes
         .get("title")

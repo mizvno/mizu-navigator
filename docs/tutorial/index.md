@@ -13,12 +13,19 @@ Every Mizu document needs at least a `layout` block with a `window` root node.
 ```
 layout
     window "Hello, Mizu!"
+        text "Hello, Mizu!"
 ```
 
 **What this does:**
 - `layout` — starts the layout block (zero-indent keyword).
 - `window "Hello, Mizu!"` — the single required root node.  The quoted string
-  is inline text, rendered as a child `text` node automatically.
+  sets the OS window title only — it is **not** rendered as page content.
+  (This is different from every other primitive: `box "..."`, `button "..."`,
+  etc. all turn their inline string into a visible child `text` node. `window`
+  is the one exception, since its string is metadata about the window, not
+  document content.)
+- `text "Hello, Mizu!"` — the actual visible content; without an explicit
+  `text`/`box` child, the window would open with a title but a blank page.
 
 Save this as `hello.mizu` and open it with the navigator.
 
