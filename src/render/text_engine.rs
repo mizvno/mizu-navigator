@@ -123,7 +123,7 @@ pub fn calculate_node_text(
     };
 
     let mut font_size = 16.0f32;
-    let mut text_color = vello::peniko::Color::WHITE;
+    let mut text_color = vello::peniko::Color::BLACK;
 
     let mut merged = StyleRules::default();
     let tag_name = mizu_node.primitive.as_str();

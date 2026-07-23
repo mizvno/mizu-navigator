@@ -487,7 +487,7 @@ pub fn paint_node(
         && let Some(text) = mizu_node.attributes.get("content")
     {
         let mut font_size = 16.0f32;
-        let mut text_color = Color::WHITE;
+        let mut text_color = Color::BLACK;
 
         if let Some(fs) = merged.font_size {
             font_size = fs;
@@ -603,7 +603,7 @@ pub fn paint_node(
     // ── Paint input text and cursor ──────────────────────────────────────────
     if mizu_node.primitive == Primitive::Input {
         let mut font_size = 16.0f32;
-        let mut text_color = Color::WHITE;
+        let mut text_color = Color::BLACK;
 
         if let Some(fs) = merged.font_size {
             font_size = fs;
