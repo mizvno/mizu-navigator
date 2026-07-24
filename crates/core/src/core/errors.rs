@@ -106,6 +106,7 @@ pub enum MizuError {
     /// instead of scraping formatted error strings.  The `#[from]` attribute
     /// auto-generates `From<ResolveError> for MizuError`, enabling `?` propagation
     /// in async DNS call sites without losing type information.
+    #[cfg(not(kani))]
     #[error("DNS error: {0}")]
     DnsError(#[from] hickory_resolver::error::ResolveError),
 
