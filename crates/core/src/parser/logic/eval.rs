@@ -284,72 +284,73 @@ pub(crate) fn check_type(
     Ok(())
 }
 
+// # Why this module is small, and what it deliberately does not attempt
+//
+// `Value` and `ValueType` are self-referential enums (`Value::List(Arc<Vec<Value>>)`,
+// `ValueType::List(Box<ValueType>)`, etc). An earlier version of this module built
+// arbitrary instances with a recursive `any_value(depth)`/`any_value_type(depth)`
+// generator that picked among *all* of a type's own variants via `kani::any()`,
+// including the recursive ones. That does not scale in CBMC — it failed to
+// complete even at `depth == 0`, i.e. even when the generator could only ever
+// produce a `Null`/`Bool`/`Int`/`String` leaf, never the recursive payload.
+//
+// Bisecting against a minimal throwaway crate (outside this repo) isolated the
+// triggers precisely, and there turn out to be several independent ones, not one:
+//
+//   1. `kani::any()`-driven branching that selects among a self-referential
+//      enum's *own* variants (e.g. `match kani::any::<u8>() % N { .. Num, .. Str
+//      .. }` where the match's result type is the recursive enum itself) hangs,
+//      even restricted to non-recursive leaf variants.
+//   2. Any code path that calls `.to_string()` on a `ValueType` — i.e.
+//      `check_type`'s *error* path, which formats `expected` into the returned
+//      `MizuError::TypeError` — hangs. Confirmed with a clean, isolated 4-minute
+//      run that never completed. `ValueType`'s `Display` impl is itself
+//      recursive-shaped (it has match arms that recurse into nested `List`/
+//      `Record`/`Nullable` payloads), and CBMC's cost for it appears to hold
+//      regardless of which concrete variant is actually being formatted.
+//   3. Constructing two or more separate instances of a recursive-payload type
+//      in the same harness (confirmed independent of both of the above).
+//
+// Given that, only harnesses with a *fixed* (compile-time-known) top-level
+// shape, a *single* instance of the recursive type, symbolic content restricted
+// to *primitives* (`bool`/`i64`), and a code path that stays on `check_type`'s
+// success side (never touches the `.to_string()` error path) verify in well
+// under a second. The three below are exactly that — real, useful, and fast.
+//
+// What this does **not** cover: `check_type`'s error paths, its `List`/`Record`/
+// `Nullable` recursion cases, and anything in `parser::typecheck`'s `infer` are
+// all left unattempted here. This is not a gap left by oversight: every harness
+// attempted for those (including, for `infer`, the *original*, fully-concrete,
+// zero-`kani::any()` harness that predates today's investigation) failed to
+// complete even after 3+ minutes in isolation. Getting there would need either
+// a substantially different verification strategy for `Value`/`ValueType`/`Expr`
+// (e.g. a `cfg(kani)`-only non-recursive shadow representation, engineered and
+// validated on its own), or is simply better served by the project's existing
+// Lean 4 development (`formal/`), which does structural induction over
+// recursive types natively — exactly what CBMC's bounded model checking is
+// fighting against here. T4 (Type Soundness) stays "Open" in `RESULTS.md`
+// pending that larger piece of work; these three harnesses are a real but
+// modest down payment on it, not a substitute for it.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
+    use std::sync::Arc;
 
-    fn any_value_type(depth: usize) -> ValueType {
-        if depth == 0 {
-            match kani::any::<u8>() % 3 {
-                0 => ValueType::Num,
-                1 => ValueType::Str,
-                _ => ValueType::Bool,
-            }
-        } else {
-            match kani::any::<u8>() % 6 {
-                0 => ValueType::Num,
-                1 => ValueType::Str,
-                2 => ValueType::Bool,
-                3 => ValueType::List(Box::new(any_value_type(depth - 1))),
-                4 => {
-                    let mut fields = Vec::new();
-                    if kani::any::<bool>() {
-                        fields.push(("f".into(), any_value_type(depth - 1)));
-                    }
-                    ValueType::Record(fields)
-                }
-                _ => ValueType::Nullable(Box::new(any_value_type(depth - 1))),
-            }
-        }
-    }
-
-    fn any_value(depth: usize) -> Value {
-        if depth == 0 {
-            match kani::any::<u8>() % 4 {
-                0 => Value::Null,
-                1 => Value::Bool(kani::any()),
-                2 => Value::Int(kani::any()),
-                _ => Value::String(String::new().into()),
-            }
-        } else {
-            match kani::any::<u8>() % 6 {
-                0 => Value::Null,
-                1 => Value::Bool(kani::any()),
-                2 => Value::Int(kani::any()),
-                3 => Value::String(String::new().into()),
-                4 => {
-                    let mut list = Vec::new();
-                    if kani::any::<bool>() {
-                        list.push(any_value(depth - 1));
-                    }
-                    Value::List(std::sync::Arc::new(list))
-                }
-                _ => {
-                    let mut fields = Vec::new();
-                    if kani::any::<bool>() {
-                        fields.push(("f".into(), any_value(depth - 1)));
-                    }
-                    Value::Record(fields.into())
-                }
-            }
-        }
+    #[kani::proof]
+    fn check_type_int_matches_num() {
+        let n: i64 = kani::any();
+        assert!(check_type(&Value::Int(n), &ValueType::Num, "f", "p").is_ok());
     }
 
     #[kani::proof]
-    #[kani::unwind(4)]
-    fn check_type_does_not_panic() {
-        let val = any_value(2);
-        let ty = any_value_type(2);
-        let _ = check_type(&val, &ty, "f", "p");
+    fn check_type_bool_matches_bool() {
+        let b: bool = kani::any();
+        assert!(check_type(&Value::Bool(b), &ValueType::Bool, "f", "p").is_ok());
+    }
+
+    #[kani::proof]
+    fn check_type_string_matches_str() {
+        let val = Value::String(Arc::from("x"));
+        assert!(check_type(&val, &ValueType::Str, "f", "p").is_ok());
     }
 }

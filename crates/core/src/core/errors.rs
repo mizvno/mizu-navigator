@@ -127,7 +127,8 @@ pub enum MizuError {
     ///
     /// The inner [`Vec`] contains every individual error found; the caller can
     /// inspect them all rather than being forced to fix-and-reparse repeatedly.
-    #[error("{} parse error(s):\n{}", .0.len(), .0.iter().enumerate().map(|(i, e)| format!("  {}. {e}", i + 1)).collect::<Vec<_>>().join("\n"))]
+    #[cfg_attr(not(kani), error("{} parse error(s):\n{}", .0.len(), .0.iter().enumerate().map(|(i, e)| format!("  {}. {e}", i + 1)).collect::<Vec<_>>().join("\n")))]
+    #[cfg_attr(kani, error("multiple parse errors"))]
     MultipleErrors(Vec<MizuError>),
 }
 
