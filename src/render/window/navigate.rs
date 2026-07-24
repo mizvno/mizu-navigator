@@ -194,6 +194,18 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                 url.starts_with("mizu://"),
             ) {
                 Ok(dom) => {
+                    // Check Static Types (Phase B)
+                    if let Err(e) = crate::parser::typecheck::check_types(
+                        &dom,
+                        &new_root_timers,
+                        &logic_fns,
+                        &new_computed,
+                        &new_interner,
+                    ) {
+                        tracing::error!(error = ?e, "static type check error");
+                        return; // Reject document load
+                    }
+
                     // Check Information Flow (Invariant F)
                     match crate::parser::flow::check_information_flow(
                         &dom,

@@ -29,8 +29,8 @@
 )]
 #![warn(missing_docs)]
 
-pub mod core;
+pub use mizu_core::core;
+pub use mizu_core::parser;
 /// Networking subsystem
 pub mod network;
-pub mod parser;
 pub mod render;

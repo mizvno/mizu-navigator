@@ -376,43 +376,94 @@ fn parse_function_block(
 /// Supported types: `num`, `string`/`str`, `bool`, `list`.
 /// Writing `dict`, `record`, or `any` produces a `ParseError` (use an
 /// unannotated parameter instead).
+fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result<ValueType, String> {
+    let mut base_type = match cursor.next() {
+        Some(Token::Ident(name)) => match name.to_lowercase().as_str() {
+            "num" | "number" => ValueType::Num,
+            "string" | "str" => ValueType::Str,
+            "bool" | "boolean" => ValueType::Bool,
+            "list" => {
+                match cursor.next() {
+                    Some(Token::Lt) => {},
+                    other => return Err(format!("expected `<` after `list`, got {other:?}")),
+                }
+                let inner = parse_type(cursor, _interner)?;
+                match cursor.next() {
+                    Some(Token::Gt) => {},
+                    other => return Err(format!("expected `>` after list type, got {other:?}")),
+                }
+                ValueType::List(Box::new(inner))
+            }
+            "record" => {
+                match cursor.next() {
+                    Some(Token::LBrace) => {},
+                    other => return Err(format!("expected `{{` after `record`, got {other:?}")),
+                }
+                let mut fields = Vec::new();
+                while !matches!(cursor.peek(), Some(Token::RBrace) | None) {
+                    let field_name: std::sync::Arc<str> = match cursor.next() {
+                        Some(Token::Ident(n)) => std::sync::Arc::from(n.as_str()),
+                        other => return Err(format!("expected field name, got {other:?}")),
+                    };
+                    match cursor.next() {
+                        Some(Token::Colon) => {},
+                        other => return Err(format!("expected `:` after field name, got {other:?}")),
+                    }
+                    let field_type = parse_type(cursor, _interner)?;
+                    fields.push((field_name, field_type));
+                    if matches!(cursor.peek(), Some(Token::Comma)) {
+                        cursor.next();
+                    }
+                }
+                match cursor.next() {
+                    Some(Token::RBrace) => {},
+                    other => return Err(format!("expected `}}` after record fields, got {other:?}")),
+                }
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                ValueType::Record(fields)
+            }
+            "dict" | "any" => return Err(format!("type `{}` is not supported; use: num, string, bool, list<T>, record{{...}}, or T?", name)),
+            other => return Err(format!("unknown type `{other}`; valid types: num, string, bool, list<T>, record{{...}}, or T?")),
+        },
+        other => return Err(format!("expected type name, got {other:?}")),
+    };
+    if matches!(cursor.peek(), Some(Token::Question)) {
+        cursor.next();
+        base_type = ValueType::Nullable(Box::new(base_type));
+    }
+    Ok(base_type)
+}
+
 fn parse_params(
     param_str: &str,
     _context: &str,
     interner: &mut StringInterner,
-) -> Result<Vec<(Symbol, Option<ValueType>)>, MizuError> {
+) -> Result<Vec<(Symbol, ValueType)>, MizuError> {
     let mut params = Vec::new();
     if param_str.trim().is_empty() {
         return Ok(params);
     }
-    for part in param_str.split(',') {
-        let part = part.trim();
-        let (name, vtype) = if let Some(colon) = part.find(':') {
-            let name = part[..colon].trim();
-            let type_str = part[colon + 1..].trim();
-            let vtype = match type_str.to_lowercase().as_str() {
-                "num" | "number" => ValueType::Num,
-                "string" | "str" => ValueType::Str,
-                "bool" | "boolean" => ValueType::Bool,
-                "list" => ValueType::List,
-                "dict" | "record" | "any" => {
-                    return Err(MizuError::ParseError(format!(
-                        "type `{type_str}` is not supported; use: num, string, bool, list"
-                    )));
-                }
-                other => {
-                    return Err(MizuError::ParseError(format!(
-                        "unknown type `{other}` for parameter `{name}`; \
-                         valid types: num, string, bool, list"
-                    )));
-                }
-            };
-            (name, Some(vtype))
-        } else {
-            (part, None)
+    let tokens = lex(param_str)?;
+    let mut cursor = Cursor::new(&tokens);
+    
+    while !matches!(cursor.peek(), None | Some(Token::Newline)) {
+        let name = match cursor.next() {
+            Some(Token::Ident(n)) => n.clone(),
+            other => return Err(MizuError::ParseError(format!("expected parameter name, got {other:?}"))),
         };
-        let sym = interner.get_or_intern(name);
-        params.push((sym, vtype));
+        match cursor.next() {
+            Some(Token::Colon) => {},
+            _other => {
+                let fn_name = _context.split('(').next().unwrap_or(_context).trim();
+                return Err(MizuError::ParseError(format!("function `{}`: parameter `{}` requires a type annotation", fn_name, name)));
+            }
+        }
+        let vtype = parse_type(&mut cursor, interner).map_err(MizuError::ParseError)?;
+        params.push((interner.get_or_intern(&name), vtype));
+        
+        if matches!(cursor.peek(), Some(Token::Comma)) {
+            cursor.next();
+        }
     }
     Ok(params)
 }
@@ -560,8 +611,8 @@ fn looks_like_binding(line: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use mizu::parser::logic::parse_logic;
-/// use mizu::core::types::StringInterner;
+/// use mizu_core::parser::logic::parse_logic;
+/// use mizu_core::core::types::StringInterner;
 /// let src = "    vat(p: num) : p * 1.22\n";
 /// let mut interner = StringInterner::new();
 /// let fns = parse_logic(src, &mut interner).unwrap();

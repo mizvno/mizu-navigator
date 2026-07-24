@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/core"]
+
 [package]
 name = "mizu-navigator"
 version = "0.1.0"
@@ -12,6 +15,7 @@ name = "mizu"
 path = "src/lib.rs"
 
 [dependencies]
+mizu-core = { path = "crates/core" }
 thiserror = "2"
 nom = "7.1.3"
 tracing = "0.1.44"

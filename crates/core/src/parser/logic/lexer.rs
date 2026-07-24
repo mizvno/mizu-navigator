@@ -17,6 +17,10 @@ pub(super) enum Token {
     LParen,
     /// `)`
     RParen,
+    /// `{`
+    LBrace,
+    /// `}`
+    RBrace,
     /// `,`
     Comma,
     /// `:`
@@ -231,6 +235,8 @@ fn lex_line(content: &str, out: &mut Vec<Token>, line_num: usize) -> Result<(), 
             (b'>', _) => (Token::Gt, 1),
             (b'(', _) => (Token::LParen, 1),
             (b')', _) => (Token::RParen, 1),
+            (b'{', _) => (Token::LBrace, 1),
+            (b'}', _) => (Token::RBrace, 1),
             (b',', _) => (Token::Comma, 1),
             (b':', _) => (Token::Colon, 1),
             (b'+', _) => (Token::Plus, 1),
@@ -284,6 +290,8 @@ fn token_display(tok: &Token) -> String {
         Token::Bool(b) => format!("`{b}`"),
         Token::LParen => "`(`".to_owned(),
         Token::RParen => "`)`".to_owned(),
+        Token::LBrace => "`{`".to_owned(),
+        Token::RBrace => "`}`".to_owned(),
         Token::Comma => "`,`".to_owned(),
         Token::Colon => "`:`".to_owned(),
         Token::Eq => "`=`".to_owned(),
