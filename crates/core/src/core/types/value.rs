@@ -7,8 +7,11 @@ use crate::core::errors::MizuError;
 
 use super::eval::MAX_EVAL_DEPTH;
 
-/// The scale factor used for fixed-point arithmetic.
-pub const DECIMAL_SCALE: i64 = 10_000;
+/// The scale factor used for fixed-point arithmetic: 8 decimal digits of
+/// precision. An `i64` holding a value scaled by this factor can represent
+/// magnitudes up to `i64::MAX / DECIMAL_SCALE`, i.e. roughly
+/// `±92,233,720,368.54775807`.
+pub const DECIMAL_SCALE: i64 = 100_000_000;
 
 /// The set of all primitive values in the Mizu type system.
 #[derive(Debug, Clone)]
@@ -69,7 +72,7 @@ impl fmt::Display for Value {
                 if fractional_part == 0 {
                     write!(f, "{}", integer_part)
                 } else {
-                    let mut frac_str = format!("{:04}", fractional_part);
+                    let mut frac_str = format!("{:08}", fractional_part);
                     frac_str = frac_str.trim_end_matches('0').to_string();
                     if *i < 0 && integer_part == 0 {
                         write!(f, "-{}.{}", integer_part, frac_str)

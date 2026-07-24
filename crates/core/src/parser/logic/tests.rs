@@ -56,7 +56,8 @@
         assert!(fns.contains_key(&pi_sym));
         let f = &fns[&pi_sym];
         assert!(f.params.is_empty());
-        assert_eq!(f.body, Expr::Literal(Value::Int(31416)));
+        // 3.14159 * DECIMAL_SCALE, rounded.
+        assert_eq!(f.body, Expr::Literal(Value::Int(314_159_000)));
     }
 
     #[test]
@@ -282,26 +283,34 @@
 
     #[test]
     fn evaluate_multiplication() {
+        // 6 * 7 = 42
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(60_000))),
+            left: Box::new(Expr::Literal(Value::Int(6 * crate::core::types::DECIMAL_SCALE))),
             op: BinOp::Mul,
-            right: Box::new(Expr::Literal(Value::Int(70_000))),
+            right: Box::new(Expr::Literal(Value::Int(7 * crate::core::types::DECIMAL_SCALE))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(420_000));
+        assert_eq!(
+            evaluate(&expr, &store, &fns).unwrap(),
+            Value::Int(42 * crate::core::types::DECIMAL_SCALE)
+        );
     }
 
     #[test]
     fn evaluate_division() {
+        // 15 / 3 = 5
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(150_000))),
+            left: Box::new(Expr::Literal(Value::Int(15 * crate::core::types::DECIMAL_SCALE))),
             op: BinOp::Div,
-            right: Box::new(Expr::Literal(Value::Int(30_000))),
+            right: Box::new(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE))),
         };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(50_000));
+        assert_eq!(
+            evaluate(&expr, &store, &fns).unwrap(),
+            Value::Int(5 * crate::core::types::DECIMAL_SCALE)
+        );
     }
 
     #[test]
@@ -375,7 +384,7 @@
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &store, &fns).unwrap();
         // netto = 10 * 3 = 30, result = 30 * 1.22 = 36.6
-        assert_eq!(result, Value::Int(366_000));
+        assert_eq!(result, Value::Int(3_660_000_000));
     }
 
     #[test]
@@ -666,7 +675,10 @@
         let action = parse_action("count = count + 1", &mut StringInterner::new()).unwrap();
         let mutated = execute_action(&action, &mut store, &functions).unwrap();
         assert!(mutated);
-        assert_eq!(*store.get("count").unwrap(), Value::Int(20_000));
+        assert_eq!(
+            *store.get("count").unwrap(),
+            Value::Int(10_000 + crate::core::types::DECIMAL_SCALE)
+        );
     }
 
     #[test]
@@ -1842,12 +1854,52 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn apply_binop_mul_overflow() {
+        // With i128-widened intermediates, `i64::MAX * 2` no longer overflows
+        // the multiply step itself (i128 comfortably holds it) — only the
+        // final narrowing back to i64 can fail, and only when the *true*
+        // result doesn't fit. `i64::MAX * i64::MAX` genuinely doesn't fit.
         let mut ic = 0u64;
-        let result = super::apply_binop(&BinOp::Mul, Value::Int(i64::MAX), Value::Int(2), &mut ic);
+        let result = super::apply_binop(&BinOp::Mul, Value::Int(i64::MAX), Value::Int(i64::MAX), &mut ic);
         assert!(
             matches!(result, Err(MizuError::ExecutionError(_))),
-            "expected ExecutionError for i64::MAX * 2, got: {result:?}"
+            "expected ExecutionError for i64::MAX * i64::MAX, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn apply_binop_mul_i128_widening_avoids_collapsed_range() {
+        // Real-valued 1000 * 1000 = 1,000,000. At the old i64-only
+        // "checked_mul(l, r) before dividing by DECIMAL_SCALE" shape, the raw
+        // scaled product `(1000 * DECIMAL_SCALE) * (1000 * DECIMAL_SCALE)`
+        // overflows i64 at this scale even though both operands and the true
+        // result comfortably fit i64. The i128-widened implementation must
+        // succeed here with the exact expected value — this is the test that
+        // proves the wider scale's range is actually usable, not just wider
+        // on paper.
+        let mut ic = 0u64;
+        let scale = crate::core::types::DECIMAL_SCALE;
+        let l = 1_000 * scale;
+        let r = 1_000 * scale;
+        // Sanity-check the premise: the old i64-only shape would have overflowed here.
+        assert!(l.checked_mul(r).is_none(), "premise broken: raw product no longer overflows i64 — pick larger operands");
+        let result = super::apply_binop(&BinOp::Mul, Value::Int(l), Value::Int(r), &mut ic).unwrap();
+        assert_eq!(result, Value::Int(1_000_000 * scale));
+    }
+
+    #[test]
+    fn apply_binop_div_i128_widening_avoids_collapsed_range() {
+        // Real-valued 1,000,000 / 1,000 = 1,000. At the old i64-only
+        // "checked_mul(l, DECIMAL_SCALE) before dividing by r" shape, the raw
+        // numerator `(1_000_000 * DECIMAL_SCALE) * DECIMAL_SCALE` overflows
+        // i64 at this scale even though the true result fits comfortably.
+        let mut ic = 0u64;
+        let scale = crate::core::types::DECIMAL_SCALE;
+        let l = 1_000_000 * scale;
+        let r = 1_000 * scale;
+        // Sanity-check the premise: the old i64-only shape would have overflowed here.
+        assert!(l.checked_mul(scale).is_none(), "premise broken: raw numerator no longer overflows i64 — pick a larger operand");
+        let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic).unwrap();
+        assert_eq!(result, Value::Int(1_000 * scale));
     }
 
     #[test]

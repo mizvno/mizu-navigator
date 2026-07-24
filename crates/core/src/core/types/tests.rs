@@ -53,14 +53,14 @@
 
     #[test]
     fn list_display_single_element() {
-        let v = Value::List(std::sync::Arc::new(vec![Value::Int(10_000)]));
+        let v = Value::List(std::sync::Arc::new(vec![Value::Int(super::DECIMAL_SCALE)]));
         assert_eq!(v.to_string(), "[1]");
     }
 
     #[test]
     fn list_display_multiple_elements() {
         let v = Value::List(std::sync::Arc::new(vec![
-            Value::Int(10_000),
+            Value::Int(super::DECIMAL_SCALE),
             Value::String(std::sync::Arc::from("two")),
             Value::Bool(false),
         ]));
@@ -70,10 +70,10 @@
     #[test]
     fn list_display_nested() {
         let inner = Value::List(std::sync::Arc::new(vec![
-            Value::Int(20_000),
-            Value::Int(30_000),
+            Value::Int(2 * super::DECIMAL_SCALE),
+            Value::Int(3 * super::DECIMAL_SCALE),
         ]));
-        let outer = Value::List(std::sync::Arc::new(vec![Value::Int(10_000), inner]));
+        let outer = Value::List(std::sync::Arc::new(vec![Value::Int(super::DECIMAL_SCALE), inner]));
         assert_eq!(outer.to_string(), "[1, [2, 3]]");
     }
 
@@ -262,7 +262,7 @@
     fn json_object_becomes_record() {
         let json: serde_json::Value = serde_json::from_str(r#"{"id":1,"name":"Neko"}"#).unwrap();
         let val = from_json(&json).unwrap();
-        assert_eq!(val.get_field("id"), Some(&Value::Int(10_000)));
+        assert_eq!(val.get_field("id"), Some(&Value::Int(super::DECIMAL_SCALE)));
         assert_eq!(
             val.get_field("name"),
             Some(&Value::String(Arc::from("Neko")))
@@ -310,13 +310,13 @@
     #[test]
     fn json_integer_becomes_value_int() {
         let val = from_json(&serde_json::json!(42)).unwrap();
-        assert_eq!(val, Value::Int(420_000));
+        assert_eq!(val, Value::Int(42 * super::DECIMAL_SCALE));
     }
 
     #[test]
     fn json_float_becomes_value_int() {
         let val = from_json(&serde_json::json!(3.14)).unwrap();
-        assert_eq!(val, Value::Int(31_400));
+        assert_eq!(val, Value::Int(314_000_000));
     }
 
     #[test]
@@ -383,7 +383,11 @@
             Value::List(v) => &v[0],
             other => panic!("level 2 must be List: {other:?}"),
         };
-        assert_eq!(*leaf, Value::Int(420_000), "leaf must be Int(420_000)");
+        assert_eq!(
+            *leaf,
+            Value::Int(42 * super::DECIMAL_SCALE),
+            "leaf must be Int(42 * DECIMAL_SCALE)"
+        );
     }
 
     #[test]
