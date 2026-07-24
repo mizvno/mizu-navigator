@@ -163,9 +163,15 @@ const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 /// Mapping:
 /// * `null` → [`Value::Null`]
 /// * `bool` → [`Value::Bool`]
-/// * number (integer or floating-point — `Value` has no separate
-///   floating-point variant) → [`Value::Int`], scaled by `DECIMAL_SCALE`
-///   and rounded to the nearest fixed-point value
+/// * number → [`Value::Int`], scaled by `DECIMAL_SCALE` (`Value` has no
+///   separate floating-point variant). Integer literals (no `.` or
+///   exponent in the source) take an exact `checked_mul` path. Fractional
+///   literals go through `f64`, which carries only ~15-17 significant
+///   decimal digits — insufficient to exactly represent every value in
+///   this type's range (an 11-digit integer part plus 8 fractional digits
+///   is up to ~19 significant digits), so a fractional literal near the
+///   top of the representable range may round to the nearest `f64`-exact
+///   neighbor rather than its exact decimal value.
 /// * string → [`Value::String`]
 /// * array → [`Value::List`] (elements converted recursively, depth-bounded)
 /// * object → [`Value::Record`] (values converted recursively, depth-bounded)
@@ -176,7 +182,9 @@ const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 /// than [`MAX_JSON_DEPTH`], rather than silently truncating the payload to
 /// [`Value::Null`]. A malicious deeply-nested payload must be rejected
 /// outright — truncation would let a caller mistake attacker-controlled data
-/// for a legitimate absence of a value.
+/// for a legitimate absence of a value. Also returns
+/// [`MizuError::SecurityViolation`] if a JSON number's scaled value doesn't
+/// fit in `i64`, rather than silently truncating or wrapping it.
 pub fn from_json(json: &serde_json::Value) -> Result<Value, MizuError> {
     from_json_bounded(json, 0)
 }
@@ -191,9 +199,32 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
         serde_json::Value::Null => Ok(Value::Null),
         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
         serde_json::Value::Number(n) => {
-            let float_val = n.as_f64().unwrap_or(0.0);
-            let scaled = (float_val * (DECIMAL_SCALE as f64)).round() as i64;
-            Ok(Value::Int(scaled))
+            // Integer JSON literals take an exact path: `checked_mul` either
+            // produces the exact scaled value or fails cleanly on overflow,
+            // never silently truncating. Fractional literals still go
+            // through `f64`, whose ~15-17 significant decimal digits cannot
+            // exactly represent every value in this type's range (an
+            // 11-digit integer part plus 8 fractional digits is up to ~19
+            // significant digits) — this is a real precision boundary, not
+            // an oversight, so overflow/non-finite results are rejected
+            // rather than silently rounded to a nearby-but-wrong value.
+            if let Some(i) = n.as_i64() {
+                return i.checked_mul(DECIMAL_SCALE).map(Value::Int).ok_or_else(|| {
+                    MizuError::SecurityViolation(
+                        "JSON number exceeds representable range".to_string(),
+                    )
+                });
+            }
+            let float_val = n
+                .as_f64()
+                .ok_or_else(|| MizuError::SecurityViolation("JSON number could not be parsed".to_string()))?;
+            let scaled = (float_val * (DECIMAL_SCALE as f64)).round();
+            if !scaled.is_finite() || scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
+                return Err(MizuError::SecurityViolation(
+                    "JSON number exceeds representable range".to_string(),
+                ));
+            }
+            Ok(Value::Int(scaled as i64))
         }
         serde_json::Value::String(s) => Ok(Value::String(Arc::from(s.as_str()))),
         serde_json::Value::Array(arr) => {
@@ -219,11 +250,12 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
 /// Mapping (inverse of [`from_json`]):
 /// * [`Value::Null`]    → `null`
 /// * [`Value::Bool`]   → `bool`
-/// * [`Value::Int`]    → `number` (unscaled by `DECIMAL_SCALE` back to a
-///   JSON float — `Value` has no floating-point variant of its own; the
-///   fixed-point `Int` representation stands in for both integers and
-///   floats. Falls back to `null` if the unscaled value isn't finite,
-///   which `serde_json::Number` cannot represent.)
+/// * [`Value::Int`]    → `number` (unscaled by `DECIMAL_SCALE` — `Value` has
+///   no floating-point variant of its own; the fixed-point `Int`
+///   representation stands in for both integers and floats. A value that is
+///   a whole number at this scale emits an exact JSON integer; otherwise it
+///   unscales through `f64` and falls back to `null` if the result isn't
+///   finite, which `serde_json::Number` cannot represent.)
 /// * [`Value::String`] → `string`
 /// * [`Value::List`]   → `array` (elements converted recursively)
 /// * [`Value::Record`] → `object` (values converted recursively)
@@ -232,10 +264,18 @@ pub fn to_json(val: &Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Int(i) => {
-            let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
-            serde_json::Number::from_f64(unscaled)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
+            // Whole values take the exact integer path (mirrors from_json's
+            // exact path for whole-number JSON literals) instead of always
+            // dividing through f64, which cannot exactly represent every
+            // value in this type's range.
+            if i % DECIMAL_SCALE == 0 {
+                serde_json::Value::Number(serde_json::Number::from(i / DECIMAL_SCALE))
+            } else {
+                let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
+                serde_json::Number::from_f64(unscaled)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }
         },
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::List(items) => serde_json::Value::Array(items.iter().map(to_json).collect()),

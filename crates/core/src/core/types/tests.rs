@@ -1,6 +1,6 @@
     use super::{
         StateMachine, StringInterner, Value, VariableStore, compare_values, field_value, from_json,
-        variant_weight, Symbol,
+        to_json, variant_weight, Symbol,
     };
     use crate::core::errors::MizuError;
     use std::collections::HashMap;
@@ -317,6 +317,38 @@
     fn json_float_becomes_value_int() {
         let val = from_json(&serde_json::json!(3.14)).unwrap();
         assert_eq!(val, Value::Int(314_000_000));
+    }
+
+    #[test]
+    fn json_integer_exact_path_avoids_float_precision_loss() {
+        // A whole-number JSON literal near the top of the representable
+        // range must round-trip exactly via the checked_mul integer path,
+        // not lose precision the way dividing through f64 unconditionally
+        // used to.
+        let val = from_json(&serde_json::json!(92_233_720_368_i64)).unwrap();
+        assert_eq!(val, Value::Int(92_233_720_368 * super::DECIMAL_SCALE));
+    }
+
+    #[test]
+    fn json_integer_exceeding_range_is_rejected_not_truncated() {
+        let val = from_json(&serde_json::json!(i64::MAX));
+        assert!(
+            matches!(val, Err(MizuError::SecurityViolation(_))),
+            "expected SecurityViolation for a JSON integer whose scaled value overflows i64, got: {val:?}"
+        );
+    }
+
+    #[test]
+    fn json_roundtrip_exact_at_top_of_range() {
+        // i64::MAX is the largest representable scaled value: exactly
+        // 92233720368.54775807. Round-tripping it through to_json/from_json
+        // must recover the exact same Value::Int, pinning the from_json
+        // exact-integer path and to_json's exact-integer emission against
+        // silent precision loss at the top of the new 8-decimal-digit range.
+        let original = Value::Int(i64::MAX);
+        let json = to_json(&original);
+        let roundtripped = from_json(&json).unwrap();
+        assert_eq!(roundtripped, original);
     }
 
     #[test]
