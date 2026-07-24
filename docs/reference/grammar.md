@@ -93,12 +93,13 @@ num_literal = [ "-" ] digit { digit | "." } ;
 
 The lexer scans the literal into an `f64` (`Token::Num`), but **there is no
 runtime `Float` type** — `parse_expr` immediately scales every numeric
-literal by `DECIMAL_SCALE` (`10_000`), rounds it, and stores it as a single
-fixed-point `Value::Int(i64)`.  `4` and `4.0` are both `Value::Int`
-internally (`40000` and `40000` respectively, at 4 decimal digits of
-precision); there is no distinct `Value` variant that a literal's shape
-selects between.  See §3 of `semantics.md` ("Numeric Model") for the full
-fixed-point arithmetic model this feeds into.
+literal by `DECIMAL_SCALE` (`100_000_000`), rounds it, and stores it as a
+single fixed-point `Value::Int(i64)`.  `4` and `4.0` are both `Value::Int`
+internally (`Value::Int(400_000_000)` and `Value::Int(400_000_000)`
+respectively, at 8 decimal digits of precision); there is no distinct
+`Value` variant that a literal's shape selects between.  See §3 of
+`semantics.md` ("Numeric Model") for the full fixed-point arithmetic model
+this feeds into.
 
 ### String Literals
 

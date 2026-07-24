@@ -103,6 +103,32 @@ binary and runs the scenario on a thread built with the *same*
 literal), so the test tracks production's actual stack size if that constant
 ever changes.
 
+**E2 — Fixed-point numeric scale is not configurable:** `DECIMAL_SCALE`
+(`core::types::Value`, currently `100_000_000`, i.e. 8 decimal digits of
+precision) is a compile-time constant, not an environment-overridable
+setting or a per-document/per-type option. Every `Value::Int` a document
+ever produces or a storage write ever persists is scaled by whatever
+`DECIMAL_SCALE` was compiled into the binary that wrote it.
+
+*Rationale:* Unlike the runtime's other tunables (`MAX_INSTRUCTIONS`,
+storage quotas, response-body and image decode limits), `DECIMAL_SCALE` is
+not a budget — it is a data format. Two binaries built with different
+`DECIMAL_SCALE` values disagree on what raw `i64` `N` means (`N /
+DECIMAL_SCALE`), so a value written by one and read by the other is silently
+misinterpreted, not merely rejected or clamped. This is exactly the
+already-stored-data corruption risk `core::config`'s module doc calls out;
+making the scale runtime-configurable (env var, feature flag, per-document
+setting) would turn every already-written `redb` record into a landmine for
+whichever future binary reads it back. `Mul`/`Div`'s `i128`-widened
+intermediate arithmetic (see `formal/FIDELITY.md` §7) depends on this same
+constant being fixed at compile time — the overflow boundary it checks
+against is derived from it.
+
+*Source constructs:* `core::types::value::DECIMAL_SCALE`.
+
+*Enforcement:* **Compile-time** — a `const`, not read from environment or
+config at startup, unlike `MAX_INSTRUCTIONS` (`env_override`).
+
 ---
 
 ## 4. Storage Invariants
@@ -264,6 +290,7 @@ gate is a compile error.
 | N5 | Uniform lifecycle | Runtime | `src/render/window.rs` |
 | L1 | Layout budget | Runtime + Parse-time | `layout_bridge.rs`, `layout.rs` |
 | E1 | Bounded evaluator recursion | Runtime + stack-size margin | `types.rs` (`eval_depth`), `logic_worker.rs` (`STACK_SIZE_BYTES`) |
+| E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
 | S1 | Write-only storage | Code boundary | `types.rs` (no `read_local`) |
 | S2 | Debounced writes are eventually (not immediately) durable | Design boundary | `StorageWriteDebouncer` in `worker.rs` |
 | P1 | Purity in observation contexts | Parse-time | `find_effectful_call` in `logic.rs` |

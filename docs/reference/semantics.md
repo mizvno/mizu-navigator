@@ -67,7 +67,7 @@ Key properties:
 |---|---|---|
 | `null` | `Value::Null` | Absence of a value; default for unset globals |
 | `bool` | `Value::Bool(bool)` | `true` / `false` |
-| `num` | `Value::Int(i64)` | **The only numeric variant.** A fixed-point decimal: the `i64` holds the value scaled by `DECIMAL_SCALE` (`10_000`), giving 4 decimal digits of precision. There is no `Value::Float` — see §3. |
+| `num` | `Value::Int(i64)` | **The only numeric variant.** A fixed-point decimal: the `i64` holds the value scaled by `DECIMAL_SCALE` (`100_000_000`), giving 8 decimal digits of precision and a representable range of `±92,233,720,368.54775807`. There is no `Value::Float` — see §3. |
 | `string` | `Value::String(Arc<str>)` | UTF-8, reference-counted |
 | `list` | `Value::List(Arc<Vec<Value>>)` | Ordered, heterogeneous, reference-counted |
 | `record` | `Value::Record(Arc<[(Arc<str>, Value)]>)` | A reference-counted, **sorted slice** of key-value pairs (not a `BTreeMap`) — sorted ascending by key at construction time; field lookup is a binary search (`Value::get_field`) |
@@ -87,12 +87,13 @@ Key properties:
 the current implementation** — `Value` has no `Float` variant at all
 (corrected in the MNT-01 pass; see §2). Every numeric literal, regardless of
 whether it has a fractional part, becomes a single `Value::Int(i64)`
-holding the value scaled by `DECIMAL_SCALE = 10_000` (4 decimal digits of
-precision), rounded to the nearest representable value:
+holding the value scaled by `DECIMAL_SCALE = 100_000_000` (8 decimal digits
+of precision), rounded to the nearest representable value. The `i64` range
+this leaves for the integer part is `±92,233,720,368.54775807`:
 
-- `4` → `Value::Int(40_000)`
-- `4.5` → `Value::Int(45_000)`
-- `0.0001` → `Value::Int(1)` (the smallest representable non-zero magnitude)
+- `4` → `Value::Int(400_000_000)`
+- `4.5` → `Value::Int(450_000_000)`
+- `0.00000001` → `Value::Int(1)` (the smallest representable non-zero magnitude)
 
 Display formatting (`Value::Display`) reverses the scaling for output, so a
 document author never sees the raw scaled integer — `4` prints as `4`,
@@ -104,15 +105,24 @@ All four operators dispatch on `(BinOp, Value::Int, Value::Int)` — there is
 no separate float code path to select between:
 
 - **`+`, `-`:** `checked_add`/`checked_sub` on the scaled `i64` directly (scaling is additive-invariant, so no rescale is needed). Overflow → `MizuError::ExecutionError("integer overflow")`.
-- **`*`:** `checked_mul` on the two scaled values, then divided by `DECIMAL_SCALE` to undo the doubled scale. Overflow (of the pre-divide product) → `MizuError::ExecutionError("integer overflow")`.
-- **`/`:** the left operand is first scaled again (`l.saturating_mul(DECIMAL_SCALE)`) so the subsequent integer division preserves precision, then `checked_div` by the (unscaled) right operand. Division by zero → `MizuError::DivisionByZero`. Overflow of the pre-divide numerator, or a `checked_div` failure (e.g. `i64::MIN / -1`) → `MizuError::ExecutionError("integer overflow")`.
+- **`*`:** both scaled `i64` operands are widened to `i128` and multiplied (`i64 * i64` can never overflow `i128`), the product is divided by `DECIMAL_SCALE` to undo the doubled scale, and the `i128` result is narrowed back to `i64` with a checked conversion. Overflow (the true result not fitting `i64`) → `MizuError::ExecutionError("integer overflow")`.
+- **`/`:** the left operand is widened to `i128` and multiplied by `DECIMAL_SCALE` (again, this can never overflow `i128`) to preserve precision, then divided by the (unscaled) right operand and narrowed back to `i64` with a checked conversion. Division by zero → `MizuError::DivisionByZero`. Overflow (the true result not fitting `i64`), or a degenerate divide (e.g. `i64::MIN / -1`, which overflows at the `i128` narrowing step) → `MizuError::ExecutionError("integer overflow")`.
+
+  The `i128` widening matters once `DECIMAL_SCALE` is large: doing the
+  multiply/divide in `i64` (checking overflow only on the raw scaled
+  product/numerator, before dividing by `DECIMAL_SCALE`) would reject
+  perfectly ordinary results — at `DECIMAL_SCALE = 100_000_000`, an i64-only
+  implementation could only support real-valued products up to roughly
+  `i64::MAX / DECIMAL_SCALE²`, i.e. under `1000`. Widening to `i128` for the
+  intermediate step means only the *true* mathematical result's fit in `i64`
+  is checked, not an artifact of the scaled representation.
 
 ⚠ Every arithmetic result is always `Value::Int` — there is no whole-number
 check that selects a different output type the way the old
 `Int`-if-remainder-0 model implied. `4 / 2` and `5 / 2` both produce
-`Value::Int` (`20_000` and `12_500` respectively, i.e. `2` and `2.5` when
-displayed) — fixed-point division does not lose the fractional part the way
-truncating integer division would.
+`Value::Int` (`200_000_000` and `125_000_000` respectively, i.e. `2` and
+`2.5` when displayed) — fixed-point division does not lose the fractional
+part the way truncating integer division would.
 
 Non-numeric operands to an arithmetic operator → `MizuError::TypeError`.
 
