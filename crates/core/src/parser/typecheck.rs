@@ -279,7 +279,7 @@ mod tests {
 mod kani_proofs {
     use super::*;
     use crate::core::types::{Value, Symbol};
-    use crate::parser::logic::eval::check_type;
+    use crate::parser::logic::check_type;
 
     fn any_value_type(depth: usize) -> ValueType {
         if depth == 0 {
@@ -297,7 +297,7 @@ mod kani_proofs {
                 4 => {
                     let mut fields = Vec::new();
                     if kani::any::<bool>() {
-                        fields.push((Symbol(kani::any()), any_value_type(depth - 1)));
+                        fields.push(("f".into(), any_value_type(depth - 1)));
                     }
                     ValueType::Record(fields)
                 }
@@ -312,27 +312,27 @@ mod kani_proofs {
                 0 => Value::Null,
                 1 => Value::Bool(kani::any()),
                 2 => Value::Int(kani::any()),
-                _ => Value::String(String::new()),
+                _ => Value::String(String::new().into()),
             }
         } else {
             match kani::any::<u8>() % 6 {
                 0 => Value::Null,
                 1 => Value::Bool(kani::any()),
                 2 => Value::Int(kani::any()),
-                3 => Value::String(String::new()),
+                3 => Value::String(String::new().into()),
                 4 => {
                     let mut list = Vec::new();
                     if kani::any::<bool>() {
                         list.push(any_value(depth - 1));
                     }
-                    Value::List(list)
+                    Value::List(std::sync::Arc::new(list))
                 }
                 _ => {
                     let mut fields = Vec::new();
                     if kani::any::<bool>() {
-                        fields.push((Symbol(kani::any()), any_value(depth - 1)));
+                        fields.push(("f".into(), any_value(depth - 1)));
                     }
-                    Value::Record(fields)
+                    Value::Record(fields.into())
                 }
             }
         }
@@ -371,7 +371,7 @@ mod kani_proofs {
                 },
                 6 => Expr::FieldAccess {
                     base: Box::new(any_expr(depth - 1)),
-                    field: String::new(),
+                    field: String::new().into(),
                 },
                 _ => Expr::FunctionCall {
                     name: Symbol(kani::any()),
@@ -420,10 +420,10 @@ mod kani_proofs {
         let env = Env::default();
         let fns = FxHashMap::default();
 
-        let sym_double = interner.intern("double");
-        let sym_x = interner.intern("x");
+        let sym_double = interner.get_or_intern("double");
+        let sym_x = interner.get_or_intern("x");
 
-        let greeting_expr = Expr::Literal(Value::String("Hello, world!".to_string()));
+        let greeting_expr = Expr::Literal(Value::String("Hello, world!".into()));
         let t1 = infer(&greeting_expr, &env, &fns, &interner).unwrap().unwrap();
         kani::assert(matches!(t1, ValueType::Str), "Expected Str");
 
