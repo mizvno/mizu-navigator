@@ -163,9 +163,8 @@ pub(crate) fn apply_binop(
             if r == 0 {
                 return Err(MizuError::DivisionByZero);
             }
-            let numerator = l.saturating_mul(crate::core::types::DECIMAL_SCALE);
-            numerator
-                .checked_div(r)
+            l.checked_mul(crate::core::types::DECIMAL_SCALE)
+                .and_then(|numerator| numerator.checked_div(r))
                 .map(Value::Int)
                 .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned()))
         },
