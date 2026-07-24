@@ -1870,6 +1870,48 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         );
     }
 
+    #[test]
+    fn apply_binop_div_numerator_overflow_errors_not_corrupts() {
+        // `l` just past `i64::MAX / DECIMAL_SCALE`, so `l.checked_mul(DECIMAL_SCALE)`
+        // overflows `i64`. Pre-fix this used `saturating_mul`, which silently
+        // clamped to `i64::MAX` and returned a wrong-but-plausible result
+        // instead of failing — this pins the fail-secure behavior.
+        let mut ic = 0u64;
+        let l = i64::MAX / crate::core::types::DECIMAL_SCALE + 1;
+        let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(1), &mut ic);
+        match result {
+            Err(MizuError::ExecutionError(msg)) => {
+                assert!(msg.contains("overflow"), "unexpected message: {msg}");
+            }
+            other => panic!("expected ExecutionError for numerator overflow, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_binop_div_non_terminating_decimal() {
+        // 5 / 2 = 2.5 — fixed-point division must not truncate the fraction.
+        let mut ic = 0u64;
+        let l = 5 * crate::core::types::DECIMAL_SCALE;
+        let r = 2 * crate::core::types::DECIMAL_SCALE;
+        let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic).unwrap();
+        assert_eq!(result, Value::Int(crate::core::types::DECIMAL_SCALE * 5 / 2));
+    }
+
+    #[test]
+    fn apply_binop_div_by_zero() {
+        let mut ic = 0u64;
+        let result = super::apply_binop(
+            &BinOp::Div,
+            Value::Int(10 * crate::core::types::DECIMAL_SCALE),
+            Value::Int(0),
+            &mut ic,
+        );
+        assert!(
+            matches!(result, Err(MizuError::DivisionByZero)),
+            "expected DivisionByZero, got: {result:?}"
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // comp keyword tests
     // ────────────────────────────────────────────────────────────────────────
