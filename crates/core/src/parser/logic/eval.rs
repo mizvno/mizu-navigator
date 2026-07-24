@@ -153,20 +153,35 @@ pub(crate) fn apply_binop(
             .map(Value::Int)
             .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
 
-        (BinOp::Mul, Value::Int(l), Value::Int(r)) => l
-            .checked_mul(r)
-            .map(|product| product / crate::core::types::DECIMAL_SCALE)
-            .map(Value::Int)
-            .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
+        // `l` and `r` are already scaled by DECIMAL_SCALE, so their raw
+        // product is scaled by DECIMAL_SCALE^2 and must be divided down by
+        // one factor of DECIMAL_SCALE to get back to a single-scaled result.
+        // Widen to i128 for that intermediate product: `i64 * i64` can never
+        // overflow i128 (i128's range vastly exceeds the square of i64's
+        // range), so no checked_mul is needed at that step. Only the final
+        // narrowing back to i64 can fail, and it fails cleanly (via
+        // checked conversion) exactly when the true result doesn't fit —
+        // not before, the way a pre-divide i64 checked_mul would.
+        (BinOp::Mul, Value::Int(l), Value::Int(r)) => {
+            let product = (l as i128) * (r as i128);
+            let scaled = product / (crate::core::types::DECIMAL_SCALE as i128);
+            i64::try_from(scaled)
+                .map(Value::Int)
+                .map_err(|_| MizuError::ExecutionError("integer overflow".to_owned()))
+        }
 
         (BinOp::Div, Value::Int(l), Value::Int(r)) => {
             if r == 0 {
                 return Err(MizuError::DivisionByZero);
             }
-            l.checked_mul(crate::core::types::DECIMAL_SCALE)
-                .and_then(|numerator| numerator.checked_div(r))
+            // Same i128-widening rationale as Mul: `l` needs one extra
+            // factor of DECIMAL_SCALE before dividing by `r` to preserve
+            // fixed-point precision, and `i64 * i64` can never overflow i128.
+            let numerator = (l as i128) * (crate::core::types::DECIMAL_SCALE as i128);
+            let quotient = numerator / (r as i128);
+            i64::try_from(quotient)
                 .map(Value::Int)
-                .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned()))
+                .map_err(|_| MizuError::ExecutionError("integer overflow".to_owned()))
         },
 
         // String concatenation via `+`: charge the combined length before
