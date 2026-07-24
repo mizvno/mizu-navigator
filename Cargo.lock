@@ -2557,6 +2557,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mizu-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ego-tree",
+ "hex",
+ "hickory-resolver",
+ "hkdf",
+ "hmac",
+ "keyring",
+ "nom 7.1.3",
+ "redb",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "taffy",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "mizu-navigator"
 version = "0.1.0"
 dependencies = [
@@ -2576,6 +2600,7 @@ dependencies = [
  "icu_segmenter",
  "image",
  "keyring",
+ "mizu-core",
  "nom 7.1.3",
  "parley",
  "pollster",

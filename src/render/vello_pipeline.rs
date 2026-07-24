@@ -1628,7 +1628,7 @@ mod tests {
         use crate::parser::layout::ConditionalClass;
         use crate::parser::logic::Expr;
         use crate::core::types::{Value, VariableStore};
-        use crate::parser::{MizuNode, MizuOverflow, Primitive};
+        use crate::parser::{MizuNode, Primitive};
 
         let mut store = VariableStore::new();
         // Intern a variable "active" and set it to true in the global store.

@@ -1,4 +1,4 @@
-﻿//! # `splitter` — Line-by-Line Macro-Block Preprocessor
+//! # `splitter` — Line-by-Line Macro-Block Preprocessor
 //!
 //! This module is the **first formal pass** of the Mizu compilation pipeline.
 //! It takes raw `.mizu` source text and produces a [`ParsedSource`] struct
@@ -145,7 +145,7 @@ fn is_import_directive(trimmed: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use mizu::parser::split_source;
+/// use mizu_core::parser::split_source;
 /// use std::path::Path;
 ///
 /// let source = r#"

@@ -530,7 +530,7 @@ def evalUser (B : Nat) (D : Doc) (σ : Store) (fuel : Nat) (env : Env)
     if args.length == fd.params.length then
       match evalArgs B D σ fuel env args s with
       | (.error er, s1) => (.error er, s1)
-      | (.ok vals, s1) => evalE B D σ fuel (bindParams fd.params vals) fd.body s1
+      | (.ok vals, s1) => evalE B D σ fuel (bindParams (fd.params.map Prod.fst) vals) fd.body s1
     else (.error (.execError "function arity mismatch"), s)
   termination_by (fuel, 2, 0)
 

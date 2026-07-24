@@ -65,7 +65,7 @@
         let vat_sym = interner.get("vat").unwrap();
         let f = &fns[&vat_sym];
         let p_sym = interner.get("p").unwrap();
-        assert_eq!(f.params, vec![(p_sym, Some(ValueType::Num))]);
+        assert_eq!(f.params, vec![(p_sym, ValueType::Num)]);
         // Body should be BinaryOp(Variable(p_sym), Mul, Literal(1.22))
         assert!(matches!(&f.body, Expr::BinaryOp { op: BinOp::Mul, .. }));
     }
@@ -78,8 +78,8 @@
         assert_eq!(f.params.len(), 2);
         let a_sym = interner.get("a").unwrap();
         let b_sym = interner.get("b").unwrap();
-        assert_eq!(f.params[0], (a_sym, Some(ValueType::Num)));
-        assert_eq!(f.params[1], (b_sym, Some(ValueType::Num)));
+        assert_eq!(f.params[0], (a_sym, ValueType::Num));
+        assert_eq!(f.params[1], (b_sym, ValueType::Num));
     }
 
     #[test]
@@ -88,7 +88,7 @@
         let greet_sym = interner.get("greet").unwrap();
         let f = &fns[&greet_sym];
         let name_sym = interner.get("name").unwrap();
-        assert_eq!(f.params[0], (name_sym, Some(ValueType::Str)));
+        assert_eq!(f.params[0], (name_sym, ValueType::Str));
     }
 
     #[test]
@@ -97,16 +97,16 @@
         let sym = interner.get("id_bool").unwrap();
         let f = &fns[&sym];
         let b_sym = interner.get("b").unwrap();
-        assert_eq!(f.params[0], (b_sym, Some(ValueType::Bool)));
+        assert_eq!(f.params[0], (b_sym, ValueType::Bool));
     }
 
     #[test]
     fn parse_inline_list_param() {
-        let (fns, interner) = single_fn("    first(items: list) : items\n").unwrap();
+        let (fns, interner) = single_fn("    first(items: list<num>) : items\n").unwrap();
         let sym = interner.get("first").unwrap();
         let f = &fns[&sym];
         let items_sym = interner.get("items").unwrap();
-        assert_eq!(f.params[0], (items_sym, Some(ValueType::List)));
+        assert_eq!(f.params[0], (items_sym, ValueType::List(Box::new(ValueType::Num))));
     }
 
     #[test]
@@ -582,15 +582,6 @@
     // Parser failure paths
     // ────────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn unannotated_param_is_valid() {
-        // Parameters without `: type` are now legal — they accept any value.
-        let result = parse_logic("    id(x) : x\n", &mut StringInterner::new());
-        assert!(
-            result.is_ok(),
-            "unannotated param should parse successfully, got: {result:?}"
-        );
-    }
 
     #[test]
     fn error_unknown_type_keyword() {
@@ -653,15 +644,15 @@
 
         let greet_sym = interner.get("greet").unwrap();
         let greet_fn = &result[&greet_sym];
-        assert_eq!(greet_fn.params[0].1, Some(ValueType::Str));
+        assert_eq!(greet_fn.params[0].1, ValueType::Str);
 
         let vat_sym = interner.get("VAT").unwrap();
         let vat_fn = &result[&vat_sym];
-        assert_eq!(vat_fn.params[0].1, Some(ValueType::Num));
+        assert_eq!(vat_fn.params[0].1, ValueType::Num);
 
         let check_sym = interner.get("check").unwrap();
         let check_fn = &result[&check_sym];
-        assert_eq!(check_fn.params[0].1, Some(ValueType::Bool));
+        assert_eq!(check_fn.params[0].1, ValueType::Bool);
     }
 
 
@@ -745,7 +736,7 @@
         assert!(mutated);
         assert_eq!(store.state_machine.accumulated_actions.len(), 1);
         match &store.state_machine.accumulated_actions[0] {
-            crate::network::RuntimeAction::NetworkCall { path_param, .. } => {
+            crate::messages::RuntimeAction::NetworkCall { path_param, .. } => {
                 assert_eq!(path_param.as_deref(), Some("abc123"));
             }
             other => panic!("expected NetworkCall, got {other:?}"),
@@ -1431,11 +1422,11 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
     #[test]
     fn parse_params_list_becomes_list() {
-        let src = "f(items: list) : 1";
+        let src = "f(items: list<string>) : 1";
         let mut interner = StringInterner::new();
         let fns = parse_logic(src, &mut interner).unwrap();
         let sym = interner.get("f").unwrap();
-        assert_eq!(fns[&sym].params[0].1, Some(ValueType::List));
+        assert_eq!(fns[&sym].params[0].1, ValueType::List(Box::new(ValueType::Str)));
     }
 
     #[test]
@@ -1472,29 +1463,28 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
     }
 
     #[test]
-    fn parse_params_no_annotation_produces_none() {
-        // f(x) — no `: type` — parameter should be untyped (None)
+    fn parse_params_no_annotation_produces_error() {
+        // f(x) — no `: type` — parameter should error
         let src = "f(x) : x";
         let mut interner = StringInterner::new();
-        let fns = parse_logic(src, &mut interner).unwrap();
-        let sym = interner.get("f").unwrap();
-        let x_sym = interner.get("x").unwrap();
-        assert_eq!(fns[&sym].params, vec![(x_sym, None)]);
+        let err = parse_logic(src, &mut interner).unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+        if let MizuError::ParseError(msg) = err {
+            println!("Actual error message: {}", msg);
+            assert!(msg.contains("function `f`: parameter `x` requires a type annotation"));
+        }
     }
 
     #[test]
-    fn parse_params_partial_annotation() {
+    fn parse_params_partial_annotation_produces_error() {
         // f(x: num, y) — first param typed, second untyped
         let src = "f(x: num, y) : x";
         let mut interner = StringInterner::new();
-        let fns = parse_logic(src, &mut interner).unwrap();
-        let sym = interner.get("f").unwrap();
-        let x_sym = interner.get("x").unwrap();
-        let y_sym = interner.get("y").unwrap();
-        assert_eq!(
-            fns[&sym].params,
-            vec![(x_sym, Some(ValueType::Num)), (y_sym, None)]
-        );
+        let err = parse_logic(src, &mut interner).unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+        if let MizuError::ParseError(msg) = err {
+            assert!(msg.contains("function `f`: parameter `y` requires a type annotation"));
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────

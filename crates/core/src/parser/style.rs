@@ -1,4 +1,4 @@
-﻿//! # `style` — Mizu Style Sheet Parser (Phase 3 + Phase 11)
+//! # `style` — Mizu Style Sheet Parser (Phase 3 + Phase 11)
 //!
 //! This module tokenizes the `style_block` produced by [`super::splitter`]
 //! into a typed, validated [`HashMap`] of class-name → [`StyleRules`] pairs,
@@ -487,7 +487,7 @@ impl StyleRules {
 /// # Examples
 ///
 /// ```
-/// use mizu::parser::style::parse_style;
+/// use mizu_core::parser::style::parse_style;
 ///
 /// let block = "    .card\n        padding 20\n        background #ffffff\n";
 /// let rules = parse_style(block).unwrap();

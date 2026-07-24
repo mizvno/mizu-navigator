@@ -1,0 +1,164 @@
+// ─────────────────────────────────────────────────────────────────────────
+// Mizu language showcase — a single-file tour of the most important
+// features across all four blocks (urls, logic, style, layout).
+//
+// This is a didactic reference file, not part of the automated example
+// suite (tests/reference_examples.rs) — it deliberately exercises nearly
+// every construct at once, which is the opposite of what a real minimal
+// document should look like.
+// ─────────────────────────────────────────────────────────────────────────
+
+urls
+    // "api" endpoints are used with GET/POST/PUT/DELETE/QUERY.
+    api items_api /api/v1/items
+    api create_item /api/v1/items
+    // "media" endpoints back `image src` and `download(...)` — always a
+    // mizu:// target, resolved at compile time (never a raw network URL).
+    media logo_img mizu://assets.example/logo.png
+
+logic
+    // Plain variables. Every number is fixed-point Value::Int under the
+    // hood — there is no runtime Float type.
+    counter = 0
+    now = 0
+    items = null
+    create_result = null
+
+    // Pure, DAG-validated functions — no recursion, no side effects.
+    // Inline form:
+    double(x: num) : x * 2
+    greet(name: string) : "Hello, " + name + "!"
+
+    // Multi-line form: intermediate `name = expr` bindings, final line is
+    // the bare return expression.
+    clamp(x: num, lo: num, hi: num)
+        limited = if x > hi then hi else x
+        if limited < lo then lo else limited
+
+    // `comp` — derived, read-only, auto-recomputes whenever a dependency
+    // changes (including a network response landing in `items`).
+    comp doubled_counter = double(counter)
+    comp item_count = clamp(counter, 0, 100)
+
+    // Root timer — the only form of recurring behavior; node-local timers
+    // ("every") were removed so a document's whole temporal surface is
+    // enumerable right here.
+    timer 1000ms -> counter = counter + 1
+
+style
+    window
+        background #0f0f12
+        padding 20
+        flex-direction column
+        align center
+        justify center
+        gap 16
+
+    .card
+        background #1a1a2e
+        padding 24
+        border-radius 12
+        width 600
+        flex-direction column
+        gap 12
+
+    // Breakpoint variant: merged over .card's base rules only while the
+    // window is narrower than 600px.
+    .card @max-width 599
+        width 100%
+
+    // Color-scheme variant: merged only while the OS reports dark mode.
+    .card @dark
+        background #14141c
+
+    .highlighted
+        border-color #34c759
+        border-width 2
+
+    .title
+        font-size 28
+        color #34c759
+        font-weight bold
+        text-align center
+
+    .subtitle
+        font-size 15
+        color #aaaaaa
+        text-align start
+        margin-inline-start 4
+
+    button
+        background #34c759
+        padding 12
+        border-radius 8
+        color #ffffff
+
+    input
+        background #22222e
+        color #ffffff
+        padding 8
+        border-radius 6
+
+    text
+        color #ffffff
+        font-size 16
+
+layout
+    // `window`'s inline string sets the OS title only (never rendered as
+    // page content — every other primitive's inline string does render).
+    // `dir="auto"` lets base text direction auto-detect per node/subtree.
+    window "Mizu Feature Showcase" dir="auto"
+        box class card
+            // Conditional class: a *document-logic*-gated extra class,
+            // distinct from the style block's environment-gated variants.
+            class highlighted if counter > 5
+
+            t "{greet(\"world\")}" class "title"
+            t "A single-file tour of Mizu's language surface." class "subtitle"
+
+            // ── Reactive state + click actions ──────────────────────────
+            box
+                t "Counter: {counter}  (doubled: {doubled_counter}, clamped: {item_count})"
+                button "Increment" click -> counter = counter + 1
+                button "Reset" click -> counter = 0
+
+            // ── Network call (GET) + reactive `comp`/`each` over the result ──
+            box
+                button "Load Items" click -> GET(items_api) -> items
+                each item in items
+                    t "- {item.name}"
+
+            // ── Form + the `$form` magic record + POST ──────────────────
+            // Fields are collected from every `input name="..."` inside the
+            // enclosing `form` and bound to `$form` (tainted/untrusted by
+            // the flow checker) right before the submit action runs.
+            form
+                input type "text" name "username" placeholder "Your name"
+                button "Submit" submit -> POST(create_item, $form) -> create_result
+                t "{create_result}"
+
+            // ── Image with alt text (accessibility tree) via a media alias ──
+            image src "logo_img" alt "Mizu logo"
+
+            // ── Markdown block (inline and multi-line forms) ────────────
+            markdown "**Inline** markdown works too."
+            markdown """
+                # Multi-line markdown
+                Mizu can render rich text blocks.
+                - Item one
+                - Item two
+            """
+
+            // ── Download + navigate actions ─────────────────────────────
+            button "Download logo" click -> download(logo_img)
+            button "About" click -> navigate "mizu://localhost/about.mizu"
+
+            // ── get_system_time builtin (target must be a bare identifier) ──
+            button "What time is it?" click -> get_system_time(now)
+            t "Last checked: {now}"
+
+// Not expressible as new syntax (automatic runtime behavior, not shown
+// above): Tab order/focus ring/Enter-Space activation on focusable nodes
+// (ux-1), the accessibility tree built from this same DOM (ux-2), session
+// history / Back-Forward (ux-4), and light/dark/high-contrast/reduced-
+// motion chrome theming (ux-5) — none of these need any markup here.

@@ -42,7 +42,7 @@ pub struct Symbol(pub u32);
 /// thread's clone. The architectural rule that prevents this from happening
 /// in practice is: never send a freshly-`get_or_intern`-ed post-freeze
 /// `Symbol` across the UI↔worker channel. Cross-thread messages instead
-/// carry the resolved `String` name (see [`crate::network::UiEvent::UpdateVariable`])
+/// carry the resolved `String` name (see [`crate::messages::UiEvent::UpdateVariable`])
 /// and the receiving thread resolves it against its *own* frozen table via
 /// `set_runtime`/`get` — the two clones never need to invent a shared ID for
 /// the same runtime string, because neither side is trusted to mint one on
