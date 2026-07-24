@@ -9,6 +9,13 @@ on:
 jobs:
   kani:
     runs-on: ubuntu-latest
+    # Safety net, not a tuning knob: every harness in this crate is verified
+    # (see parser::logic::eval's kani_proofs module doc) to complete in
+    # seconds. If a future harness addition makes CBMC hang the way several
+    # earlier ones did (self-referential Value/ValueType/Expr construction —
+    # see that same doc comment), this bounds the cost of finding out to one
+    # job instead of burning the full 6-hour Actions default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
