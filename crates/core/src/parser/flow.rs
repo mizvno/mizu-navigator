@@ -288,9 +288,10 @@ fn collect_get_system_time_targets(expr: &Expr, arena: &ExprArena, gst_sym: Symb
             collect_get_system_time_targets(&arena[*left], arena, gst_sym, out);
             collect_get_system_time_targets(&arena[*right], arena, gst_sym, out);
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args_start, args_len } => {
+            let args = arena.args(*args_start, *args_len);
             if *name == gst_sym
-                && let [id] = args.as_slice()
+                && let [id] = args
                 && let Expr::Variable(target) = &arena[*id]
             {
                 out.push(*target);
@@ -333,14 +334,14 @@ fn is_expr_tainted(
             is_expr_tainted(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
                 || is_expr_tainted(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym)
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args_start, args_len } => {
             if Some(*name) == gst_sym {
                 return false;
             }
             if tainted_functions.contains(name) {
                 return true;
             }
-            for &arg in args {
+            for &arg in arena.args(*args_start, *args_len) {
                 if is_expr_tainted(&arena[arg], arena, tainted_vars, tainted_functions, gst_sym) {
                     return true;
                 }
@@ -381,14 +382,14 @@ fn find_tainted_var_in_expr(
             find_tainted_var_in_expr(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
                 .or_else(|| find_tainted_var_in_expr(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym))
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args_start, args_len } => {
             if Some(*name) == gst_sym {
                 return None;
             }
             if tainted_functions.contains(name) {
                 return Some(*name);
             }
-            for &arg in args {
+            for &arg in arena.args(*args_start, *args_len) {
                 if let Some(s) = find_tainted_var_in_expr(&arena[arg], arena, tainted_vars, tainted_functions, gst_sym) {
                     return Some(s);
                 }

@@ -337,9 +337,11 @@
         let store = Rc::new(store);
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(100 * crate::core::types::DECIMAL_SCALE)));
+        let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: vat_sym,
-            args: vec![arg0],
+            args_start,
+            args_len,
         };
         let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
         // 100 * 1.22 = 122
@@ -356,9 +358,11 @@
         let quadruple_sym = interner.get("quadruple").unwrap();
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)));
+        let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: quadruple_sym,
-            args: vec![arg0],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
@@ -378,9 +382,11 @@
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)));
         let arg1 = arena.alloc(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)));
+        let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: total_sym,
-            args: vec![arg0, arg1],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
@@ -400,9 +406,11 @@
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(5 * crate::core::types::DECIMAL_SCALE)));
         let arg1 = arena.alloc(Expr::Literal(Value::Int(4 * crate::core::types::DECIMAL_SCALE)));
+        let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: area_sym,
-            args: vec![arg0, arg1],
+            args_start,
+            args_len,
         };
         // Function arguments override the outer store inside the function body.
         let result = evaluate(&call_expr, &arena, &outer_store, &fns).unwrap();
@@ -510,9 +518,11 @@
         let vat_sym = interner.get("vat").unwrap();
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Bool(true)));
+        let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: vat_sym,
-            args: vec![arg0],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &arena, &store, &fns);
@@ -529,9 +539,11 @@
         let add_sym = interner.get("add").unwrap();
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
+        let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: add_sym,
-            args: vec![arg0],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &arena, &store, &fns);
@@ -549,9 +561,11 @@
         let mut arena = ExprArena::new();
         let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
         let arg1 = arena.alloc(Expr::Literal(Value::Int(2)));
+        let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: inc_sym,
-            args: vec![arg0, arg1],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let result = evaluate(&call_expr, &arena, &store, &fns);
@@ -562,10 +576,12 @@
     fn error_undefined_function_call() {
         let mut interner = StringInterner::new();
         let ghost_sym = interner.get_or_intern("ghost");
-        let arena = ExprArena::new();
+        let mut arena = ExprArena::new();
+        let (args_start, args_len) = arena.push_args(&[]).unwrap();
         let call_expr = Expr::FunctionCall {
             name: ghost_sym,
-            args: vec![],
+            args_start,
+            args_len,
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let fns = FxHashMap::default();
@@ -815,12 +831,12 @@
         let Action::Eval(tree) = action else {
             panic!("expected Action::Eval(FunctionCall), got: {action:?}");
         };
-        let Expr::FunctionCall { name, args } = tree.root() else {
+        let Expr::FunctionCall { name, args_start, args_len } = tree.root() else {
             panic!("expected FunctionCall root, got: {:?}", tree.root());
         };
         assert_eq!(interner.resolve(*name), Some("get_system_time"));
         let my_var_sym = interner.get("my_var").unwrap();
-        let arg_exprs: Vec<&Expr> = args.iter().map(|&id| &tree.arena[id]).collect();
+        let arg_exprs: Vec<&Expr> = tree.arena.args(*args_start, *args_len).iter().map(|&id| &tree.arena[id]).collect();
         assert_eq!(arg_exprs, vec![&Expr::Variable(my_var_sym)]);
     }
 

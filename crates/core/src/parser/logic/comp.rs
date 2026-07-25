@@ -343,8 +343,8 @@ fn collect_vars(expr: &Expr, arena: &ExprArena, out: &mut FxHashSet<Symbol>) {
             collect_vars(&arena[*left], arena, out);
             collect_vars(&arena[*right], arena, out);
         }
-        Expr::FunctionCall { args, .. } => {
-            for &arg in args {
+        Expr::FunctionCall { args_start, args_len, .. } => {
+            for &arg in arena.args(*args_start, *args_len) {
                 collect_vars(&arena[arg], arena, out);
             }
         }
@@ -384,9 +384,9 @@ pub(super) fn collect_calls(
             collect_calls(&arena[*left], arena, out, function_names);
             collect_calls(&arena[*right], arena, out, function_names);
         }
-        Expr::FunctionCall { name: sym, args } => {
+        Expr::FunctionCall { name: sym, args_start, args_len } => {
             out.insert(*sym);
-            for &arg in args {
+            for &arg in arena.args(*args_start, *args_len) {
                 collect_calls(&arena[arg], arena, out, function_names);
             }
         }

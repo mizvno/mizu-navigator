@@ -716,8 +716,8 @@ pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &StringInterner) -> St
             binop_str(op),
             format_expr(&arena[*right], arena, interner)
         ),
-        Expr::FunctionCall { name, args } => {
-            let args: Vec<String> = args.iter().map(|&a| format_expr(&arena[a], arena, interner)).collect();
+        Expr::FunctionCall { name, args_start, args_len } => {
+            let args: Vec<String> = arena.args(*args_start, *args_len).iter().map(|&a| format_expr(&arena[a], arena, interner)).collect();
             format!(
                 "{}({})",
                 interner.resolve(*name).unwrap_or("?"),

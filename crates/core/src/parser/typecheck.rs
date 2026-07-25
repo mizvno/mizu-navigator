@@ -166,7 +166,8 @@ fn infer(
                 None => Ok(None),
             }
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args_start, args_len } => {
+            let args = arena.args(*args_start, *args_len);
             let func_name = interner.resolve(*name).unwrap_or("");
             if func_name == "filter" && args.len() == 3 {
                 let list_ty = infer(&arena[args[0]], arena, env, functions, interner)?;

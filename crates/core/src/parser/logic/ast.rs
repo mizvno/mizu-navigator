@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value};
 
 /// The type annotation on a Mizu function parameter or binding.
@@ -152,13 +153,23 @@ pub struct ExprId(u32);
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExprArena {
     nodes: Vec<Expr>,
+    /// Shared backing storage for every `FunctionCall`'s argument list in
+    /// this arena. A `FunctionCall` node stores only a `(start, len)` pair
+    /// into this pool (see [`Expr::FunctionCall`]) instead of owning its
+    /// own `Vec`/`Box<[ExprId]>` — one small heap allocation per call with
+    /// arguments would otherwise round-trip the global allocator on every
+    /// parse, defeating the point of arena-allocating `Expr` nodes in the
+    /// first place. Appending here grows this one buffer geometrically
+    /// (the same amortized-O(1) cost `nodes` already pays), rather than
+    /// allocating a new buffer per call.
+    args_pool: Vec<ExprId>,
 }
 
 impl ExprArena {
     /// Creates a new, empty arena.
     #[must_use]
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self { nodes: Vec::new(), args_pool: Vec::new() }
     }
 
     /// Appends `expr` to the arena and returns its new [`ExprId`].
@@ -172,6 +183,43 @@ impl ExprArena {
     #[must_use]
     pub fn get(&self, id: ExprId) -> &Expr {
         &self.nodes[id.0 as usize]
+    }
+
+    /// Appends `args` to the shared argument pool and returns the
+    /// `(start, len)` pair a [`Expr::FunctionCall`] node needs to recover
+    /// its argument slice via [`Self::args`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MizuError::ParseError`] if `args.len()` doesn't fit in a
+    /// `u32` (or if the pool itself would grow past `u32::MAX` entries).
+    /// This is generously far beyond any legitimate call's argument count,
+    /// but a document (or a directly-constructed `Expr`) is untrusted
+    /// input — rejecting cleanly here instead of truncating or panicking
+    /// keeps this fail-secure the same way every other arena/parser limit
+    /// in this crate is.
+    pub fn push_args(&mut self, args: &[ExprId]) -> Result<(u32, u32), MizuError> {
+        let start = u32::try_from(self.args_pool.len()).map_err(|_| {
+            MizuError::ParseError(
+                "expression arena argument pool exceeds u32::MAX entries".to_string(),
+            )
+        })?;
+        let len = u32::try_from(args.len()).map_err(|_| {
+            MizuError::ParseError(
+                "function call has more arguments than can be represented".to_string(),
+            )
+        })?;
+        self.args_pool.extend_from_slice(args);
+        Ok((start, len))
+    }
+
+    /// Resolves a `FunctionCall`'s `(start, len)` pair back to its argument
+    /// slice. `start`/`len` must have come from [`Self::push_args`] on
+    /// *this* arena — see [`ExprTree`]'s note on why a root and its arena
+    /// always travel together.
+    #[must_use]
+    pub fn args(&self, start: u32, len: u32) -> &[ExprId] {
+        &self.args_pool[start as usize..(start as usize + len as usize)]
     }
 }
 
@@ -217,10 +265,12 @@ impl ExprTree {
 /// Recursive positions here are [`ExprId`] indices into an [`ExprArena`]
 /// rather than `Box<Expr>`, keeping a whole tree in one contiguous
 /// allocation instead of one heap allocation per node. See [`ExprTree`] for
-/// how a root node and its arena travel together. `FunctionCall::args` is a
-/// `Vec<ExprId>` for the same reason — each argument expression's own
-/// descendants live in the *caller's* arena, not a separate allocation per
-/// argument.
+/// how a root node and its arena travel together. `FunctionCall`'s argument
+/// list is a `(start, len)` pair into the same arena's shared argument pool
+/// ([`ExprArena::push_args`]/[`ExprArena::args`]) rather than an owned
+/// `Vec`/`Box<[ExprId]>` — a per-call collection would otherwise hit the
+/// global allocator once per call with arguments, on top of whatever the
+/// arena itself already amortizes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A compile-time constant literal.
@@ -244,8 +294,13 @@ pub enum Expr {
     FunctionCall {
         /// The function name, pre-interned at parse time.
         name: Symbol,
-        /// Positional argument expressions, evaluated left-to-right.
-        args: Vec<ExprId>,
+        /// Start offset of this call's arguments in the owning
+        /// [`ExprArena`]'s shared argument pool. Resolve via
+        /// [`ExprArena::args`] — never meaningful without the arena this
+        /// node came from.
+        args_start: u32,
+        /// Number of argument expressions, evaluated left-to-right.
+        args_len: u32,
     },
 
     /// A local binding used in multi-line function bodies.
@@ -364,4 +419,59 @@ pub struct ComputedBinding {
     /// [`parse_computed_with_functions`] — the globals read transitively inside
     /// any called logic function.  May include other comp vars.
     pub depends_on: Vec<Symbol>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_args_then_args_round_trips_exactly() {
+        let mut arena = ExprArena::new();
+        let a = arena.alloc(Expr::Literal(Value::Int(1)));
+        let b = arena.alloc(Expr::Literal(Value::Int(2)));
+        let c = arena.alloc(Expr::Literal(Value::Int(3)));
+        let (start, len) = arena.push_args(&[a, b, c]).unwrap();
+        assert_eq!(arena.args(start, len), &[a, b, c]);
+    }
+
+    #[test]
+    fn push_args_empty_slice_round_trips_to_empty() {
+        let mut arena = ExprArena::new();
+        let (start, len) = arena.push_args(&[]).unwrap();
+        assert_eq!(arena.args(start, len), &[] as &[ExprId]);
+    }
+
+    #[test]
+    fn multiple_push_args_calls_do_not_overlap() {
+        // Two FunctionCall nodes' argument ranges, pushed in sequence, must
+        // each resolve back to exactly their own arguments -- proving the
+        // shared pool doesn't let one call's args bleed into another's.
+        let mut arena = ExprArena::new();
+        let x = arena.alloc(Expr::Literal(Value::Int(10)));
+        let y = arena.alloc(Expr::Literal(Value::Int(20)));
+        let (start1, len1) = arena.push_args(&[x]).unwrap();
+        let (start2, len2) = arena.push_args(&[y, x]).unwrap();
+        assert_eq!(arena.args(start1, len1), &[x]);
+        assert_eq!(arena.args(start2, len2), &[y, x]);
+    }
+
+    #[test]
+    fn function_call_args_resolve_through_shared_pool() {
+        // End-to-end: a FunctionCall node stores (args_start, args_len),
+        // not its own collection -- resolving it through the arena must
+        // recover the exact argument ExprIds that were pushed.
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(42)));
+        let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
+        let call = Expr::FunctionCall {
+            name: Symbol(0),
+            args_start,
+            args_len,
+        };
+        let Expr::FunctionCall { args_start, args_len, .. } = call else {
+            unreachable!()
+        };
+        assert_eq!(arena.args(args_start, args_len), &[arg0]);
+    }
 }

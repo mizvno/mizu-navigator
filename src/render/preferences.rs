@@ -375,13 +375,15 @@ mod tests {
         ] {
             let mut interner = StringInterner::new();
             let sym = interner.get_or_intern(candidate);
+            let mut arena = ExprArena::new();
+            let (args_start, args_len) = arena.push_args(&[]).unwrap();
             let call = Expr::FunctionCall {
                 name: sym,
-                args: vec![],
+                args_start,
+                args_len,
             };
             let mut machine = StateMachine::new();
             let no_functions = Default::default();
-            let arena = ExprArena::new();
             let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);
             assert!(
                 result.is_err(),

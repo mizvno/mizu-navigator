@@ -668,7 +668,8 @@
         let sym = store.interner.get_or_intern(name);
         let mut arena = ExprArena::new();
         let arg_ids: Vec<_> = args.into_iter().map(|a| arena.alloc(a)).collect();
-        let expr = crate::parser::logic::Expr::FunctionCall { name: sym, args: arg_ids };
+        let (args_start, args_len) = arena.push_args(&arg_ids).unwrap();
+        let expr = crate::parser::logic::Expr::FunctionCall { name: sym, args_start, args_len };
         let fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
         store.state_machine.instruction_count = 0;
         store
@@ -1325,9 +1326,11 @@
         // MAX_EVAL_DEPTH (256).
         let mut call_arena = ExprArena::new();
         let arg0 = call_arena.alloc(Expr::Literal(Value::Int(1)));
+        let (args_start, args_len) = call_arena.push_args(&[arg0]).unwrap();
         let mut call_site = Expr::FunctionCall {
             name: func_sym,
-            args: vec![arg0],
+            args_start,
+            args_len,
         };
         for _ in 0..20 {
             let left = call_arena.alloc(call_site);
