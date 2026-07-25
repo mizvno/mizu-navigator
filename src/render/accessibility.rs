@@ -197,17 +197,17 @@ fn build_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap as StdHashMap;
+    use rustc_hash::FxHashMap;
 
     fn node(primitive: Primitive, attrs: &[(&str, &str)]) -> MizuNode {
-        let mut attributes = StdHashMap::new();
+        let mut attributes = FxHashMap::default();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v.to_string());
         }
         MizuNode {
             primitive,
             attributes,
-            events: StdHashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }

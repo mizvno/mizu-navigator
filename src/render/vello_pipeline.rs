@@ -1079,8 +1079,8 @@ mod tests {
         // Build a DOM tree: Window -> Text
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -1090,12 +1090,12 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Text,
                 attributes: {
-                    let mut attrs = HashMap::new();
+                    let mut attrs = FxHashMap::default();
                     attrs.insert("class".to_string(), "welcome-text".to_string());
                     attrs.insert("content".to_string(), "Benvenuto in Mizu!".to_string());
                     attrs
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })
@@ -1223,8 +1223,8 @@ mod tests {
         // Build DOM: Window -> Each(item in lista) -> Text("{item.name}")
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -1233,8 +1233,8 @@ mod tests {
             .root_mut()
             .append(MizuNode {
                 primitive: Primitive::Each,
-                attributes: HashMap::new(),
-                events: HashMap::new(),
+                attributes: FxHashMap::default(),
+                events: FxHashMap::default(),
                 iterator_context: Some(("item".to_string(), "lista".to_string())),
                 conditional_classes: Vec::new(),
             })
@@ -1247,11 +1247,11 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Text,
                 attributes: {
-                    let mut a = HashMap::new();
+                    let mut a = FxHashMap::default();
                     a.insert("content".to_string(), "{item.name}".to_string());
                     a
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })
@@ -1375,8 +1375,8 @@ mod tests {
         // DOM: Window → Each → Box
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -1384,8 +1384,8 @@ mod tests {
             .root_mut()
             .append(MizuNode {
                 primitive: Primitive::Each,
-                attributes: HashMap::new(),
-                events: HashMap::new(),
+                attributes: FxHashMap::default(),
+                events: FxHashMap::default(),
                 iterator_context: Some(("item".to_string(), "rows".to_string())),
                 conditional_classes: Vec::new(),
             })
@@ -1396,11 +1396,11 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Box,
                 attributes: {
-                    let mut a = HashMap::new();
+                    let mut a = FxHashMap::default();
                     a.insert("class".to_string(), ".row".to_string());
                     a
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })
@@ -1530,8 +1530,8 @@ mod tests {
         // Build: Window -> (low, high, mid)
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -1541,11 +1541,11 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Box,
                 attributes: {
-                    let mut m = HashMap::new();
+                    let mut m = FxHashMap::default();
                     m.insert("class".into(), ".low".into());
                     m
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })
@@ -1555,11 +1555,11 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Box,
                 attributes: {
-                    let mut m = HashMap::new();
+                    let mut m = FxHashMap::default();
                     m.insert("class".into(), ".high".into());
                     m
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })
@@ -1569,11 +1569,11 @@ mod tests {
             .append(MizuNode {
                 primitive: Primitive::Box,
                 attributes: {
-                    let mut m = HashMap::new();
+                    let mut m = FxHashMap::default();
                     m.insert("class".into(), ".mid".into());
                     m
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })

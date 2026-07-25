@@ -242,8 +242,8 @@ mod tests {
         let fns = parse_logic(src, &mut interner)?;
         let dom = ego_tree::Tree::new(MizuNode {
             primitive: crate::parser::layout::Primitive::Box,
-            attributes: std::collections::HashMap::new(),
-            events: std::collections::HashMap::new(),
+            attributes: rustc_hash::FxHashMap::default(),
+            events: rustc_hash::FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });

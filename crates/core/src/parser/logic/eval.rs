@@ -196,9 +196,10 @@ pub(crate) fn apply_binop(
             if *instruction_count > *crate::core::types::MAX_INSTRUCTIONS {
                 return Err(MizuError::Timeout);
             }
-            Ok(Value::String(std::sync::Arc::from(
-                format!("{l}{r}").as_str(),
-            )))
+            let mut buf = String::with_capacity(l.len() + r.len());
+            buf.push_str(&l);
+            buf.push_str(&r);
+            Ok(Value::String(std::sync::Arc::from(buf)))
         }
 
         // Equality — works across numerics and strings/bools

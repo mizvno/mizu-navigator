@@ -271,7 +271,7 @@ pub fn calculate_node_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap as StdHashMap;
+    use rustc_hash::FxHashMap;
 
     /// The "No Tofu" coverage bar (ux-3, modeled on Noto's own coverage
     /// benchmark): every script here must shape without a single `.notdef`
@@ -296,12 +296,12 @@ mod tests {
     ];
 
     fn text_node(content: &str) -> MizuNode {
-        let mut attrs = StdHashMap::new();
+        let mut attrs = FxHashMap::default();
         attrs.insert("content".to_string(), content.to_string());
         MizuNode {
             primitive: Primitive::Text,
             attributes: attrs,
-            events: StdHashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }
@@ -389,13 +389,13 @@ mod tests {
             crate::parser::MizuFontFamily::Serif,
             crate::parser::MizuFontFamily::Monospace,
         ] {
-            let mut attrs = StdHashMap::new();
+            let mut attrs = FxHashMap::default();
             attrs.insert("content".to_string(), "Hello".to_string());
             attrs.insert("class".to_string(), "label".to_string());
             let node = MizuNode {
                 primitive: Primitive::Text,
                 attributes: attrs,
-                events: StdHashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             };
@@ -452,13 +452,13 @@ mod tests {
 ";
         let (style_rules, style_variants) = parse_style_with_variants(style).unwrap();
 
-        let mut attrs = StdHashMap::new();
+        let mut attrs = FxHashMap::default();
         attrs.insert("content".to_string(), "Hi".to_string());
         attrs.insert("class".to_string(), "label".to_string());
         let node = MizuNode {
             primitive: Primitive::Text,
             attributes: attrs,
-            events: StdHashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         };
@@ -532,7 +532,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
 
     fn text_node_with_dir(content: &str, class: &str, dir: Option<&str>) -> MizuNode {
-        let mut attrs = StdHashMap::new();
+        let mut attrs = FxHashMap::default();
         attrs.insert("content".to_string(), content.to_string());
         attrs.insert("class".to_string(), class.to_string());
         if let Some(d) = dir {
@@ -541,7 +541,7 @@ mod tests {
         MizuNode {
             primitive: Primitive::Text,
             attributes: attrs,
-            events: StdHashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }
@@ -618,11 +618,11 @@ mod tests {
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut a = StdHashMap::new();
+                let mut a = FxHashMap::default();
                 a.insert("dir".to_string(), "rtl".to_string());
                 a
             },
-            events: StdHashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
