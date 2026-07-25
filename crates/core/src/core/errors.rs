@@ -57,8 +57,11 @@ pub enum MizuError {
     /// is a static string literal, while `expected` can be a dynamically formatted type like `"list<num>"`.
     #[error("type error: expected `{expected}`, found `{found}`")]
     TypeError {
-        /// The Mizu type name that was required in this position.
-        expected: String,
+        /// The Mizu type name that was required in this position. Boxed to
+        /// keep `MizuError` (and therefore every `Result<_, MizuError>` on
+        /// the evaluator's hot path) small — see this module's size-budget
+        /// assertion below for the measured rationale.
+        expected: Box<String>,
         /// The Mizu type name actually produced by evaluation.
         found: &'static str,
     },
@@ -132,6 +135,15 @@ pub enum MizuError {
     MultipleErrors(Vec<MizuError>),
 }
 
+// Regression guard: `MizuError` sits in `Result<Value, MizuError>` on the
+// evaluator's hot path (see `StateMachine::evaluate`). Measured at 40 bytes
+// before boxing `TypeError::expected`, 32 bytes after — see
+// PROMPT-thin-mizuerror.md for the measurement method. If this assertion
+// fires, a new/changed variant has re-grown the enum; re-run the same
+// measurement before deciding whether to raise this bound or shrink the
+// offending variant.
+const _: () = assert!(std::mem::size_of::<MizuError>() <= 32);
+
 #[cfg(test)]
 mod tests {
     use super::MizuError;
@@ -153,7 +165,7 @@ mod tests {
     #[test]
     fn type_error_formats_expected_and_found() {
         let err = MizuError::TypeError {
-            expected: "num".to_string(),
+            expected: Box::new("num".to_string()),
             found: "bool",
         };
         assert_eq!(err.to_string(), "type error: expected `num`, found `bool`");
@@ -162,11 +174,11 @@ mod tests {
     #[test]
     fn type_error_fields_are_accessible() {
         let err = MizuError::TypeError {
-            expected: "string".to_string(),
+            expected: Box::new("string".to_string()),
             found: "list",
         };
         if let MizuError::TypeError { expected, found } = err {
-            assert_eq!(expected, "string");
+            assert_eq!(*expected, "string");
             assert_eq!(found, "list");
         } else {
             panic!("unexpected variant");
