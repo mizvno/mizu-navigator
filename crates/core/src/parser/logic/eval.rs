@@ -228,7 +228,7 @@ pub(crate) fn apply_binop(
 
         // Type mismatch
         (_, l, _) => Err(MizuError::TypeError {
-            expected: "compatible operand types".to_string(),
+            expected: Box::new("compatible operand types".to_string()),
             found: type_name(&l),
         }),
     }
@@ -290,7 +290,7 @@ pub(crate) fn check_type(
     };
     if !ok {
         return Err(MizuError::TypeError {
-            expected: expected.to_string(),
+            expected: Box::new(expected.to_string()),
             found: type_name(val),
         });
     }

@@ -510,7 +510,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list".to_string(),
+                                    expected: Box::new("list".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -526,7 +526,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string".to_string(),
+                                    expected: Box::new("string".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -552,7 +552,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list".to_string(),
+                                    expected: Box::new("list".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -566,7 +566,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string".to_string(),
+                                    expected: Box::new("string".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -618,7 +618,7 @@ impl StateMachine {
                             Value::List(l) => l,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "list".to_string(),
+                                    expected: Box::new("list".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -639,7 +639,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string".to_string(),
+                                    expected: Box::new("string".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -648,7 +648,7 @@ impl StateMachine {
                             Value::String(s) => s,
                             other => {
                                 return Err(MizuError::TypeError {
-                                    expected: "string".to_string(),
+                                    expected: Box::new("string".to_string()),
                                     found: type_name(&other),
                                 });
                             }
@@ -723,7 +723,7 @@ impl StateMachine {
                 match val {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
                     other => Err(crate::core::errors::MizuError::TypeError {
-                        expected: "bool".to_string(),
+                        expected: Box::new("bool".to_string()),
                         found: type_name(&other),
                     }),
                 }
@@ -743,7 +743,7 @@ impl StateMachine {
                         self.evaluate(else_expr, frame_pointer, functions, interner)
                     }
                     other => Err(crate::core::errors::MizuError::TypeError {
-                        expected: "bool".to_string(),
+                        expected: Box::new("bool".to_string()),
                         found: type_name(&other),
                     }),
                 }
@@ -752,7 +752,7 @@ impl StateMachine {
                 let base_val = self.evaluate(base, frame_pointer, functions, interner)?;
                 if !matches!(base_val, Value::Record(_)) {
                     return Err(MizuError::TypeError {
-                        expected: "record".to_string(),
+                        expected: Box::new("record".to_string()),
                         found: type_name(&base_val),
                     });
                 }
