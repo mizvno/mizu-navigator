@@ -89,8 +89,8 @@ mod purity;
 mod tests;
 
 pub use ast::{
-    Action, BinOp, ComputedBinding, Expr, MizuFunction, NetworkMethod, RootTimer, TimerInterval,
-    ValueType,
+    Action, BinOp, ComputedBinding, Expr, ExprArena, ExprId, ExprTree, MizuFunction, NetworkMethod,
+    RootTimer, TimerInterval, ValueType,
 };
 pub use comp::{
     CompReverseIndex, build_comp_reverse_index, parse_computed, parse_computed_with_functions,

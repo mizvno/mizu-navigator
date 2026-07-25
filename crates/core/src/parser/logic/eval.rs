@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value, VariableStore};
 
-use super::ast::{Action, BinOp, Expr, MizuFunction, ValueType};
+use super::ast::{Action, BinOp, Expr, ExprArena, MizuFunction, ValueType};
 use super::parse::path_param_ok;
 
 /// Executes a compiled [`Action`] against the provided variable store.
@@ -29,20 +29,20 @@ pub fn execute_action(
             }
             let result = store
                 .state_machine
-                .evaluate(expr, 0, functions, &store.interner)?;
+                .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
             store.set(target, result);
             Ok(true)
         }
         Action::Eval(expr) => {
             store
                 .state_machine
-                .evaluate(expr, 0, functions, &store.interner)?;
+                .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
             Ok(false)
         }
         Action::Navigate { url } => {
             let eval_url = store
                 .state_machine
-                .evaluate(url, 0, functions, &store.interner)?;
+                .evaluate(url.root(), 0, functions, &store.interner, &url.arena)?;
             let url_str = match eval_url {
                 Value::String(s) => s.to_string(),
                 _ => {
@@ -70,7 +70,7 @@ pub fn execute_action(
                 Some(
                     store
                         .state_machine
-                        .evaluate(p, 0, functions, &store.interner)?,
+                        .evaluate(p.root(), 0, functions, &store.interner, &p.arena)?,
                 )
             } else {
                 None
@@ -78,7 +78,7 @@ pub fn execute_action(
             let path_param_str = if let Some(pp) = path_param {
                 let v = store
                     .state_machine
-                    .evaluate(pp, 0, functions, &store.interner)?;
+                    .evaluate(pp.root(), 0, functions, &store.interner, &pp.arena)?;
                 let s = match v {
                     Value::String(s) => s.to_string(),
                     Value::Int(n) => n.to_string(),
@@ -118,6 +118,7 @@ pub fn execute_action(
 /// budget is enforced from scratch on each call.
 pub fn evaluate(
     expr: &Expr,
+    arena: &ExprArena,
     store: &mut VariableStore,
     functions: &FxHashMap<Symbol, MizuFunction>,
     frame_pointer: usize,
@@ -125,7 +126,7 @@ pub fn evaluate(
     store.state_machine.instruction_count = 0;
     store
         .state_machine
-        .evaluate(expr, frame_pointer, functions, &store.interner)
+        .evaluate(expr, frame_pointer, functions, &store.interner, arena)
 }
 
 /// Applies a binary arithmetic operator to two already-evaluated values.

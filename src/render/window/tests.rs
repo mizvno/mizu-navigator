@@ -342,10 +342,12 @@
     // --- Keyboard focus order / activation tests (ux-1) ---------------------
 
     fn click_event_block() -> crate::parser::EventBlock {
+        let mut arena = crate::parser::logic::ExprArena::new();
+        let root = arena.alloc(crate::parser::Expr::Literal(crate::core::types::Value::Bool(true)));
         crate::parser::EventBlock::Click {
             action: crate::parser::Action::Assign {
                 target: "clicked".to_string(),
-                expr: crate::parser::Expr::Literal(crate::core::types::Value::Bool(true)),
+                expr: crate::parser::logic::ExprTree { arena, root },
             },
         }
     }

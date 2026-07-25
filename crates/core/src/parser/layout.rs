@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::core::errors::MizuError;
 use crate::core::types::StringInterner;
 use crate::parser::logic::{
-    Action, Expr, find_side_effect_call, parse_action_with_urls, parse_expr_standalone,
+    Action, ExprTree, find_side_effect_call, parse_action_with_urls, parse_expr_standalone,
 };
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
@@ -112,7 +112,7 @@ pub struct ConditionalClass {
     /// CSS class name to activate when the condition is truthy.
     pub class_name: String,
     /// Pure boolean expression evaluated at runtime (no side effects allowed).
-    pub condition: Expr,
+    pub condition: ExprTree,
 }
 
 
@@ -623,7 +623,7 @@ pub fn parse_layout_with_urls(
                     line_idx + 1
                 ))
             })?;
-            if let Some(bad_fn) = find_side_effect_call(&condition, interner) {
+            if let Some(bad_fn) = find_side_effect_call(condition.root(), &condition.arena, interner) {
                 return Err(MizuError::ParseError(format!(
                     "line {}: conditional class condition must be pure â€” \
                      `{bad_fn}` is a side-effecting call",
@@ -1574,15 +1574,18 @@ mod tests {
             .expect("click event not found");
         match click_event {
             EventBlock::Click {
-                action: Action::Eval(Expr::FunctionCall { name, args }),
+                action: Action::Eval(tree),
             } => {
+                let Expr::FunctionCall { name, args } = tree.root() else {
+                    panic!("expected FunctionCall root, got {:?}", tree.root());
+                };
                 assert_eq!(
                     interner.resolve(*name),
                     Some("download"),
                     "function name should be 'download'"
                 );
                 assert_eq!(args.len(), 1, "download should have 1 argument");
-                match &args[0] {
+                match &tree.arena[args[0]] {
                     Expr::Variable(sym) => assert_eq!(interner.resolve(*sym), Some("backup_alias")),
                     other => panic!("expected Variable arg, got {other:?}"),
                 }
@@ -1679,7 +1682,7 @@ mod tests {
 
         let mut store = VariableStore::with_interner(interner);
         store.set("flag", Value::Bool(true));
-        let result = evaluate(&cc.condition, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(true),
@@ -1706,7 +1709,7 @@ mod tests {
 
         let mut store = VariableStore::with_interner(interner);
         store.set("flag", Value::Bool(false));
-        let result = evaluate(&cc.condition, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(false),
@@ -1742,7 +1745,7 @@ mod tests {
             .iter()
             .filter(|cc| {
                 matches!(
-                    evaluate(&cc.condition, &mut store, &fns, 0),
+                    evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &fns, 0),
                     Ok(Value::Bool(true))
                 )
             })
@@ -1776,7 +1779,7 @@ mod tests {
         store.set("item", { record_map.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(record_map)) });
 
         let cc = &box_node.value().conditional_classes[0];
-        let result = evaluate(&cc.condition, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(true),

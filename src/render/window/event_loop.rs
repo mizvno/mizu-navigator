@@ -85,7 +85,8 @@ pub fn run_window_loop(
     for (&sym, func) in &manager.logic_fns {
         if func.params.is_empty()
             && let Ok(val) = crate::parser::logic::evaluate(
-                &func.body,
+                func.body.root(),
+                &func.body.arena,
                 &mut manager.store,
                 &manager.logic_fns,
                 0,

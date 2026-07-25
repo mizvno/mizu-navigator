@@ -235,7 +235,7 @@ pub fn paint_node(
                 // Rust allows this because they are distinct struct fields.
                 let sm = &mut ctx.store.state_machine;
                 let interner = &ctx.store.interner;
-                sm.evaluate(&cc.condition, 0, &empty_fns, interner)
+                sm.evaluate(cc.condition.root(), 0, &empty_fns, interner, &cc.condition.arena)
                     .map(|v| matches!(v, Value::Bool(true)))
                     .unwrap_or(false)
             };
@@ -1626,7 +1626,7 @@ mod tests {
     #[test]
     fn conditional_class_evaluation_leaves_local_stack_clean() {
         use crate::parser::layout::ConditionalClass;
-        use crate::parser::logic::Expr;
+        use crate::parser::logic::{Expr, ExprArena, ExprTree};
         use crate::core::types::{Value, VariableStore};
         use crate::parser::{MizuNode, Primitive};
 
@@ -1635,6 +1635,8 @@ mod tests {
         let active_sym = store.interner.get_or_intern("active");
         store.state_machine.global_store.insert(active_sym, Value::Bool(true));
 
+        let mut cond_arena = ExprArena::new();
+        let cond_root = cond_arena.alloc(Expr::Variable(active_sym));
         let mut tree = ego_tree::Tree::new(MizuNode {
             primitive: Primitive::Box,
             attributes: Default::default(),
@@ -1643,7 +1645,7 @@ mod tests {
             conditional_classes: vec![ConditionalClass {
                 class_name: "active-style".to_string(),
                 // condition: `active` (a Variable reference)
-                condition: Expr::Variable(active_sym),
+                condition: ExprTree { arena: cond_arena, root: cond_root },
             }],
         });
 
@@ -1742,7 +1744,7 @@ mod tests {
     #[test]
     fn conditional_class_item_binding_shadows_global() {
         use crate::parser::layout::ConditionalClass;
-        use crate::parser::logic::Expr;
+        use crate::parser::logic::{Expr, ExprArena, ExprTree};
         use crate::core::types::{Value, VariableStore};
         use crate::parser::{MizuNode, Primitive};
 
@@ -1752,6 +1754,8 @@ mod tests {
         store.state_machine.global_store.insert(flag_sym, Value::Bool(false));
 
         // The conditional class condition: `flag`
+        let mut cond_arena = ExprArena::new();
+        let cond_root = cond_arena.alloc(Expr::Variable(flag_sym));
         let node = MizuNode {
             primitive: Primitive::Box,
             attributes: Default::default(),
@@ -1759,7 +1763,7 @@ mod tests {
             iterator_context: None,
             conditional_classes: vec![ConditionalClass {
                 class_name: "highlight".to_string(),
-                condition: Expr::Variable(flag_sym),
+                condition: ExprTree { arena: cond_arena, root: cond_root },
             }],
         };
         let tree = ego_tree::Tree::new(node);

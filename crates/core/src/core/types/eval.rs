@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::core::errors::MizuError;
-use crate::parser::logic::{Expr, MizuFunction, apply_binop, check_type, type_name};
+use crate::parser::logic::{Expr, ExprArena, MizuFunction, apply_binop, check_type, type_name};
 
 use super::interner::{StringInterner, Symbol};
 use super::value::Value;
@@ -369,6 +369,7 @@ impl StateMachine {
         frame_pointer: usize,
         functions: &FxHashMap<Symbol, MizuFunction>,
         interner: &StringInterner,
+        arena: &ExprArena,
     ) -> Result<Value, MizuError> {
         self.instruction_count += 1;
         if self.instruction_count > *MAX_INSTRUCTIONS {
@@ -381,7 +382,7 @@ impl StateMachine {
                 "evaluation nesting too deep (max 256 levels)".to_owned(),
             ));
         }
-        let result = self.evaluate_impl(expr, frame_pointer, functions, interner);
+        let result = self.evaluate_impl(expr, frame_pointer, functions, interner, arena);
         self.eval_depth -= 1;
         result
     }
@@ -392,6 +393,7 @@ impl StateMachine {
         frame_pointer: usize,
         functions: &FxHashMap<Symbol, MizuFunction>,
         interner: &StringInterner,
+        arena: &ExprArena,
     ) -> Result<Value, MizuError> {
         match expr {
             Expr::Literal(v) => Ok(v.clone()),
@@ -409,8 +411,8 @@ impl StateMachine {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                let lv = self.evaluate(left, frame_pointer, functions, interner)?;
-                let rv = self.evaluate(right, frame_pointer, functions, interner)?;
+                let lv = self.evaluate(&arena[*left], frame_pointer, functions, interner, arena)?;
+                let rv = self.evaluate(&arena[*right], frame_pointer, functions, interner, arena)?;
                 apply_binop(op, lv, rv, &mut self.instruction_count)
             }
             Expr::FunctionCall { name: sym, args } => {
@@ -422,7 +424,7 @@ impl StateMachine {
                                 "copy_to_clipboard expects 1 argument".to_string(),
                             ));
                         }
-                        let val = self.evaluate(&args[0], frame_pointer, functions, interner)?;
+                        let val = self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let node_id = match val {
                             Value::String(s) => s.to_string(),
                             _ => {
@@ -454,7 +456,10 @@ impl StateMachine {
                         // fixes the target at parse time, so this is now analyzable
                         // exactly like any other assignment.
                         let target_variable = match args.as_slice() {
-                            [Expr::Variable(sym)] => *sym,
+                            [id] if matches!(&arena[*id], Expr::Variable(_)) => {
+                                let Expr::Variable(sym) = &arena[*id] else { unreachable!() };
+                                *sym
+                            }
                             _ => {
                                 return Err(MizuError::ExecutionError(
                                     "get_system_time expects a single bare variable \
@@ -483,7 +488,7 @@ impl StateMachine {
                             ));
                         }
                         let key_val =
-                            self.evaluate(&args[0], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let key_str = match key_val {
                             Value::String(s) => s.to_string(),
                             _ => {
@@ -492,7 +497,7 @@ impl StateMachine {
                                 ));
                             }
                         };
-                        let value = self.evaluate(&args[1], frame_pointer, functions, interner)?;
+                        let value = self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
                         self.accumulated_actions
                             .push(crate::messages::RuntimeAction::StoreLocal {
                                 key: key_str,
@@ -502,10 +507,10 @@ impl StateMachine {
                     }
                     "filter" if args.len() == 3 => {
                         let list_val =
-                            self.evaluate(&args[0], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let field_val =
-                            self.evaluate(&args[1], frame_pointer, functions, interner)?;
-                        let target = self.evaluate(&args[2], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
+                        let target = self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?;
                         let list = match list_val {
                             Value::List(l) => l,
                             other => {
@@ -544,10 +549,10 @@ impl StateMachine {
                     }
                     "count" if args.len() == 3 => {
                         let list_val =
-                            self.evaluate(&args[0], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let field_val =
-                            self.evaluate(&args[1], frame_pointer, functions, interner)?;
-                        let target = self.evaluate(&args[2], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
+                        let target = self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?;
                         let list = match list_val {
                             Value::List(l) => l,
                             other => {
@@ -584,7 +589,7 @@ impl StateMachine {
                     "download" if args.len() == 1 => {
                         // arg[0] must be a bare alias identifier (Expr::Variable);
                         // aliases are not runtime variables and cannot be store-looked-up.
-                        let alias_sym = match &args[0] {
+                        let alias_sym = match &arena[args[0]] {
                             Expr::Variable(sym) => *sym,
                             _ => return Err(MizuError::ExecutionError(
                                 "download: alias must be a bare identifier, e.g. download(backup)"
@@ -600,19 +605,19 @@ impl StateMachine {
                     }
                     "sort" if args.len() == 3 => {
                         let list_val =
-                            self.evaluate(&args[0], frame_pointer, functions, interner)?;
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let field_val =
-                            self.evaluate(&args[1], frame_pointer, functions, interner)?;
-                        let direction_val = match &args[2] {
+                            self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
+                        let direction_val = match &arena[args[2]] {
                             Expr::Variable(sym) => {
                                 let name = interner.resolve(*sym).unwrap_or("");
                                 if name == "asc" || name == "desc" {
                                     Value::String(Arc::from(name))
                                 } else {
-                                    self.evaluate(&args[2], frame_pointer, functions, interner)?
+                                    self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?
                                 }
                             }
-                            _ => self.evaluate(&args[2], frame_pointer, functions, interner)?,
+                            _ => self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?,
                         };
                         let list = match list_val {
                             Value::List(l) => l,
@@ -686,12 +691,13 @@ impl StateMachine {
                 }
 
                 let mut evaluated_args = Vec::with_capacity(args.len());
-                for arg_expr in args {
+                for &arg_id in args {
                     evaluated_args.push(self.evaluate(
-                        arg_expr,
+                        &arena[arg_id],
                         frame_pointer,
                         functions,
                         interner,
+                        arena,
                     )?);
                 }
 
@@ -703,7 +709,7 @@ impl StateMachine {
                     self.push_local(*param_sym, arg_val);
                 }
 
-                let res = self.evaluate(&func.body, new_fp, functions, interner);
+                let res = self.evaluate(func.body.root(), new_fp, functions, interner, &func.body.arena);
                 self.truncate_locals(new_fp);
                 res
             }
@@ -712,14 +718,14 @@ impl StateMachine {
                 value,
                 body,
             } => {
-                let bound_val = self.evaluate(value, frame_pointer, functions, interner)?;
+                let bound_val = self.evaluate(&arena[*value], frame_pointer, functions, interner, arena)?;
                 self.push_local(*sym, bound_val);
-                let res = self.evaluate(body, frame_pointer, functions, interner);
+                let res = self.evaluate(&arena[*body], frame_pointer, functions, interner, arena);
                 self.pop_local();
                 res
             }
             Expr::Not(inner) => {
-                let val = self.evaluate(inner, frame_pointer, functions, interner)?;
+                let val = self.evaluate(&arena[*inner], frame_pointer, functions, interner, arena)?;
                 match val {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
                     other => Err(crate::core::errors::MizuError::TypeError {
@@ -734,13 +740,13 @@ impl StateMachine {
                 then_expr,
                 else_expr,
             } => {
-                let cond_val = self.evaluate(condition, frame_pointer, functions, interner)?;
+                let cond_val = self.evaluate(&arena[*condition], frame_pointer, functions, interner, arena)?;
                 match cond_val {
                     Value::Bool(true) => {
-                        self.evaluate(then_expr, frame_pointer, functions, interner)
+                        self.evaluate(&arena[*then_expr], frame_pointer, functions, interner, arena)
                     }
                     Value::Bool(false) => {
-                        self.evaluate(else_expr, frame_pointer, functions, interner)
+                        self.evaluate(&arena[*else_expr], frame_pointer, functions, interner, arena)
                     }
                     other => Err(crate::core::errors::MizuError::TypeError {
                         expected: Box::new("bool".to_string()),
@@ -749,7 +755,7 @@ impl StateMachine {
                 }
             }
             Expr::FieldAccess { base, field } => {
-                let base_val = self.evaluate(base, frame_pointer, functions, interner)?;
+                let base_val = self.evaluate(&arena[*base], frame_pointer, functions, interner, arena)?;
                 if !matches!(base_val, Value::Record(_)) {
                     return Err(MizuError::TypeError {
                         expected: Box::new("record".to_string()),

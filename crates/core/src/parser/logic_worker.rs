@@ -141,10 +141,11 @@ impl LogicWorker {
                         if func.params.is_empty() {
                             self.store.state_machine.instruction_count = 0;
                             if let Ok(val) = self.store.state_machine.evaluate(
-                                &func.body,
+                                func.body.root(),
                                 0,
                                 &self.logic_fns,
                                 &self.store.interner,
+                                &func.body.arena,
                             ) {
                                 self.store.set_symbol(sym, val);
                             }
@@ -687,7 +688,7 @@ mod tests {
     /// process crashing.
     fn run_logic_worker_depth_guard_child(ok_marker: &str) {
         use crate::messages::{ReloadPayload, UiEvent};
-        use crate::parser::logic::{BinOp, Expr};
+        use crate::parser::logic::{BinOp, Expr, ExprArena, ExprTree};
         use std::sync::mpsc;
 
         let (tx_in, rx_in) = mpsc::channel::<UiEvent>();
@@ -697,17 +698,17 @@ mod tests {
         // 300-level deep chain: exceeds MAX_EVAL_DEPTH (256), same shape as
         // core::types::tests::eval_depth_guard /
         // cross_function_composition_depth_guard.
+        let mut arena = ExprArena::new();
         let mut expr = Expr::Literal(Value::Int(0));
         for _ in 0..300 {
-            expr = Expr::BinaryOp {
-                left: Box::new(expr),
-                op: BinOp::Add,
-                right: Box::new(Expr::Literal(Value::Int(0))),
-            };
+            let left = arena.alloc(expr);
+            let right = arena.alloc(Expr::Literal(Value::Int(0)));
+            expr = Expr::BinaryOp { left, op: BinOp::Add, right };
         }
+        let root = arena.alloc(expr);
 
         let mut click_actions = HashMap::new();
-        click_actions.insert(0u32, Action::Eval(expr));
+        click_actions.insert(0u32, Action::Eval(ExprTree { arena, root }));
 
         let mut interner = StringInterner::new();
         interner.freeze();

@@ -7,9 +7,9 @@ use std::collections::{BTreeSet, VecDeque};
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, VariableStore};
 
-use super::ast::{ComputedBinding, Expr, MizuFunction};
+use super::ast::{ComputedBinding, Expr, ExprArena, MizuFunction};
 use super::lexer::{Cursor, assert_cursor_empty, leading_spaces, lex};
-use super::parse::parse_expr;
+use super::parse::parse_expr_tree;
 
 /// Parses `comp name = expr` declarations at the baseline indent of `logic_content`.
 ///
@@ -91,15 +91,15 @@ pub fn parse_computed_with_functions(
 
         let tokens = lex(expr_src)?;
         let mut cursor = Cursor::new(&tokens);
-        let expr = parse_expr(&mut cursor, 0, 0, interner)?;
+        let expr = parse_expr_tree(&mut cursor, interner)?;
         assert_cursor_empty(&cursor, expr_src)?;
 
         let name_sym = interner.get_or_intern(name);
         let mut dep_set: FxHashSet<Symbol> = FxHashSet::default();
-        collect_vars(&expr, &mut dep_set);
+        collect_vars(expr.root(), &expr.arena, &mut dep_set);
         // Union the globals read inside every function reachable from the RHS,
         // so mutations to those globals also trigger a recompute.
-        collect_reachable_function_reads(&expr, functions, &function_names, &mut dep_set);
+        collect_reachable_function_reads(expr.root(), &expr.arena, functions, &function_names, &mut dep_set);
         // Function names are code references, not data dependencies.
         for fname in &function_names {
             dep_set.remove(fname);
@@ -282,7 +282,7 @@ pub fn recompute_computed_bindings(
         store.state_machine.instruction_count = 0;
         if let Ok(val) = store
             .state_machine
-            .evaluate(&cb.expr, 0, functions, &store.interner)
+            .evaluate(cb.expr.root(), 0, functions, &store.interner, &cb.expr.arena)
         {
             store.set_symbol(cb.name, val);
             if changed.insert(cb.name)
@@ -317,7 +317,7 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
         store.state_machine.instruction_count = 0;
         if let Ok(val) = store
             .state_machine
-            .evaluate(&cb.expr, 0, functions, &store.interner)
+            .evaluate(cb.expr.root(), 0, functions, &store.interner, &cb.expr.arena)
         {
             store.set_symbol(cb.name, val);
             changed.insert(cb.name);
@@ -333,41 +333,46 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
 /// right-hand side.  Function names that appear as `Expr::Variable` in the AST
 /// (zero-arg calls written without parentheses) are included; the caller must
 /// remove the binding's own name and any pure built-ins if desired.
-fn collect_vars(expr: &Expr, out: &mut FxHashSet<Symbol>) {
+fn collect_vars(expr: &Expr, arena: &ExprArena, out: &mut FxHashSet<Symbol>) {
     match expr {
         Expr::Variable(sym) => {
             out.insert(*sym);
         }
         Expr::Literal(_) => {}
         Expr::BinaryOp { left, right, .. } => {
-            collect_vars(left, out);
-            collect_vars(right, out);
+            collect_vars(&arena[*left], arena, out);
+            collect_vars(&arena[*right], arena, out);
         }
         Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_vars(arg, out);
+            for &arg in args {
+                collect_vars(&arena[arg], arena, out);
             }
         }
         Expr::Let { value, body, .. } => {
-            collect_vars(value, out);
-            collect_vars(body, out);
+            collect_vars(&arena[*value], arena, out);
+            collect_vars(&arena[*body], arena, out);
         }
-        Expr::Not(inner) => collect_vars(inner, out),
+        Expr::Not(inner) => collect_vars(&arena[*inner], arena, out),
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            collect_vars(condition, out);
-            collect_vars(then_expr, out);
-            collect_vars(else_expr, out);
+            collect_vars(&arena[*condition], arena, out);
+            collect_vars(&arena[*then_expr], arena, out);
+            collect_vars(&arena[*else_expr], arena, out);
         }
-        Expr::FieldAccess { base, .. } => collect_vars(base, out),
+        Expr::FieldAccess { base, .. } => collect_vars(&arena[*base], arena, out),
     }
 }
 
 /// Collects all `FunctionCall` and variable reference symbols that match defined functions.
-pub(super) fn collect_calls(expr: &Expr, out: &mut FxHashSet<Symbol>, function_names: &FxHashSet<Symbol>) {
+pub(super) fn collect_calls(
+    expr: &Expr,
+    arena: &ExprArena,
+    out: &mut FxHashSet<Symbol>,
+    function_names: &FxHashSet<Symbol>,
+) {
     match expr {
         Expr::Literal(_) => {}
         Expr::Variable(sym) => {
@@ -376,30 +381,30 @@ pub(super) fn collect_calls(expr: &Expr, out: &mut FxHashSet<Symbol>, function_n
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_calls(left, out, function_names);
-            collect_calls(right, out, function_names);
+            collect_calls(&arena[*left], arena, out, function_names);
+            collect_calls(&arena[*right], arena, out, function_names);
         }
         Expr::FunctionCall { name: sym, args } => {
             out.insert(*sym);
-            for arg in args {
-                collect_calls(arg, out, function_names);
+            for &arg in args {
+                collect_calls(&arena[arg], arena, out, function_names);
             }
         }
         Expr::Let { value, body, .. } => {
-            collect_calls(value, out, function_names);
-            collect_calls(body, out, function_names);
+            collect_calls(&arena[*value], arena, out, function_names);
+            collect_calls(&arena[*body], arena, out, function_names);
         }
-        Expr::Not(inner) => collect_calls(inner, out, function_names),
+        Expr::Not(inner) => collect_calls(&arena[*inner], arena, out, function_names),
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            collect_calls(condition, out, function_names);
-            collect_calls(then_expr, out, function_names);
-            collect_calls(else_expr, out, function_names);
+            collect_calls(&arena[*condition], arena, out, function_names);
+            collect_calls(&arena[*then_expr], arena, out, function_names);
+            collect_calls(&arena[*else_expr], arena, out, function_names);
         }
-        Expr::FieldAccess { base, .. } => collect_calls(base, out, function_names),
+        Expr::FieldAccess { base, .. } => collect_calls(&arena[*base], arena, out, function_names),
     }
 }
 
@@ -412,12 +417,13 @@ pub(super) fn collect_calls(expr: &Expr, out: &mut FxHashSet<Symbol>, function_n
 /// (DAG-check-rejected, hence impossible) cyclic graph — defence in depth.
 fn collect_reachable_function_reads(
     expr: &Expr,
+    arena: &ExprArena,
     functions: &FxHashMap<Symbol, MizuFunction>,
     function_names: &FxHashSet<Symbol>,
     out: &mut FxHashSet<Symbol>,
 ) {
     let mut initial_calls: FxHashSet<Symbol> = FxHashSet::default();
-    collect_calls(expr, &mut initial_calls, function_names);
+    collect_calls(expr, arena, &mut initial_calls, function_names);
 
     let mut visited: FxHashSet<Symbol> = FxHashSet::default();
     let mut worklist: Vec<Symbol> = initial_calls.into_iter().collect();
@@ -429,9 +435,9 @@ fn collect_reachable_function_reads(
         let Some(func) = functions.get(&sym) else {
             continue;
         };
-        collect_vars(&func.body, out);
+        collect_vars(func.body.root(), &func.body.arena, out);
         let mut nested_calls: FxHashSet<Symbol> = FxHashSet::default();
-        collect_calls(&func.body, &mut nested_calls, function_names);
+        collect_calls(func.body.root(), &func.body.arena, &mut nested_calls, function_names);
         worklist.extend(nested_calls);
     }
 }

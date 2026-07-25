@@ -362,7 +362,7 @@ mod tests {
         // plausible name a document-readable color-scheme primitive might
         // have used, and confirm each fails as an undefined function.
         use crate::core::types::{StateMachine, StringInterner};
-        use crate::parser::logic::Expr;
+        use crate::parser::logic::{Expr, ExprArena};
 
         for candidate in [
             "get_color_scheme",
@@ -381,7 +381,8 @@ mod tests {
             };
             let mut machine = StateMachine::new();
             let no_functions = Default::default();
-            let result = machine.evaluate(&call, 0, &no_functions, &interner);
+            let arena = ExprArena::new();
+            let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);
             assert!(
                 result.is_err(),
                 "`{candidate}` must not resolve to any evaluator function"
