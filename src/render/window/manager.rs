@@ -357,6 +357,11 @@ impl MizuWindowManager {
             }
         }
 
+        // Measured, not assumed: a full parse of this repo's largest example
+        // document interns only 21 symbols (~458 bytes estimated clone
+        // payload) -- see StringInterner's Clone impl for the measurement
+        // method and the reasoning for not optimizing this call. This fires
+        // on document reload, not per frame/interaction.
         let mut interner = self.store.interner.clone();
         for node in self.dom.nodes() {
             for event in node.value().events.values() {

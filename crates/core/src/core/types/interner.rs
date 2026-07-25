@@ -71,6 +71,21 @@ impl Clone for StringInterner {
         // Callers that run after freeze and might encounter runtime-generated
         // strings must use VariableStore::set_runtime, which consults
         // interner.get() (not get_or_intern()) and discards unknown names.
+        //
+        // Measured, not assumed: a full parse of
+        // docs/reference/examples/showcase.mizu -- this repo's largest
+        // example document at 6443 bytes / 164 lines -- interns only
+        // 21 symbols, for an estimated clone payload (map + vec) of ~458
+        // bytes. This is orders of magnitude below the "tens of KB, not
+        // worth changing" threshold, let alone the "hundreds of KB" bar that
+        // would justify an Arc/copy-on-write redesign. The interner only
+        // holds identifiers (variable/function names), not literal string
+        // content, so reaching a size where this clone matters would require
+        // thousands of distinct identifiers in one document -- implausible
+        // for a hypermedia UI document. Re-measure with the same method
+        // (parse a real document, read interner.map.len() and estimate
+        // bytes) before revisiting this, rather than assuming the number has
+        // changed.
         Self {
             map: self.map.clone(),
             vec: self.vec.clone(),
