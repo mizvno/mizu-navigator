@@ -53,16 +53,16 @@ pub(super) fn parse_expr(
             Expr::Literal(Value::Int(scaled))
         }
         Some(Token::Bool(b)) => Expr::Literal(Value::Bool(*b)),
-        Some(Token::Str(s)) => Expr::Literal(Value::String(std::sync::Arc::from(s.as_str()))),
+        Some(Token::Str(s)) => Expr::Literal(Value::String(std::sync::Arc::from(*s))),
 
         Some(Token::Ident(name)) => {
-            let name = name.clone();
+            let name = *name;
 
             // ── `if <cond> then <then> else <else>` ─────────────────────────
             if name == "if" {
                 let condition = parse_expr(cursor, 0, depth + 1, interner)?;
                 match cursor.next() {
-                    Some(Token::Ident(kw)) if kw == "then" => {}
+                    Some(Token::Ident(kw)) if *kw == "then" => {}
                     other => {
                         return Err(MizuError::ParseError(format!(
                             "expected `then` after `if` condition, got: {other:?}"
@@ -71,7 +71,7 @@ pub(super) fn parse_expr(
                 }
                 let then_expr = parse_expr(cursor, 0, depth + 1, interner)?;
                 match cursor.next() {
-                    Some(Token::Ident(kw)) if kw == "else" => {}
+                    Some(Token::Ident(kw)) if *kw == "else" => {}
                     other => {
                         return Err(MizuError::ParseError(format!(
                             "expected `else` branch in `if` expression, got: {other:?}"
@@ -122,11 +122,11 @@ pub(super) fn parse_expr(
                     ));
                 }
                 Expr::FunctionCall {
-                    name: interner.get_or_intern(&name),
+                    name: interner.get_or_intern(name),
                     args,
                 }
             } else {
-                Expr::Variable(interner.get_or_intern(&name))
+                Expr::Variable(interner.get_or_intern(name))
             }
         }
 
@@ -175,7 +175,7 @@ pub(super) fn parse_expr(
             }
             cursor.next(); // consume `.`
             let field = match cursor.next() {
-                Some(Token::Ident(name)) => Arc::from(name.as_str()),
+                Some(Token::Ident(name)) => Arc::from(*name),
                 other => {
                     return Err(MizuError::ParseError(format!(
                         "expected field name after `.`, got: {other:?}"
@@ -402,7 +402,7 @@ fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result
                 let mut fields = Vec::new();
                 while !matches!(cursor.peek(), Some(Token::RBrace) | None) {
                     let field_name: std::sync::Arc<str> = match cursor.next() {
-                        Some(Token::Ident(n)) => std::sync::Arc::from(n.as_str()),
+                        Some(Token::Ident(n)) => std::sync::Arc::from(*n),
                         other => return Err(format!("expected field name, got {other:?}")),
                     };
                     match cursor.next() {
@@ -448,7 +448,7 @@ fn parse_params(
     
     while !matches!(cursor.peek(), None | Some(Token::Newline)) {
         let name = match cursor.next() {
-            Some(Token::Ident(n)) => n.clone(),
+            Some(Token::Ident(n)) => *n,
             other => return Err(MizuError::ParseError(format!("expected parameter name, got {other:?}"))),
         };
         match cursor.next() {
@@ -459,7 +459,7 @@ fn parse_params(
             }
         }
         let vtype = parse_type(&mut cursor, interner).map_err(MizuError::ParseError)?;
-        params.push((interner.get_or_intern(&name), vtype));
+        params.push((interner.get_or_intern(name), vtype));
         
         if matches!(cursor.peek(), Some(Token::Comma)) {
             cursor.next();

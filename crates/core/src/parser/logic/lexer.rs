@@ -4,13 +4,13 @@ use crate::core::errors::MizuError;
 
 /// Internal token produced by the Mizu logic lexer.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum Token {
+pub(super) enum Token<'a> {
     /// An identifier or keyword.
-    Ident(String),
+    Ident(&'a str),
     /// A numeric literal (already parsed to `f64`).
     Num(f64),
     /// A string literal (content without surrounding quotes).
-    Str(String),
+    Str(&'a str),
     /// `true` or `false`.
     Bool(bool),
     /// `(`
@@ -70,8 +70,8 @@ pub(super) enum Token {
 /// The input is a slice of lines belonging to one function (as assembled by
 /// `parse_logic`).  Returns a flat token stream including `Indent`/`Dedent`
 /// markers that let the parser track block structure without counting spaces.
-pub(super) fn lex(source: &str) -> Result<Vec<Token>, MizuError> {
-    let mut tokens: Vec<Token> = Vec::new();
+pub(super) fn lex(source: &str) -> Result<Vec<Token<'_>>, MizuError> {
+    let mut tokens: Vec<Token<'_>> = Vec::new();
     let mut indent_stack: Vec<usize> = vec![0];
 
     for (line_idx, raw_line) in source.lines().enumerate() {
@@ -121,7 +121,7 @@ pub(super) fn lex(source: &str) -> Result<Vec<Token>, MizuError> {
 
 /// Scans a single line's *content* (already stripped of leading whitespace)
 /// and appends tokens to `out`.
-fn lex_line(content: &str, out: &mut Vec<Token>, line_num: usize) -> Result<(), MizuError> {
+fn lex_line<'a>(content: &'a str, out: &mut Vec<Token<'a>>, line_num: usize) -> Result<(), MizuError> {
     let bytes = content.as_bytes();
     let mut i = 0usize;
 
@@ -153,7 +153,7 @@ fn lex_line(content: &str, out: &mut Vec<Token>, line_num: usize) -> Result<(), 
             let s = std::str::from_utf8(&bytes[start..i]).map_err(|_| {
                 MizuError::ParseError(format!("line {line_num}: invalid UTF-8 in string literal"))
             })?;
-            out.push(Token::Str(s.to_owned()));
+            out.push(Token::Str(s));
             i += 1; // skip closing quote
             continue;
         }
@@ -214,7 +214,7 @@ fn lex_line(content: &str, out: &mut Vec<Token>, line_num: usize) -> Result<(), 
             let tok = match word {
                 "true" => Token::Bool(true),
                 "false" => Token::Bool(false),
-                _ => Token::Ident(word.to_owned()),
+                _ => Token::Ident(word),
             };
             out.push(tok);
             continue;
@@ -261,20 +261,20 @@ fn lex_line(content: &str, out: &mut Vec<Token>, line_num: usize) -> Result<(), 
 
 /// A simple indexed cursor over a token stream.
 pub(super) struct Cursor<'a> {
-    tokens: &'a [Token],
+    tokens: &'a [Token<'a>],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    pub(super) fn new(tokens: &'a [Token]) -> Self {
+    pub(super) fn new(tokens: &'a [Token<'a>]) -> Self {
         Self { tokens, pos: 0 }
     }
 
-    pub(super) fn peek(&self) -> Option<&Token> {
+    pub(super) fn peek(&self) -> Option<&Token<'a>> {
         self.tokens.get(self.pos)
     }
 
-    pub(super) fn next(&mut self) -> Option<&Token> {
+    pub(super) fn next(&mut self) -> Option<&Token<'a>> {
         let tok = self.tokens.get(self.pos)?;
         self.pos += 1;
         Some(tok)
@@ -282,7 +282,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// Returns a human-readable representation of a token for use in error messages.
-fn token_display(tok: &Token) -> String {
+fn token_display(tok: &Token<'_>) -> String {
     match tok {
         Token::Ident(s) => format!("`{s}`"),
         Token::Str(s) => format!("`\"{s}\"`"),
