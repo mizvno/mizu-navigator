@@ -88,13 +88,14 @@ fn hit_test_node(
 mod tests {
     use super::*;
     use crate::parser::Primitive;
+    use rustc_hash::FxHashMap;
 
     #[test]
     fn test_hit_test_inside() {
         let mut tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -105,8 +106,8 @@ mod tests {
             .root_mut()
             .append(MizuNode {
                 primitive: Primitive::Button,
-                attributes: HashMap::new(),
-                events: HashMap::new(),
+                attributes: FxHashMap::default(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             })

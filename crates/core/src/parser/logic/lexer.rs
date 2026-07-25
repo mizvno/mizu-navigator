@@ -358,5 +358,5 @@ pub(super) fn assert_cursor_empty(cursor: &Cursor<'_>, context: &str) -> Result<
 /// Returns the number of leading space characters in `line`.
 #[inline]
 pub(super) fn leading_spaces(line: &str) -> usize {
-    line.len() - line.trim_start_matches(' ').len()
+    line.as_bytes().iter().take_while(|&&b| b == b' ').count()
 }

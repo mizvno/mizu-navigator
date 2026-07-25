@@ -120,17 +120,17 @@ pub fn strip_bidi_overrides(s: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     fn node(dir: Option<&str>) -> MizuNode {
-        let mut attributes = HashMap::new();
+        let mut attributes = FxHashMap::default();
         if let Some(d) = dir {
             attributes.insert("dir".to_string(), d.to_string());
         }
         MizuNode {
             primitive: crate::parser::Primitive::Box,
             attributes,
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }

@@ -14,7 +14,7 @@
 #![forbid(unsafe_code)]
 
 use ego_tree::{NodeId, Tree};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::core::errors::MizuError;
 use crate::core::types::StringInterner;
@@ -71,9 +71,9 @@ pub struct MizuNode {
     /// The primitive type of this node.
     pub primitive: Primitive,
     /// Inline attributes mapping (e.g. `class -> .card`).
-    pub attributes: HashMap<String, String>,
+    pub attributes: FxHashMap<String, String>,
     /// Behavioral event blocks mapping (e.g. `click -> EventBlock::Click`).
-    pub events: HashMap<String, EventBlock>,
+    pub events: FxHashMap<String, EventBlock>,
     /// For `each` nodes: `(item_variable, list_name)`, e.g. `each item in list` â†’ `("item", "list")`.
     pub iterator_context: Option<(String, String)>,
     /// Runtime-evaluated conditional classes (applied in declaration order after the base class).
@@ -119,7 +119,7 @@ pub struct ConditionalClass {
 /// Returns the number of leading space characters in `line`.
 #[inline]
 fn leading_spaces(line: &str) -> usize {
-    line.len() - line.trim_start_matches(' ').len()
+    line.as_bytes().iter().take_while(|&&b| b == b' ').count()
 }
 
 /// Splits a string on its first whitespace boundary into `(first_word, rest)`.
@@ -187,13 +187,13 @@ fn find_trailing_layout_keyword(action_str: &str) -> Option<&'static str> {
 }
 
 /// Parses inline attribute key-value pairs (e.g. `type "text" class .input`) and inline events.
-pub type AttrsAndEvents = (HashMap<String, String>, HashMap<String, EventBlock>);
+pub type AttrsAndEvents = (FxHashMap<String, String>, FxHashMap<String, EventBlock>);
 fn parse_attributes_and_events(
     mut s: &str,
     interner: &mut StringInterner,
 ) -> Result<AttrsAndEvents, MizuError> {
-    let mut attrs = HashMap::new();
-    let mut events = HashMap::new();
+    let mut attrs = FxHashMap::default();
+    let mut events = FxHashMap::default();
     loop {
         s = s.trim_start();
         if s.is_empty() {
@@ -347,8 +347,8 @@ fn parse_primitive_and_attrs(
             let list_name = words[2].to_string();
             let node = MizuNode {
                 primitive: Primitive::Each,
-                attributes: HashMap::new(),
-                events: HashMap::new(),
+                attributes: FxHashMap::default(),
+                events: FxHashMap::default(),
                 iterator_context: Some((item_var, list_name)),
                 conditional_classes: Vec::new(),
             };
@@ -498,11 +498,11 @@ pub fn parse_layout_with_urls(
         let text_node = MizuNode {
             primitive: Primitive::Text,
             attributes: {
-                let mut m = HashMap::new();
+                let mut m = FxHashMap::default();
                 m.insert("content".to_string(), text_str);
                 m
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         };
@@ -823,11 +823,11 @@ pub fn parse_layout_with_urls(
             let text_node = MizuNode {
                 primitive: Primitive::Text,
                 attributes: {
-                    let mut m = HashMap::new();
+                    let mut m = FxHashMap::default();
                     m.insert("content".to_string(), text_str);
                     m
                 },
-                events: HashMap::new(),
+                events: FxHashMap::default(),
                 iterator_context: None,
                 conditional_classes: Vec::new(),
             };

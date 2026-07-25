@@ -15,11 +15,11 @@
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut attrs = HashMap::new();
+                let mut attrs = FxHashMap::default();
                 attrs.insert("class".to_string(), "window".to_string());
                 attrs
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -68,11 +68,11 @@
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut attrs = HashMap::new();
+                let mut attrs = FxHashMap::default();
                 attrs.insert("class".to_string(), "window".to_string());
                 attrs
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -227,12 +227,12 @@
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut m = HashMap::new();
+                let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "sensitive-data".to_string());
                 m.insert("content".to_string(), "local secret".to_string());
                 m
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -262,12 +262,12 @@
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut m = HashMap::new();
+                let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "my-node".to_string());
                 m.insert("content".to_string(), "Copy me!".to_string());
                 m
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -292,8 +292,8 @@
         // even when a gesture is present (no arbitrary text can be injected).
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -317,12 +317,12 @@
         let tree = Tree::new(MizuNode {
             primitive: Primitive::Window,
             attributes: {
-                let mut m = HashMap::new();
+                let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "label".to_string());
                 m.insert("content".to_string(), "Copy me!".to_string());
                 m
             },
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
@@ -355,8 +355,8 @@
     fn window_node() -> MizuNode {
         MizuNode {
             primitive: Primitive::Window,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }
@@ -365,19 +365,19 @@
     fn plain_box_node() -> MizuNode {
         MizuNode {
             primitive: Primitive::Box,
-            attributes: HashMap::new(),
-            events: HashMap::new(),
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }
     }
 
     fn clickable_box_node() -> MizuNode {
-        let mut events = HashMap::new();
+        let mut events = FxHashMap::default();
         events.insert("click".to_string(), click_event_block());
         MizuNode {
             primitive: Primitive::Box,
-            attributes: HashMap::new(),
+            attributes: FxHashMap::default(),
             events,
             iterator_context: None,
             conditional_classes: Vec::new(),
@@ -385,23 +385,23 @@
     }
 
     fn input_node(name: &str) -> MizuNode {
-        let mut attrs = HashMap::new();
+        let mut attrs = FxHashMap::default();
         attrs.insert("name".to_string(), name.to_string());
         MizuNode {
             primitive: Primitive::Input,
             attributes: attrs,
-            events: HashMap::new(),
+            events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
         }
     }
 
     fn button_node() -> MizuNode {
-        let mut events = HashMap::new();
+        let mut events = FxHashMap::default();
         events.insert("click".to_string(), click_event_block());
         MizuNode {
             primitive: Primitive::Button,
-            attributes: HashMap::new(),
+            attributes: FxHashMap::default(),
             events,
             iterator_context: None,
             conditional_classes: Vec::new(),

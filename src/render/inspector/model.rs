@@ -793,10 +793,9 @@ mod tests {
 
     #[test]
     fn node_label_shows_events_and_class() {
-        use std::collections::HashMap;
-        let mut attributes = HashMap::new();
+        let mut attributes = FxHashMap::default();
         attributes.insert("class".to_string(), "card".to_string());
-        let mut events = HashMap::new();
+        let mut events = FxHashMap::default();
         let mut it = StringInterner::new();
         let action = crate::parser::logic::parse_action("x = 1", &mut it).unwrap();
         events.insert("click".to_string(), EventBlock::Click { action });
