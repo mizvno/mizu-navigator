@@ -30,13 +30,13 @@ pub fn find_side_effect_call(expr: &Expr, arena: &ExprArena, interner: &StringIn
             find_side_effect_call(&arena[*left], arena, interner)
                 .or_else(|| find_side_effect_call(&arena[*right], arena, interner))
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args_start, args_len } => {
             if let Some(n) = interner.resolve(*name)
                 && SIDE_EFFECT_BUILTINS.contains(&n)
             {
                 return Some(n.to_string());
             }
-            for &arg in args {
+            for &arg in arena.args(*args_start, *args_len) {
                 if let Some(n) = find_side_effect_call(&arena[arg], arena, interner) {
                     return Some(n);
                 }

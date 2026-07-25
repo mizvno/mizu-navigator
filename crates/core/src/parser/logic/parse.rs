@@ -131,9 +131,11 @@ pub(super) fn parse_expr(
                     ));
                 }
                 let arg_ids: Vec<super::ast::ExprId> = args.into_iter().map(|a| arena.alloc(a)).collect();
+                let (args_start, args_len) = arena.push_args(&arg_ids)?;
                 Expr::FunctionCall {
                     name: interner.get_or_intern(name),
-                    args: arg_ids,
+                    args_start,
+                    args_len,
                 }
             } else {
                 Expr::Variable(interner.get_or_intern(name))
@@ -1116,9 +1118,11 @@ pub fn parse_action_with_urls(
         let download_sym = interner.get_or_intern("download");
         let mut arena = ExprArena::new();
         let arg = arena.alloc(Expr::Variable(alias_sym));
+        let (args_start, args_len) = arena.push_args(&[arg])?;
         let root = arena.alloc(Expr::FunctionCall {
             name: download_sym,
-            args: vec![arg],
+            args_start,
+            args_len,
         });
         return Ok(Action::Eval(ExprTree { arena, root }));
     }

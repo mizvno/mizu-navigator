@@ -415,7 +415,8 @@ impl StateMachine {
                 let rv = self.evaluate(&arena[*right], frame_pointer, functions, interner, arena)?;
                 apply_binop(op, lv, rv, &mut self.instruction_count)
             }
-            Expr::FunctionCall { name: sym, args } => {
+            Expr::FunctionCall { name: sym, args_start, args_len } => {
+                let args = arena.args(*args_start, *args_len);
                 let resolved_name = interner.resolve(*sym).unwrap_or("<unknown>");
                 match resolved_name {
                     "copy_to_clipboard" => {
@@ -455,7 +456,7 @@ impl StateMachine {
                         // check able to see it. Requiring a bare identifier here
                         // fixes the target at parse time, so this is now analyzable
                         // exactly like any other assignment.
-                        let target_variable = match args.as_slice() {
+                        let target_variable = match args {
                             [id] if matches!(&arena[*id], Expr::Variable(_)) => {
                                 let Expr::Variable(sym) = &arena[*id] else { unreachable!() };
                                 *sym

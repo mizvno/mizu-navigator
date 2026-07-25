@@ -1576,9 +1576,10 @@ mod tests {
             EventBlock::Click {
                 action: Action::Eval(tree),
             } => {
-                let Expr::FunctionCall { name, args } = tree.root() else {
+                let Expr::FunctionCall { name, args_start, args_len } = tree.root() else {
                     panic!("expected FunctionCall root, got {:?}", tree.root());
                 };
+                let args = tree.arena.args(*args_start, *args_len);
                 assert_eq!(
                     interner.resolve(*name),
                     Some("download"),
