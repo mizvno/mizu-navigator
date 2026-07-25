@@ -15,7 +15,7 @@ use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
 use crate::parser::layout::{EventBlock, MizuNode};
 use crate::parser::logic::{
-    Action, BinOp, ComputedBinding, Expr, MizuFunction, RootTimer, ValueType,
+    Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, RootTimer, ValueType,
 };
 use rustc_hash::FxHashMap;
 
@@ -32,7 +32,7 @@ pub fn check_types(
     let mut global_env = Env::default();
 
     for comp in comps {
-        let ty = infer(&comp.expr, &global_env, functions, interner)?;
+        let ty = infer(comp.expr.root(), &comp.expr.arena, &global_env, functions, interner)?;
         global_env.insert(comp.name, ty);
     }
 
@@ -41,7 +41,7 @@ pub fn check_types(
         for (sym, ty_ann) in &func.params {
             local_env.insert(*sym, Some(ty_ann.clone()));
         }
-        infer(&func.body, &local_env, functions, interner)?;
+        infer(func.body.root(), &func.body.arena, &local_env, functions, interner)?;
     }
 
     for node in dom.nodes() {
@@ -69,7 +69,7 @@ fn check_action(
 ) -> Result<(), MizuError> {
     match action {
         Action::Eval(expr) | Action::Assign { expr, .. } | Action::Navigate { url: expr } => {
-            infer(expr, env, functions, interner)?;
+            infer(expr.root(), &expr.arena, env, functions, interner)?;
         }
         Action::NetworkCall {
             payload,
@@ -77,10 +77,10 @@ fn check_action(
             ..
         } => {
             if let Some(p) = payload {
-                infer(p, env, functions, interner)?;
+                infer(p.root(), &p.arena, env, functions, interner)?;
             }
             if let Some(p) = path_param {
-                infer(p, env, functions, interner)?;
+                infer(p.root(), &p.arena, env, functions, interner)?;
             }
         }
     }
@@ -89,6 +89,7 @@ fn check_action(
 
 fn infer(
     expr: &Expr,
+    arena: &ExprArena,
     env: &Env,
     functions: &FxHashMap<Symbol, MizuFunction>,
     interner: &crate::core::types::StringInterner,
@@ -112,8 +113,8 @@ fn infer(
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            infer(left, env, functions, interner)?;
-            infer(right, env, functions, interner)?;
+            infer(&arena[*left], arena, env, functions, interner)?;
+            infer(&arena[*right], arena, env, functions, interner)?;
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ok(Some(ValueType::Num)),
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
@@ -121,13 +122,13 @@ fn infer(
             }
         }
         Expr::Let { name, value, body } => {
-            let val_ty = infer(value, env, functions, interner)?;
+            let val_ty = infer(&arena[*value], arena, env, functions, interner)?;
             let mut local_env = env.clone();
             local_env.insert(*name, val_ty);
-            infer(body, &local_env, functions, interner)
+            infer(&arena[*body], arena, &local_env, functions, interner)
         }
         Expr::Not(inner) => {
-            infer(inner, env, functions, interner)?;
+            infer(&arena[*inner], arena, env, functions, interner)?;
             Ok(Some(ValueType::Bool))
         }
         Expr::IfElse {
@@ -135,9 +136,9 @@ fn infer(
             then_expr,
             else_expr,
         } => {
-            infer(condition, env, functions, interner)?;
-            let then_ty = infer(then_expr, env, functions, interner)?;
-            let else_ty = infer(else_expr, env, functions, interner)?;
+            infer(&arena[*condition], arena, env, functions, interner)?;
+            let then_ty = infer(&arena[*then_expr], arena, env, functions, interner)?;
+            let else_ty = infer(&arena[*else_expr], arena, env, functions, interner)?;
             if then_ty == else_ty {
                 Ok(then_ty)
             } else {
@@ -145,7 +146,7 @@ fn infer(
             }
         }
         Expr::FieldAccess { base, field } => {
-            let base_ty = infer(base, env, functions, interner)?;
+            let base_ty = infer(&arena[*base], arena, env, functions, interner)?;
             match base_ty {
                 Some(ValueType::Record(fields)) => {
                     for (name, ty) in fields.iter() {
@@ -168,9 +169,9 @@ fn infer(
         Expr::FunctionCall { name, args } => {
             let func_name = interner.resolve(*name).unwrap_or("");
             if func_name == "filter" && args.len() == 3 {
-                let list_ty = infer(&args[0], env, functions, interner)?;
-                infer(&args[1], env, functions, interner)?;
-                infer(&args[2], env, functions, interner)?;
+                let list_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                infer(&arena[args[1]], arena, env, functions, interner)?;
+                infer(&arena[args[2]], arena, env, functions, interner)?;
                 match list_ty {
                     Some(ValueType::List(inner)) => Ok(Some(ValueType::List(inner))),
                     Some(other) => Err(MizuError::StaticTypeError(format!(
@@ -180,9 +181,9 @@ fn infer(
                     None => Ok(None),
                 }
             } else if func_name == "count" && args.len() == 3 {
-                let list_ty = infer(&args[0], env, functions, interner)?;
-                infer(&args[1], env, functions, interner)?;
-                infer(&args[2], env, functions, interner)?;
+                let list_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                infer(&arena[args[1]], arena, env, functions, interner)?;
+                infer(&arena[args[2]], arena, env, functions, interner)?;
                 match list_ty {
                     Some(ValueType::List(_)) | None => Ok(Some(ValueType::Num)),
                     Some(other) => Err(MizuError::StaticTypeError(format!(
@@ -191,9 +192,9 @@ fn infer(
                     ))),
                 }
             } else if func_name == "sort" && args.len() == 3 {
-                let list_ty = infer(&args[0], env, functions, interner)?;
-                infer(&args[1], env, functions, interner)?;
-                infer(&args[2], env, functions, interner)?;
+                let list_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                infer(&arena[args[1]], arena, env, functions, interner)?;
+                infer(&arena[args[2]], arena, env, functions, interner)?;
                 match list_ty {
                     Some(ValueType::List(inner)) => Ok(Some(ValueType::List(inner))),
                     Some(other) => Err(MizuError::StaticTypeError(format!(
@@ -211,16 +212,16 @@ fn infer(
                         args.len()
                     )));
                 }
-                for arg in args.iter() {
-                    infer(arg, env, functions, interner)?;
+                for &arg in args.iter() {
+                    infer(&arena[arg], arena, env, functions, interner)?;
                 }
                 // We do not infer return types of functions in Phase B yet,
                 // or we could if we memoize/check them. For now, functions return dynamic.
                 Ok(None)
             } else {
                 // Builtin like 'download' or undefined function
-                for arg in args {
-                    infer(arg, env, functions, interner)?;
+                for &arg in args {
+                    infer(&arena[arg], arena, env, functions, interner)?;
                 }
                 Ok(None)
             }

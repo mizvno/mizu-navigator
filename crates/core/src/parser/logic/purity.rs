@@ -2,7 +2,7 @@
 
 use crate::core::types::StringInterner;
 
-use super::ast::Expr;
+use super::ast::{Expr, ExprArena};
 
 /// Built-in names that produce observable side effects when called.
 ///
@@ -23,11 +23,12 @@ const SIDE_EFFECT_BUILTINS: &[&str] = &[
 
 /// Walks `expr` and returns the name of the first side-effecting function
 /// call found, or `None` if the expression is pure.
-pub fn find_side_effect_call(expr: &Expr, interner: &StringInterner) -> Option<String> {
+pub fn find_side_effect_call(expr: &Expr, arena: &ExprArena, interner: &StringInterner) -> Option<String> {
     match expr {
         Expr::Literal(_) | Expr::Variable(_) => None,
         Expr::BinaryOp { left, right, .. } => {
-            find_side_effect_call(left, interner).or_else(|| find_side_effect_call(right, interner))
+            find_side_effect_call(&arena[*left], arena, interner)
+                .or_else(|| find_side_effect_call(&arena[*right], arena, interner))
         }
         Expr::FunctionCall { name, args } => {
             if let Some(n) = interner.resolve(*name)
@@ -35,24 +36,25 @@ pub fn find_side_effect_call(expr: &Expr, interner: &StringInterner) -> Option<S
             {
                 return Some(n.to_string());
             }
-            for arg in args {
-                if let Some(n) = find_side_effect_call(arg, interner) {
+            for &arg in args {
+                if let Some(n) = find_side_effect_call(&arena[arg], arena, interner) {
                     return Some(n);
                 }
             }
             None
         }
         Expr::Let { value, body, .. } => {
-            find_side_effect_call(value, interner).or_else(|| find_side_effect_call(body, interner))
+            find_side_effect_call(&arena[*value], arena, interner)
+                .or_else(|| find_side_effect_call(&arena[*body], arena, interner))
         }
-        Expr::Not(inner) => find_side_effect_call(inner, interner),
+        Expr::Not(inner) => find_side_effect_call(&arena[*inner], arena, interner),
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
-        } => find_side_effect_call(condition, interner)
-            .or_else(|| find_side_effect_call(then_expr, interner))
-            .or_else(|| find_side_effect_call(else_expr, interner)),
-        Expr::FieldAccess { base, .. } => find_side_effect_call(base, interner),
+        } => find_side_effect_call(&arena[*condition], arena, interner)
+            .or_else(|| find_side_effect_call(&arena[*then_expr], arena, interner))
+            .or_else(|| find_side_effect_call(&arena[*else_expr], arena, interner)),
+        Expr::FieldAccess { base, .. } => find_side_effect_call(&arena[*base], arena, interner),
     }
 }

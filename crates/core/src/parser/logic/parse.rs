@@ -9,7 +9,7 @@ use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value};
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
-use super::ast::{Action, BinOp, Expr, MizuFunction, NetworkMethod, RootTimer, TimerInterval, ValueType};
+use super::ast::{Action, BinOp, Expr, ExprArena, ExprTree, MizuFunction, NetworkMethod, RootTimer, TimerInterval, ValueType};
 use super::comp::collect_calls;
 use super::lexer::{Cursor, Token, assert_cursor_empty, leading_spaces, lex};
 
@@ -34,11 +34,16 @@ static MAX_PARSE_DEPTH: std::sync::LazyLock<u32> =
 /// pass `0` to parse a full expression.
 /// `depth` tracks the current recursion depth; external callers must pass `0`.
 /// `interner` is used to intern all identifier names at parse time.
+/// `arena` accumulates every child node this call (and its recursive
+/// descendants) allocates; the returned `Expr` is *not itself* allocated
+/// into `arena` — callers that need an `ExprId`/`ExprTree` for the returned
+/// root must `arena.alloc(...)` it themselves (see [`parse_expr_tree`]).
 pub(super) fn parse_expr(
     cursor: &mut Cursor<'_>,
     min_bp: u8,
     depth: u32,
     interner: &mut StringInterner,
+    arena: &mut ExprArena,
 ) -> Result<Expr, MizuError> {
     if depth > *MAX_PARSE_DEPTH {
         return Err(MizuError::ParseError(format!(
@@ -60,7 +65,8 @@ pub(super) fn parse_expr(
 
             // ── `if <cond> then <then> else <else>` ─────────────────────────
             if name == "if" {
-                let condition = parse_expr(cursor, 0, depth + 1, interner)?;
+                let condition = parse_expr(cursor, 0, depth + 1, interner, arena)?;
+                let condition = arena.alloc(condition);
                 match cursor.next() {
                     Some(Token::Ident(kw)) if *kw == "then" => {}
                     other => {
@@ -69,7 +75,8 @@ pub(super) fn parse_expr(
                         )));
                     }
                 }
-                let then_expr = parse_expr(cursor, 0, depth + 1, interner)?;
+                let then_expr = parse_expr(cursor, 0, depth + 1, interner, arena)?;
+                let then_expr = arena.alloc(then_expr);
                 match cursor.next() {
                     Some(Token::Ident(kw)) if *kw == "else" => {}
                     other => {
@@ -78,11 +85,12 @@ pub(super) fn parse_expr(
                         )));
                     }
                 }
-                let else_expr = parse_expr(cursor, 0, depth + 1, interner)?;
+                let else_expr = parse_expr(cursor, 0, depth + 1, interner, arena)?;
+                let else_expr = arena.alloc(else_expr);
                 return Ok(Expr::IfElse {
-                    condition: Box::new(condition),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
+                    condition,
+                    then_expr,
+                    else_expr,
                 });
             }
 
@@ -92,7 +100,8 @@ pub(super) fn parse_expr(
                 let mut args = Vec::new();
                 // Parse comma-separated argument list.
                 while !matches!(cursor.peek(), Some(Token::RParen) | None) {
-                    args.push(parse_expr(cursor, 0, depth + 1, interner)?);
+                    let arg = parse_expr(cursor, 0, depth + 1, interner, arena)?;
+                    args.push(arg);
                     if matches!(cursor.peek(), Some(Token::Comma)) {
                         cursor.next();
                     }
@@ -121,9 +130,10 @@ pub(super) fn parse_expr(
                             .to_string(),
                     ));
                 }
+                let arg_ids: Vec<super::ast::ExprId> = args.into_iter().map(|a| arena.alloc(a)).collect();
                 Expr::FunctionCall {
                     name: interner.get_or_intern(name),
-                    args,
+                    args: arg_ids,
                 }
             } else {
                 Expr::Variable(interner.get_or_intern(name))
@@ -132,23 +142,26 @@ pub(super) fn parse_expr(
 
         // Unary minus: `-expr`
         Some(Token::Minus) => {
-            let operand = parse_expr(cursor, 30, depth + 1, interner)?; // highest precedence for unary
+            let operand = parse_expr(cursor, 30, depth + 1, interner, arena)?; // highest precedence for unary
             // Fold into a binary `0 - operand` to keep the AST simple.
+            let left = arena.alloc(Expr::Literal(Value::Int(0)));
+            let right = arena.alloc(operand);
             Expr::BinaryOp {
-                left: Box::new(Expr::Literal(Value::Int(0))),
+                left,
                 op: BinOp::Sub,
-                right: Box::new(operand),
+                right,
             }
         }
 
         // Logical NOT: `!expr`
         Some(Token::Bang) => {
-            let operand = parse_expr(cursor, 30, depth + 1, interner)?; // highest unary precedence
-            Expr::Not(Box::new(operand))
+            let operand = parse_expr(cursor, 30, depth + 1, interner, arena)?; // highest unary precedence
+            let operand = arena.alloc(operand);
+            Expr::Not(operand)
         }
 
         Some(Token::LParen) => {
-            let inner = parse_expr(cursor, 0, depth + 1, interner)?;
+            let inner = parse_expr(cursor, 0, depth + 1, interner, arena)?;
             match cursor.next() {
                 Some(Token::RParen) => inner,
                 _ => {
@@ -182,8 +195,9 @@ pub(super) fn parse_expr(
                     )));
                 }
             };
+            let base = arena.alloc(lhs);
             lhs = Expr::FieldAccess {
-                base: Box::new(lhs),
+                base,
                 field,
             };
             continue;
@@ -196,7 +210,7 @@ pub(super) fn parse_expr(
                 break;
             }
             cursor.next(); // consume `?`
-            let then_expr = parse_expr(cursor, 0, depth + 1, interner)?;
+            let then_expr = parse_expr(cursor, 0, depth + 1, interner, arena)?;
             match cursor.next() {
                 Some(Token::Colon) => {}
                 other => {
@@ -205,11 +219,14 @@ pub(super) fn parse_expr(
                     )));
                 }
             }
-            let else_expr = parse_expr(cursor, 0, depth + 1, interner)?; // right-assoc: min_bp = 0
+            let else_expr = parse_expr(cursor, 0, depth + 1, interner, arena)?; // right-assoc: min_bp = 0
+            let condition = arena.alloc(lhs);
+            let then_expr = arena.alloc(then_expr);
+            let else_expr = arena.alloc(else_expr);
             lhs = Expr::IfElse {
-                condition: Box::new(lhs),
-                then_expr: Box::new(then_expr),
-                else_expr: Box::new(else_expr),
+                condition,
+                then_expr,
+                else_expr,
             };
             continue;
         }
@@ -236,15 +253,34 @@ pub(super) fn parse_expr(
         }
 
         cursor.next(); // consume the operator
-        let rhs = parse_expr(cursor, right_bp, depth + 1, interner)?;
+        let rhs = parse_expr(cursor, right_bp, depth + 1, interner, arena)?;
+        let left = arena.alloc(lhs);
+        let right = arena.alloc(rhs);
         lhs = Expr::BinaryOp {
-            left: Box::new(lhs),
+            left,
             op,
-            right: Box::new(rhs),
+            right,
         };
     }
 
     Ok(lhs)
+}
+
+/// Parses a complete expression and wraps it (with everything it
+/// transitively allocated) into a self-contained [`ExprTree`].
+///
+/// This is the entry point every caller outside this module's own recursive
+/// descent should use — [`parse_expr`] alone returns an unanchored root
+/// `Expr` plus whatever it allocated into the caller-supplied `arena`, but
+/// does not allocate the root itself; this does that last step.
+pub(super) fn parse_expr_tree(
+    cursor: &mut Cursor<'_>,
+    interner: &mut StringInterner,
+) -> Result<ExprTree, MizuError> {
+    let mut arena = ExprArena::new();
+    let root_expr = parse_expr(cursor, 0, 0, interner, &mut arena)?;
+    let root = arena.alloc(root_expr);
+    Ok(ExprTree { arena, root })
 }
 
 /// Returns the `(left, right)` binding powers for a binary operator.
@@ -296,7 +332,7 @@ fn parse_function_block(
         }
         let tokens = lex(body_src)?;
         let mut cursor = Cursor::new(&tokens);
-        let body_expr = parse_expr(&mut cursor, 0, 0, interner)?;
+        let body_expr = parse_expr_tree(&mut cursor, interner)?;
         return Ok((
             name,
             MizuFunction {
@@ -337,7 +373,7 @@ fn parse_function_block(
     // Two forms:
     //   1. Inline:    `func(x: num) : expr`        → rest_after_paren starts with `:`
     //   2. Multi-line: `func(x: num)\n    line1\n  last` → subsequent indented lines
-    let body_expr: Expr;
+    let body_expr: ExprTree;
 
     if let Some(colon_body) = rest_after_paren.strip_prefix(':') {
         // ── Form 1: inline ───────────────────────────────────────────────
@@ -349,7 +385,7 @@ fn parse_function_block(
         }
         let tokens = lex(body_source)?;
         let mut cursor = Cursor::new(&tokens);
-        body_expr = parse_expr(&mut cursor, 0, 0, interner)?;
+        body_expr = parse_expr_tree(&mut cursor, interner)?;
     } else if lines.len() > 1 {
         // ── Form 2: multi-line ───────────────────────────────────────────
         // The body lines are lines[1..], each indented by some amount.
@@ -478,7 +514,7 @@ fn parse_multiline_body(
     body_lines: &[&str],
     func_name: &str,
     interner: &mut StringInterner,
-) -> Result<Expr, MizuError> {
+) -> Result<ExprTree, MizuError> {
     if body_lines.is_empty() {
         return Err(MizuError::ParseError(format!(
             "multi-line function `{func_name}` has an empty body"
@@ -515,10 +551,12 @@ fn parse_multiline_body(
         )));
     }
 
-    // Parse the return expression.
+    // Parse the return expression. Every line's expression shares this one
+    // arena, since the whole Let-chain is a single self-contained tree.
+    let mut arena = ExprArena::new();
     let tokens = lex(return_line)?;
     let mut cursor = Cursor::new(&tokens);
-    let mut result_expr = parse_expr(&mut cursor, 0, 0, interner)?;
+    let mut result_expr = parse_expr(&mut cursor, 0, 0, interner, &mut arena)?;
 
     // Wrap in Let-bindings from bottom to top (right-to-left over prefix lines).
     for &binding_line in lines[..lines.len() - 1].iter().rev() {
@@ -537,16 +575,19 @@ fn parse_multiline_body(
         let bind_expr_src = binding_line[eq_pos + 1..].trim();
         let bind_tokens = lex(bind_expr_src)?;
         let mut bind_cursor = Cursor::new(&bind_tokens);
-        let bind_expr = parse_expr(&mut bind_cursor, 0, 0, interner)?;
+        let bind_expr = parse_expr(&mut bind_cursor, 0, 0, interner, &mut arena)?;
         let bind_sym = interner.get_or_intern(bind_name);
+        let value = arena.alloc(bind_expr);
+        let body = arena.alloc(result_expr);
         result_expr = Expr::Let {
             name: bind_sym,
-            value: Box::new(bind_expr),
-            body: Box::new(result_expr),
+            value,
+            body,
         };
     }
 
-    Ok(result_expr)
+    let root = arena.alloc(result_expr);
+    Ok(ExprTree { arena, root })
 }
 
 /// Finds the byte position of a bare assignment `=` in `s`, skipping over
@@ -768,7 +809,7 @@ pub fn parse_root_timers(
 }
 
 
-/// Parses a standalone expression string into an [`Expr`] AST node.
+/// Parses a standalone expression string into an [`ExprTree`].
 ///
 /// Used by the layout parser to parse conditional class conditions
 /// (e.g., the `flag` part of `class active if flag`).
@@ -777,12 +818,12 @@ pub fn parse_root_timers(
 ///
 /// Returns [`MizuError::ParseError`] if the input is syntactically invalid
 /// or if tokens remain unconsumed after the expression.
-pub fn parse_expr_standalone(expr: &str, interner: &mut StringInterner) -> Result<Expr, MizuError> {
+pub fn parse_expr_standalone(expr: &str, interner: &mut StringInterner) -> Result<ExprTree, MizuError> {
     let tokens = lex(expr)?;
     let mut cursor = Cursor::new(&tokens);
-    let e = parse_expr(&mut cursor, 0, 0, interner)?;
+    let tree = parse_expr_tree(&mut cursor, interner)?;
     assert_cursor_empty(&cursor, "")?;
-    Ok(e)
+    Ok(tree)
 }
 
 /// Runs Kahn's BFS topological sort over the function call-graph to detect
@@ -804,7 +845,7 @@ fn check_dag(functions: &FxHashMap<Symbol, MizuFunction>) -> Result<(), MizuErro
 
     for (&sym, func) in functions {
         let mut calls: FxHashSet<Symbol> = FxHashSet::default();
-        collect_calls(&func.body, &mut calls, &function_names);
+        collect_calls(func.body.root(), &func.body.arena, &mut calls, &function_names);
 
         for callee in calls {
             if functions.contains_key(&callee) {
@@ -951,14 +992,14 @@ pub fn parse_action_with_urls(
             let payload = if let Some(src) = second {
                 let tokens = lex(src)?;
                 let mut cursor = Cursor::new(&tokens);
-                Some(Box::new(parse_expr(&mut cursor, 0, 0, interner)?))
+                Some(parse_expr_tree(&mut cursor, interner)?)
             } else {
                 None
             };
             let path_param = if let Some(src) = third {
                 let tokens = lex(src)?;
                 let mut cursor = Cursor::new(&tokens);
-                Some(Box::new(parse_expr(&mut cursor, 0, 0, interner)?))
+                Some(parse_expr_tree(&mut cursor, interner)?)
             } else {
                 None
             };
@@ -976,7 +1017,7 @@ pub fn parse_action_with_urls(
             let path_param = if let Some(src) = second {
                 let tokens = lex(src)?;
                 let mut cursor = Cursor::new(&tokens);
-                Some(Box::new(parse_expr(&mut cursor, 0, 0, interner)?))
+                Some(parse_expr_tree(&mut cursor, interner)?)
             } else {
                 None
             };
@@ -1073,16 +1114,19 @@ pub fn parse_action_with_urls(
             }
         }
         let download_sym = interner.get_or_intern("download");
-        return Ok(Action::Eval(Expr::FunctionCall {
+        let mut arena = ExprArena::new();
+        let arg = arena.alloc(Expr::Variable(alias_sym));
+        let root = arena.alloc(Expr::FunctionCall {
             name: download_sym,
-            args: vec![Expr::Variable(alias_sym)],
-        }));
+            args: vec![arg],
+        });
+        return Ok(Action::Eval(ExprTree { arena, root }));
     }
 
     if let Some(rest) = action_trimmed.strip_prefix("navigate ") {
         let tokens = lex(rest.trim())?;
         let mut cursor = Cursor::new(&tokens);
-        let url = parse_expr(&mut cursor, 0, 0, interner)?;
+        let url = parse_expr_tree(&mut cursor, interner)?;
         assert_cursor_empty(&cursor, "`navigate ...`")?;
         Ok(Action::Navigate { url })
     } else if let Some(eq_pos) = find_assignment_eq(action_trimmed) {
@@ -1097,7 +1141,7 @@ pub fn parse_action_with_urls(
 
         let tokens = lex(rhs)?;
         let mut cursor = Cursor::new(&tokens);
-        let expr = parse_expr(&mut cursor, 0, 0, interner)?;
+        let expr = parse_expr_tree(&mut cursor, interner)?;
         assert_cursor_empty(&cursor, &format!("`{lhs} = ...`"))?;
         Ok(Action::Assign {
             target: lhs.to_string(),
@@ -1109,7 +1153,7 @@ pub fn parse_action_with_urls(
         }
         let tokens = lex(action_trimmed)?;
         let mut cursor = Cursor::new(&tokens);
-        let expr = parse_expr(&mut cursor, 0, 0, interner)?;
+        let expr = parse_expr_tree(&mut cursor, interner)?;
         assert_cursor_empty(&cursor, &format!("`{action_trimmed}`"))?;
         Ok(Action::Eval(expr))
     }

@@ -131,11 +131,96 @@ pub enum BinOp {
     Or,
 }
 
+/// A 0-based index of an [`Expr`] node within an [`ExprArena`].
+///
+/// Never constructed directly outside this module — the only way to obtain
+/// one is [`ExprArena::alloc`], so every `ExprId` that exists is guaranteed
+/// resolvable in the arena that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExprId(u32);
+
+/// Owns every descendant node of one self-contained expression tree (a
+/// [`MizuFunction`] body, an [`Action`]'s expression, a [`ComputedBinding`]'s
+/// expression, ...) in one contiguous `Vec`, instead of one heap allocation
+/// per recursive `Box<Expr>` node.
+///
+/// Append-only: [`alloc`](Self::alloc) is the only way to add a node, and it
+/// always returns a fresh, valid [`ExprId`]. Indexing with an `ExprId` that
+/// did not come from *this* arena (e.g. one from a different function's
+/// arena) is a logic error — see [`ExprTree`], which pairs a root `ExprId`
+/// with the arena it belongs to so the two are never separated.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExprArena {
+    nodes: Vec<Expr>,
+}
+
+impl ExprArena {
+    /// Creates a new, empty arena.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Appends `expr` to the arena and returns its new [`ExprId`].
+    pub fn alloc(&mut self, expr: Expr) -> ExprId {
+        let id = ExprId(self.nodes.len() as u32);
+        self.nodes.push(expr);
+        id
+    }
+
+    /// Resolves `id` to its node.
+    #[must_use]
+    pub fn get(&self, id: ExprId) -> &Expr {
+        &self.nodes[id.0 as usize]
+    }
+}
+
+impl std::ops::Index<ExprId> for ExprArena {
+    type Output = Expr;
+    fn index(&self, id: ExprId) -> &Expr {
+        self.get(id)
+    }
+}
+
+/// A complete, self-contained expression tree: a root node plus the arena
+/// holding every node it (transitively) references.
+///
+/// This is what a `Box<Expr>`-based field held directly before the arena
+/// migration — every former top-level `Expr` field (`MizuFunction::body`,
+/// `Action::Eval`'s payload, `ComputedBinding::expr`, ...) now holds one of
+/// these instead, so the root and its arena travel together and can never
+/// be paired with the wrong arena.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExprTree {
+    /// Every node in this tree.
+    pub arena: ExprArena,
+    /// The tree's root node.
+    pub root: ExprId,
+}
+
+impl ExprTree {
+    /// Returns the root [`Expr`] node.
+    #[must_use]
+    pub fn root(&self) -> &Expr {
+        self.arena.get(self.root)
+    }
+}
+
 /// An expression node in the Mizu AST.
 ///
 /// `Expr` is a read-only AST tree — there are no mutation nodes,
 /// no assignment nodes, and no loop nodes.  Every evaluation is a
 /// deterministic fold over this tree.
+///
+/// ## Arena-indexed, not `Box`-recursive
+///
+/// Recursive positions here are [`ExprId`] indices into an [`ExprArena`]
+/// rather than `Box<Expr>`, keeping a whole tree in one contiguous
+/// allocation instead of one heap allocation per node. See [`ExprTree`] for
+/// how a root node and its arena travel together. `FunctionCall::args` is a
+/// `Vec<ExprId>` for the same reason — each argument expression's own
+/// descendants live in the *caller's* arena, not a separate allocation per
+/// argument.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A compile-time constant literal.
@@ -148,11 +233,11 @@ pub enum Expr {
     /// A binary arithmetic operation.
     BinaryOp {
         /// Left-hand operand.
-        left: Box<Expr>,
+        left: ExprId,
         /// The operator.
         op: BinOp,
         /// Right-hand operand.
-        right: Box<Expr>,
+        right: ExprId,
     },
 
     /// A call to a named Mizu function.
@@ -160,7 +245,7 @@ pub enum Expr {
         /// The function name, pre-interned at parse time.
         name: Symbol,
         /// Positional argument expressions, evaluated left-to-right.
-        args: Vec<Expr>,
+        args: Vec<ExprId>,
     },
 
     /// A local binding used in multi-line function bodies.
@@ -173,13 +258,13 @@ pub enum Expr {
         /// The bound name, pre-interned at parse time.
         name: Symbol,
         /// The expression whose result is bound to `name`.
-        value: Box<Expr>,
+        value: ExprId,
         /// The expression that may reference `name`.
-        body: Box<Expr>,
+        body: ExprId,
     },
 
     /// Logical NOT unary operator (`!expr`).
-    Not(Box<Expr>),
+    Not(ExprId),
 
     /// A conditional expression — produced by both syntactic forms:
     ///
@@ -191,11 +276,11 @@ pub enum Expr {
     /// `TypeError`.
     IfElse {
         /// The boolean guard expression.
-        condition: Box<Expr>,
+        condition: ExprId,
         /// Expression evaluated when condition is true.
-        then_expr: Box<Expr>,
+        then_expr: ExprId,
         /// Expression evaluated when condition is false.
-        else_expr: Box<Expr>,
+        else_expr: ExprId,
     },
 
     /// Field access on a [`Value::Record`]: `base.field`.
@@ -205,7 +290,7 @@ pub enum Expr {
     /// as left-nested nodes: `FieldAccess { base: FieldAccess { base: a, field: b }, field: c }`.
     FieldAccess {
         /// The base expression, which must evaluate to a `Record`.
-        base: Box<Expr>,
+        base: ExprId,
         /// The field name to look up in the record.
         field: Arc<str>,
     },
@@ -215,18 +300,18 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// An expression evaluated for its effects (e.g., calling a procedure).
-    Eval(Expr),
+    Eval(ExprTree),
     /// An assignment that mutates a variable in the store.
     Assign {
         /// The target variable name.
         target: String,
         /// The expression to evaluate and assign.
-        expr: Expr,
+        expr: ExprTree,
     },
     /// A declarative navigation request to completely replace the document.
     Navigate {
         /// The URI expression to navigate to.
-        url: Expr,
+        url: ExprTree,
     },
     /// A compile-time–validated HTTP call via a named URL alias.
     ///
@@ -238,9 +323,9 @@ pub enum Action {
         /// The interned Symbol for the URL alias (e.g. `login` → `Symbol(N)`).
         alias_sym: Symbol,
         /// Optional JSON payload expression (used by POST, PUT, QUERY).
-        payload: Option<Box<Expr>>,
+        payload: Option<ExprTree>,
         /// Optional path parameter expression (used by DELETE for `/item/{id}`).
-        path_param: Option<Box<Expr>>,
+        path_param: Option<ExprTree>,
         /// The variable name that receives the response.
         target_var: String,
     },
@@ -257,7 +342,7 @@ pub struct MizuFunction {
     pub params: Vec<(Symbol, ValueType)>,
     /// The function body expression (may be a chain of [`Expr::Let`] nodes
     /// for multi-line functions, with the return value at the innermost body).
-    pub body: Expr,
+    pub body: ExprTree,
 }
 
 /// A computed (derived) variable that auto-recomputes when dependencies change.
@@ -273,7 +358,7 @@ pub struct ComputedBinding {
     /// Interned symbol for the variable name.
     pub name: Symbol,
     /// The expression that defines this variable's value.
-    pub expr: Expr,
+    pub expr: ExprTree,
     /// Symbols of all variables this binding may read: those referenced
     /// directly by `expr` plus — when parsed via
     /// [`parse_computed_with_functions`] — the globals read transitively inside

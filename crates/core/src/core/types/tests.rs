@@ -445,7 +445,7 @@
     #[test]
     fn eval_field_access_on_record() {
         use crate::core::types::Symbol;
-        use crate::parser::logic::{Expr, MizuFunction};
+        use crate::parser::logic::{Expr, ExprArena, MizuFunction};
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
@@ -454,8 +454,10 @@
         store.set("item", Value::Record(Arc::from(map)));
 
         let item_sym = store.interner.get_or_intern("item");
+        let mut arena = ExprArena::new();
+        let base = arena.alloc(Expr::Variable(item_sym));
         let expr = Expr::FieldAccess {
-            base: Box::new(Expr::Variable(item_sym)),
+            base,
             field: Arc::from("name"),
         };
 
@@ -463,14 +465,14 @@
         store.state_machine.instruction_count = 0;
         let result = store
             .state_machine
-            .evaluate(&expr, 0, &funcs, &store.interner);
+            .evaluate(&expr, 0, &funcs, &store.interner, &arena);
         assert_eq!(result.unwrap(), Value::String(Arc::from("Neko")));
     }
 
     #[test]
     fn eval_field_access_missing_field() {
         use crate::core::types::Symbol;
-        use crate::parser::logic::{Expr, MizuFunction};
+        use crate::parser::logic::{Expr, ExprArena, MizuFunction};
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
@@ -478,8 +480,10 @@
         store.set("item", Value::Record(Arc::from(map)));
 
         let item_sym = store.interner.get_or_intern("item");
+        let mut arena = ExprArena::new();
+        let base = arena.alloc(Expr::Variable(item_sym));
         let expr = Expr::FieldAccess {
-            base: Box::new(Expr::Variable(item_sym)),
+            base,
             field: Arc::from("missing"),
         };
 
@@ -487,22 +491,24 @@
         store.state_machine.instruction_count = 0;
         let result = store
             .state_machine
-            .evaluate(&expr, 0, &funcs, &store.interner);
+            .evaluate(&expr, 0, &funcs, &store.interner, &arena);
         assert!(matches!(result, Err(MizuError::VariableNotFound(_))));
     }
 
     #[test]
     fn eval_field_access_on_non_record() {
         use crate::core::types::Symbol;
-        use crate::parser::logic::{Expr, MizuFunction};
+        use crate::parser::logic::{Expr, ExprArena, MizuFunction};
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
         store.set("item", Value::String(Arc::from("hello")));
 
         let item_sym = store.interner.get_or_intern("item");
+        let mut arena = ExprArena::new();
+        let base = arena.alloc(Expr::Variable(item_sym));
         let expr = Expr::FieldAccess {
-            base: Box::new(Expr::Variable(item_sym)),
+            base,
             field: Arc::from("field"),
         };
 
@@ -510,7 +516,7 @@
         store.state_machine.instruction_count = 0;
         let result = store
             .state_machine
-            .evaluate(&expr, 0, &funcs, &store.interner);
+            .evaluate(&expr, 0, &funcs, &store.interner, &arena);
         assert!(matches!(result, Err(MizuError::TypeError { .. })));
     }
 
@@ -657,15 +663,17 @@
         args: Vec<crate::parser::logic::Expr>,
     ) -> Result<Value, MizuError> {
         use crate::core::types::Symbol;
-        use crate::parser::logic::MizuFunction;
+        use crate::parser::logic::{ExprArena, MizuFunction};
         use rustc_hash::FxHashMap;
         let sym = store.interner.get_or_intern(name);
-        let expr = crate::parser::logic::Expr::FunctionCall { name: sym, args };
+        let mut arena = ExprArena::new();
+        let arg_ids: Vec<_> = args.into_iter().map(|a| arena.alloc(a)).collect();
+        let expr = crate::parser::logic::Expr::FunctionCall { name: sym, args: arg_ids };
         let fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
         store.state_machine.instruction_count = 0;
         store
             .state_machine
-            .evaluate(&expr, 0, &fns, &store.interner)
+            .evaluate(&expr, 0, &fns, &store.interner, &arena)
     }
 
     #[test]
@@ -942,35 +950,38 @@
         // MAX_INSTRUCTIONS (20 000) around k≈14 — so 40 levels (well under
         // the 256-level depth guard, and nowhere near problematic string
         // sizes) must already time out.
-        use crate::parser::logic::{BinOp, Expr};
+        use crate::parser::logic::{BinOp, Expr, ExprArena};
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
         let sym = store.interner.get_or_intern("s");
 
+        let mut arena = ExprArena::new();
         let mut body = Expr::Variable(sym);
         for _ in 0..40 {
-            let double_val = Expr::BinaryOp {
-                left: Box::new(Expr::Variable(sym)),
-                op: BinOp::Add,
-                right: Box::new(Expr::Variable(sym)),
-            };
+            let left = arena.alloc(Expr::Variable(sym));
+            let right = arena.alloc(Expr::Variable(sym));
+            let double_val = Expr::BinaryOp { left, op: BinOp::Add, right };
+            let value = arena.alloc(double_val);
+            let body_id = arena.alloc(body);
             body = Expr::Let {
                 name: sym,
-                value: Box::new(double_val),
-                body: Box::new(body),
+                value,
+                body: body_id,
             };
         }
+        let value = arena.alloc(Expr::Literal(Value::String(Arc::from("a"))));
+        let body_id = arena.alloc(body);
         let ast = Expr::Let {
             name: sym,
-            value: Box::new(Expr::Literal(Value::String(Arc::from("a")))),
-            body: Box::new(body),
+            value,
+            body: body_id,
         };
 
         store.state_machine.instruction_count = 0;
         store.state_machine.eval_depth = 0;
         let fns = FxHashMap::default();
-        let result = store.state_machine.evaluate(&ast, 0, &fns, &store.interner);
+        let result = store.state_machine.evaluate(&ast, 0, &fns, &store.interner, &arena);
 
         assert!(
             matches!(result, Err(MizuError::Timeout)),
@@ -1153,18 +1164,21 @@
             .stack_size(16 * 1024 * 1024) // 16 MB
             .spawn(|| {
                 use crate::core::errors::MizuError;
-                use crate::parser::logic::{BinOp, Expr};
+                use crate::parser::logic::{BinOp, Expr, ExprArena};
                 use rustc_hash::FxHashMap;
 
                 // Build a 300-level deep BinaryOp chain entirely in Rust.
                 // The parser would reject this before evaluation, so we bypass
                 // it to test the evaluator's own depth guard directly.
+                let mut arena = ExprArena::new();
                 let mut ast = Expr::Literal(Value::Int(0));
                 for _ in 0..300 {
+                    let left = arena.alloc(ast);
+                    let right = arena.alloc(Expr::Literal(Value::Int(0)));
                     ast = Expr::BinaryOp {
-                        left: Box::new(ast),
+                        left,
                         op: BinOp::Add,
-                        right: Box::new(Expr::Literal(Value::Int(0))),
+                        right,
                     };
                 }
 
@@ -1173,7 +1187,7 @@
                 store.state_machine.eval_depth = 0;
                 let fns = FxHashMap::default();
 
-                let result = store.state_machine.evaluate(&ast, 0, &fns, &store.interner);
+                let result = store.state_machine.evaluate(&ast, 0, &fns, &store.interner, &arena);
                 match result {
                     Err(MizuError::ExecutionError(msg)) => {
                         assert!(
@@ -1279,7 +1293,7 @@
     /// The actual cross-function composition scenario, run on whatever
     /// thread `run_cross_function_composition_child` builds.
     fn run_cross_function_composition_scenario(ok_marker: &str) {
-        use crate::parser::logic::{BinOp, Expr, MizuFunction};
+        use crate::parser::logic::{BinOp, Expr, ExprArena, ExprTree, MizuFunction};
         use rustc_hash::FxHashMap;
 
         let mut store = VariableStore::new();
@@ -1289,17 +1303,17 @@
         // Function body: ~250 levels of BinaryOp nesting -- representative
         // of the deepest single expression tree the parser will accept
         // under MAX_PARSE_DEPTH (256) for a function body parsed on its own.
+        let mut body_arena = ExprArena::new();
         let mut body = Expr::Variable(param);
         for _ in 0..250 {
-            body = Expr::BinaryOp {
-                left: Box::new(body),
-                op: BinOp::Add,
-                right: Box::new(Expr::Literal(Value::Int(0))),
-            };
+            let left = body_arena.alloc(body);
+            let right = body_arena.alloc(Expr::Literal(Value::Int(0)));
+            body = Expr::BinaryOp { left, op: BinOp::Add, right };
         }
+        let body_root = body_arena.alloc(body);
         let func = MizuFunction {
             params: vec![(param, crate::parser::logic::ValueType::Num)],
-            body,
+            body: ExprTree { arena: body_arena, root: body_root },
         };
         let mut functions = FxHashMap::default();
         functions.insert(func_sym, func);
@@ -1309,16 +1323,16 @@
         // to the function above. Neither tree alone violates
         // MAX_PARSE_DEPTH, but composed at evaluation time they exceed
         // MAX_EVAL_DEPTH (256).
+        let mut call_arena = ExprArena::new();
+        let arg0 = call_arena.alloc(Expr::Literal(Value::Int(1)));
         let mut call_site = Expr::FunctionCall {
             name: func_sym,
-            args: vec![Expr::Literal(Value::Int(1))],
+            args: vec![arg0],
         };
         for _ in 0..20 {
-            call_site = Expr::BinaryOp {
-                left: Box::new(call_site),
-                op: BinOp::Add,
-                right: Box::new(Expr::Literal(Value::Int(0))),
-            };
+            let left = call_arena.alloc(call_site);
+            let right = call_arena.alloc(Expr::Literal(Value::Int(0)));
+            call_site = Expr::BinaryOp { left, op: BinOp::Add, right };
         }
 
         store.state_machine.instruction_count = 0;
@@ -1326,7 +1340,7 @@
 
         let result = store
             .state_machine
-            .evaluate(&call_site, 0, &functions, &store.interner);
+            .evaluate(&call_site, 0, &functions, &store.interner, &call_arena);
 
         match result {
             Err(MizuError::ExecutionError(msg)) if msg.contains("nesting too deep") => {
@@ -1444,19 +1458,18 @@
     /// whether the result is the depth-guard error or a timeout — both are
     /// controlled, non-crashing outcomes).
     fn run_stack_measurement_child(stack_size: usize, ok_marker: &str) {
-        use crate::parser::logic::{BinOp, Expr};
+        use crate::parser::logic::{BinOp, Expr, ExprArena};
         use rustc_hash::FxHashMap;
 
         let handle = std::thread::Builder::new()
             .stack_size(stack_size)
             .spawn(|| {
+                let mut arena = ExprArena::new();
                 let mut ast = Expr::Literal(Value::Int(0));
                 for _ in 0..300 {
-                    ast = Expr::BinaryOp {
-                        left: Box::new(ast),
-                        op: BinOp::Add,
-                        right: Box::new(Expr::Literal(Value::Int(0))),
-                    };
+                    let left = arena.alloc(ast);
+                    let right = arena.alloc(Expr::Literal(Value::Int(0)));
+                    ast = Expr::BinaryOp { left, op: BinOp::Add, right };
                 }
 
                 let mut store = VariableStore::new();
@@ -1464,7 +1477,7 @@
                 store.state_machine.eval_depth = 0;
                 let fns = FxHashMap::default();
 
-                let _ = store.state_machine.evaluate(&ast, 0, &fns, &store.interner);
+                let _ = store.state_machine.evaluate(&ast, 0, &fns, &store.interner, &arena);
             })
             .expect("thread spawn must succeed");
 

@@ -1,5 +1,5 @@
     use super::{
-        Action, BinOp, ComputedBinding, Expr, MizuFunction, NetworkMethod, TimerInterval,
+        Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, NetworkMethod, TimerInterval,
         ValueType, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,
     };
     use crate::core::errors::MizuError;
@@ -17,11 +17,12 @@
 
     fn evaluate(
         expr: &Expr,
+        arena: &ExprArena,
         store: &Rc<VariableStore>,
         functions: &FxHashMap<Symbol, MizuFunction>,
     ) -> Result<Value, MizuError> {
         let mut temp_store = (**store).clone();
-        super::evaluate(expr, &mut temp_store, functions, 0)
+        super::evaluate(expr, arena, &mut temp_store, functions, 0)
     }
 
     fn execute_action(
@@ -42,7 +43,7 @@
             .get("f")
             .ok_or_else(|| MizuError::ParseError("f not found in interner".to_string()))?;
         let store = Rc::new(VariableStore::with_interner(interner));
-        evaluate(&fns[&f_sym].body, &store, &fns)
+        evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns)
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@
         let f = &fns[&pi_sym];
         assert!(f.params.is_empty());
         // 3.14159 * DECIMAL_SCALE, rounded.
-        assert_eq!(f.body, Expr::Literal(Value::Int(314_159_000)));
+        assert_eq!(*f.body.root(), Expr::Literal(Value::Int(314_159_000)));
     }
 
     #[test]
@@ -68,7 +69,7 @@
         let p_sym = interner.get("p").unwrap();
         assert_eq!(f.params, vec![(p_sym, ValueType::Num)]);
         // Body should be BinaryOp(Variable(p_sym), Mul, Literal(1.22))
-        assert!(matches!(&f.body, Expr::BinaryOp { op: BinOp::Mul, .. }));
+        assert!(matches!(f.body.root(), Expr::BinaryOp { op: BinOp::Mul, .. }));
     }
 
     #[test]
@@ -142,7 +143,7 @@
         let f = &fns[&total_sym];
         let netto_sym = interner.get("netto").unwrap();
         // Body should be Let { name: netto_sym, value: price * qty, body: netto * 1.22 }
-        assert!(matches!(&f.body, Expr::Let { name, .. } if *name == netto_sym));
+        assert!(matches!(f.body.root(), Expr::Let { name, .. } if *name == netto_sym));
     }
 
     #[test]
@@ -155,7 +156,7 @@
         assert_eq!(fns.len(), 2);
         let total_sym = interner.get("total").unwrap();
         let vat_sym = interner.get("vat").unwrap();
-        let body = &fns[&total_sym].body;
+        let body = fns[&total_sym].body.root();
         assert!(matches!(body, Expr::FunctionCall { name, .. } if *name == vat_sym));
     }
 
@@ -181,7 +182,7 @@
         let (fns, interner) = single_fn("    f() : 2 + 3 * 4\n").unwrap();
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
+        let result = evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns).unwrap();
         // 2 + 12 = 14
         assert_eq!(result, Value::Int(14 * crate::core::types::DECIMAL_SCALE));
     }
@@ -192,7 +193,7 @@
         let (fns, interner) = single_fn("    f() : (2 + 3) * 4\n").unwrap();
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
+        let result = evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns).unwrap();
         assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
     }
 
@@ -202,7 +203,7 @@
         let (fns, interner) = single_fn("    f() : 10 - 3 - 2\n").unwrap();
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
+        let result = evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns).unwrap();
         assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
     }
 
@@ -212,7 +213,7 @@
         let (fns, interner) = single_fn("    f() : 12 / 6 / 2\n").unwrap();
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
+        let result = evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns).unwrap();
         assert_eq!(result, Value::Int(1 * crate::core::types::DECIMAL_SCALE));
     }
 
@@ -222,7 +223,7 @@
         let (fns, interner) = single_fn("    f() : 1 + 2 * 3 + 4 / 2\n").unwrap();
         let f_sym = interner.get("f").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&fns[&f_sym].body, &store, &fns).unwrap();
+        let result = evaluate(fns[&f_sym].body.root(), &fns[&f_sym].body.arena, &store, &fns).unwrap();
         assert_eq!(result, Value::Int(9 * crate::core::types::DECIMAL_SCALE));
     }
 
@@ -233,17 +234,19 @@
     #[test]
     fn evaluate_literal_num() {
         let expr = Expr::Literal(Value::Int(420_000));
+        let arena = ExprArena::new();
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(420_000));
+        assert_eq!(evaluate(&expr, &arena, &store, &fns).unwrap(), Value::Int(420_000));
     }
 
     #[test]
     fn evaluate_literal_bool() {
         let expr = Expr::Literal(Value::Bool(true));
+        let arena = ExprArena::new();
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Bool(true));
+        assert_eq!(evaluate(&expr, &arena, &store, &fns).unwrap(), Value::Bool(true));
     }
 
     #[test]
@@ -253,46 +256,44 @@
         let x_sym = store.interner.get("x").unwrap();
         let store = Rc::new(store);
         let expr = Expr::Variable(x_sym);
+        let arena = ExprArena::new();
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(70_000));
+        assert_eq!(evaluate(&expr, &arena, &store, &fns).unwrap(), Value::Int(70_000));
     }
 
     #[test]
     fn evaluate_addition() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(30_000))),
-            op: BinOp::Add,
-            right: Box::new(Expr::Literal(Value::Int(40_000))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(30_000)));
+        let right = arena.alloc(Expr::Literal(Value::Int(40_000)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Add, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(70_000));
+        assert_eq!(evaluate(&expr, &arena, &store, &fns).unwrap(), Value::Int(70_000));
     }
 
     #[test]
     fn evaluate_subtraction() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(100_000))),
-            op: BinOp::Sub,
-            right: Box::new(Expr::Literal(Value::Int(35_000))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(100_000)));
+        let right = arena.alloc(Expr::Literal(Value::Int(35_000)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Sub, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        assert_eq!(evaluate(&expr, &store, &fns).unwrap(), Value::Int(65_000));
+        assert_eq!(evaluate(&expr, &arena, &store, &fns).unwrap(), Value::Int(65_000));
     }
 
     #[test]
     fn evaluate_multiplication() {
         // 6 * 7 = 42
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(6 * crate::core::types::DECIMAL_SCALE))),
-            op: BinOp::Mul,
-            right: Box::new(Expr::Literal(Value::Int(7 * crate::core::types::DECIMAL_SCALE))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(6 * crate::core::types::DECIMAL_SCALE)));
+        let right = arena.alloc(Expr::Literal(Value::Int(7 * crate::core::types::DECIMAL_SCALE)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Mul, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
         assert_eq!(
-            evaluate(&expr, &store, &fns).unwrap(),
+            evaluate(&expr, &arena, &store, &fns).unwrap(),
             Value::Int(42 * crate::core::types::DECIMAL_SCALE)
         );
     }
@@ -300,32 +301,28 @@
     #[test]
     fn evaluate_division() {
         // 15 / 3 = 5
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(15 * crate::core::types::DECIMAL_SCALE))),
-            op: BinOp::Div,
-            right: Box::new(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(15 * crate::core::types::DECIMAL_SCALE)));
+        let right = arena.alloc(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Div, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
         assert_eq!(
-            evaluate(&expr, &store, &fns).unwrap(),
+            evaluate(&expr, &arena, &store, &fns).unwrap(),
             Value::Int(5 * crate::core::types::DECIMAL_SCALE)
         );
     }
 
     #[test]
     fn evaluate_string_concatenation() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::String(std::sync::Arc::from(
-                "Hello, ",
-            )))),
-            op: BinOp::Add,
-            right: Box::new(Expr::Literal(Value::String(std::sync::Arc::from("Mizu!")))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::String(std::sync::Arc::from("Hello, "))));
+        let right = arena.alloc(Expr::Literal(Value::String(std::sync::Arc::from("Mizu!"))));
+        let expr = Expr::BinaryOp { left, op: BinOp::Add, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
         assert_eq!(
-            evaluate(&expr, &store, &fns).unwrap(),
+            evaluate(&expr, &arena, &store, &fns).unwrap(),
             Value::String(std::sync::Arc::from("Hello, Mizu!"))
         );
     }
@@ -338,11 +335,13 @@
         let mut store = VariableStore::with_interner(interner);
         store.set("p", 100 * crate::core::types::DECIMAL_SCALE);
         let store = Rc::new(store);
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(100 * crate::core::types::DECIMAL_SCALE)));
         let call_expr = Expr::FunctionCall {
             name: vat_sym,
-            args: vec![Expr::Literal(Value::Int(100 * crate::core::types::DECIMAL_SCALE))],
+            args: vec![arg0],
         };
-        let result = evaluate(&call_expr, &store, &fns).unwrap();
+        let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
         // 100 * 1.22 = 122
         assert_eq!(result, Value::Int(122 * crate::core::types::DECIMAL_SCALE));
     }
@@ -355,12 +354,14 @@
 ";
         let (fns, interner) = single_fn(src).unwrap();
         let quadruple_sym = interner.get("quadruple").unwrap();
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)));
         let call_expr = Expr::FunctionCall {
             name: quadruple_sym,
-            args: vec![Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE))],
+            args: vec![arg0],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&call_expr, &store, &fns).unwrap();
+        let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
         // 3 * 4 = 12
         assert_eq!(result, Value::Int(12 * crate::core::types::DECIMAL_SCALE));
     }
@@ -374,15 +375,15 @@
 ";
         let (fns, interner) = single_fn(src).unwrap();
         let total_sym = interner.get("total").unwrap();
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)));
+        let arg1 = arena.alloc(Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)));
         let call_expr = Expr::FunctionCall {
             name: total_sym,
-            args: vec![
-                Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)),
-                Expr::Literal(Value::Int(3 * crate::core::types::DECIMAL_SCALE)),
-            ],
+            args: vec![arg0, arg1],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&call_expr, &store, &fns).unwrap();
+        let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
         // netto = 10 * 3 = 30, result = 30 * 1.22 = 36.6
         assert_eq!(result, Value::Int(3_660_000_000));
     }
@@ -396,15 +397,15 @@
         let mut outer_store = VariableStore::with_interner(interner);
         outer_store.set("w", 999 * crate::core::types::DECIMAL_SCALE); // should be ignored inside the function
         let outer_store = Rc::new(outer_store);
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(5 * crate::core::types::DECIMAL_SCALE)));
+        let arg1 = arena.alloc(Expr::Literal(Value::Int(4 * crate::core::types::DECIMAL_SCALE)));
         let call_expr = Expr::FunctionCall {
             name: area_sym,
-            args: vec![
-                Expr::Literal(Value::Int(5 * crate::core::types::DECIMAL_SCALE)),
-                Expr::Literal(Value::Int(4 * crate::core::types::DECIMAL_SCALE)),
-            ],
+            args: vec![arg0, arg1],
         };
         // Function arguments override the outer store inside the function body.
-        let result = evaluate(&call_expr, &outer_store, &fns).unwrap();
+        let result = evaluate(&call_expr, &arena, &outer_store, &fns).unwrap();
         assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
     }
 
@@ -464,14 +465,13 @@
 
     #[test]
     fn error_num_plus_bool_is_type_error() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(1))),
-            op: BinOp::Add,
-            right: Box::new(Expr::Literal(Value::Bool(true))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(1)));
+        let right = arena.alloc(Expr::Literal(Value::Bool(true)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Add, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        let result = evaluate(&expr, &store, &fns);
+        let result = evaluate(&expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::TypeError { .. })),
             "expected TypeError, got: {result:?}"
@@ -480,27 +480,25 @@
 
     #[test]
     fn error_num_mul_string_is_type_error() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Int(2))),
-            op: BinOp::Mul,
-            right: Box::new(Expr::Literal(Value::String(std::sync::Arc::from("oops")))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Int(2)));
+        let right = arena.alloc(Expr::Literal(Value::String(std::sync::Arc::from("oops"))));
+        let expr = Expr::BinaryOp { left, op: BinOp::Mul, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        let result = evaluate(&expr, &store, &fns);
+        let result = evaluate(&expr, &arena, &store, &fns);
         assert!(matches!(result, Err(MizuError::TypeError { .. })));
     }
 
     #[test]
     fn error_bool_sub_num_is_type_error() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Literal(Value::Bool(true))),
-            op: BinOp::Sub,
-            right: Box::new(Expr::Literal(Value::Int(1))),
-        };
+        let mut arena = ExprArena::new();
+        let left = arena.alloc(Expr::Literal(Value::Bool(true)));
+        let right = arena.alloc(Expr::Literal(Value::Int(1)));
+        let expr = Expr::BinaryOp { left, op: BinOp::Sub, right };
         let store = Rc::new(VariableStore::new());
         let fns = FxHashMap::default();
-        let result = evaluate(&expr, &store, &fns);
+        let result = evaluate(&expr, &arena, &store, &fns);
         assert!(matches!(result, Err(MizuError::TypeError { .. })));
     }
 
@@ -510,12 +508,14 @@
         let src = "    vat(p: num) : p * 1.22\n";
         let (fns, interner) = single_fn(src).unwrap();
         let vat_sym = interner.get("vat").unwrap();
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Bool(true)));
         let call_expr = Expr::FunctionCall {
             name: vat_sym,
-            args: vec![Expr::Literal(Value::Bool(true))],
+            args: vec![arg0],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&call_expr, &store, &fns);
+        let result = evaluate(&call_expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::TypeError { .. })),
             "expected TypeError for wrong argument type, got: {result:?}"
@@ -527,12 +527,14 @@
         let src = "    add(a: num, b: num) : a + b\n";
         let (fns, interner) = single_fn(src).unwrap();
         let add_sym = interner.get("add").unwrap();
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
         let call_expr = Expr::FunctionCall {
             name: add_sym,
-            args: vec![Expr::Literal(Value::Int(1))],
+            args: vec![arg0],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&call_expr, &store, &fns);
+        let result = evaluate(&call_expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("argument")),
             "expected arity error, got: {result:?}"
@@ -544,15 +546,15 @@
         let src = "    inc(x: num) : x + 1\n";
         let (fns, interner) = single_fn(src).unwrap();
         let inc_sym = interner.get("inc").unwrap();
+        let mut arena = ExprArena::new();
+        let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
+        let arg1 = arena.alloc(Expr::Literal(Value::Int(2)));
         let call_expr = Expr::FunctionCall {
             name: inc_sym,
-            args: vec![
-                Expr::Literal(Value::Int(1)),
-                Expr::Literal(Value::Int(2)),
-            ],
+            args: vec![arg0, arg1],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
-        let result = evaluate(&call_expr, &store, &fns);
+        let result = evaluate(&call_expr, &arena, &store, &fns);
         assert!(matches!(result, Err(MizuError::ParseError(_))));
     }
 
@@ -560,13 +562,14 @@
     fn error_undefined_function_call() {
         let mut interner = StringInterner::new();
         let ghost_sym = interner.get_or_intern("ghost");
+        let arena = ExprArena::new();
         let call_expr = Expr::FunctionCall {
             name: ghost_sym,
             args: vec![],
         };
         let store = Rc::new(VariableStore::with_interner(interner));
         let fns = FxHashMap::default();
-        let result = evaluate(&call_expr, &store, &fns);
+        let result = evaluate(&call_expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("ghost")),
             "expected undefined-function error, got: {result:?}"
@@ -578,9 +581,10 @@
         let mut interner = StringInterner::new();
         let missing_sym = interner.get_or_intern("missing");
         let expr = Expr::Variable(missing_sym);
+        let arena = ExprArena::new();
         let store = Rc::new(VariableStore::with_interner(interner));
         let fns = FxHashMap::default();
-        let result = evaluate(&expr, &store, &fns);
+        let result = evaluate(&expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::VariableNotFound(_))),
             "expected VariableNotFound, got: {result:?}"
@@ -700,11 +704,13 @@
     // ────────────────────────────────────────────────────────────────────────
 
     fn network_call_action(path_param_value: &str) -> Action {
+        let mut arena = ExprArena::new();
+        let root = arena.alloc(Expr::Literal(Value::from(path_param_value)));
         Action::NetworkCall {
             method: NetworkMethod::Get,
             alias_sym: Symbol(0),
             payload: None,
-            path_param: Some(Box::new(Expr::Literal(Value::from(path_param_value)))),
+            path_param: Some(crate::parser::logic::ExprTree { arena, root }),
             target_var: "data".to_string(),
         }
     }
@@ -806,12 +812,16 @@
     fn get_system_time_bare_identifier_accepted() {
         let mut interner = StringInterner::new();
         let action = parse_action("get_system_time(my_var)", &mut interner).unwrap();
-        let Action::Eval(Expr::FunctionCall { name, args }) = action else {
+        let Action::Eval(tree) = action else {
             panic!("expected Action::Eval(FunctionCall), got: {action:?}");
         };
-        assert_eq!(interner.resolve(name), Some("get_system_time"));
+        let Expr::FunctionCall { name, args } = tree.root() else {
+            panic!("expected FunctionCall root, got: {:?}", tree.root());
+        };
+        assert_eq!(interner.resolve(*name), Some("get_system_time"));
         let my_var_sym = interner.get("my_var").unwrap();
-        assert_eq!(args, vec![Expr::Variable(my_var_sym)]);
+        let arg_exprs: Vec<&Expr> = args.iter().map(|&id| &tree.arena[id]).collect();
+        assert_eq!(arg_exprs, vec![&Expr::Variable(my_var_sym)]);
     }
 
     #[test]
@@ -867,7 +877,7 @@
         let mut interner = StringInterner::new();
         let expr = super::parse_expr_standalone("get_system_time(x)", &mut interner).unwrap();
         assert_eq!(
-            super::find_side_effect_call(&expr, &interner),
+            super::find_side_effect_call(expr.root(), &expr.arena, &interner),
             Some("get_system_time".to_string())
         );
     }
@@ -880,7 +890,7 @@
         assert!(fns.contains_key(&count_sym));
         let f = &fns[&count_sym];
         assert!(f.params.is_empty());
-        assert_eq!(f.body, Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)));
+        assert_eq!(*f.body.root(), Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE)));
     }
 
     #[test]
@@ -890,7 +900,8 @@
         let count_sym = interner.get("count").unwrap();
         let store = Rc::new(VariableStore::with_interner(interner));
         let expr = Expr::Variable(count_sym);
-        let result = evaluate(&expr, &store, &fns);
+        let arena = ExprArena::new();
+        let result = evaluate(&expr, &arena, &store, &fns);
         assert!(
             matches!(result, Err(MizuError::VariableNotFound(ref name)) if name == "count"),
             "expected VariableNotFound for count, got: {result:?}"
@@ -936,8 +947,9 @@
         let interner = crate::core::types::StringInterner::new();
         let fns = FxHashMap::default();
         let expr = Expr::Literal(Value::Int(1));
+        let arena = ExprArena::new();
 
-        let res = sm.evaluate(&expr, 0, &fns, &interner);
+        let res = sm.evaluate(&expr, 0, &fns, &interner, &arena);
         assert!(
             matches!(res, Err(MizuError::Timeout)),
             "expected Timeout, got: {res:?}"
@@ -959,9 +971,11 @@
 
         // First action — must succeed even if counter was near-exhausted from a prior call.
         store.state_machine.instruction_count = *MAX_INSTRUCTIONS - 1;
+        let mut arena1 = ExprArena::new();
+        let root1 = arena1.alloc(Expr::Literal(Value::Int(1)));
         let action1 = Action::Assign {
             target: "x".to_string(),
-            expr: Expr::Literal(Value::Int(1)),
+            expr: crate::parser::logic::ExprTree { arena: arena1, root: root1 },
         };
         let r1 = super::execute_action(&action1, &mut store, &fns);
         assert!(
@@ -970,9 +984,11 @@
         );
 
         // Second action — counter was reset by execute_action, must also succeed.
+        let mut arena2 = ExprArena::new();
+        let root2 = arena2.alloc(Expr::Literal(Value::Int(2)));
         let action2 = Action::Assign {
             target: "x".to_string(),
-            expr: Expr::Literal(Value::Int(2)),
+            expr: crate::parser::logic::ExprTree { arena: arena2, root: root2 },
         };
         let r2 = super::execute_action(&action2, &mut store, &fns);
         assert!(
@@ -997,17 +1013,18 @@
 
         // Evaluate an expression shadowing 'x' using Let binding:
         // let x = 15 in x + y
+        let mut arena = ExprArena::new();
+        let value = arena.alloc(Expr::Literal(Value::Int(15)));
+        let left = arena.alloc(Expr::Variable(x_sym));
+        let right = arena.alloc(Expr::Variable(y_sym));
+        let body = arena.alloc(Expr::BinaryOp { left, op: BinOp::Add, right });
         let expr = Expr::Let {
             name: x_sym,
-            value: Box::new(Expr::Literal(Value::Int(15))),
-            body: Box::new(Expr::BinaryOp {
-                left: Box::new(Expr::Variable(x_sym)),
-                op: BinOp::Add,
-                right: Box::new(Expr::Variable(y_sym)),
-            }),
+            value,
+            body,
         };
 
-        let res = sm.evaluate(&expr, 0, &fns, &interner).unwrap();
+        let res = sm.evaluate(&expr, 0, &fns, &interner, &arena).unwrap();
         assert_eq!(res, Value::Int(35));
     }
 
@@ -1203,12 +1220,12 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         store.set("n", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
         let v = store
             .state_machine
-            .evaluate(&pos, 0, &fns, &store.interner)
+            .evaluate(pos.root(), 0, &fns, &store.interner, &pos.arena)
             .unwrap();
         // just verify the function compiles — full eval needs param binding
         let _ = v;
         // Smoke test: parse succeeds and body is IfElse
-        assert!(matches!(fns[&va_sym].body, Expr::IfElse { .. }));
+        assert!(matches!(fns[&va_sym].body.root(), Expr::IfElse { .. }));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -2026,9 +2043,11 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         store.state_machine.computed_var_syms.insert(derived_sym);
 
         let fns = FxHashMap::default();
+        let mut arena = ExprArena::new();
+        let root = arena.alloc(Expr::Literal(Value::Int(99)));
         let action = Action::Assign {
             target: "derived".to_string(),
-            expr: Expr::Literal(Value::Int(99)),
+            expr: crate::parser::logic::ExprTree { arena, root },
         };
         let result = super::execute_action(&action, &mut store, &fns);
         assert!(
@@ -2206,16 +2225,20 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
             }
 
             // expr = (i+1)*100 + dep_0 + dep_1 + ...
+            let mut arena = ExprArena::new();
             let mut expr = Expr::Literal(Value::Int((i as i64 + 1) * 100));
             for &d in &deps {
-                expr = Expr::BinaryOp {
-                    left: Box::new(expr),
-                    op: BinOp::Add,
-                    right: Box::new(Expr::Variable(d)),
-                };
+                let left = arena.alloc(expr);
+                let right = arena.alloc(Expr::Variable(d));
+                expr = Expr::BinaryOp { left, op: BinOp::Add, right };
             }
+            let root = arena.alloc(expr);
 
-            bindings.push(ComputedBinding { name, expr, depends_on: deps });
+            bindings.push(ComputedBinding {
+                name,
+                expr: crate::parser::logic::ExprTree { arena, root },
+                depends_on: deps,
+            });
         }
         (base_syms, bindings)
     }
@@ -2321,13 +2344,13 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let bindings: Vec<ComputedBinding> = (0..N_COMPS)
             .map(|i| {
                 let name = interner.get_or_intern(&format!("comp{i}"));
+                let mut arena = ExprArena::new();
+                let left = arena.alloc(Expr::Variable(base_syms[i]));
+                let right = arena.alloc(Expr::Literal(Value::Int(1)));
+                let root = arena.alloc(Expr::BinaryOp { left, op: BinOp::Add, right });
                 ComputedBinding {
                     name,
-                    expr: Expr::BinaryOp {
-                        left: Box::new(Expr::Variable(base_syms[i])),
-                        op: BinOp::Add,
-                        right: Box::new(Expr::Literal(Value::Int(1))),
-                    },
+                    expr: crate::parser::logic::ExprTree { arena, root },
                     depends_on: vec![base_syms[i]],
                 }
             })

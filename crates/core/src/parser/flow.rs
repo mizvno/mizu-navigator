@@ -24,7 +24,7 @@
 
 use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
-use crate::parser::logic::{Action, Expr, MizuFunction, ComputedBinding};
+use crate::parser::logic::{Action, Expr, ExprArena, ExprTree, MizuFunction, ComputedBinding};
 use crate::parser::layout::{MizuNode, EventBlock};
 use crate::parser::urls::UrlRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -124,7 +124,7 @@ pub fn check_information_flow(
         // Propagate through user-defined functions
         for (sym, func) in functions {
             if !tainted_functions.contains(sym)
-                && is_expr_tainted(&func.body, &tainted_vars, &tainted_functions, gst_sym)
+                && is_expr_tainted(func.body.root(), &func.body.arena, &tainted_vars, &tainted_functions, gst_sym)
             {
                 tainted_functions.insert(*sym);
                 changed = true;
@@ -134,12 +134,12 @@ pub fn check_information_flow(
         // Propagate through ComputedBindings
         for comp in comps {
             if !tainted_vars.contains(&comp.name)
-                && is_expr_tainted(&comp.expr, &tainted_vars, &tainted_functions, gst_sym)
+                && is_expr_tainted(comp.expr.root(), &comp.expr.arena, &tainted_vars, &tainted_functions, gst_sym)
             {
                 tainted_vars.insert(comp.name);
                 // Track the propagation origin for diagnostics
                 if let Some(source_sym) = find_tainted_var_in_expr(
-                    &comp.expr, &tainted_vars, &tainted_functions, gst_sym,
+                    comp.expr.root(), &comp.expr.arena, &tainted_vars, &tainted_functions, gst_sym,
                 ) {
                     let from_name = interner.resolve(source_sym)
                         .unwrap_or("<unknown>").to_string();
@@ -157,11 +157,11 @@ pub fn check_information_flow(
                 Action::Assign { target, expr } => {
                     if let Some(target_sym) = interner.get(target)
                         && !tainted_vars.contains(&target_sym)
-                        && is_expr_tainted(expr, &tainted_vars, &tainted_functions, gst_sym)
+                        && is_expr_tainted(expr.root(), &expr.arena, &tainted_vars, &tainted_functions, gst_sym)
                     {
                         tainted_vars.insert(target_sym);
                         if let Some(source_sym) = find_tainted_var_in_expr(
-                            expr, &tainted_vars, &tainted_functions, gst_sym,
+                            expr.root(), &expr.arena, &tainted_vars, &tainted_functions, gst_sym,
                         ) {
                             let from_name = interner.resolve(source_sym)
                                 .unwrap_or("<unknown>").to_string();
@@ -202,14 +202,14 @@ pub fn check_information_flow(
     if let Some(gst_sym) = gst_sym {
         let mut gst_targets = Vec::new();
         for func in functions.values() {
-            collect_get_system_time_targets(&func.body, gst_sym, &mut gst_targets);
+            collect_get_system_time_targets(func.body.root(), &func.body.arena, gst_sym, &mut gst_targets);
         }
         for comp in comps {
-            collect_get_system_time_targets(&comp.expr, gst_sym, &mut gst_targets);
+            collect_get_system_time_targets(comp.expr.root(), &comp.expr.arena, gst_sym, &mut gst_targets);
         }
         for (_, action) in &actions {
-            for expr in action_exprs(action) {
-                collect_get_system_time_targets(expr, gst_sym, &mut gst_targets);
+            for tree in action_exprs(action) {
+                collect_get_system_time_targets(tree.root(), &tree.arena, gst_sym, &mut gst_targets);
             }
         }
         for target in gst_targets {
@@ -232,12 +232,12 @@ pub fn check_information_flow(
         // percent-encoded).  See SECURITY-INVARIANTS.md Â§5, gate G2.
         if let Action::Navigate { url } = action {
             num_sinks += 1;
-            if is_expr_tainted(url, &tainted_vars, &tainted_functions, gst_sym) {
+            if is_expr_tainted(url.root(), &url.arena, &tainted_vars, &tainted_functions, gst_sym) {
                 // Gate G1: user-gesture navigation discharges taint
                 if *ctx != ActionContext::UserGesture {
                     // Build diagnostic path (F3)
                     let path = build_taint_path(
-                        url, &tainted_vars, &tainted_functions,
+                        url.root(), &url.arena, &tainted_vars, &tainted_functions,
                         &taint_origins, interner, gst_sym,
                     );
                     return Err(MizuError::ParseError(format!(
@@ -256,7 +256,7 @@ pub fn check_information_flow(
 /// Used to walk the whole action graph looking for `get_system_time` calls,
 /// which â€” unlike `Navigate`/`NetworkCall`/`Assign` â€” are not a top-level
 /// `Action` variant of their own and can be nested anywhere inside these.
-fn action_exprs(action: &Action) -> Vec<&Expr> {
+fn action_exprs(action: &Action) -> Vec<&ExprTree> {
     match action {
         Action::Eval(e) => vec![e],
         Action::Assign { expr, .. } => vec![expr],
@@ -264,10 +264,10 @@ fn action_exprs(action: &Action) -> Vec<&Expr> {
         Action::NetworkCall { payload, path_param, .. } => {
             let mut exprs = Vec::new();
             if let Some(p) = payload {
-                exprs.push(p.as_ref());
+                exprs.push(p);
             }
             if let Some(p) = path_param {
-                exprs.push(p.as_ref());
+                exprs.push(p);
             }
             exprs
         }
@@ -281,34 +281,35 @@ fn action_exprs(action: &Action) -> Vec<&Expr> {
 /// (`parser::logic.rs`), every call found here has a statically-known
 /// target â€” the whole point of this walk is to make that target visible to
 /// the checker, exactly as an `Action::Assign`'s target already is.
-fn collect_get_system_time_targets(expr: &Expr, gst_sym: Symbol, out: &mut Vec<Symbol>) {
+fn collect_get_system_time_targets(expr: &Expr, arena: &ExprArena, gst_sym: Symbol, out: &mut Vec<Symbol>) {
     match expr {
         Expr::Literal(_) | Expr::Variable(_) => {}
         Expr::BinaryOp { left, right, .. } => {
-            collect_get_system_time_targets(left, gst_sym, out);
-            collect_get_system_time_targets(right, gst_sym, out);
+            collect_get_system_time_targets(&arena[*left], arena, gst_sym, out);
+            collect_get_system_time_targets(&arena[*right], arena, gst_sym, out);
         }
         Expr::FunctionCall { name, args } => {
             if *name == gst_sym
-                && let [Expr::Variable(target)] = args.as_slice()
+                && let [id] = args.as_slice()
+                && let Expr::Variable(target) = &arena[*id]
             {
                 out.push(*target);
             }
-            for arg in args {
-                collect_get_system_time_targets(arg, gst_sym, out);
+            for &arg in args {
+                collect_get_system_time_targets(&arena[arg], arena, gst_sym, out);
             }
         }
         Expr::Let { value, body, .. } => {
-            collect_get_system_time_targets(value, gst_sym, out);
-            collect_get_system_time_targets(body, gst_sym, out);
+            collect_get_system_time_targets(&arena[*value], arena, gst_sym, out);
+            collect_get_system_time_targets(&arena[*body], arena, gst_sym, out);
         }
-        Expr::Not(inner) => collect_get_system_time_targets(inner, gst_sym, out),
+        Expr::Not(inner) => collect_get_system_time_targets(&arena[*inner], arena, gst_sym, out),
         Expr::IfElse { condition, then_expr, else_expr } => {
-            collect_get_system_time_targets(condition, gst_sym, out);
-            collect_get_system_time_targets(then_expr, gst_sym, out);
-            collect_get_system_time_targets(else_expr, gst_sym, out);
+            collect_get_system_time_targets(&arena[*condition], arena, gst_sym, out);
+            collect_get_system_time_targets(&arena[*then_expr], arena, gst_sym, out);
+            collect_get_system_time_targets(&arena[*else_expr], arena, gst_sym, out);
         }
-        Expr::FieldAccess { base, .. } => collect_get_system_time_targets(base, gst_sym, out),
+        Expr::FieldAccess { base, .. } => collect_get_system_time_targets(&arena[*base], arena, gst_sym, out),
     }
 }
 
@@ -320,6 +321,7 @@ fn collect_get_system_time_targets(expr: &Expr, gst_sym: Symbol, out: &mut Vec<S
 /// `check_information_flow`) rather than walked like an ordinary argument.
 fn is_expr_tainted(
     expr: &Expr,
+    arena: &ExprArena,
     tainted_vars: &FxHashSet<Symbol>,
     tainted_functions: &FxHashSet<Symbol>,
     gst_sym: Option<Symbol>,
@@ -328,8 +330,8 @@ fn is_expr_tainted(
         Expr::Variable(sym) => tainted_vars.contains(sym),
         Expr::Literal(_) => false,
         Expr::BinaryOp { left, right, .. } => {
-            is_expr_tainted(left, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(right, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
+                || is_expr_tainted(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym)
         }
         Expr::FunctionCall { name, args } => {
             if Some(*name) == gst_sym {
@@ -338,25 +340,25 @@ fn is_expr_tainted(
             if tainted_functions.contains(name) {
                 return true;
             }
-            for arg in args {
-                if is_expr_tainted(arg, tainted_vars, tainted_functions, gst_sym) {
+            for &arg in args {
+                if is_expr_tainted(&arena[arg], arena, tainted_vars, tainted_functions, gst_sym) {
                     return true;
                 }
             }
             false
         }
         Expr::Let { value, body, .. } => {
-            is_expr_tainted(value, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(body, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(&arena[*value], arena, tainted_vars, tainted_functions, gst_sym)
+                || is_expr_tainted(&arena[*body], arena, tainted_vars, tainted_functions, gst_sym)
         }
-        Expr::Not(inner) => is_expr_tainted(inner, tainted_vars, tainted_functions, gst_sym),
+        Expr::Not(inner) => is_expr_tainted(&arena[*inner], arena, tainted_vars, tainted_functions, gst_sym),
         Expr::IfElse { condition, then_expr, else_expr } => {
-            is_expr_tainted(condition, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(then_expr, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(else_expr, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(&arena[*condition], arena, tainted_vars, tainted_functions, gst_sym)
+                || is_expr_tainted(&arena[*then_expr], arena, tainted_vars, tainted_functions, gst_sym)
+                || is_expr_tainted(&arena[*else_expr], arena, tainted_vars, tainted_functions, gst_sym)
         }
         Expr::FieldAccess { base, .. } => {
-            is_expr_tainted(base, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(&arena[*base], arena, tainted_vars, tainted_functions, gst_sym)
         }
     }
 }
@@ -365,6 +367,7 @@ fn is_expr_tainted(
 /// tracking). `gst_sym`: see `is_expr_tainted`.
 fn find_tainted_var_in_expr(
     expr: &Expr,
+    arena: &ExprArena,
     tainted_vars: &FxHashSet<Symbol>,
     tainted_functions: &FxHashSet<Symbol>,
     gst_sym: Option<Symbol>,
@@ -375,8 +378,8 @@ fn find_tainted_var_in_expr(
         }
         Expr::Literal(_) => None,
         Expr::BinaryOp { left, right, .. } => {
-            find_tainted_var_in_expr(left, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(right, tainted_vars, tainted_functions, gst_sym))
+            find_tainted_var_in_expr(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
+                .or_else(|| find_tainted_var_in_expr(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym))
         }
         Expr::FunctionCall { name, args } => {
             if Some(*name) == gst_sym {
@@ -385,25 +388,25 @@ fn find_tainted_var_in_expr(
             if tainted_functions.contains(name) {
                 return Some(*name);
             }
-            for arg in args {
-                if let Some(s) = find_tainted_var_in_expr(arg, tainted_vars, tainted_functions, gst_sym) {
+            for &arg in args {
+                if let Some(s) = find_tainted_var_in_expr(&arena[arg], arena, tainted_vars, tainted_functions, gst_sym) {
                     return Some(s);
                 }
             }
             None
         }
         Expr::Let { value, body, .. } => {
-            find_tainted_var_in_expr(value, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(body, tainted_vars, tainted_functions, gst_sym))
+            find_tainted_var_in_expr(&arena[*value], arena, tainted_vars, tainted_functions, gst_sym)
+                .or_else(|| find_tainted_var_in_expr(&arena[*body], arena, tainted_vars, tainted_functions, gst_sym))
         }
-        Expr::Not(inner) => find_tainted_var_in_expr(inner, tainted_vars, tainted_functions, gst_sym),
+        Expr::Not(inner) => find_tainted_var_in_expr(&arena[*inner], arena, tainted_vars, tainted_functions, gst_sym),
         Expr::IfElse { condition, then_expr, else_expr } => {
-            find_tainted_var_in_expr(condition, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(then_expr, tainted_vars, tainted_functions, gst_sym))
-                .or_else(|| find_tainted_var_in_expr(else_expr, tainted_vars, tainted_functions, gst_sym))
+            find_tainted_var_in_expr(&arena[*condition], arena, tainted_vars, tainted_functions, gst_sym)
+                .or_else(|| find_tainted_var_in_expr(&arena[*then_expr], arena, tainted_vars, tainted_functions, gst_sym))
+                .or_else(|| find_tainted_var_in_expr(&arena[*else_expr], arena, tainted_vars, tainted_functions, gst_sym))
         }
         Expr::FieldAccess { base, .. } => {
-            find_tainted_var_in_expr(base, tainted_vars, tainted_functions, gst_sym)
+            find_tainted_var_in_expr(&arena[*base], arena, tainted_vars, tainted_functions, gst_sym)
         }
     }
 }
@@ -413,13 +416,14 @@ fn find_tainted_var_in_expr(
 /// Example output: `"value 'next' (tainted from GET(api))"`
 fn build_taint_path(
     expr: &Expr,
+    arena: &ExprArena,
     tainted_vars: &FxHashSet<Symbol>,
     tainted_functions: &FxHashSet<Symbol>,
     origins: &FxHashMap<Symbol, TaintOrigin>,
     interner: &crate::core::types::StringInterner,
     gst_sym: Option<Symbol>,
 ) -> String {
-    if let Some(sym) = find_tainted_var_in_expr(expr, tainted_vars, tainted_functions, gst_sym) {
+    if let Some(sym) = find_tainted_var_in_expr(expr, arena, tainted_vars, tainted_functions, gst_sym) {
         let var_name = interner.resolve(sym).unwrap_or("<unknown>");
         if let Some(origin) = origins.get(&sym) {
             match origin {
