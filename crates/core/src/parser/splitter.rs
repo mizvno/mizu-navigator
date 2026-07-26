@@ -210,14 +210,8 @@ pub fn split_source_with_origin(
                 "layout" => {
                     active = ActiveBlock::Layout;
                 }
-                "reach" => {
-                    active = ActiveBlock::Urls;
-                }
                 "urls" => {
-                    return Err(MizuError::ParseError(format!(
-                        "line {}: `urls` is no longer supported; use `reach` instead",
-                        line_idx + 1
-                    )));
+                    active = ActiveBlock::Urls;
                 }
                 _ if is_import_directive(trimmed) => match origin {
                     Origin::Network => {
@@ -759,24 +753,9 @@ logic
     }
 
     #[test]
-    fn old_urls_keyword_is_a_clear_parse_error_naming_reach() {
-        let source = "\
-urls
-    api login /api/v1/login
-layout
-    doc
-";
-        let result = split_source(source, Path::new(NO_IMPORT_DIR));
-        assert!(
-            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("urls") && m.contains("reach")),
-            "expected a ParseError naming both `urls` and `reach`, got: {result:?}"
-        );
-    }
-
-    #[test]
     fn split_urls_block_parsed_correctly() {
         let source = "\
-reach
+urls
     api login /api/v1/login
     media logo mizu://cdn.example.com/logo.png
 layout

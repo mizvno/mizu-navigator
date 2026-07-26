@@ -1,4 +1,4 @@
-﻿//! # `urls` — Compile-Time URL Registry Parser
+//! # `urls` — Compile-Time URL Registry Parser
 //!
 //! This module parses the `urls` macro-block produced by [`super::splitter`]
 //! into a [`UrlRegistry`] — a symbol-keyed map of named endpoint aliases.
@@ -164,6 +164,15 @@ pub fn parse_urls(content: &str, interner: &mut StringInterner) -> Result<UrlReg
     Ok(registry)
 }
 
+
+// No Kani harness for `parse_urls` here (see `SECURITY-INVARIANTS.md` §8 for
+// the rest of this crate's Kani coverage). `parse_urls` interns aliases via
+// `StringInterner`, which is backed by a `HashMap`. Even with a fully
+// bounded, tiny symbolic `content` string, CBMC's exploration of the
+// hashing/allocation paths reached through `HashMap` insertion caused the
+// same kind of path explosion documented for `flow.rs`'s taint-propagation
+// core — a known limitation of bounded model checking against hash-based
+// lookup tables, not something bounding the input further would fix.
 
 #[cfg(test)]
 mod tests {

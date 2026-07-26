@@ -8,7 +8,7 @@
 // document should look like.
 // ─────────────────────────────────────────────────────────────────────────
 
-reach
+urls
     // "api" endpoints are used with GET/POST/PUT/DELETE/QUERY.
     api items_api /api/v1/items
     api create_item /api/v1/items

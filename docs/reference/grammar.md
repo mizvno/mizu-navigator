@@ -11,7 +11,7 @@
 
 1. [Document Structure](#1-document-structure)
 2. [Lexical Conventions](#2-lexical-conventions)
-3. [reach Block](#3-reach-block)
+3. [urls Block](#3-urls-block)
 4. [logic Block](#4-logic-block)
 5. [style Block](#5-style-block)
 6. [layout Block](#6-layout-block)
@@ -33,7 +33,7 @@ import_directive
               = ( "import" | "include" ) SP+ DQUOTE path DQUOTE NL ;
 
 block          = block_header block_body ;
-block_header   = ( "logic" | "style" | "layout" | "reach" ) NL ;
+block_header   = ( "logic" | "style" | "layout" | "urls" ) NL ;
 
 block_body     = { indented_line } ;
 indented_line  = SP+ content NL ;
@@ -68,7 +68,7 @@ sections is accepted identically to one at the top of the file (see the
 comment = "//" { any_char } ;
 ```
 
-`//` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `//` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `reach` block.
+`//` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `//` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `urls` block.
 
 ### Identifiers
 
@@ -125,12 +125,12 @@ Significant whitespace (spaces only). Each block parser determines the *baseline
 
 ---
 
-## 3. `reach` Block
+## 3. `urls` Block
 
 **Implementing source:** `src/parser/urls.rs` — `parse_urls`
 
 ```ebnf
-reach_block = { url_entry } ;
+urls_block = { url_entry } ;
 url_entry   = api_entry | media_entry ;
 api_entry   = SP+ "api"   SP+ alias SP+ api_path  NL ;
 media_entry = SP+ "media" SP+ alias SP+ mizu_url  NL ;
@@ -520,7 +520,7 @@ eval_action   = expr ;
 
 - Verb keywords are **case-sensitive uppercase**; both the parenthesized call form (`get(alias) -> var`) and the space-separated legacy form (`get /api/foo -> var`) are rejected with a "use the uppercase registry form" `ParseError`.
   *(Resolved MNT-01: `parse_action_with_urls` in `src/parser/logic/parse.rs` previously detected the verb by uppercasing the whole action string before comparing, making the parenthesized form case-insensitive. Fixed to match on exact case; see `walkthrough.md`'s "MNT-01" entry.)*
-- `alias` must be declared in the `reach` block as an `api` endpoint; missing or wrong-kind → `ParseError`.
+- `alias` must be declared in the `urls` block as an `api` endpoint; missing or wrong-kind → `ParseError`.
 - `download` alias must be declared as a `media` endpoint; wrong kind → `ParseError`.
 - `path_param` at runtime must be a single path segment — no `/`, `\`, `..`, or ASCII control characters (`path_param_ok`, `src/parser/logic.rs`).
 - Assigning to a `comp` variable in an assignment action → runtime `ExecutionError`.

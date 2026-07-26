@@ -146,10 +146,10 @@ layout
 
 ## 6. Fetching Data from an API
 
-Declare an endpoint in `reach`, then call it from an action.
+Declare an endpoint in `urls`, then call it from an action.
 
 ```
-reach
+urls
     api items /api/v1/items
 
 logic
@@ -165,7 +165,7 @@ layout
 Wait — the alias name must match what is declared.  Let us do it correctly:
 
 ```
-reach
+urls
     api items_api /api/v1/items
 
 logic
@@ -212,7 +212,7 @@ the UI.
 ## 8. Rendering a List with `each`
 
 ```
-reach
+urls
     api todos_api /api/v1/todos
 
 logic
@@ -234,7 +234,7 @@ layout
 ## 9. Forms
 
 ```
-reach
+urls
     api submit_api /api/v1/message
 
 logic
