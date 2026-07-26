@@ -108,7 +108,7 @@ pub fn calculate_node_text(
     let node_ref = ctx.dom.get(node_id)?;
     let mizu_node = node_ref.value();
 
-    if mizu_node.primitive == Primitive::Window {
+    if mizu_node.primitive == Primitive::Doc {
         return None;
     }
 
@@ -644,7 +644,7 @@ mod tests {
         // render::bidi::resolve_direction's ancestor walk, and produces a
         // layout without erroring for right-to-left content.
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut a = FxHashMap::default();
                 a.insert("dir".to_string(), "rtl".to_string());

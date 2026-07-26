@@ -170,15 +170,16 @@ pub fn run_window_loop(
 
 
     let root_node = manager.dom.root().value();
-    if root_node.primitive != Primitive::Window {
+    if root_node.primitive != Primitive::Doc {
         return Err(MizuError::ParseError(
-            "Root element must be a Window".into(),
+            "Root element must be a `doc`".into(),
         ));
     }
 
-    // `window "..."`'s inline text is stored here as the `title` attribute
-    // (parser::layout::parse_primitive_and_attrs) — it sets the OS window
-    // title only and is never rendered as page content.
+    // `doc`'s explicit `title "..."` attribute sets the OS window title —
+    // never rendered as page content (parser::layout::parse_primitive_and_attrs
+    // rejects `title` on any other primitive, and no longer accepts it as
+    // positional inline text on `doc` either).
     let title = root_node
         .attributes
         .get("title")
@@ -1030,9 +1031,9 @@ fn dispatch_redraw_requested(
     let device = &render_cx.devices[surface.dev_id].device;
     let queue = &render_cx.devices[surface.dev_id].queue;
 
-    // Resolve background color from window style rule
+    // Resolve background color from the root `doc` style rule
     let mut bg_color = vello::peniko::Color::rgba8(255, 255, 255, 255);
-    if let Some(rules) = manager.style_rules.get("window")
+    if let Some(rules) = manager.style_rules.get("doc")
         && let Some(crate::parser::style::MizuBackground::Solid(c)) = &rules.background
     {
         bg_color = vello::peniko::Color::rgba8(c.r, c.g, c.b, c.a);

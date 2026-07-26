@@ -163,7 +163,7 @@ logic
     comp saved = "payload-derived-from-$form-field"
     timer 1s -> navigate saved
 layout
-    window
+    doc
         "#;
     let res = check_flow_doc(doc);
     assert!(

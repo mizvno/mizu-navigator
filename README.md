@@ -76,7 +76,7 @@ A `.mizu` document is four optional blocks — `urls`, `logic`, `style`,
 - **`style`** is a CSS-like cascade: tag/class selectors, a fixed and
   intentionally small property set, and environment-gated variants
   (`@dark`, `@min-width 600`, …).
-- **`layout`** is the DOM: `window`, `box`, `text`, `button`, `input`,
+- **`layout`** is the DOM: `doc`, `box`, `text`, `button`, `input`,
   `image`, `form`, `each`, conditional classes, and `click`/`submit` actions
   that can assign state, navigate, or call a declared endpoint.
 

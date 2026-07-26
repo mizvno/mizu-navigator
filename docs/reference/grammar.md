@@ -11,7 +11,7 @@
 
 1. [Document Structure](#1-document-structure)
 2. [Lexical Conventions](#2-lexical-conventions)
-3. [urls Block](#3-urls-block)
+3. [reach Block](#3-reach-block)
 4. [logic Block](#4-logic-block)
 5. [style Block](#5-style-block)
 6. [layout Block](#6-layout-block)
@@ -33,7 +33,7 @@ import_directive
               = ( "import" | "include" ) SP+ DQUOTE path DQUOTE NL ;
 
 block          = block_header block_body ;
-block_header   = ( "logic" | "style" | "layout" | "urls" ) NL ;
+block_header   = ( "logic" | "style" | "layout" | "reach" ) NL ;
 
 block_body     = { indented_line } ;
 indented_line  = SP+ content NL ;
@@ -68,7 +68,7 @@ sections is accepted identically to one at the top of the file (see the
 comment = "//" { any_char } ;
 ```
 
-`//` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `//` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `urls` block.
+`//` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `//` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `reach` block.
 
 ### Identifiers
 
@@ -125,12 +125,12 @@ Significant whitespace (spaces only). Each block parser determines the *baseline
 
 ---
 
-## 3. `urls` Block
+## 3. `reach` Block
 
 **Implementing source:** `src/parser/urls.rs` — `parse_urls`
 
 ```ebnf
-urls_block  = { url_entry } ;
+reach_block = { url_entry } ;
 url_entry   = api_entry | media_entry ;
 api_entry   = SP+ "api"   SP+ alias SP+ api_path  NL ;
 media_entry = SP+ "media" SP+ alias SP+ mizu_url  NL ;
@@ -212,7 +212,7 @@ style_rule        = selector_line NL { property_line NL } ;
 selector_line     = selector { SP+ variant_condition } ;
 selector          = class_selector | tag_selector ;
 class_selector    = "." ident ;
-tag_selector      = "window" | "box" | "text" | "button"
+tag_selector      = "doc" | "box" | "text" | "button"
                   | "input"  | "image" | "markdown" ;
 variant_condition = "@min-width" SP+ integer
                   | "@max-width" SP+ integer
@@ -315,7 +315,7 @@ integers (no unit suffix), matching every other pixel-valued property.
 
 ```ebnf
 layout_block = root_node ;
-root_node    = "window" [ inline_text ] attr_list NL { child_line } ;
+root_node    = "doc" attr_list NL { child_line } ;
 
 child_line   = SP+ layout_item NL ;
 layout_item  = primitive_node
@@ -345,7 +345,7 @@ conditional_class
 
 | Keyword | Alt | Role |
 |---------|-----|------|
-| `window` | — | Root node (exactly one per document) |
+| `doc` | — | Root node (exactly one per document) |
 | `box` | — | Layout container |
 | `text` | `t` | Text content node |
 | `button` | — | Clickable element |
@@ -357,16 +357,24 @@ conditional_class
 
 **Constraints:**
 
-- First non-empty line must be `window`; other roots produce `ParseError`.
-- **`window`'s inline text is the one exception to `inline_text` becoming a
-  visible child node.** For every other primitive, `box "..."`, `button
-  "..."`, `text "..."`, etc., the quoted string is sugar for an implicit
-  child `text` node. `window "..."`, instead, sets the OS window `title`
-  attribute directly and produces **no** child node — it is metadata about
-  the window, not page content. An explicit `title="..."` attribute, if also
-  given, takes precedence over the positional string. A bare `window "X"`
-  with no other children therefore opens a window titled `X` with a blank
-  page — add an explicit `text`/`box` child for visible content.
+- First non-empty line must be `doc`; other roots produce `ParseError`.
+  `window` as the root keyword is a hard `ParseError` naming `doc`.
+- **`doc` does not accept positional inline text.** For every other
+  primitive, `box "..."`, `button "..."`, `text "..."`, etc., a quoted string
+  right after the keyword is sugar for an implicit child `text` node. `doc`
+  has no such sugar — `doc "..."` is a `ParseError`. The OS window title must
+  be set via the explicit `title` attribute (`doc title "My App"`), which is
+  valid **only** on `doc` — `title` on any other primitive is `ParseError`.
+  `title` produces **no** child node; it is metadata about the OS window,
+  not page content. A bare `doc` with no children therefore opens an
+  untitled, blank window — add an explicit `text`/`box` child and a `title`
+  attribute for a real page.
+- **`lang`** (BCP-47-ish shape: a lowercase 2–3-letter primary subtag,
+  optionally followed by `-` and an uppercase 2-letter region, e.g. `it`,
+  `en`, `en-US`, `zh-CN`) is settable on `doc` as the document-wide default
+  and, like `dir`, overridable on any node and inherited down the tree
+  unless overridden. Unlike `dir`, it is not restricted to `doc` only — any
+  node may set `lang` to override the inherited value for its subtree.
 - `each` inside another `each` is `ParseError`.
 - Absolute URLs (`mizu://`, `http://`, `https://`) in `image src` → `ParseError`, unconditionally (regardless of whether a `urls` registry was supplied).
 - `image src` starting with `file://` is `ParseError` when the document is remote-origin (`is_remote_origin = true`).
@@ -495,7 +503,7 @@ eval_action   = expr ;
 
 - Verb keywords are **case-sensitive uppercase**; both the parenthesized call form (`get(alias) -> var`) and the space-separated legacy form (`get /api/foo -> var`) are rejected with a "use the uppercase registry form" `ParseError`.
   *(Resolved MNT-01: `parse_action_with_urls` in `src/parser/logic/parse.rs` previously detected the verb by uppercasing the whole action string before comparing, making the parenthesized form case-insensitive. Fixed to match on exact case; see `walkthrough.md`'s "MNT-01" entry.)*
-- `alias` must be declared in the `urls` block as an `api` endpoint; missing or wrong-kind → `ParseError`.
+- `alias` must be declared in the `reach` block as an `api` endpoint; missing or wrong-kind → `ParseError`.
 - `download` alias must be declared as a `media` endpoint; wrong kind → `ParseError`.
 - `path_param` at runtime must be a single path segment — no `/`, `\`, `..`, or ASCII control characters (`path_param_ok`, `src/parser/logic.rs`).
 - Assigning to a `comp` variable in an assignment action → runtime `ExecutionError`.

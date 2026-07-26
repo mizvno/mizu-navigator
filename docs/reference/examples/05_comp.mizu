@@ -4,6 +4,6 @@ logic
     comp total = price * qty
     comp vat = total * 0.22
 layout
-    window "Invoice"
+    doc title "Invoice"
         text "Total: {total}"
         button "Add item" click -> qty = qty + 1

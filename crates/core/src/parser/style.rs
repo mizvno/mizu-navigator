@@ -601,7 +601,7 @@ pub fn parse_style_with_variants(
             } else {
                 let is_valid_tag = matches!(
                     selector_name.to_lowercase().as_str(),
-                    "window" | "box" | "text" | "button" | "input" | "image" | "markdown"
+                    "doc" | "box" | "text" | "button" | "input" | "image" | "markdown"
                 );
                 if !is_valid_tag {
                     return Err(MizuError::ParseError(format!(

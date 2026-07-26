@@ -65,7 +65,7 @@ pub(crate) fn resolve_ego_id(
 /// container, matching `Box`.
 fn role_for(primitive: Primitive) -> Role {
     match primitive {
-        Primitive::Window => Role::Window,
+        Primitive::Doc => Role::Window,
         Primitive::Box | Primitive::Each => Role::GenericContainer,
         Primitive::Text | Primitive::Markdown => Role::StaticText,
         Primitive::Button => Role::Button,
@@ -223,7 +223,7 @@ mod tests {
         EgoNodeId, // labeled image
         EgoNodeId, // bare image
     ) {
-        let mut tree = Tree::new(node(Primitive::Window, &[]));
+        let mut tree = Tree::new(node(Primitive::Doc, &[]));
         let button_id = tree
             .root_mut()
             .append(node(Primitive::Button, &[("content", "Save")]))
@@ -297,7 +297,7 @@ mod tests {
     fn removing_alt_regresses_the_name_to_empty() {
         // Regression pin: `alt` must never become dead code again. If this
         // starts failing, something stopped reading the `alt` attribute.
-        let mut tree = Tree::new(node(Primitive::Window, &[]));
+        let mut tree = Tree::new(node(Primitive::Doc, &[]));
         let with_alt = tree
             .root_mut()
             .append(node(Primitive::Image, &[("alt", "a cat")]))
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(named.as_deref(), Some("a cat"));
 
         // Now the same image, minus `alt`.
-        let mut tree2 = Tree::new(node(Primitive::Window, &[]));
+        let mut tree2 = Tree::new(node(Primitive::Doc, &[]));
         let without_alt = tree2.root_mut().append(node(Primitive::Image, &[])).id();
         let mut node_id_to_u32_2 = HashMap::new();
         for (i, n) in tree2.nodes().enumerate() {

@@ -442,7 +442,7 @@ Other bounds (layout node cap, redirect limit, response body cap, storage quotas
 
 ### Tree structure
 
-The layout tree is a single-root `ego-tree` with `MizuNode` values.  The root must be `window`.
+The layout tree is a single-root `ego-tree` with `MizuNode` values.  The root must be `doc`.
 
 ### `each item in list`
 

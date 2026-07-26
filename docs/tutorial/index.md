@@ -8,22 +8,22 @@ machine-checked by `tests/reference_examples.rs`.
 
 ## 1. The Minimal Document
 
-Every Mizu document needs at least a `layout` block with a `window` root node.
+Every Mizu document needs at least a `layout` block with a `doc` root node.
 
 ```
 layout
-    window "Hello, Mizu!"
+    doc title "Hello, Mizu!"
         text "Hello, Mizu!"
 ```
 
 **What this does:**
 - `layout` — starts the layout block (zero-indent keyword).
-- `window "Hello, Mizu!"` — the single required root node.  The quoted string
-  sets the OS window title only — it is **not** rendered as page content.
-  (This is different from every other primitive: `box "..."`, `button "..."`,
-  etc. all turn their inline string into a visible child `text` node. `window`
-  is the one exception, since its string is metadata about the window, not
-  document content.)
+- `doc title "Hello, Mizu!"` — the single required root node.  The `title`
+  attribute sets the OS window title only — it is **not** rendered as page
+  content, and unlike every other primitive's inline string (`box "..."`,
+  `button "..."`, etc., which all turn into a visible child `text` node),
+  `title` must be given explicitly as an attribute — `doc` does not accept a
+  positional inline string at all.
 - `text "Hello, Mizu!"` — the actual visible content; without an explicit
   `text`/`box` child, the window would open with a title but a blank page.
 
@@ -37,7 +37,7 @@ Use `box` to group elements; `text` (or `t`) for text content.
 
 ```
 layout
-    window "My App"
+    doc title "My App"
         box
             text "First paragraph"
             text "Second paragraph"
@@ -54,7 +54,7 @@ level deeper in the DOM tree.
 
 ```
 style
-    window
+    doc
         background #1a1a2e
         color #eaeaea
 
@@ -64,7 +64,7 @@ style
         border-radius 8
 
 layout
-    window "Styled App"
+    doc title "Styled App"
         box class card
             text "This is a styled card"
 ```
@@ -115,7 +115,7 @@ logic
     double(x: num) : x * 2
 
 layout
-    window "Logic Demo"
+    doc title "Logic Demo"
         text "{greeting}"
         text "double(5) = {double(5)}"
 ```
@@ -134,7 +134,7 @@ logic
     count = 0
 
 layout
-    window "Counter"
+    doc title "Counter"
         text "{count}"
         button "Increment" click -> count = count + 1
 ```
@@ -146,7 +146,7 @@ layout
 
 ## 6. Fetching Data from an API
 
-Declare an endpoint in `urls`, then call it from an action.
+Declare an endpoint in `reach`, then call it from an action.
 
 ```
 reach
@@ -157,7 +157,7 @@ logic
     loaded = false
 
 layout
-    window "Item List"
+    doc title "Item List"
         button "Load Items" click -> GET(items_api) -> items
         button "Load Items" click -> GET(items) -> items
 ```
@@ -172,7 +172,7 @@ logic
     items = null
 
 layout
-    window "Item List"
+    doc title "Item List"
         button "Load Items" click -> GET(items_api) -> items
         text "{items}"
 ```
@@ -195,7 +195,7 @@ logic
     comp vat = total * 0.22
 
 layout
-    window "Invoice"
+    doc title "Invoice"
         text "Price: {price}"
         text "Qty:   {qty}"
         text "Total: {total}"
@@ -219,7 +219,7 @@ logic
     todos = null
 
 layout
-    window "To-do List"
+    doc title "To-do List"
         button "Load" click -> GET(todos_api) -> todos
         each todo in todos
             text "{todo.title}"
@@ -241,7 +241,7 @@ logic
     result = ""
 
 layout
-    window "Contact"
+    doc title "Contact"
         form submit -> POST(submit_api, $form) -> result
             input type "text" name "message"
             button "Send" type "submit"
@@ -263,7 +263,7 @@ logic
     timer 1000ms -> tick = tick + 1
 
 layout
-    window "Clock"
+    doc title "Clock"
         text "Seconds elapsed: {tick}"
 ```
 

@@ -1,6 +1,6 @@
 logic
     count = 0
 layout
-    window "Counter"
+    doc title "Counter"
         text "{count}"
         button "Increment" click -> count = count + 1

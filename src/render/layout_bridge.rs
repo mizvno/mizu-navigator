@@ -498,7 +498,7 @@ pub fn build_taffy_tree(
     let dir = resolve_direction(node);
     let mut style = translate_style(&merged_rules, ctx.env.viewport, dir);
 
-    if mizu_node.primitive == Primitive::Window {
+    if mizu_node.primitive == Primitive::Doc {
         style.size = Size {
             width: taffy::style::Dimension::Percent(1.0),
             height: taffy::style::Dimension::Percent(1.0),
@@ -600,7 +600,7 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let dom = parse_layout(
-            "window\n    box class box\n        box class box\n        box class box\n",
+            "doc\n    box class box\n        box class box\n        box class box\n",
             &mut interner,
         )
         .unwrap();
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn each_small_list_unaffected_by_budget() {
         let mut interner = StringInterner::new();
-        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let dom = parse_layout("doc\n    each x in items\n        box\n", &mut interner).unwrap();
         let store = setup_test_store(vec![Value::Bool(true); 5]);
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn each_huge_list_clamped_to_budget() {
         let mut interner = StringInterner::new();
-        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let dom = parse_layout("doc\n    each x in items\n        box\n", &mut interner).unwrap();
         let store = setup_test_store(vec![Value::Bool(true); *MAX_SYNTHETIC_LAYOUT_NODES + 100]);
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn repeated_expansion_no_arena_growth() {
         let mut interner = StringInterner::new();
-        let dom = parse_layout("window\n    each x in items\n        box\n", &mut interner).unwrap();
+        let dom = parse_layout("doc\n    each x in items\n        box\n", &mut interner).unwrap();
         let store = setup_test_store(vec![Value::Bool(true); 10]);
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
@@ -859,7 +859,7 @@ mod tests {
         // ancestor walk — not just translate_style's unit-level behavior.
         let mut interner = StringInterner::new();
         let dom = parse_layout(
-            "window dir=rtl\n    box class row\n",
+            "doc dir=rtl\n    box class row\n",
             &mut interner,
         )
         .unwrap();
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(
             resolved_style.flex_direction,
             FlexDirection::RowReverse,
-            "the window's dir=\"rtl\" must inherit down to the row box and mirror it"
+            "the root doc's dir=\"rtl\" must inherit down to the row box and mirror it"
         );
     }
 }

@@ -3,6 +3,6 @@ reach
 logic
     items = null
 layout
-    window "Item List"
+    doc title "Item List"
         button "Load Items" click -> GET(items_api) -> items
         text "{items}"

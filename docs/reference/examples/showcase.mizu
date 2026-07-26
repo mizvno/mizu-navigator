@@ -46,7 +46,7 @@ logic
     timer 1000ms -> counter = counter + 1
 
 style
-    window
+    doc
         background #0f0f12
         padding 20
         flex-direction column
@@ -104,10 +104,11 @@ style
         font-size 16
 
 layout
-    // `window`'s inline string sets the OS title only (never rendered as
-    // page content — every other primitive's inline string does render).
+    // `doc`'s `title` attribute sets the OS window title only (never
+    // rendered as page content — it must be explicit, unlike every other
+    // primitive's inline string, which renders as visible text).
     // `dir="auto"` lets base text direction auto-detect per node/subtree.
-    window "Mizu Feature Showcase" dir="auto"
+    doc title "Mizu Feature Showcase" dir="auto"
         box class card
             // Conditional class: a *document-logic*-gated extra class,
             // distinct from the style block's environment-gated variants.

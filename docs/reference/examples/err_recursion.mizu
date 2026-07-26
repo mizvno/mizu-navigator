@@ -1,4 +1,4 @@
 logic
     f(x: num) : f(x)
 layout
-    window "Should fail"
+    doc title "Should fail"
