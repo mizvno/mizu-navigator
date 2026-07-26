@@ -994,6 +994,13 @@ fn dispatch_mouse_wheel(
             .unwrap_or(0.0);
         let max_scroll = (content_h - viewport_h).max(0.0);
         manager.root_scroll_offset_y = (manager.root_scroll_offset_y + delta_y).clamp(0.0, max_scroll);
+        // Cheap no-op in the common case (small scroll deltas well inside the
+        // already-expanded window); only pays for a re-expansion once the
+        // scroll position has moved far enough to need one. See
+        // `MizuWindowManager::refresh_virtualized_windows`.
+        if let Err(e) = manager.refresh_virtualized_windows(viewport_h) {
+            tracing::error!("virtualized Each re-expansion failed during scroll: {e}");
+        }
         window.request_redraw();
     }
 }
@@ -1085,6 +1092,8 @@ fn dispatch_redraw_requested(
             text_layouts: &manager.text_layouts,
             item_bindings: std::collections::HashMap::new(),
             each_groups: &manager.each_expansion.groups,
+            each_window_start: &manager.each_expansion.window_start,
+            each_container_offset_y: &mut manager.each_container_offset_y,
             taffy_id_overrides: std::collections::HashMap::new(),
         };
         paint_node(manager.dom.root().id(), &mut ctx, &mut scene, (0.0, 0.0));

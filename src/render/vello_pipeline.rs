@@ -97,6 +97,16 @@ pub struct PaintContext<'a> {
     /// [`crate::render::layout_bridge::expand_each_nodes`] before each layout
     /// pass and consumed read-only during painting.
     pub each_groups: &'a HashMap<EgoNodeId, EachGroupEntries>,
+    /// Absolute list index of `each_groups`'s first entry per `Each` node —
+    /// `groups[i]` corresponds to list index `each_window_start[node] + i`
+    /// once virtualization windowing is active. Missing entry means 0 (the
+    /// whole list fit inside the window).
+    pub each_window_start: &'a HashMap<EgoNodeId, usize>,
+    /// Absolute Y offset of each `Each` container's top edge, written here
+    /// every frame so the *next* layout pass's virtualization windowing
+    /// knows where each block starts. See
+    /// `MizuWindowManager::each_container_offset_y`.
+    pub each_container_offset_y: &'a mut HashMap<EgoNodeId, f32>,
     /// Temporary per-iteration Taffy ID overrides installed by `paint_each`
     /// so that `paint_node` reads positions from the correct synthetic Taffy
     /// node rather than from the stale single-template node.
@@ -985,6 +995,10 @@ fn paint_each(
             .map(|l| (offset.0 + l.location.x, offset.1 + l.location.y))
             .unwrap_or(offset);
 
+        // Recorded for the *next* layout pass's virtualization windowing —
+        // see `MizuWindowManager::each_container_offset_y`.
+        ctx.each_container_offset_y.insert(node_id, iy);
+
         let (item_var, list_name) = match mizu_node.iterator_context.as_ref() {
             Some((v, l)) => (v.clone(), l.clone()),
             None => {
@@ -998,14 +1012,18 @@ fn paint_each(
     }; // node_ref dropped — ctx.tree borrow released
 
     // ── Phase 2: look up the list value ──────────────────────────────────
-    let list_items: Vec<Value> = {
+    // Kept as the `Arc` rather than cloning the whole backing `Vec` (which
+    // used to happen on every single paint frame regardless of list size):
+    // with virtualization only a small visible window of items is ever
+    // touched below, so only those get cloned.
+    let list_arc: std::sync::Arc<Vec<Value>> = {
         let val = ctx
             .item_bindings
             .get(&list_name)
             .cloned()
             .or_else(|| ctx.store.get(&list_name).ok().cloned());
         match val {
-            Some(Value::List(arc)) => (*arc).clone(),
+            Some(Value::List(arc)) => arc,
             _ => {
                 tracing::warn!("paint_each: `{}` is not a list or not found", list_name);
                 return 0;
@@ -1013,21 +1031,24 @@ fn paint_each(
         }
     };
 
-    let n = list_items.len();
+    let n = list_arc.len();
 
     // ── Phase 3: clone expansion groups (if available) before mutating ctx ─
     // Cloned upfront so we hold no borrow on ctx.each_groups while we later
-    // mutate ctx.item_bindings and ctx.taffy_id_overrides.
+    // mutate ctx.item_bindings and ctx.taffy_id_overrides. Only the visible
+    // window's entries, not the whole list.
     let groups: Option<EachGroupEntries> = ctx.each_groups.get(&node_id).cloned();
 
     // ── Phase 4: iterate and paint ────────────────────────────────────────
     let mut drawn_count = 0;
 
     if let Some(groups) = groups {
-        // ── Expanded path: Taffy has N row containers with correct positions ──
-        for (idx, item_val) in list_items.into_iter().enumerate() {
-            let Some((row_taffy_id, overrides)) = groups.get(idx) else {
-                // List grew larger than expansion since last resize_viewport.
+        // ── Expanded path: Taffy has row containers for the visible window ──
+        let window_start = ctx.each_window_start.get(&node_id).copied().unwrap_or(0);
+        for (i, (row_taffy_id, overrides)) in groups.iter().enumerate() {
+            let idx = window_start + i;
+            let Some(item_val) = list_arc.get(idx).cloned() else {
+                // List shrank since last resize_viewport.
                 break;
             };
 
@@ -1069,7 +1090,7 @@ fn paint_each(
         } else {
             0.0
         };
-        for (idx, item_val) in list_items.into_iter().enumerate() {
+        for (idx, item_val) in list_arc.iter().cloned().enumerate() {
             ctx.item_bindings.insert(item_var.clone(), item_val);
             let item_offset = (current_x, current_y + idx as f32 * item_height);
             for &child_id in &child_ids {
@@ -1217,6 +1238,8 @@ mod tests {
         let text_layouts = HashMap::new();
 
         let empty_each_groups = HashMap::new();
+        let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
+        let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
 
         // Setup PaintContext
         let mut ctx = PaintContext {
@@ -1247,6 +1270,8 @@ mod tests {
             text_layouts: &text_layouts,
             item_bindings: HashMap::new(),
             each_groups: &empty_each_groups,
+            each_window_start: &empty_window_start,
+            each_container_offset_y: &mut empty_each_offset_y,
             taffy_id_overrides: HashMap::new(),
         };
 
@@ -1349,6 +1374,10 @@ mod tests {
             &node_to_taffy_id,
             &EachExpansion::default(),
             None, // full rebuild in tests
+            0.0,
+            600.0,
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1371,6 +1400,7 @@ mod tests {
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
+        let mut each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
 
         let mut ctx = PaintContext {
             tree: &tree,
@@ -1400,6 +1430,8 @@ mod tests {
             text_layouts: &text_layouts,
             item_bindings: HashMap::new(),
             each_groups: &expansion.groups,
+            each_window_start: &expansion.window_start,
+            each_container_offset_y: &mut each_offset_y,
             taffy_id_overrides: HashMap::new(),
         };
 
@@ -1512,6 +1544,10 @@ mod tests {
             &node_to_taffy_id,
             &EachExpansion::default(),
             None, // full rebuild in tests
+            0.0,
+            600.0,
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1761,6 +1797,8 @@ mod tests {
         let stack_before = store.state_machine.local_stack.len();
 
         let empty_each_groups = HashMap::new();
+        let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
+        let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut ctx = PaintContext {
             tree: &tree,
             taffy: &taffy,
@@ -1789,6 +1827,8 @@ mod tests {
             text_layouts: &text_layouts,
             item_bindings: HashMap::new(),
             each_groups: &empty_each_groups,
+            each_window_start: &empty_window_start,
+            each_container_offset_y: &mut empty_each_offset_y,
             taffy_id_overrides: HashMap::new(),
         };
 
@@ -1857,6 +1897,8 @@ mod tests {
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let empty_each_groups = HashMap::new();
+        let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
+        let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
 
         let mut ctx = PaintContext {
             tree: &tree,
@@ -1883,6 +1925,8 @@ mod tests {
             text_layouts: &text_layouts,
             item_bindings: HashMap::new(),
             each_groups: &empty_each_groups,
+            each_window_start: &empty_window_start,
+            each_container_offset_y: &mut empty_each_offset_y,
             taffy_id_overrides: HashMap::new(),
         };
 
@@ -1966,6 +2010,8 @@ mod tests {
         item_bindings.insert("flag".to_string(), Value::Bool(true));
 
         let empty_each_groups = HashMap::new();
+        let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
+        let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut ctx = PaintContext {
             tree: &tree,
             taffy: &taffy,
@@ -1994,6 +2040,8 @@ mod tests {
             text_layouts: &text_layouts,
             item_bindings,
             each_groups: &empty_each_groups,
+            each_window_start: &empty_window_start,
+            each_container_offset_y: &mut empty_each_offset_y,
             taffy_id_overrides: HashMap::new(),
         };
 

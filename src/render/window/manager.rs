@@ -78,6 +78,20 @@ pub struct MizuWindowManager {
     pub root_scroll_offset_y: f32,
     /// Keyboard modifiers state.
     pub modifiers: winit::keyboard::ModifiersState,
+    /// Average measured row height (logical px) per `Each` block, refreshed
+    /// after every layout pass from the just-built visible window's real
+    /// Taffy-computed row heights. Persists across calls to
+    /// `resize_viewport_with_dirty_lists` (which otherwise rebuilds
+    /// `self.taffy`/`self.each_expansion` from scratch every time) so
+    /// virtualization windowing converges on a real estimate instead of the
+    /// `DEFAULT_ROW_HEIGHT_ESTIMATE_PX` fallback. See `expand_each_nodes`.
+    pub each_row_height_estimate: HashMap<EgoNodeId, f32>,
+    /// Absolute Y offset (logical px) of each `Each` container's top edge,
+    /// captured every frame by `paint_each` (which already computes this
+    /// value while walking the tree top-down). Used, together with
+    /// `each_row_height_estimate`, to decide which rows fall inside the
+    /// virtualized viewport window on the *next* layout pass.
+    pub each_container_offset_y: HashMap<EgoNodeId, f32>,
     /// Cache for decoded images used in `background-image` and `image` tags.
     /// Bounded (see `IMAGE_CACHE_CAPACITY`) so long browsing sessions with many
     /// distinct images (e.g. scrolling a long thread) can't grow this without limit.
@@ -269,6 +283,8 @@ impl MizuWindowManager {
             chrome_state: ChromeState::default(),
             root_scroll_offset_y: 0.0,
             modifiers: winit::keyboard::ModifiersState::default(),
+            each_row_height_estimate: HashMap::new(),
+            each_container_offset_y: HashMap::new(),
             image_cache: lru::LruCache::new(
                 std::num::NonZeroUsize::new(IMAGE_CACHE_CAPACITY).unwrap(),
             ),
@@ -640,6 +656,10 @@ impl MizuWindowManager {
             &self.node_to_taffy_id,
             &self.each_expansion,
             dirty_list_names.as_ref(), // None = full rebuild; Some(set) = granular
+            self.root_scroll_offset_y,
+            content_height,
+            &self.each_container_offset_y,
+            &self.each_row_height_estimate,
         )?;
 
         for (node_id, &new_count) in &new_expansion.truncated {
@@ -730,7 +750,109 @@ impl MizuWindowManager {
             )
             .map_err(|e| MizuError::ParseError(format!("Layout computation error: {:?}", e)))?;
 
+        // Refresh each virtualized `Each` block's row-height estimate from
+        // this frame's real Taffy measurements, so the *next* layout pass
+        // (which rebuilds `self.taffy` from scratch and can't see these
+        // synthetic row ids anymore) windows against real data instead of
+        // `DEFAULT_ROW_HEIGHT_ESTIMATE_PX`. Cheap: one `layout()` lookup per
+        // currently-visible row, not per list element.
+        for (each_dom_id, groups) in &self.each_expansion.groups {
+            if groups.is_empty() {
+                continue;
+            }
+            let mut total = 0.0f32;
+            let mut count = 0usize;
+            for (row_id, _) in groups {
+                if let Ok(layout) = self.taffy.layout(*row_id) {
+                    total += layout.size.height;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                self.each_row_height_estimate
+                    .insert(*each_dom_id, total / count as f32);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Cheaply checks whether the current scroll position still falls inside
+    /// each virtualized `Each` block's already-expanded row window (plus a
+    /// small slack margin), and only pays for a real re-expansion — via the
+    /// existing granular `resize_viewport_with_dirty_lists` invalidation path
+    /// — for the blocks that actually need it. No DOM scan and no Taffy work
+    /// happen unless something is actually dirty, so small scroll deltas
+    /// (the common case) stay free, matching `resize_viewport`'s own
+    /// "not on every pixel" philosophy.
+    ///
+    /// Returns `true` if a re-expansion was triggered (the caller should
+    /// `request_redraw`; `resize_viewport_with_dirty_lists` does not do so
+    /// itself).
+    pub fn refresh_virtualized_windows(&mut self, viewport_height: f32) -> Result<bool, MizuError> {
+        let scroll_y = self.root_scroll_offset_y;
+        let slack_rows = (*crate::render::layout_bridge::VIRTUALIZATION_BUFFER_ROWS / 2).max(1) as isize;
+
+        let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (&each_dom_id, &window_start) in &self.each_expansion.window_start {
+            let Some(groups) = self.each_expansion.groups.get(&each_dom_id) else {
+                continue;
+            };
+            let Some(list_name) = self
+                .dom
+                .get(each_dom_id)
+                .and_then(|n| n.value().iterator_context.as_ref())
+                .map(|(_, name)| name.clone())
+            else {
+                continue;
+            };
+            let n = match self.store.get(&list_name).ok() {
+                Some(Value::List(arc)) => arc.len(),
+                _ => continue,
+            };
+
+            let y0 = self.each_container_offset_y.get(&each_dom_id).copied().unwrap_or(0.0);
+            let row_h = self
+                .each_row_height_estimate
+                .get(&each_dom_id)
+                .copied()
+                .unwrap_or(*crate::render::layout_bridge::DEFAULT_ROW_HEIGHT_ESTIMATE_PX)
+                .max(1.0);
+            let buffer = *crate::render::layout_bridge::VIRTUALIZATION_BUFFER_ROWS as f32 * row_h;
+
+            let needed_first = (((scroll_y - y0 - buffer) / row_h).floor().max(0.0) as usize).min(n);
+            let needed_last =
+                (((scroll_y + viewport_height - y0 + buffer) / row_h).ceil().max(0.0) as usize).clamp(needed_first, n);
+
+            let window_end = window_start + groups.len();
+            let still_covered = needed_first as isize >= window_start as isize - slack_rows
+                && needed_last as isize <= window_end as isize + slack_rows;
+
+            if !still_covered {
+                dirty.insert(list_name);
+            }
+        }
+
+        if dirty.is_empty() {
+            return Ok(false);
+        }
+
+        // Reuse the last-known viewport size — this is a scroll-driven
+        // refresh, not a real resize, so there is no new width/height to
+        // query. `self.viewport_size` already has the inspector panel width
+        // subtracted (and chrome height), so undo both before passing back
+        // into `resize_viewport_with_dirty_lists`, which subtracts them
+        // again itself.
+        let width = self.viewport_size.width
+            + if self.inspector.open {
+                crate::render::inspector::PANEL_WIDTH
+            } else {
+                0.0
+            };
+        let height = self.viewport_size.height + CHROME_HEIGHT;
+        self.resize_viewport_with_dirty_lists(width, height, Some(dirty))?;
+        Ok(true)
     }
 
     /// Marks a node's cached text layout stale (after typing or a focus change

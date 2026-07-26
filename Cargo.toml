@@ -67,6 +67,7 @@ insecure-dev = []
 
 [profile.dev]
 debug = true
+split-debuginfo = "unpacked"
 
 [profile.release]
 opt-level = 3

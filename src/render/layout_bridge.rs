@@ -36,7 +36,23 @@ pub static MAX_SYNTHETIC_LAYOUT_NODES: std::sync::LazyLock<usize> = std::sync::L
     crate::core::config::env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", 20_000)
 });
 
-/// One entry per list element: `(row_container_taffy_id, override_map)`.
+/// Default estimated row height (logical px) used to decide which rows of an
+/// `Each` list fall inside the virtualized window before any row of that
+/// block has actually been measured. Refined every frame from real Taffy
+/// measurements once available — see `MizuWindowManager::each_row_height_estimate`.
+pub static DEFAULT_ROW_HEIGHT_ESTIMATE_PX: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+    crate::core::config::env_override("MIZU_EACH_ROW_HEIGHT_ESTIMATE_PX", 96.0)
+});
+
+/// Extra rows of slack expanded on each side of the visible viewport, so
+/// small scroll deltas don't force a re-expansion every frame.
+pub static VIRTUALIZATION_BUFFER_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    crate::core::config::env_override("MIZU_EACH_VIRTUALIZATION_BUFFER_ROWS", 6)
+});
+
+/// One entry per *visible* list element: `(row_container_taffy_id, override_map)`.
+/// Indexed relative to the block's `EachExpansion::window_start`, not the
+/// absolute list index — see [`expand_each_nodes`]'s windowing pass.
 pub type EachGroupEntries = Vec<(taffy::prelude::NodeId, EachIterationOverrides)>;
 
 /// All synthetic Taffy nodes produced during one [`expand_each_nodes`] call.
@@ -55,6 +71,11 @@ pub struct EachExpansion {
     pub all_synthetic_ids: Vec<taffy::prelude::NodeId>,
     /// Number of hidden list items per `Each` node due to budget truncation.
     pub truncated: HashMap<EgoNodeId, usize>,
+    /// Index of the first list element represented in `groups` for each
+    /// `Each` node (0 when the whole list fit inside the window). Lets
+    /// painting and scroll-driven re-virtualization map a visible-window
+    /// position back to an absolute list index.
+    pub window_start: HashMap<EgoNodeId, usize>,
 }
 
 
@@ -79,6 +100,19 @@ pub struct EachExpansion {
 ///   list variable name is in `set` are torn down and re-expanded; all other
 ///   blocks are carried forward from `prev` as-is. Use this after a store
 ///   mutation so that unaffected lists pay zero Taffy allocation cost.
+///
+/// ## Virtualization
+///
+/// Only the rows whose estimated position falls in
+/// `[scroll_y - buffer, scroll_y + viewport_height + buffer]` are expanded
+/// into real synthetic Taffy subtrees; the rest are represented by up to two
+/// fixed-height "spacer" leaves (before/after the visible window) so the
+/// `Each` container's total height stays approximately correct without ever
+/// cloning more than a small, viewport-bounded number of rows. `each_offsets_y`
+/// and `each_row_heights` are the previous frame's measurements (see
+/// `MizuWindowManager::each_container_offset_y` / `each_row_height_estimate`);
+/// missing entries (first paint) fall back to `y = 0.0` /
+/// `DEFAULT_ROW_HEIGHT_ESTIMATE_PX` and self-correct on the next frame.
 pub fn expand_each_nodes(
     dom: &Tree<MizuNode>,
     store: &VariableStore,
@@ -86,6 +120,10 @@ pub fn expand_each_nodes(
     node_to_taffy_id: &HashMap<EgoNodeId, taffy::prelude::NodeId>,
     prev: &EachExpansion,
     dirty_list_names: Option<&std::collections::HashSet<String>>,
+    scroll_y: f32,
+    viewport_height: f32,
+    each_offsets_y: &HashMap<EgoNodeId, f32>,
+    each_row_heights: &HashMap<EgoNodeId, f32>,
 ) -> Result<EachExpansion, MizuError> {
     // ── Step 1: restore the previous expansion ────────────────────────────
     // When `dirty_list_names` is `Some(set)`, only restore (and free) the
@@ -149,6 +187,7 @@ pub fn expand_each_nodes(
             original_children: HashMap::new(),
             all_synthetic_ids: Vec::new(),
             truncated: HashMap::new(),
+            window_start: HashMap::new(),
         };
         for (each_dom_id, groups) in &prev.groups {
             let is_dirty = dom
@@ -163,6 +202,9 @@ pub fn expand_each_nodes(
                 }
                 if let Some(&trunc) = prev.truncated.get(each_dom_id) {
                     carried.truncated.insert(*each_dom_id, trunc);
+                }
+                if let Some(&ws) = prev.window_start.get(each_dom_id) {
+                    carried.window_start.insert(*each_dom_id, ws);
                 }
                 // Carry their synthetic IDs so future full-rebuild teardowns work.
                 for (row_id, _) in groups {
@@ -227,13 +269,31 @@ pub fn expand_each_nodes(
         }
 
         let budget_per_row = template_size + 1; // +1 for the row container
-        let max_rows = if budget_per_row == 0 { 0 } else { remaining_budget / budget_per_row };
-        let clamped_n = n.min(max_rows);
 
-        if clamped_n < n {
-            expansion.truncated.insert(each_dom_id, n - clamped_n);
+        // ── Virtualization window: only expand rows near the viewport ──────
+        let y0 = each_offsets_y.get(&each_dom_id).copied().unwrap_or(0.0);
+        let row_h = each_row_heights
+            .get(&each_dom_id)
+            .copied()
+            .unwrap_or(*DEFAULT_ROW_HEIGHT_ESTIMATE_PX)
+            .max(1.0);
+        let buffer = *VIRTUALIZATION_BUFFER_ROWS as f32 * row_h;
+        let rel_top = scroll_y - y0 - buffer;
+        let rel_bottom = scroll_y + viewport_height - y0 + buffer;
+        let first = ((rel_top / row_h).floor().max(0.0) as usize).min(n);
+        let wanted_last = ((rel_bottom / row_h).ceil().max(0.0) as usize).clamp(first, n);
+        let wanted_rows = wanted_last - first;
+
+        let max_rows = if budget_per_row == 0 { 0 } else { remaining_budget / budget_per_row };
+        let visible_rows = wanted_rows.min(max_rows);
+        let last = first + visible_rows;
+
+        if visible_rows < wanted_rows {
+            // Budget-clamped — distinct from rows simply outside the
+            // virtualized window (those are expected and unremarkable).
+            expansion.truncated.insert(each_dom_id, wanted_rows - visible_rows);
         }
-        remaining_budget = remaining_budget.saturating_sub(clamped_n * budget_per_row);
+        remaining_budget = remaining_budget.saturating_sub(visible_rows * budget_per_row);
 
         // Save the original Taffy children for restoration next frame.
         let orig_taffy_children: Vec<taffy::prelude::NodeId> = template_dom_children
@@ -244,10 +304,11 @@ pub fn expand_each_nodes(
             .original_children
             .insert(each_dom_id, orig_taffy_children);
 
-        // Build N iteration groups, each containing a clone of the template subtree.
-        let mut groups: EachGroupEntries = Vec::with_capacity(clamped_n);
+        // Build one iteration group per visible row, each containing a clone
+        // of the template subtree.
+        let mut groups: EachGroupEntries = Vec::with_capacity(visible_rows);
 
-        for _ in 0..clamped_n {
+        for _ in first..last {
             let mut overrides: EachIterationOverrides = HashMap::new();
             let mut row_children: Vec<taffy::prelude::NodeId> = Vec::new();
 
@@ -278,8 +339,24 @@ pub fn expand_each_nodes(
             groups.push((row_id, overrides));
         }
 
-        // Replace the Each's Taffy children with the N row containers.
-        let row_ids: Vec<taffy::prelude::NodeId> = groups.iter().map(|(id, _)| *id).collect();
+        // Replace the Each's Taffy children with (optional top spacer) +
+        // the visible row containers + (optional bottom spacer), so the
+        // container's total height stays approximately correct for rows
+        // that were virtualized out rather than actually laid out.
+        let mut row_ids: Vec<taffy::prelude::NodeId> = Vec::with_capacity(visible_rows + 2);
+
+        if first > 0 {
+            let spacer_id = new_spacer_leaf(taffy, first as f32 * row_h)?;
+            expansion.all_synthetic_ids.push(spacer_id);
+            row_ids.push(spacer_id);
+        }
+        row_ids.extend(groups.iter().map(|(id, _)| *id));
+        if last < n {
+            let spacer_id = new_spacer_leaf(taffy, (n - last) as f32 * row_h)?;
+            expansion.all_synthetic_ids.push(spacer_id);
+            row_ids.push(spacer_id);
+        }
+
         taffy
             .set_children(each_taffy_id, &row_ids)
             .map_err(|e| MizuError::ParseError(format!("Each set_children: {e}")))?;
@@ -293,9 +370,30 @@ pub fn expand_each_nodes(
         }
 
         expansion.groups.insert(each_dom_id, groups);
+        expansion.window_start.insert(each_dom_id, first);
     }
 
     Ok(expansion)
+}
+
+/// Creates a fixed-height, full-width leaf node representing the combined
+/// height of a run of virtualized-out (not actually expanded) `Each` rows,
+/// so the container's total height stays approximately correct.
+fn new_spacer_leaf(
+    taffy: &mut TaffyTree<EgoNodeId>,
+    height: f32,
+) -> Result<taffy::prelude::NodeId, MizuError> {
+    let style = taffy::style::Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: taffy::style::Dimension::Auto,
+            height: taffy::style::Dimension::Length(height),
+        },
+        ..taffy::style::Style::default()
+    };
+    taffy
+        .new_leaf(style)
+        .map_err(|e| MizuError::ParseError(format!("Each spacer: {e}")))
 }
 
 /// Helper to count the total nodes in a DOM subtree.
@@ -803,8 +901,20 @@ mod tests {
         }
         
         let prev = EachExpansion::default();
-        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev, None).unwrap();
-        
+        let expansion = expand_each_nodes(
+            &dom,
+            &store,
+            &mut taffy,
+            &node_to_taffy,
+            &prev,
+            None,
+            0.0,
+            800.0,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
         assert!(expansion.truncated.is_empty(), "Small list should not be truncated");
         let each_node = dom.root().children().next().unwrap().id();
         assert_eq!(expansion.groups.get(&each_node).unwrap().len(), 5);
@@ -822,12 +932,120 @@ mod tests {
         }
         
         let prev = EachExpansion::default();
-        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev, None).unwrap();
-        
+        // An oversized viewport makes the *needed* virtualization window span
+        // the whole list, isolating the budget-clamp path from windowing —
+        // see `each_huge_list_with_normal_viewport_is_virtualized_not_truncated`
+        // for the "normal viewport" case.
+        let expansion = expand_each_nodes(
+            &dom,
+            &store,
+            &mut taffy,
+            &node_to_taffy,
+            &prev,
+            None,
+            0.0,
+            10_000_000.0,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
         let each_node = dom.root().children().next().unwrap().id();
         let truncated = expansion.truncated.get(&each_node).copied().unwrap_or(0);
         assert!(truncated > 0, "Huge list must be truncated");
         assert_eq!(expansion.groups.get(&each_node).unwrap().len() + truncated, *MAX_SYNTHETIC_LAYOUT_NODES + 100);
+    }
+
+    #[test]
+    fn each_huge_list_with_normal_viewport_is_virtualized_not_truncated() {
+        let mut interner = StringInterner::new();
+        let dom = parse_layout("doc\n    each x in items\n        box\n", &mut interner).unwrap();
+        let store = setup_test_store(vec![Value::Bool(true); *MAX_SYNTHETIC_LAYOUT_NODES + 100]);
+        let mut taffy = TaffyTree::new();
+        let mut node_to_taffy = HashMap::new();
+        for node in dom.nodes() {
+            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+        }
+
+        let prev = EachExpansion::default();
+        let expansion = expand_each_nodes(
+            &dom,
+            &store,
+            &mut taffy,
+            &node_to_taffy,
+            &prev,
+            None,
+            0.0,
+            800.0,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let each_node = dom.root().children().next().unwrap().id();
+        assert!(
+            expansion.truncated.is_empty(),
+            "a normal viewport must virtualize a huge list, not hit the budget backstop"
+        );
+        let window_len = expansion.groups.get(&each_node).unwrap().len();
+        assert!(
+            window_len < 200,
+            "only a small window of rows near the viewport should be expanded, got {window_len}"
+        );
+        assert_eq!(
+            expansion.window_start.get(&each_node).copied().unwrap_or(999),
+            0,
+            "scrolled to the top, the window should start at index 0"
+        );
+    }
+
+    #[test]
+    fn scrolling_shifts_the_virtualized_window() {
+        let mut interner = StringInterner::new();
+        let dom = parse_layout("doc\n    each x in items\n        box\n", &mut interner).unwrap();
+        let store = setup_test_store(vec![Value::Bool(true); *MAX_SYNTHETIC_LAYOUT_NODES + 100]);
+        let mut taffy = TaffyTree::new();
+        let mut node_to_taffy = HashMap::new();
+        for node in dom.nodes() {
+            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+        }
+        let each_node = dom.root().children().next().unwrap().id();
+
+        let prev = EachExpansion::default();
+        let top = expand_each_nodes(
+            &dom,
+            &store,
+            &mut taffy,
+            &node_to_taffy,
+            &prev,
+            None,
+            0.0,
+            800.0,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let top_start = top.window_start.get(&each_node).copied().unwrap_or(999);
+        assert_eq!(top_start, 0, "scrolled to the top, window starts at 0");
+
+        let scrolled = expand_each_nodes(
+            &dom,
+            &store,
+            &mut taffy,
+            &node_to_taffy,
+            &top,
+            None,
+            5000.0,
+            800.0,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let scrolled_start = scrolled.window_start.get(&each_node).copied().unwrap_or(0);
+        assert!(
+            scrolled_start > top_start,
+            "scrolling down must move the window's start index forward, got {scrolled_start}"
+        );
     }
 
     #[test]
@@ -845,7 +1063,19 @@ mod tests {
         let mut base_node_count = 0;
         
         for i in 0..5 {
-            expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &expansion, None).unwrap();
+            expansion = expand_each_nodes(
+                &dom,
+                &store,
+                &mut taffy,
+                &node_to_taffy,
+                &expansion,
+                None,
+                0.0,
+                800.0,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
             let total_nodes = taffy.total_node_count();
             if i == 0 {
                 base_node_count = total_nodes;
