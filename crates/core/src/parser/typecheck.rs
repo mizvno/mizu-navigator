@@ -205,6 +205,44 @@ fn infer(
                     ))),
                     None => Ok(None),
                 }
+            } else if func_name == "length" && args.len() == 1 {
+                let arg_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                match arg_ty {
+                    Some(ValueType::List(_)) | Some(ValueType::Str) | None => Ok(Some(ValueType::Num)),
+                    Some(other) => Err(MizuError::StaticTypeError(format!(
+                        "length expects a list or string, got `{}`",
+                        other
+                    ))),
+                }
+            } else if func_name == "to_string" && args.len() == 1 {
+                let arg_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                match arg_ty {
+                    Some(ValueType::Num) | Some(ValueType::Bool) | None => Ok(Some(ValueType::Str)),
+                    Some(other) => Err(MizuError::StaticTypeError(format!(
+                        "to_string expects num or bool, got `{}`",
+                        other
+                    ))),
+                }
+            } else if func_name == "contains" && args.len() == 2 {
+                let haystack_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                infer(&arena[args[1]], arena, env, functions, interner)?;
+                match haystack_ty {
+                    Some(ValueType::Str) | None => Ok(Some(ValueType::Bool)),
+                    Some(other) => Err(MizuError::StaticTypeError(format!(
+                        "contains expects a string, got `{}`",
+                        other
+                    ))),
+                }
+            } else if func_name == "has_field" && args.len() == 2 {
+                let record_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
+                infer(&arena[args[1]], arena, env, functions, interner)?;
+                match record_ty {
+                    Some(ValueType::Record(_)) | None => Ok(Some(ValueType::Bool)),
+                    Some(other) => Err(MizuError::StaticTypeError(format!(
+                        "has_field expects a record, got `{}`",
+                        other
+                    ))),
+                }
             } else if let Some(func) = functions.get(name) {
                 if args.len() != func.params.len() {
                     return Err(MizuError::StaticTypeError(format!(

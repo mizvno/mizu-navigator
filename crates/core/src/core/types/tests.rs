@@ -1213,6 +1213,188 @@
     }
 
     // ────────────────────────────────────────────────────────────────────────
+    // length / to_string / contains / has_field
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_length_of_list() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let result = eval_builtin(&mut store, "length", vec![Expr::Variable(tasks_sym)]).unwrap();
+        assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    }
+
+    #[test]
+    fn test_length_of_string_counts_chars_not_bytes() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        // "héllo": 5 Unicode scalar values, but 6 UTF-8 bytes ('é' is 2 bytes)
+        // — proves this counts chars, not bytes.
+        let args = vec![Expr::Literal(Value::String(Arc::from("héllo")))];
+        let result = eval_builtin(&mut store, "length", args).unwrap();
+        assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    }
+
+    #[test]
+    fn test_length_type_error() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![Expr::Literal(Value::Int(1))];
+        let result = eval_builtin(&mut store, "length", args);
+        assert!(matches!(result, Err(MizuError::TypeError { .. })));
+    }
+
+    #[test]
+    fn test_length_large_string_triggers_timeout() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let big = "a".repeat(25_000);
+        let args = vec![Expr::Literal(Value::String(Arc::from(big)))];
+        let result = eval_builtin(&mut store, "length", args);
+        assert!(
+            matches!(result, Err(MizuError::Timeout)),
+            "length() on a 25 000-char string must return Timeout, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_string_int() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        // 3.5 in fixed-point representation.
+        let n = 3 * crate::core::types::DECIMAL_SCALE + crate::core::types::DECIMAL_SCALE / 2;
+        let args = vec![Expr::Literal(Value::Int(n))];
+        let result = eval_builtin(&mut store, "to_string", args).unwrap();
+        assert_eq!(result, Value::String(Arc::from("3.5")));
+    }
+
+    #[test]
+    fn test_to_string_bool() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![Expr::Literal(Value::Bool(true))];
+        let result = eval_builtin(&mut store, "to_string", args).unwrap();
+        assert_eq!(result, Value::String(Arc::from("true")));
+    }
+
+    #[test]
+    fn test_to_string_type_error_on_string() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![Expr::Literal(Value::String(Arc::from("already a string")))];
+        let result = eval_builtin(&mut store, "to_string", args);
+        assert!(matches!(result, Err(MizuError::TypeError { .. })));
+    }
+
+    #[test]
+    fn test_to_string_type_error_on_list() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let result = eval_builtin(&mut store, "to_string", vec![Expr::Variable(tasks_sym)]);
+        assert!(matches!(result, Err(MizuError::TypeError { .. })));
+    }
+
+    #[test]
+    fn test_contains_true() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(Value::String(Arc::from("hello world"))),
+            Expr::Literal(Value::String(Arc::from("wor"))),
+        ];
+        let result = eval_builtin(&mut store, "contains", args).unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_contains_false() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(Value::String(Arc::from("hello world"))),
+            Expr::Literal(Value::String(Arc::from("xyz"))),
+        ];
+        let result = eval_builtin(&mut store, "contains", args).unwrap();
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_contains_type_error() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(Value::Int(1)),
+            Expr::Literal(Value::String(Arc::from("x"))),
+        ];
+        let result = eval_builtin(&mut store, "contains", args);
+        assert!(matches!(result, Err(MizuError::TypeError { .. })));
+    }
+
+    #[test]
+    fn test_contains_large_haystack_triggers_timeout() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let big = "a".repeat(25_000);
+        let args = vec![
+            Expr::Literal(Value::String(Arc::from(big))),
+            Expr::Literal(Value::String(Arc::from("zzz"))),
+        ];
+        let result = eval_builtin(&mut store, "contains", args);
+        assert!(
+            matches!(result, Err(MizuError::Timeout)),
+            "contains() over a 25 000-byte haystack must return Timeout, got: {result:?}"
+        );
+    }
+
+    /// The first record in `make_task_list()`'s underlying list.
+    fn first_task_record() -> Value {
+        match make_task_list() {
+            Value::List(items) => items[0].clone(),
+            _ => panic!("expected list"),
+        }
+    }
+
+    #[test]
+    fn test_has_field_present() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(first_task_record()),
+            Expr::Literal(Value::String(Arc::from("priority"))),
+        ];
+        let result = eval_builtin(&mut store, "has_field", args).unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_has_field_absent() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(first_task_record()),
+            Expr::Literal(Value::String(Arc::from("nonexistent_field"))),
+        ];
+        let result = eval_builtin(&mut store, "has_field", args).unwrap();
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_has_field_type_error() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        let args = vec![
+            Expr::Literal(Value::Int(1)),
+            Expr::Literal(Value::String(Arc::from("field"))),
+        ];
+        let result = eval_builtin(&mut store, "has_field", args);
+        assert!(matches!(result, Err(MizuError::TypeError { .. })));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
     // get_system_time — dynamic write-target closed (RM-04)
     // ────────────────────────────────────────────────────────────────────────
 

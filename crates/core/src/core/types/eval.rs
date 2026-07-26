@@ -727,6 +727,125 @@ impl StateMachine {
                         });
                         return Ok(Value::List(Arc::new(items)));
                     }
+                    "length" if args.len() == 1 => {
+                        let value =
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
+                        let n = match value {
+                            // O(1): Arc<Vec<Value>>'s length is already tracked.
+                            Value::List(l) => l.len() as i64,
+                            // O(n): char count, not byte count — this is a
+                            // user-facing text length for a document-rendering
+                            // language, not a security byte-budget (those are
+                            // separate, e.g. INPUT_MAX_BYTES), so counting
+                            // Unicode scalar values is the correct choice; byte
+                            // length would misreport for any multi-byte text.
+                            // Charged against the instruction budget before
+                            // doing the work, same discipline as string `+`
+                            // and `contains`, so a huge string can't bypass
+                            // MAX_INSTRUCTIONS via repeated length() calls.
+                            Value::String(s) => {
+                                let char_count = s.chars().count() as u64;
+                                self.instruction_count =
+                                    self.instruction_count.saturating_add(char_count);
+                                if self.instruction_count > *MAX_INSTRUCTIONS {
+                                    return Err(MizuError::Timeout);
+                                }
+                                char_count as i64
+                            }
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("list or string".to_string()),
+                                    found: type_name(&other),
+                                });
+                            }
+                        };
+                        return Ok(Value::Int(
+                            n.saturating_mul(crate::core::types::DECIMAL_SCALE),
+                        ));
+                    }
+                    "to_string" if args.len() == 1 => {
+                        let value =
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
+                        // Int/Bool only: reuses Value's own Display impl (which
+                        // already handles DECIMAL_SCALE fixed-point formatting
+                        // correctly) rather than reimplementing that logic.
+                        // Anything else is a TypeError rather than silently
+                        // stringifying — a list/record has no single canonical
+                        // textual form, and guessing one invites confusing
+                        // output over a clear rejection.
+                        match &value {
+                            Value::Int(_) | Value::Bool(_) => {
+                                return Ok(Value::String(Arc::from(value.to_string())));
+                            }
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("num or bool".to_string()),
+                                    found: type_name(other),
+                                });
+                            }
+                        }
+                    }
+                    "contains" if args.len() == 2 => {
+                        let haystack_val =
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
+                        let needle_val =
+                            self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
+                        let haystack = match haystack_val {
+                            Value::String(s) => s,
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("string".to_string()),
+                                    found: type_name(&other),
+                                });
+                            }
+                        };
+                        let needle = match needle_val {
+                            Value::String(s) => s,
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("string".to_string()),
+                                    found: type_name(&other),
+                                });
+                            }
+                        };
+                        // Charge the scan cost before doing the work — mirrors
+                        // the `+` concatenation charge (same discipline: an
+                        // O(n) native operation must pre-charge its size).
+                        self.instruction_count =
+                            self.instruction_count.saturating_add(haystack.len() as u64);
+                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                            return Err(MizuError::Timeout);
+                        }
+                        return Ok(Value::Bool(haystack.contains(needle.as_ref())));
+                    }
+                    "has_field" if args.len() == 2 => {
+                        let record_val =
+                            self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
+                        let name_val =
+                            self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
+                        if !matches!(record_val, Value::Record(_)) {
+                            return Err(MizuError::TypeError {
+                                expected: Box::new("record".to_string()),
+                                found: type_name(&record_val),
+                            });
+                        }
+                        let name = match name_val {
+                            Value::String(s) => s,
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("string".to_string()),
+                                    found: type_name(&other),
+                                });
+                            }
+                        };
+                        // Additive predicate only — does not relax
+                        // Expr::FieldAccess's existing strict-fail-on-missing
+                        // behavior; this is for callers who need to branch on
+                        // optional/variable-shaped network data before ever
+                        // accessing the field, not a replacement for it.
+                        let present = record_val.get_field(name.as_ref()).is_some();
+                        return Ok(Value::Bool(present));
+                    }
                     _ => {}
                 }
 
