@@ -1143,13 +1143,15 @@ fn dispatch_redraw_requested(
         };
         crate::render::inspector::paint::paint_panel(
             &mut scene,
-            &mut manager.inspector,
-            &rows,
-            logical_width,
-            logical_height,
-            scale as f32,
-            &mut manager.font_cx,
-            &mut manager.layout_cx,
+            &mut crate::render::inspector::paint::PanelPaintContext {
+                state: &mut manager.inspector,
+                rows: &rows,
+                window_width: logical_width,
+                window_height: logical_height,
+                scale: scale as f32,
+                font_cx: &mut manager.font_cx,
+                layout_cx: &mut manager.layout_cx,
+            },
         );
     }
 

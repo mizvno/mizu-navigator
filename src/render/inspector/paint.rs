@@ -112,37 +112,48 @@ fn draw_layout(
     }
 }
 
+/// Context for [`paint_panel`], bundling everything but the `Scene` it
+/// draws into (kept separate, matching this codebase's `paint_node`
+/// convention of threading the draw target alongside a context struct).
+pub struct PanelPaintContext<'a> {
+    /// Panel UI state (selected tab, scroll offsets, picker mode); mutated
+    /// to clamp scroll and record the content height each paint.
+    pub state: &'a mut InspectorState,
+    /// The panel's currently visible rows for the active tab.
+    pub rows: &'a [Row],
+    /// Logical window width.
+    pub window_width: f32,
+    /// Logical window height.
+    pub window_height: f32,
+    /// DPI scale factor.
+    pub scale: f32,
+    /// Parley font context, for row/tab-label text layout.
+    pub font_cx: &'a mut parley::FontContext,
+    /// Parley layout context, for row/tab-label text layout.
+    pub layout_cx: &'a mut parley::LayoutContext<Color>,
+}
+
 /// Paints the docked panel: background, tab bar, picker button, visible rows,
 /// and scrollbar.  Also clamps the active tab's scroll offset against the
-/// current content height (stored back into `state.max_scroll`).
-#[allow(clippy::too_many_arguments)]
-pub fn paint_panel(
-    scene: &mut Scene,
-    state: &mut InspectorState,
-    rows: &[Row],
-    window_width: f32,
-    window_height: f32,
-    scale: f32,
-    font_cx: &mut parley::FontContext,
-    layout_cx: &mut parley::LayoutContext<Color>,
-) {
-    let transform = Affine::scale(scale as f64);
-    let left = panel_left(window_width);
+/// current content height (stored back into `ctx.state.max_scroll`).
+pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
+    let transform = Affine::scale(ctx.scale as f64);
+    let left = panel_left(ctx.window_width);
     let top = CHROME_HEIGHT;
 
     // ── Panel background + divider ───────────────────────────────────────
     let panel_rect = Rect::new(
         left as f64,
         top as f64,
-        window_width as f64,
-        window_height as f64,
+        ctx.window_width as f64,
+        ctx.window_height as f64,
     );
     scene.fill(Fill::NonZero, transform, PANEL_BG, None, &panel_rect);
     let divider = Rect::new(
         left as f64,
         top as f64,
         (left + 1.0) as f64,
-        window_height as f64,
+        ctx.window_height as f64,
     );
     scene.fill(Fill::NonZero, transform, DIVIDER, None, &divider);
 
@@ -151,7 +162,7 @@ pub fn paint_panel(
     let tab_width = tab_strip_width / InspectorTab::ALL.len() as f32;
     for (i, tab) in InspectorTab::ALL.iter().enumerate() {
         let x0 = left + i as f32 * tab_width;
-        if *tab == state.tab {
+        if *tab == ctx.state.tab {
             let r = Rect::new(
                 x0 as f64,
                 top as f64,
@@ -160,15 +171,15 @@ pub fn paint_panel(
             );
             scene.fill(Fill::NonZero, transform, TAB_ACTIVE_BG, None, &r);
         }
-        let color = if *tab == state.tab { COL_ACCENT } else { COL_DIM };
-        let layout = build_row_layout(tab.label(), color, font_cx, layout_cx);
+        let color = if *tab == ctx.state.tab { COL_ACCENT } else { COL_DIM };
+        let layout = build_row_layout(tab.label(), color, ctx.font_cx, ctx.layout_cx);
         let tx = x0 + (tab_width - layout.width()).max(0.0) / 2.0;
         let ty = top + (TAB_BAR_HEIGHT - layout.height()).max(0.0) / 2.0;
         draw_layout(scene, &layout, tx, ty, color, transform);
     }
     // Picker button.
     let picker_x0 = left + tab_strip_width;
-    if state.picker {
+    if ctx.state.picker {
         let r = Rect::new(
             picker_x0 as f64,
             top as f64,
@@ -177,8 +188,8 @@ pub fn paint_panel(
         );
         scene.fill(Fill::NonZero, transform, PICKER_ACTIVE_BG, None, &r);
     }
-    let picker_color = if state.picker { COL_NORMAL } else { COL_DIM };
-    let picker_layout = build_row_layout("[+]", picker_color, font_cx, layout_cx);
+    let picker_color = if ctx.state.picker { COL_NORMAL } else { COL_DIM };
+    let picker_layout = build_row_layout("[+]", picker_color, ctx.font_cx, ctx.layout_cx);
     let px = picker_x0 + (PICKER_BTN_WIDTH - picker_layout.width()).max(0.0) / 2.0;
     let py = top + (TAB_BAR_HEIGHT - picker_layout.height()).max(0.0) / 2.0;
     draw_layout(scene, &picker_layout, px, py, picker_color, transform);
@@ -186,25 +197,25 @@ pub fn paint_panel(
     let bar_divider = Rect::new(
         left as f64,
         (top + TAB_BAR_HEIGHT) as f64,
-        window_width as f64,
+        ctx.window_width as f64,
         (top + TAB_BAR_HEIGHT + 1.0) as f64,
     );
     scene.fill(Fill::NonZero, transform, DIVIDER, None, &bar_divider);
 
     // ── Content: scroll clamp + visible slice ────────────────────────────
     let content_top = top + TAB_BAR_HEIGHT + 1.0;
-    let viewport_h = (window_height - content_top).max(0.0);
-    let content_h = rows.len() as f32 * ROW_HEIGHT;
-    state.max_scroll = (content_h - viewport_h).max(0.0);
-    let idx = state.tab.index();
-    state.scroll[idx] = state.scroll[idx].clamp(0.0, state.max_scroll);
-    let scroll = state.scroll[idx];
+    let viewport_h = (ctx.window_height - content_top).max(0.0);
+    let content_h = ctx.rows.len() as f32 * ROW_HEIGHT;
+    ctx.state.max_scroll = (content_h - viewport_h).max(0.0);
+    let idx = ctx.state.tab.index();
+    ctx.state.scroll[idx] = ctx.state.scroll[idx].clamp(0.0, ctx.state.max_scroll);
+    let scroll = ctx.state.scroll[idx];
 
     let clip = Rect::new(
         left as f64,
         content_top as f64,
-        window_width as f64,
-        window_height as f64,
+        ctx.window_width as f64,
+        ctx.window_height as f64,
     );
     scene.push_layer(
         vello::peniko::BlendMode::new(vello::peniko::Mix::Normal, vello::peniko::Compose::SrcOver),
@@ -215,8 +226,9 @@ pub fn paint_panel(
 
     let first = (scroll / ROW_HEIGHT).floor() as usize;
     let visible = (viewport_h / ROW_HEIGHT).ceil() as usize + 1;
-    let last = (first + visible).min(rows.len());
-    for (i, row) in rows
+    let last = (first + visible).min(ctx.rows.len());
+    for (i, row) in ctx
+        .rows
         .iter()
         .enumerate()
         .skip(first)
@@ -224,18 +236,18 @@ pub fn paint_panel(
     {
         let y = content_top + i as f32 * ROW_HEIGHT - scroll;
         // Selection background for node rows.
-        if row.node.is_some() && row.node == state.selected {
+        if row.node.is_some() && row.node == ctx.state.selected {
             let r = Rect::new(
                 left as f64,
                 y as f64,
-                window_width as f64,
+                ctx.window_width as f64,
                 (y + ROW_HEIGHT) as f64,
             );
             scene.fill(Fill::NonZero, transform, SELECTION_BG, None, &r);
         }
         let color = row_color(row.kind);
         let x = left + 8.0 + row.indent as f32 * 12.0;
-        let layout = build_row_layout(&row.text, color, font_cx, layout_cx);
+        let layout = build_row_layout(&row.text, color, ctx.font_cx, ctx.layout_cx);
         let ty = y + (ROW_HEIGHT - layout.height()).max(0.0) / 2.0;
         draw_layout(scene, &layout, x, ty, color, transform);
     }
@@ -243,13 +255,13 @@ pub fn paint_panel(
     scene.pop_layer();
 
     // ── Scrollbar ────────────────────────────────────────────────────────
-    if state.max_scroll > 0.0 && content_h > 0.0 {
+    if ctx.state.max_scroll > 0.0 && content_h > 0.0 {
         let thumb_h = (viewport_h / content_h * viewport_h).max(24.0);
-        let thumb_y = content_top + (scroll / state.max_scroll) * (viewport_h - thumb_h);
+        let thumb_y = content_top + (scroll / ctx.state.max_scroll) * (viewport_h - thumb_h);
         let r = Rect::new(
-            (window_width - 5.0) as f64,
+            (ctx.window_width - 5.0) as f64,
             thumb_y as f64,
-            (window_width - 2.0) as f64,
+            (ctx.window_width - 2.0) as f64,
             (thumb_y + thumb_h) as f64,
         );
         scene.fill(Fill::NonZero, transform, SCROLLBAR, None, &r);
