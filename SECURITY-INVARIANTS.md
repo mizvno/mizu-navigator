@@ -209,15 +209,16 @@ user-defined function (looked up against the document's own function table)
 nor a known-pure builtin is conservatively treated as effectful and
 rejected.
 
-*Known-pure builtins:* `filter`, `count`, `sort` — the complete set of
-`Expr::FunctionCall`-reachable pure builtins the evaluator
-(`crates/core/src/core/types/eval.rs`) currently implements. (An earlier
-version of this list additionally named `len`, `to_string`, `contains`,
-`starts_with`, `ends_with`, `replace`, `concat`, `reverse`, `json_encode`,
-`map`, `sort_by`, `validate_path` — none of these exist in the evaluator's
-dispatch; that was aspirational/stale documentation, not a description of
-shipped behavior. Re-add a name here only once it is real and confirmed
-pure.)
+*Known-pure builtins:* `filter`, `count`, `sort`, `length`, `to_string`,
+`contains`, `has_field` — the complete set of `Expr::FunctionCall`-reachable
+pure builtins the evaluator (`crates/core/src/core/types/eval.rs`)
+currently implements; see `docs/reference/semantics.md`'s "List and value
+built-ins" for their full signatures. (An earlier version of this list also
+named `starts_with`, `ends_with`, `replace`, `concat`, `reverse`,
+`json_encode`, `map`, `sort_by`, `validate_path` — none of these exist in
+the evaluator's dispatch; that was aspirational/stale documentation, not a
+description of shipped behavior. Re-add a name here only once it is real
+and confirmed pure.)
 
 *Effectful builtins rejected by this checker:* `copy_to_clipboard`,
 `store_local`, `download`, `get_system_time` — the complete set of

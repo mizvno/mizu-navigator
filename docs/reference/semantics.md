@@ -153,7 +153,7 @@ Left-to-right, strict (eager) evaluation of sub-expressions, **except** for `IfE
 
 Each `evaluate` call increments `instruction_count`.  Once `instruction_count > MAX_INSTRUCTIONS` (20 000), the call returns `MizuError::Timeout`.  The counter is reset to 0 before each top-level action or timer evaluation.
 
-⚠ **List builtins** charge the budget proportional to the list length (`filter`, `count`, `sort`) before any iteration.  A large list can exhaust the budget before iterating a single element.
+Warning -- list/string builtins (`filter`, `count`, `sort`, `length`, `contains`) charge the budget proportional to the list/string length before any iteration.  A large list or string can exhaust the budget before iterating a single element.
 
 ### Nesting depth
 
@@ -231,6 +231,76 @@ select the target, giving `$form`/network-response data a channel to choose
 same `UiEvent::UpdateVariable` path a network response uses — it is never
 attacker-influenced, so (unlike form/network data) it needs no flow-checker
 taint tracking.
+
+### List and value built-ins
+
+**Source:** `crates/core/src/core/types/eval.rs` (runtime), `crates/core/src/parser/logic/parse.rs` (`filter`/`sort`'s keyword arguments), `crates/core/src/parser/typecheck.rs` (`infer`), `crates/core/src/parser/logic/purity.rs` (`KNOWN_PURE_BUILTINS`)
+
+All seven are pure (side-effect-free) built-ins, callable like any function
+and permitted inside a `class X if <expr>` condition (P1,
+`SECURITY-INVARIANTS.md`).
+
+- **`filter(list, field, value)`** / **`filter(list, field, op, value)`** ->
+  `list`, keeping only elements whose `field` compares true against `value`
+  under `op`. The 3-argument form is sugar for `op = eq`, resolved at parse
+  time -- the two forms behave identically. `op` is one of:
+
+  | `op` | Meaning | Value types |
+  |---|---|---|
+  | `eq` | equal | any |
+  | `ne` | not equal | any |
+  | `lt` | less than | `num`, `string` |
+  | `le` | less than or equal | `num`, `string` |
+  | `gt` | greater than | `num`, `string` |
+  | `ge` | greater than or equal | `num`, `string` |
+  | `contains` | substring | `string` only |
+
+  `op` is a **hard parse-time keyword**, not an expression -- `eq`/`ne`/etc.
+  can never be `Expr::Variable`, so an in-scope variable with the same name
+  can never shadow it. It is recognized *positionally*: a bare identifier
+  in the third argument slot is only treated as `op` when immediately
+  followed by a comma (a fourth argument follows); a genuine 3-argument
+  call whose `value` happens to be a variable literally named e.g. `eq`
+  still parses as that variable. `lt`/`le`/`gt`/`ge` reuse the same
+  `BinOp::Lt`/`Le`/`Gt`/`Ge` semantics as the language's own `<`/`<=`/`>`/`>=`
+  operators (SS3), including their `string` support (lexicographic byte
+  order) -- not a separate comparison implementation.
+
+- **`count(list, field, value)`** -> `num`, the count of elements matching
+  (same comparison as `filter`'s 3-argument/`eq` form; `count` does not yet
+  have an `op` argument).
+
+- **`sort(list, field, dir)`** -> `list`, sorted by `field`. `dir` is a
+  **hard parse-time keyword**, `asc` or `desc` -- like `filter`'s `op`,
+  never `Expr::Variable`, so an in-scope variable named `asc`/`desc` can
+  never shadow it and silently substitute for a real sort direction. Any
+  other token in this position is a `ParseError`.
+
+- **`length(value)`** -> `num`. `list` -> item count (O(1)). `string` ->
+  Unicode scalar value (char) count, *not* byte count -- this is a
+  user-facing text length for a document-rendering language, not a
+  security byte budget (those are separate, e.g. `INPUT_MAX_BYTES`); byte
+  length would misreport for any multi-byte UTF-8 text. Anything else is a
+  `TypeError`.
+
+- **`to_string(value)`** -> `string`. `num` or `bool` only -- reuses
+  `Value`'s own `Display` formatting (SS3's fixed-point rules apply, e.g.
+  `3.5`, not `3.50000000`). `string`/`null`/`list`/`record` are a
+  `TypeError`: a list/record has no single canonical textual form, so this
+  rejects rather than guessing one.
+
+- **`contains(haystack, needle)`** -> `bool`. `string` only, substring
+  check.
+
+- **`has_field(record, name)`** -> `bool`. `record` + `string` field name.
+  An additive existence predicate -- does **not** relax `FieldAccess`
+  (`record.field`)'s existing strict-fail-on-missing-field behavior; use it
+  to branch on optional/variable-shaped network data *before* accessing a
+  field that might not be present, not as a replacement for direct access.
+
+Instruction budget: `filter`, `count`, `length` (string case), `contains`,
+and `sort` all charge their native O(n) (or O(n log2 n) for `sort`) cost
+against the instruction budget *before* doing the work -- see section 12.
 
 ---
 
@@ -346,7 +416,7 @@ guaranteed re-readable from storage; a lower JSON limit would silently brick
 a stored value the evaluator itself was allowed to construct. Corrected in
 the MNT-01 pass.
 
-⚠ **List builtin budget cliff:** `filter(list, field, value)`, `count(list, field, value)`, and `sort(list, field, dir)` each charge `list.len()` (or `n * log2(n)` for sort) to the instruction counter **before** iterating.  A 20 001-element list with a single `filter` call will time out immediately.
+Warning -- list builtin budget cliff: `filter`/`count`/`length`(string)/`contains` charge `list.len()` (or the string/haystack length) and `sort` charges `n * log2(n)`, each to the instruction counter **before** iterating -- see section 6's "List and value built-ins" for the full signatures (`filter`'s `op` argument, `sort`'s `asc`/`desc` keyword). A 20 001-element list with a single `filter` call will time out immediately.
 
 Other bounds (layout node cap, redirect limit, response body cap, storage quotas) are defined in the network/layout layers and cross-linked from `SECURITY-INVARIANTS.md`.
 

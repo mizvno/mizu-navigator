@@ -438,8 +438,17 @@ ternary     = expr "?" expr ":" expr ;
 - `if/then/else` and `? :` produce the same `IfElse` AST node; only the selected branch is evaluated.
 - Field access (`.`) has the highest precedence of any operator.
 - `+` on strings performs concatenation; on mismatched types → `TypeError`.
+- `<`, `>`, `<=`, `>=` accept `num`×`num` or `string`×`string` (lexicographic byte order); other type pairings → `TypeError`.
 - `&&` and `||` require both operands to be `bool`; other types → `TypeError`.
 - Conditional-class expressions must be pure (see §6).
+- `filter`'s optional 4th argument and `sort`'s 3rd argument are exceptions
+  to `arg_list`'s generic `expr` grammar: in those specific positions, the
+  parser requires a bare reserved keyword token (`eq|ne|lt|le|gt|ge|contains`
+  for `filter`; `asc|desc` for `sort`) instead of a general expression — it
+  is never `Expr::Variable`, so it can never be shadowed by an in-scope
+  variable of the same name. See `docs/reference/semantics.md`'s "List and
+  value built-ins" for the full signatures, matching `get_system_time`'s
+  own bare-identifier grammar restriction (§8) in spirit.
 
 ---
 
