@@ -3,7 +3,7 @@ pub use mizu_core::messages;
 /// OpenNIC DNS resolver — forces all domain lookups through OpenNIC servers
 pub mod opennic;
 /// URI parser for `mizu://`
-pub mod uri;
+pub use mizu_core::core::uri;
 /// Zero-Touch Vault for credentials
 pub mod vault;
 /// Asynchronous QUIC worker thread

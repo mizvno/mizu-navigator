@@ -335,23 +335,106 @@ gate is a compile error.
 
 ---
 
-## 8. Kani / Creusot Handoff
+## 8. Kani Mechanized Verification
 
-The following invariants are candidates for mechanized proof as a separate
-assurance workstream:
+Where the Lean 4 development in `formal/` proves the *design* (the checker, as
+a mathematical function, is sound — see `formal/RESULTS.md`), Kani proves the
+*code*: that specific shipped Rust kernel functions cannot panic and obey the
+invariants stated above. This section records the current state of that
+workstream — what is covered, what is not, and why.
 
-1. **N2 + N3 + N4** — `check_navigation` is a pure function with no I/O.
-   A Kani harness can exhaustively verify the scheme and origin checks for all
-   `NavigationInitiator` variants.
-2. **L1** — The layout budget counter in `layout_bridge.rs` is a simple
-   monotonically-decreasing integer.  A proof can show it never exceeds
-   `MAX_SYNTHETIC_LAYOUT_NODES`.
-3. **F1** — The taint fixpoint in `flow.rs` terminates (the graph is a DAG and
-   the tainted set only grows).  A proof can show soundness: every source→sink
-   path in the AST is detected.
+### 8.1 How to run Kani (read this first)
 
-This document (`SECURITY-INVARIANTS.md`) serves as the specification input to
-any such effort.
+**Kani only runs against `mizu-core`, and only from that crate's directory:**
+
+```bash
+cd crates/core && cargo kani
+```
+
+Two hard constraints make this non-negotiable, neither of which is fixable
+from this repository:
+
+1. **The `mizu-navigator` (main) crate cannot be compiled by Kani at all.**
+   `image`'s default `default-formats` feature pulls in `ravif → rav1e`, and
+   `rav1e` fails under Kani's instrumented rustc with an `assert`
+   macro-ambiguity error (`E0659`) inside `rav1e`'s own source. Running
+   `cargo kani` from the workspace root therefore fails before reaching any
+   Mizu code. On Linux it additionally fails earlier still, in
+   `yeslogic-fontconfig-sys`'s build script, because the GUI dependency chain
+   (`parley`/`accesskit`) requires a system `fontconfig` that the
+   verification environment has no reason to provide.
+   *This is the reason the security kernel was extracted into
+   `crates/core/src/security/` in the first place* — see §8.2.
+2. **Kani has no native Windows support.** On a Windows development machine,
+   every invocation must go through WSL:
+   `wsl cargo kani --working-directory crates/core`. Long runs have been
+   observed to crash the WSL VM itself (`Wsl/Service/E_UNEXPECTED`); a
+   `wsl --shutdown` and retry clears it.
+
+### 8.2 Trusted-base extraction
+
+To make the security kernel reachable by Kani despite constraint (1) above,
+the pure policy functions were moved out of the main crate into `mizu-core`,
+with thin `pub use` re-exports left at their original paths so no call site
+changed:
+
+| Function | Now lives in | Re-exported from |
+|---|---|---|
+| `check_navigation` (+ `NavigationInitiator`/`NavigationVerdict`) | `crates/core/src/security/navigation.rs` | `src/render/navigation.rs` |
+| `is_local_host` | `crates/core/src/security/network.rs` | `src/network/worker/tls.rs` |
+| `file_sandbox_contains`, `normalize_path_components` | `crates/core/src/security/sandbox.rs` | `src/render/security.rs` |
+| `CapabilityPolicy` / `check_storage_write` (+ quota constants) | `crates/core/src/security/quota.rs` | `src/render/security.rs` |
+| `MizuUri::parse` | `crates/core/src/core/uri.rs` | `src/network/uri` |
+
+### 8.3 Coverage status
+
+| Target | Invariant | Kani status |
+|---|---|---|
+| `is_local_host` | quota tier / SSRF block / TLS bypass gate | **Harnessed** — `security/network.rs` |
+| `normalize_path_components` + containment check | file sandbox | **Harnessed** — `security/sandbox.rs` |
+| `check_storage_write` | S-quota, L1-style bounded counter | **Harnessed** — `security/quota.rs` |
+| `check_type` (3 harnesses) | T4 down payment | **Verified** — `parser/logic/eval.rs` |
+| `check_navigation` | N2 + N3 + N4 | **Not harnessed** — CBMC intractable |
+| `MizuUri::parse` | URI/origin policy | **Not harnessed** — Kani ICE |
+| `parse_urls` | endpoint-kind contract | **Not harnessed** — CBMC intractable |
+| `check_information_flow` / `is_expr_tainted` | F1 | **Not harnessed** — CBMC intractable |
+| Layout budget (`layout_bridge.rs`) | L1 | **Not attempted** — main crate, unreachable per §8.1(1) |
+
+### 8.4 Why four targets are not harnessed
+
+These are recorded failures of the *tool* against this code shape, not
+untested code — every one of them is covered by conventional unit tests, and
+F1 additionally has a full mechanized soundness proof in Lean
+(`T2_non_interference`). Each is also documented in a comment at the
+corresponding source location.
+
+- **`MizuUri::parse`** — calls `url::Url::parse`, which reaches
+  `icu_normalizer::Decomposition::new_with_supplements` over a
+  `zerovec::ZeroSlice<u16>`. Kani 0.67's goto codegen hits an internal
+  compiler error on that type (`operand.rs:351`, "entered unreachable code").
+  This is a whole-crate *codegen* failure: the mere presence of a harness that
+  can reach `url::Url::parse` breaks `cargo kani` for every other harness in
+  the crate, so no amount of input bounding avoids it. Upstream Kani/`zerovec`
+  incompatibility.
+- **`parse_urls`** — interns aliases through `StringInterner`, which is
+  backed by a `HashMap`. CBMC's exploration of the hashing and allocation
+  paths reached by insertion explodes even with a tiny bounded symbolic input.
+- **`is_expr_tainted`** (the `check_information_flow` core) — recursion
+  combined with `Expr::FunctionCall`'s internal argument-slice loop.
+  Unresolved after 5+ minutes even for a fully concrete two-node tree with
+  zero `kani::any()` calls, which rules out symbolic input as the cause and
+  points at the recursion+loop shape itself.
+- **`check_navigation`** — despite being pure and I/O-free (the most obvious
+  candidate on paper), the symbolic-string comparisons across four scheme
+  prefixes plus the `RedirectOf` recursion did not converge in a usable time
+  budget. Worth revisiting with a different string-modelling strategy.
+
+The general pattern: CBMC's bounded model checking is a poor fit for
+recursive types, hash tables, and symbolic strings — exactly what Lean's
+structural induction handles natively. Kani's value here is concentrated on
+*flat, arithmetic, bounded-counter* properties. `formal/` remains the primary
+mechanized-proof vehicle for the rest; this document is the specification
+input to both.
 
 ---
 

@@ -412,6 +412,23 @@ fn find_tainted_var_in_expr(
     }
 }
 
+// No Kani harness for the taint-propagation core here (see
+// `SECURITY-INVARIANTS.md` §8 for the rest of this crate's Kani coverage).
+// `is_expr_tainted` recurses through `ExprArena`/`Expr::FunctionCall`'s
+// internal `for &arg in arena.args(..)` loop; CBMC's symbolic execution
+// explores that loop's shape across the whole function body regardless of
+// which `Expr` variant a harness's concrete input actually selects, and
+// this stayed pathologically slow (unresolved after 5+ minutes, even for
+// a harness with a single concrete two-node tree and *zero* remaining
+// `kani::any()` calls after multiple attempts to eliminate symbolic input
+// as the cause — narrowing it down to something inherent to this
+// recursion+loop shape under CBMC, not to how the harness was written).
+// This is the same class of wall `parser::logic::eval::kani_proofs`
+// documents for `Value`/`Expr` recursive-type verification (T4): "a real
+// but modest down payment... not a substitute" for the larger Lean
+// development in `formal/`, which already proves `check_information_flow`'s
+// soundness (T2) structurally over these exact recursive types.
+
 /// Builds a human-readable taint path for diagnostics (F3).
 ///
 /// Example output: `"value 'next' (tainted from GET(api))"`
@@ -474,7 +491,7 @@ mod tests {
     #[test]
     fn network_var_into_navigate_rejected() {
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -518,7 +535,7 @@ layout
     #[test]
     fn gated_gesture_navigation_allowed() {
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -539,7 +556,7 @@ layout
         // validation.  This test verifies the design change from the previous
         // validate_path-based gate to the by-construction gate.
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/user/{id}
 logic
     timer 1s -> GET(api) -> data
@@ -558,7 +575,7 @@ layout
         // `data` is tainted (from GET), navigating `data.url` should be
         // rejected since FieldAccess propagates taint.
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -588,7 +605,7 @@ layout
         // source â†’ comp â†’ sink: `data` (from GET) â†’ `comp derived = data` â†’
         // navigate `derived` without gesture should be rejected.
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -605,7 +622,7 @@ layout
     fn taint_propagates_through_function_return() {
         // A user function that returns a tainted global should taint the result
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     passthrough(x) : x
@@ -622,7 +639,7 @@ layout
     fn taint_propagates_through_transitive_global() {
         // A function reads a tainted global transitively
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     read_data() : data
@@ -644,7 +661,7 @@ layout
         // `data`, even though at runtime the else is never taken.
         // This is acceptable: sound over complete.
         let doc = r#"
-reach
+urls
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -724,7 +741,7 @@ layout
     #[test]
     fn diagnostic_includes_source_and_sink() {
         let doc = r#"
-reach
+urls
     feed: mizu://api.example.com/feed
 logic
     timer 1s -> GET(feed) -> next

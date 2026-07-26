@@ -16,3 +16,4 @@ pub mod config;
 pub mod errors;
 pub mod storage;
 pub mod types;
+pub mod uri;

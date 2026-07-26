@@ -109,6 +109,23 @@ impl MizuUri {
     }
 }
 
+// No Kani harness for `MizuUri::parse` here (see `SECURITY-INVARIANTS.md`
+// §8 for the rest of the Kani coverage in this crate): `MizuUri::parse`
+// calls `url::Url::parse`, which is reachable to IDNA/Unicode-normalization
+// codepaths in `idna`/`icu_normalizer` — specifically
+// `icu_normalizer::Decomposition::new_with_supplements` operating over a
+// `zerovec::ZeroSlice<u16>`. Kani 0.67's MIR-to-goto codegen hits an
+// internal compiler error on that type (`operand.rs:351`, "entered
+// unreachable code") *whenever `url::Url::parse` is reachable from any
+// harness in the crate at all* — this is a static whole-function codegen
+// failure, not a dynamically-reached branch, so no amount of bounding the
+// symbolic input avoids it. Confirmed empirically: adding a harness that
+// calls `MizuUri::parse` breaks `cargo kani` for the entire crate; removing
+// it restores the other harnesses. This is an upstream Kani/zerovec
+// incompatibility (https://github.com/model-checking/kani), not something
+// fixable from this codebase — same category of hard tooling wall as the
+// `rav1e` blocker documented on the main crate's extraction rationale.
+
 #[cfg(test)]
 mod tests {
     use super::*;

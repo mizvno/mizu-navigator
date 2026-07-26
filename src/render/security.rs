@@ -1,154 +1,17 @@
 #![forbid(unsafe_code)]
 
-use crate::core::errors::MizuError;
 use crate::core::storage::ValidatedDomain;
 use crate::core::types::{Value, VariableStore};
 use crate::network::{RuntimeAction, UiEvent};
-use std::time::Instant;
 
 
-/// Normalises a path lexically (no I/O) by resolving `.` and `..` components.
-///
-/// Returns an empty [`std::path::PathBuf`] if the path would escape above its
-/// root, ensuring that the `starts_with` sandbox check always fails for
-/// path-traversal attempts.
-pub(crate) fn normalize_path_components(path: &std::path::Path) -> std::path::PathBuf {
-    let mut out = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                // pop() returns false when there is nothing left to pop
-                // (empty PathBuf or root-only).  In that case the traversal
-                // would escape above root — signal failure with an empty path.
-                if !out.pop() {
-                    return std::path::PathBuf::new();
-                }
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Strips Windows' verbatim prefix (`\\?\`) from a path.
-///
-/// [`std::fs::canonicalize`] on Windows returns verbatim paths whose prefix
-/// component (`VerbatimDisk`) never matches the plain `Disk` prefix of a
-/// lexically-normalised path, so `Path::starts_with` would always fail when
-/// one side was canonicalised and the other was not (e.g. an existing sandbox
-/// base vs. a not-yet-existing target).  No-op on non-Windows paths.
-fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        return std::path::PathBuf::from(rest.to_string());
-    }
-    p
-}
-
-/// Returns `true` if `target` is contained within `sandbox_base`.
-///
-/// Uses [`std::fs::canonicalize`] when both paths exist (resolves symlinks);
-/// falls back to [`normalize_path_components`] for non-existent targets (e.g.
-/// first-time navigation, unit tests).  Returns `false` when either canonical
-/// path is empty (escape detected) or when the target does not start with
-/// `sandbox_base`.
-pub(crate) fn file_sandbox_contains(
-    sandbox_base: &std::path::Path,
-    target: &std::path::Path,
-) -> bool {
-    let canon_base = strip_verbatim_prefix(
-        std::fs::canonicalize(sandbox_base)
-            .unwrap_or_else(|_| normalize_path_components(sandbox_base)),
-    );
-    let canon_target = strip_verbatim_prefix(
-        std::fs::canonicalize(target).unwrap_or_else(|_| normalize_path_components(target)),
-    );
-    !canon_base.as_os_str().is_empty()
-        && !canon_target.as_os_str().is_empty()
-        && canon_target.starts_with(&canon_base)
-}
-
-
-/// Maximum bytes a remote-origin document may store on disk (512 KiB).
-pub const STORAGE_QUOTA_BYTES_REMOTE: usize = 512 * 1024;
-/// Maximum bytes a local-file-origin document may store on disk (1 MiB).
-pub const STORAGE_QUOTA_BYTES_LOCAL_FILE: usize = 1024 * 1024;
-/// Maximum bytes a localhost document may store on disk (10 MiB).
-pub const STORAGE_QUOTA_BYTES_LOCALHOST: usize = 10 * 1024 * 1024;
-/// Maximum `StorageStore` writes allowed within a single one-second window.
-pub const STORAGE_RATE_LIMIT_WRITES_PER_SEC: u32 = 10;
-
-/// Per-origin capability budget and rate-limiting state.
-///
-/// One instance lives on [`crate::render::window::MizuWindowManager`] and is
-/// reset every time the user navigates to a new URL.
-pub struct CapabilityPolicy {
-    /// Accumulated storage bytes written by the current origin.
-    pub bytes_stored: usize,
-    /// Hard quota limit (bytes).  Derived from origin type at construction.
-    pub quota_bytes: usize,
-    /// Number of storage writes in the current one-second sliding window.
-    write_count_this_second: u32,
-    /// Start of the current one-second window.
-    window_start: Instant,
-}
-
-impl CapabilityPolicy {
-    /// Creates a fresh policy sized to the origin type of `chrome_url`.
-    ///
-    /// Quota tier is determined by parsed origin, not by raw substring search:
-    /// `mizu://attacker.com/?host=localhost` must NOT receive the localhost quota.
-    pub fn new(chrome_url: &str) -> Self {
-        let quota_bytes = if chrome_url.starts_with("file://") {
-            // file:// origins always get the local-file quota regardless of path content.
-            STORAGE_QUOTA_BYTES_LOCAL_FILE
-        } else if let Ok(uri) = crate::network::uri::MizuUri::parse(chrome_url) {
-            // Use the structurally-extracted domain, not raw substring matching, to
-            // avoid `mizu://evil.com?host=localhost` bypassing the remote quota.
-            if crate::network::worker::is_local_host(&uri.domain) {
-                STORAGE_QUOTA_BYTES_LOCALHOST
-            } else {
-                STORAGE_QUOTA_BYTES_REMOTE
-            }
-        } else {
-            STORAGE_QUOTA_BYTES_REMOTE
-        };
-        Self {
-            bytes_stored: 0,
-            quota_bytes,
-            write_count_this_second: 0,
-            window_start: Instant::now(),
-        }
-    }
-
-    /// Checks and records a storage write of `byte_count` bytes.
-    ///
-    /// Advances `bytes_stored` and `write_count_this_second` on success.
-    /// Returns [`MizuError::SecurityViolation`] if either the rate limit or
-    /// the total quota would be exceeded.
-    pub fn check_storage_write(&mut self, byte_count: usize) -> Result<(), MizuError> {
-        if self.window_start.elapsed().as_secs() >= 1 {
-            self.write_count_this_second = 0;
-            self.window_start = Instant::now();
-        }
-        if self.write_count_this_second >= STORAGE_RATE_LIMIT_WRITES_PER_SEC {
-            return Err(MizuError::SecurityViolation(format!(
-                "storage rate limit exceeded: max {STORAGE_RATE_LIMIT_WRITES_PER_SEC} writes/s"
-            )));
-        }
-        let new_total = self.bytes_stored.saturating_add(byte_count);
-        if new_total > self.quota_bytes {
-            return Err(MizuError::SecurityViolation(format!(
-                "storage quota exceeded: {} / {} bytes",
-                new_total, self.quota_bytes
-            )));
-        }
-        self.bytes_stored = new_total;
-        self.write_count_this_second += 1;
-        Ok(())
-    }
-}
+pub(crate) use mizu_core::security::sandbox::file_sandbox_contains;
+#[cfg(test)]
+pub(crate) use mizu_core::security::sandbox::normalize_path_components;
+pub use mizu_core::security::quota::{
+    CapabilityPolicy, STORAGE_QUOTA_BYTES_LOCALHOST, STORAGE_QUOTA_BYTES_LOCAL_FILE,
+    STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC,
+};
 
 /// Estimates the serialized byte size of a [`Value`].
 ///

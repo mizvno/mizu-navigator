@@ -8,28 +8,7 @@ use std::sync::Arc;
 #[allow(dead_code)] // intentional: available in test builds and insecure-dev builds
 pub(crate) const INSECURE_DEV_ACTIVE: bool = cfg!(feature = "insecure-dev");
 
-/// Returns `true` when `host` is a loopback address (`127.0.0.0/8`, `::1`) or a
-/// loopback hostname (`localhost`, `*.localhost`).
-///
-/// Deliberately excludes RFC 1918 private ranges and `.local` (mDNS) names:
-/// on a shared LAN those can be claimed or answered by other machines, so they
-/// receive no special trust — neither for the insecure-dev TLS bypass, nor for
-/// the file→remote SSRF block, nor for the storage quota tier.  Only traffic
-/// that provably never leaves this machine is treated as local.
-///
-/// Compiled in all configurations so that the locality invariant is testable
-/// regardless of the active feature set.
-#[allow(dead_code)] // intentional: used by is_local_server_name (insecure-dev) and tests
-pub(crate) fn is_local_host(host: &str) -> bool {
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        return addr.is_loopback();
-    }
-    false
-}
-
+pub(crate) use mizu_core::security::network::is_local_host;
 /// Classifies a [`rustls::pki_types::ServerName`] as local or non-local.
 ///
 /// This is the single source of truth used by [`LocalOrWebPkiVerifier`].
