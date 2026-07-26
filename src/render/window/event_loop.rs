@@ -35,25 +35,52 @@ use super::input::{
 use super::manager::MizuWindowManager;
 use super::navigate::{navigate_back, navigate_forward, navigate_to_url, process_network_result};
 
+/// Everything needed to construct the initial window/manager state: the
+/// parsed document (DOM, styles, logic) plus the URL it was loaded from.
+/// Replaces `run_window_loop`'s prior 9-parameter positional argument list.
+pub struct InitialDocument {
+    /// The parsed DOM tree.
+    pub dom: Tree<MizuNode>,
+    /// Tag/class style rules from the `style` block.
+    pub style_rules: HashMap<String, StyleRules>,
+    /// Breakpoint/color-scheme style variants (ux-6).
+    pub style_variants: Vec<crate::parser::style::StyleVariant>,
+    /// Declared `logic` functions, keyed by interned name.
+    pub logic_fns: FxHashMap<Symbol, MizuFunction>,
+    /// The string interner shared by every symbol in this document.
+    pub interner: StringInterner,
+    /// Compile-time endpoint alias registry from the `urls` block.
+    pub url_registry: crate::parser::UrlRegistry,
+    /// The URL this document was loaded from, shown in the chrome bar.
+    pub initial_url: String,
+    /// `comp`-declared computed/derived bindings.
+    pub computed_bindings: Vec<ComputedBinding>,
+    /// Declared `timer` blocks at the root scope.
+    pub root_timers: Vec<RootTimer>,
+}
+
 /// Connects the rendering manager to the Winit event loop.
 ///
 /// `allow_insecure`: when `true`, TLS certificate verification is skipped on
 /// QUIC connections (development only).  When `false` (the default), every
 /// `mizu://` connection must present a valid TLS certificate; the client drops
 /// connections that fail verification.
-#[allow(clippy::too_many_arguments)]
 pub fn run_window_loop(
-    dom: Tree<MizuNode>,
-    style_rules: HashMap<String, StyleRules>,
-    style_variants: Vec<crate::parser::style::StyleVariant>,
-    logic_fns: FxHashMap<Symbol, MizuFunction>,
-    interner: StringInterner,
-    url_registry: crate::parser::UrlRegistry,
-    initial_url: String,
+    doc: InitialDocument,
     #[cfg(feature = "insecure-dev")] allow_insecure: bool,
-    computed_bindings: Vec<ComputedBinding>,
-    root_timers: Vec<RootTimer>,
 ) -> Result<(), MizuError> {
+    let InitialDocument {
+        dom,
+        style_rules,
+        style_variants,
+        logic_fns,
+        interner,
+        url_registry,
+        initial_url,
+        computed_bindings,
+        root_timers,
+    } = doc;
+
     let event_loop = winit::event_loop::EventLoopBuilder::<MizuUserEvent>::with_user_event()
         .build()
         .map_err(|e| MizuError::ParseError(e.to_string()))?;
