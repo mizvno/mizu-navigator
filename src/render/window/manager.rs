@@ -192,13 +192,15 @@ impl MizuWindowManager {
         };
         let root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
             dom.root(),
-            &style_rules,
-            &mut taffy,
-            &mut node_to_taffy_id,
-            &empty_cache,
-            default_chrome_url,
-            &style_variants,
-            &initial_env,
+            &mut crate::render::layout_bridge::TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut taffy,
+                node_to_taffy_id: &mut node_to_taffy_id,
+                image_cache: &empty_cache,
+                chrome_url: default_chrome_url,
+                variants: &style_variants,
+                env: &initial_env,
+            },
         )?;
 
         let (network_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
@@ -441,13 +443,15 @@ impl MizuWindowManager {
         };
         let root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
             dom.root(),
-            &style_rules,
-            &mut taffy,
-            &mut node_to_taffy_id,
-            &self.image_cache,
-            &self.chrome_state.url,
-            &style_variants,
-            &env,
+            &mut crate::render::layout_bridge::TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut taffy,
+                node_to_taffy_id: &mut node_to_taffy_id,
+                image_cache: &self.image_cache,
+                chrome_url: &self.chrome_state.url,
+                variants: &style_variants,
+                env: &env,
+            },
         )?;
 
         self.dom = dom;
@@ -545,13 +549,15 @@ impl MizuWindowManager {
         let mut new_node_to_taffy_id = HashMap::new();
         let new_root_taffy_id = crate::render::layout_bridge::build_taffy_tree(
             self.dom.root(),
-            &self.style_rules,
-            &mut new_taffy,
-            &mut new_node_to_taffy_id,
-            &self.image_cache,
-            &self.chrome_state.url,
-            &self.style_variants,
-            &env,
+            &mut crate::render::layout_bridge::TaffyBuildContext {
+                style_rules_map: &self.style_rules,
+                taffy: &mut new_taffy,
+                node_to_taffy_id: &mut new_node_to_taffy_id,
+                image_cache: &self.image_cache,
+                chrome_url: &self.chrome_state.url,
+                variants: &self.style_variants,
+                env: &env,
+            },
         )?;
         self.taffy = new_taffy;
         self.node_to_taffy_id = new_node_to_taffy_id;

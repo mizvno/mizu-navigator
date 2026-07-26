@@ -433,34 +433,32 @@ pub fn translate_style(rules: &StyleRules, viewport: ViewportSize, dir: Resolved
     style
 }
 
-/// Recursively traverses the DOM tree bottom-up to build the Taffy tree layout.
+/// Shared context threaded through the recursive `build_taffy_tree` walk.
 ///
-/// `variants`/`env` resolve ux-6 breakpoint/color-scheme style variants —
-/// pass `&[]` and a default `RenderEnvironment` for callers that don't need
-/// responsive behavior (e.g. tests).
-#[allow(clippy::too_many_arguments)]
+/// `taffy` and `node_to_taffy_id` are the two fields actually mutated, once
+/// per node; everything else is read-only lookup state for the whole build
+/// pass. Mirrors the `PaintContext` pattern already used for the analogous
+/// recursive paint walk (`render::vello_pipeline`).
+pub struct TaffyBuildContext<'a> {
+    pub style_rules_map: &'a HashMap<String, StyleRules>,
+    pub taffy: &'a mut TaffyTree<EgoNodeId>,
+    pub node_to_taffy_id: &'a mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
+    pub image_cache: &'a HashMap<String, AssetSlot>,
+    pub chrome_url: &'a str,
+    /// ux-6 breakpoint/color-scheme style variants. Pass `&[]` for callers
+    /// that don't need responsive behavior (e.g. tests).
+    pub variants: &'a [StyleVariant],
+    pub env: &'a RenderEnvironment,
+}
+
+/// Recursively traverses the DOM tree bottom-up to build the Taffy tree layout.
 pub fn build_taffy_tree(
     node: NodeRef<MizuNode>,
-    style_rules_map: &HashMap<String, StyleRules>,
-    taffy: &mut TaffyTree<EgoNodeId>,
-    node_to_taffy_id: &mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
-    image_cache: &HashMap<String, AssetSlot>,
-    chrome_url: &str,
-    variants: &[StyleVariant],
-    env: &RenderEnvironment,
+    ctx: &mut TaffyBuildContext<'_>,
 ) -> Result<taffy::prelude::NodeId, MizuError> {
     let mut children_ids = Vec::new();
     for child in node.children() {
-        let child_id = build_taffy_tree(
-            child,
-            style_rules_map,
-            taffy,
-            node_to_taffy_id,
-            image_cache,
-            chrome_url,
-            variants,
-            env,
-        )?;
+        let child_id = build_taffy_tree(child, ctx)?;
         children_ids.push(child_id);
     }
 
@@ -469,14 +467,14 @@ pub fn build_taffy_tree(
 
     // 1. Tag styles
     let tag_name = mizu_node.primitive.as_str();
-    if let Some(tag_rules) = style_rules_map.get(tag_name) {
+    if let Some(tag_rules) = ctx.style_rules_map.get(tag_name) {
         merged_rules = merged_rules.merge(tag_rules.clone());
     }
 
     // 2. Class styles
     let class_attr = mizu_node.attributes.get("class").map(String::as_str);
     if let Some(class_attr) = class_attr
-        && let Some(class_rules) = style_rules_map.get(class_attr)
+        && let Some(class_rules) = ctx.style_rules_map.get(class_attr)
     {
         merged_rules = merged_rules.merge(class_rules.clone());
     }
@@ -487,12 +485,12 @@ pub fn build_taffy_tree(
         Some(c) => &[tag_name, c],
         None => &[tag_name],
     };
-    merged_rules = merged_rules.merge(resolve_matching_variants(variants, selectors, env));
+    merged_rules = merged_rules.merge(resolve_matching_variants(ctx.variants, selectors, ctx.env));
 
     // ux-7: resolved once per node via `dir` attribute inheritance (an
     // O(depth) ancestor walk — see `render::bidi`'s doc for the cost class).
     let dir = resolve_direction(node);
-    let mut style = translate_style(&merged_rules, env.viewport, dir);
+    let mut style = translate_style(&merged_rules, ctx.env.viewport, dir);
 
     if mizu_node.primitive == Primitive::Window {
         style.size = Size {
@@ -516,7 +514,7 @@ pub fn build_taffy_tree(
     {
         let abs_url = if src.starts_with("mizu://") {
             src.clone()
-        } else if let Ok(base_uri) = crate::network::uri::MizuUri::parse(chrome_url) {
+        } else if let Ok(base_uri) = crate::network::uri::MizuUri::parse(ctx.chrome_url) {
             let path = if src.starts_with('/') {
                 src.clone()
             } else {
@@ -530,7 +528,7 @@ pub fn build_taffy_tree(
         let mut intr_width = None;
         let mut intr_height = None;
 
-        if let Some(AssetSlot::Ready(cached)) = image_cache.get(&abs_url) {
+        if let Some(AssetSlot::Ready(cached)) = ctx.image_cache.get(&abs_url) {
             intr_width = Some(cached.width() as f32);
             intr_height = Some(cached.height() as f32);
         }
@@ -552,16 +550,16 @@ pub fn build_taffy_tree(
     }
 
     let taffy_id = if children_ids.is_empty() {
-        taffy
+        ctx.taffy
             .new_leaf_with_context(style, node.id())
             .map_err(|e| MizuError::ParseError(format!("Failed to create Taffy node: {e}")))?
     } else {
-        taffy
+        ctx.taffy
             .new_with_children(style, &children_ids)
             .map_err(|e| MizuError::ParseError(format!("Failed to create Taffy node: {e}")))?
     };
 
-    node_to_taffy_id.insert(node.id(), taffy_id);
+    ctx.node_to_taffy_id.insert(node.id(), taffy_id);
     Ok(taffy_id)
 }
 
@@ -621,13 +619,15 @@ mod tests {
         let mut narrow_map = HashMap::new();
         build_taffy_tree(
             dom.root(),
-            &style_rules,
-            &mut narrow_taffy,
-            &mut narrow_map,
-            &image_cache,
-            "mizu://test/index.mizu",
-            &variants,
-            &narrow_env,
+            &mut TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut narrow_taffy,
+                node_to_taffy_id: &mut narrow_map,
+                image_cache: &image_cache,
+                chrome_url: "mizu://test/index.mizu",
+                variants: &variants,
+                env: &narrow_env,
+            },
         )
         .unwrap();
 
@@ -635,13 +635,15 @@ mod tests {
         let mut wide_map = HashMap::new();
         build_taffy_tree(
             dom.root(),
-            &style_rules,
-            &mut wide_taffy,
-            &mut wide_map,
-            &image_cache,
-            "mizu://test/index.mizu",
-            &variants,
-            &wide_env,
+            &mut TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut wide_taffy,
+                node_to_taffy_id: &mut wide_map,
+                image_cache: &image_cache,
+                chrome_url: "mizu://test/index.mizu",
+                variants: &variants,
+                env: &wide_env,
+            },
         )
         .unwrap();
 
@@ -870,13 +872,15 @@ mod tests {
         let mut node_map = HashMap::new();
         build_taffy_tree(
             dom.root(),
-            &style_rules,
-            &mut taffy,
-            &mut node_map,
-            &image_cache,
-            "mizu://test/index.mizu",
-            &variants,
-            &env,
+            &mut TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut taffy,
+                node_to_taffy_id: &mut node_map,
+                image_cache: &image_cache,
+                chrome_url: "mizu://test/index.mizu",
+                variants: &variants,
+                env: &env,
+            },
         )
         .unwrap();
 
