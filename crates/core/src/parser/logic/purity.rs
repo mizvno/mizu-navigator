@@ -19,7 +19,8 @@ use super::ast::{Expr, ExprArena, MizuFunction};
 /// its name here, or it will be incorrectly rejected as effectful
 /// (fail-secure in the wrong direction, but loud — a parse error — not
 /// silent).
-const KNOWN_PURE_BUILTINS: &[&str] = &["filter", "count", "sort"];
+const KNOWN_PURE_BUILTINS: &[&str] =
+    &["filter", "count", "sort", "length", "to_string", "contains", "has_field"];
 
 /// Walks `expr` and returns the name of the first side-effecting function
 /// call found, or `None` if the expression is pure.
