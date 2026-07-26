@@ -192,6 +192,7 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                 &mut new_interner,
                 Some(&new_url_registry),
                 url.starts_with("mizu://"),
+                &logic_fns,
             ) {
                 Ok(dom) => {
                     // Check Static Types (Phase B)

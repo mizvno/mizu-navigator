@@ -72,7 +72,7 @@ fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), mizu::core::errors
     let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions)
         .unwrap_or_default();
     let timers = parse_root_timers(&blocks.logic_block, &mut interner).unwrap_or_default();
-    let dom = parse_layout_with_urls(&blocks.layout_block, &mut interner, Some(&urls), true)
+    let dom = parse_layout_with_urls(&blocks.layout_block, &mut interner, Some(&urls), true, &functions)
         .expect("parse_layout_with_urls");
 
     check_information_flow(&dom, &timers, &functions, &comps, &urls, &interner)

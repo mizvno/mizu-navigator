@@ -197,27 +197,40 @@ would break referential transparency and allow network or storage activity
 proportional to the rendering frame rate.
 
 *Source constructs:* `Expr::FunctionCall` in conditional-class condition
-expressions (`src/parser/layout.rs`).
+expressions (`crates/core/src/parser/layout.rs`).
 
-*Enforcement:* **Parse-time** — `find_effectful_call` in
-`src/parser/logic.rs`.  Uses a **pure-builtins allowlist** (not a denylist):
-any function call whose name is not a user-defined function and not a
-known-pure builtin is conservatively treated as effectful and rejected.
+*Enforcement:* **Parse-time** — `find_side_effect_call` in
+`crates/core/src/parser/logic/purity.rs`.  Uses a **pure-builtins allowlist**
+(`KNOWN_PURE_BUILTINS`, not a denylist): a call whose name is neither a
+user-defined function (looked up against the document's own function table)
+nor a known-pure builtin is conservatively treated as effectful and
+rejected.
 
-*Known-pure builtins:* `filter`, `count`, `sort`, `len`, `to_string`,
-`contains`, `starts_with`, `ends_with`, `replace`, `concat`, `reverse`,
-`json_encode`, `map`, `sort_by`, `validate_path`.
+*Known-pure builtins:* `filter`, `count`, `sort` — the complete set of
+`Expr::FunctionCall`-reachable pure builtins the evaluator
+(`crates/core/src/core/types/eval.rs`) currently implements. (An earlier
+version of this list additionally named `len`, `to_string`, `contains`,
+`starts_with`, `ends_with`, `replace`, `concat`, `reverse`, `json_encode`,
+`map`, `sort_by`, `validate_path` — none of these exist in the evaluator's
+dispatch; that was aspirational/stale documentation, not a description of
+shipped behavior. Re-add a name here only once it is real and confirmed
+pure.)
 
-*Effectful intrinsics* (push to `accumulated_actions` in the evaluator or
-produce `Action` nodes at the parser level): `GET`, `POST`, `PUT`, `DELETE`,
-`QUERY`, `navigate`, `store_local`, `copy_to_clipboard`, `download`,
-`get_system_time`.
+*Effectful builtins rejected by this checker:* `copy_to_clipboard`,
+`store_local`, `download`, `get_system_time` — the complete set of
+`Expr::FunctionCall`-reachable names the evaluator treats as effectful.
+`GET`/`POST`/`PUT`/`DELETE`/`QUERY`/`navigate` are **not** relevant to this
+checker: they parse exclusively as `Action` variants
+(`Action::NetworkCall`/`Action::Navigate`, see `ast.rs`), never as
+`Expr::FunctionCall`, so they cannot syntactically appear inside a
+condition expression at all — P1 only walks `Expr` trees.
 
-*Structural justification:* These names are the evaluator's dispatch keys
-(`src/core/types.rs`).  There is no AST-level structural difference between a
-pure and an effectful `FunctionCall`; the name *is* the structure.  The
-allowlist inverts the maintenance burden: new pure builtins must opt in; new
-effectful builtins are rejected by default (**fail-secure**).
+*Structural justification:* These names are the evaluator's `FunctionCall`
+dispatch keys (`crates/core/src/core/types/eval.rs`).  There is no AST-level
+structural difference between a pure and an effectful `FunctionCall`; the
+name *is* the structure.  The allowlist inverts the maintenance burden: new
+pure builtins must opt in (`KNOWN_PURE_BUILTINS`); new effectful builtins are
+rejected by default (**fail-secure**) without any change needed here.
 
 ---
 

@@ -59,6 +59,7 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
         &mut interner,
         Some(&url_registry),
         true,
+        &logic_fns,
     )?;
 
     check_types(&dom_tree, &root_timers, &logic_fns, &computed_bindings, &interner)?;
