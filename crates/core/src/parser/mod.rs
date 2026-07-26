@@ -58,7 +58,9 @@ pub mod style;
 pub mod urls;
 
 pub use crate::core::types::Symbol;
-pub use layout::{EventBlock, MizuNode, Primitive, parse_layout, parse_layout_with_urls};
+pub use layout::{
+    ConditionalClass, EventBlock, MizuNode, Primitive, parse_layout, parse_layout_with_urls,
+};
 pub use logic::{
     Action, BinOp, Expr, MizuFunction, NetworkMethod, RootTimer, TimerInterval, ValueType,
     evaluate, execute_action, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,

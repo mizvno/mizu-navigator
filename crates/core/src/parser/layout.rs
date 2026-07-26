@@ -17,10 +17,10 @@ use ego_tree::{NodeId, Tree};
 use rustc_hash::FxHashMap;
 
 use crate::core::errors::MizuError;
-use crate::core::types::{StringInterner, Symbol};
+use crate::core::types::{StringInterner, Symbol, Value};
 use crate::parser::logic::{
-    Action, ExprTree, MizuFunction, find_side_effect_call, parse_action_with_urls,
-    parse_expr_standalone,
+    Action, Expr, ExprArena, ExprTree, MizuFunction, find_side_effect_call,
+    parse_action_with_urls, parse_expr_standalone,
 };
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
@@ -130,17 +130,35 @@ pub enum EventBlock {
 
 /// A runtime-evaluated class binding declared as a child line of a node.
 ///
-/// Syntax: `class <name> if <boolean-expr>`
-///
-/// If `condition` evaluates to `true` on a given paint frame, `class_name` is
-/// added to the node's active class set for that frame (after the static base
-/// class).  Multiple conditional classes may be active simultaneously.
+/// Two independent forms share this type because they are declared with the
+/// same `class ...` child-line syntax, but they mean different things at
+/// paint time — see each variant.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ConditionalClass {
-    /// CSS class name to activate when the condition is truthy.
-    pub class_name: String,
-    /// Pure boolean expression evaluated at runtime (no side effects allowed).
-    pub condition: ExprTree,
+pub enum ConditionalClass {
+    /// `class <name> if <boolean-expr>` — a fixed class name, toggled on or
+    /// off. If `condition` evaluates to `true` on a given paint frame,
+    /// `class_name` is added to the node's active class set for that frame
+    /// (after the static base class); otherwise it contributes nothing.
+    Toggle {
+        /// CSS class name to activate when the condition is truthy.
+        class_name: String,
+        /// Pure boolean expression evaluated at runtime (no side effects allowed).
+        condition: ExprTree,
+    },
+    /// `class <condition> ? "<name-a>" : "<name-b>"` (nested ternaries
+    /// allowed in either branch) — always contributes exactly one class
+    /// name; *which* one depends on evaluating `expr`. Every leaf `expr` can
+    /// evaluate to (every branch reachable without passing through a nested
+    /// ternary's own condition) is statically guaranteed to be a string
+    /// literal — enforced at parse time, not just by convention — so
+    /// evaluating this can never itself become an information-flow
+    /// concern: the *set* of possible outputs is fixed and known before the
+    /// document ever runs, only *which one* is chosen varies.
+    Ternary {
+        /// Expression tree whose root is `Expr::IfElse`; every leaf is a
+        /// string literal.
+        expr: ExprTree,
+    },
 }
 
 
@@ -231,6 +249,36 @@ fn is_valid_lang_tag(value: &str) -> bool {
         None => true,
     };
     primary_ok && region_ok
+}
+
+/// Walks `expr`'s value-producing branches (recursing through nested
+/// `Expr::IfElse`'s `then_expr`/`else_expr` — deliberately *not* into any
+/// `condition`, which is allowed to be an arbitrary pure boolean expression)
+/// and returns a description of the first branch found that is not a plain
+/// `Expr::Literal(Value::String(_))`.
+///
+/// This is the load-bearing check that makes a ternary conditional class
+/// safe to add at all: without it, `class expr ? a : b` would let a
+/// document choose a CSS class name from a variable, field access, or
+/// function-call result — an information-flow surface this feature must
+/// not open. Every possible output is required to be a literal the
+/// document author wrote, known in full before the document ever runs;
+/// only *which* literal is chosen varies at runtime.
+fn find_non_literal_string_branch(expr: &Expr, arena: &ExprArena) -> Option<&'static str> {
+    match expr {
+        Expr::Literal(Value::String(_)) => None,
+        Expr::IfElse { then_expr, else_expr, .. } => {
+            find_non_literal_string_branch(&arena[*then_expr], arena)
+                .or_else(|| find_non_literal_string_branch(&arena[*else_expr], arena))
+        }
+        Expr::Literal(_) => Some("a non-string literal"),
+        Expr::Variable(_) => Some("a variable"),
+        Expr::FieldAccess { .. } => Some("a field access"),
+        Expr::FunctionCall { .. } => Some("a function call"),
+        Expr::BinaryOp { .. } => Some("a binary operation"),
+        Expr::Not(_) => Some("a `!` expression"),
+        Expr::Let { .. } => Some("a `let` binding"),
+    }
 }
 
 /// Parses inline attribute key-value pairs (e.g. `type "text" class input`) and inline events.
@@ -692,43 +740,82 @@ pub fn parse_layout_with_urls(
             continue;
         }
 
-        // â”€â”€ Conditional class: `class <name> if <expr>` â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // â”€â”€ Conditional class: `class <name> if <expr>` (toggle) or â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // `class <cond> ? "a" : "b"` (ternary, `if`/`then`/`else` spelling
+        // also accepted since it's the same underlying expression grammar) â”€
         if first_word == "class" {
-            let (class_name, rest2) = split_first_word(rest);
-            if class_name.is_empty() {
+            let (first_tok, rest2) = split_first_word(rest);
+            if first_tok.is_empty() {
                 return Err(MizuError::ParseError(format!(
-                    "line {}: `class` child line is missing the class name",
+                    "line {}: `class` child line is missing the class name or condition",
                     line_idx + 1
                 )));
             }
-            let (if_kw, expr_str) = split_first_word(rest2);
-            if if_kw != "if" {
-                return Err(MizuError::ParseError(format!(
-                    "line {}: conditional class `class {class_name}` is missing the `if` keyword",
-                    line_idx + 1
-                )));
-            }
-            if expr_str.is_empty() {
-                return Err(MizuError::ParseError(format!(
-                    "line {}: conditional class `class {class_name} if` is missing the condition",
-                    line_idx + 1
-                )));
-            }
-            let condition = parse_expr_standalone(expr_str, interner).map_err(|e| {
-                MizuError::ParseError(format!(
-                    "line {}: conditional class expression error: {e}",
-                    line_idx + 1
-                ))
-            })?;
-            if let Some(bad_fn) =
-                find_side_effect_call(condition.root(), &condition.arena, interner, functions)
-            {
-                return Err(MizuError::ParseError(format!(
-                    "line {}: conditional class condition must be pure â€” \
-                     `{bad_fn}` is a side-effecting call",
-                    line_idx + 1
-                )));
-            }
+            let (second_tok, expr_str) = split_first_word(rest2);
+
+            let conditional_class = if second_tok == "if" {
+                // â”€â”€ Toggle form: `class <name> if <expr>` â”€â”€
+                let class_name = first_tok;
+                if expr_str.is_empty() {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: conditional class `class {class_name} if` is missing the condition",
+                        line_idx + 1
+                    )));
+                }
+                let condition = parse_expr_standalone(expr_str, interner).map_err(|e| {
+                    MizuError::ParseError(format!(
+                        "line {}: conditional class expression error: {e}",
+                        line_idx + 1
+                    ))
+                })?;
+                if let Some(bad_fn) =
+                    find_side_effect_call(condition.root(), &condition.arena, interner, functions)
+                {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: conditional class condition must be pure â€” \
+                         `{bad_fn}` is a side-effecting call",
+                        line_idx + 1
+                    )));
+                }
+                ConditionalClass::Toggle {
+                    class_name: class_name.to_string(),
+                    condition,
+                }
+            } else {
+                // â”€â”€ Ternary form: `class <cond> ? "a" : "b"` â”€â”€
+                let expr = parse_expr_standalone(rest, interner).map_err(|e| {
+                    MizuError::ParseError(format!(
+                        "line {}: `class {rest}` is neither a valid `if` toggle nor a \
+                         valid `?:` ternary conditional class: {e}",
+                        line_idx + 1
+                    ))
+                })?;
+                if !matches!(expr.root(), Expr::IfElse { .. }) {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: `class {rest}` is missing the `if` keyword (for a toggle) \
+                         or a `?:` ternary",
+                        line_idx + 1
+                    )));
+                }
+                if let Some(bad_fn) =
+                    find_side_effect_call(expr.root(), &expr.arena, interner, functions)
+                {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: conditional class condition must be pure â€” \
+                         `{bad_fn}` is a side-effecting call",
+                        line_idx + 1
+                    )));
+                }
+                if let Some(bad_branch) = find_non_literal_string_branch(expr.root(), &expr.arena)
+                {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: ternary conditional class `class {rest}` has {bad_branch} \
+                         as a branch; every branch must be a string literal",
+                        line_idx + 1
+                    )));
+                }
+                ConditionalClass::Ternary { expr }
+            };
 
             while let Some(&(stack_indent, _)) = stack.last() {
                 if stack_indent >= indent {
@@ -741,7 +828,7 @@ pub fn parse_layout_with_urls(
                 Some(&(_, id)) => id,
                 None => {
                     return Err(MizuError::ParseError(format!(
-                        "line {}: `class {class_name} if` has no parent node",
+                        "line {}: `class {rest}` has no parent node",
                         line_idx + 1
                     )));
                 }
@@ -755,10 +842,7 @@ pub fn parse_layout_with_urls(
                 })?
                 .value()
                 .conditional_classes
-                .push(ConditionalClass {
-                    class_name: class_name.to_string(),
-                    condition,
-                });
+                .push(conditional_class);
             continue;
         }
 
@@ -944,7 +1028,7 @@ pub fn parse_layout_with_urls(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventBlock, Primitive, parse_layout, parse_layout_with_urls};
+    use super::{ConditionalClass, EventBlock, Primitive, parse_layout, parse_layout_with_urls};
     use crate::core::errors::MizuError;
     use crate::core::types::StringInterner;
     use crate::parser::logic::parse_action;
@@ -1840,7 +1924,10 @@ mod tests {
             Some("base")
         );
         assert_eq!(box_node.value().conditional_classes.len(), 1);
-        assert_eq!(box_node.value().conditional_classes[0].class_name, "active");
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Toggle { class_name, .. } if class_name == "active"
+        ));
     }
 
     #[test]
@@ -1858,11 +1945,14 @@ mod tests {
             .children()
             .find(|n| n.value().primitive == Primitive::Box)
             .unwrap();
-        let cc = &box_node.value().conditional_classes[0];
+        let ConditionalClass::Toggle { condition, .. } = &box_node.value().conditional_classes[0]
+        else {
+            panic!("expected ConditionalClass::Toggle");
+        };
 
         let mut store = VariableStore::with_interner(interner);
         store.set("flag", Value::Bool(true));
-        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(true),
@@ -1885,11 +1975,14 @@ mod tests {
             .children()
             .find(|n| n.value().primitive == Primitive::Box)
             .unwrap();
-        let cc = &box_node.value().conditional_classes[0];
+        let ConditionalClass::Toggle { condition, .. } = &box_node.value().conditional_classes[0]
+        else {
+            panic!("expected ConditionalClass::Toggle");
+        };
 
         let mut store = VariableStore::with_interner(interner);
         store.set("flag", Value::Bool(false));
-        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(false),
@@ -1924,8 +2017,11 @@ mod tests {
         let truthy_count = ccs
             .iter()
             .filter(|cc| {
+                let ConditionalClass::Toggle { condition, .. } = cc else {
+                    return false;
+                };
                 matches!(
-                    evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &fns, 0),
+                    evaluate(condition.root(), &condition.arena, &mut store, &fns, 0),
                     Ok(Value::Bool(true))
                 )
             })
@@ -1949,7 +2045,10 @@ mod tests {
             .children()
             .find(|n| n.value().primitive == Primitive::Box)
             .unwrap();
-        assert_eq!(box_node.value().conditional_classes[0].class_name, "active");
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Toggle { class_name, .. } if class_name == "active"
+        ));
 
         let mut record_map: Vec<(Arc<str>, Value)> =
             Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
@@ -1958,8 +2057,11 @@ mod tests {
         let mut store = VariableStore::with_interner(interner);
         store.set("item", { record_map.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(record_map)) });
 
-        let cc = &box_node.value().conditional_classes[0];
-        let result = evaluate(cc.condition.root(), &cc.condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let ConditionalClass::Toggle { condition, .. } = &box_node.value().conditional_classes[0]
+        else {
+            panic!("expected ConditionalClass::Toggle");
+        };
+        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
         assert_eq!(
             result,
             Value::Bool(true),
@@ -1982,5 +2084,184 @@ mod tests {
             }
             other => panic!("expected ParseError for side-effecting condition, got: {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Ternary-valued conditional classes
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ternary_conditional_class_basic_two_branch() {
+        use crate::core::types::{Value, VariableStore};
+        use crate::parser::logic::evaluate;
+        use rustc_hash::FxHashMap;
+
+        let layout = "doc\n    box\n        class flag ? \"on\" : \"off\"\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        let ConditionalClass::Ternary { expr } = &box_node.value().conditional_classes[0] else {
+            panic!("expected ConditionalClass::Ternary");
+        };
+
+        let mut store = VariableStore::with_interner(interner);
+        store.set("flag", Value::Bool(true));
+        let result = evaluate(expr.root(), &expr.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        assert_eq!(result, Value::String(std::sync::Arc::from("on")));
+
+        store.set("flag", Value::Bool(false));
+        let result = evaluate(expr.root(), &expr.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        assert_eq!(result, Value::String(std::sync::Arc::from("off")));
+    }
+
+    #[test]
+    fn ternary_conditional_class_if_then_else_spelling_also_parses() {
+        let layout = "doc\n    box\n        class if flag then \"on\" else \"off\"\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Ternary { .. }
+        ));
+    }
+
+    #[test]
+    fn ternary_conditional_class_nested_ternary_is_accepted() {
+        let layout =
+            "doc\n    box\n        class a ? \"x\" : b ? \"y\" : \"z\"\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Ternary { .. }
+        ));
+    }
+
+    #[test]
+    fn ternary_conditional_class_rejects_variable_branch() {
+        let layout = "doc\n    box\n        class flag ? name : \"off\"\n";
+        let mut interner = StringInterner::new();
+        let result = parse_layout(layout, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("variable")),
+            "expected ParseError naming the variable branch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ternary_conditional_class_rejects_field_access_branch() {
+        let layout = "doc\n    box\n        class flag ? item.name : \"off\"\n";
+        let mut interner = StringInterner::new();
+        let result = parse_layout(layout, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("field access")),
+            "expected ParseError naming the field-access branch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ternary_conditional_class_rejects_function_call_branch() {
+        // `to_string` is a known-pure builtin (see `KNOWN_PURE_BUILTINS` in
+        // purity.rs), so this exercises the literal-branch check
+        // specifically -- not the separate purity check, which it passes.
+        let layout = "doc\n    box\n        class flag ? to_string(1) : \"off\"\n";
+        let mut interner = StringInterner::new();
+        let result = parse_layout(layout, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("function call")),
+            "expected ParseError naming the function-call branch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ternary_conditional_class_rejects_effectful_condition() {
+        let layout = "doc\n    box\n        class GET(api_alias) ? \"on\" : \"off\"\n";
+        let mut interner = StringInterner::new();
+        let result = parse_layout(layout, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("GET") || m.contains("side-effect") || m.contains("pure")),
+            "expected ParseError naming the side-effecting condition, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_class_toggle_name_literally_if_still_parses() {
+        // Edge case: the class name in the toggle form happens to be the
+        // literal word `if` -- disambiguation keys off the *second* token's
+        // position, not this one, so it must not misfire.
+        let layout = "doc\n    box\n        class if if flag\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Toggle { class_name, .. } if class_name == "if"
+        ));
+    }
+
+    #[test]
+    fn conditional_class_toggle_condition_with_question_mark_in_string_still_parses() {
+        // Edge case: a `?` inside a quoted string within a toggle condition
+        // must not be mistaken for a ternary -- the `if` keyword at the
+        // second token position is checked before any ternary attempt.
+        let layout =
+            "doc\n    box\n        class active if content == \"is this ok?\"\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        assert!(matches!(
+            &box_node.value().conditional_classes[0],
+            ConditionalClass::Toggle { class_name, .. } if class_name == "active"
+        ));
+    }
+
+    #[test]
+    fn conditional_class_three_forms_coexist_and_disambiguate_correctly() {
+        // Realistic neighboring examples: static-toggle, and both ternary
+        // spellings, back to back on sibling nodes.
+        let layout = "doc\n    box\n        class active if flag\n    box\n        class flag ? \"on\" : \"off\"\n    box\n        class if flag then \"on\" else \"off\"\n";
+        let mut interner = StringInterner::new();
+        let tree = parse_layout(layout, &mut interner).unwrap();
+        let mut boxes = tree.root().children().filter(|n| n.value().primitive == Primitive::Box);
+
+        let toggle_box = boxes.next().unwrap();
+        assert!(matches!(
+            &toggle_box.value().conditional_classes[0],
+            ConditionalClass::Toggle { class_name, .. } if class_name == "active"
+        ));
+
+        let ternary_question_box = boxes.next().unwrap();
+        assert!(matches!(
+            &ternary_question_box.value().conditional_classes[0],
+            ConditionalClass::Ternary { .. }
+        ));
+
+        let ternary_ifelse_box = boxes.next().unwrap();
+        assert!(matches!(
+            &ternary_ifelse_box.value().conditional_classes[0],
+            ConditionalClass::Ternary { .. }
+        ));
     }
 }

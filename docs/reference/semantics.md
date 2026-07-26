@@ -454,6 +454,8 @@ The layout tree is a single-root `ego-tree` with `MizuNode` values.  The root mu
 
 `class name if expr` — `expr` must be pure; evaluated on each render frame.  If `true`, the class name is appended to the node's active class set for that frame.
 
+`class expr ? "a" : "b"` (or `class if expr then "a" else "b"`) — a ternary conditional class: always contributes exactly one class name, chosen by evaluating `expr` each render frame.  `expr` must be pure, and every branch it can produce (recursing through nested ternaries, but not into their conditions) must be a string literal — a variable, field access, or function call in a branch position is a `ParseError`, not a runtime concern.
+
 ### Image src resolution
 
 **Source:** `src/parser/layout.rs` — `parse_layout_with_urls`

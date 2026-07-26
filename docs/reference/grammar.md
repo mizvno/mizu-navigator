@@ -338,7 +338,10 @@ bare_token   = non_whitespace_char+ ;
 event_attr   = ( "click" | "submit" ) "->" action ;
 
 conditional_class
-             = "class" SP+ ident SP+ "if" SP+ expr ;
+             = toggle_class | ternary_class ;
+toggle_class = "class" SP+ ident SP+ "if" SP+ expr ;
+ternary_class
+             = "class" SP+ expr ;  (* expr's root must be Expr::IfElse *)
 ```
 
 **Primitives:**
@@ -380,8 +383,22 @@ conditional_class
 - `image src` starting with `file://` is `ParseError` when the document is remote-origin (`is_remote_origin = true`).
   ⚠ **Known gap (MNT-01):** a *plain relative path* (e.g. `image src "assets/logo.png"`, matched by `is_direct_path` — anything containing `.` or `/`) in `image src` is currently accepted **without rejection even for remote-origin documents**, contrary to the design this section previously documented ("relative paths in `image src` → `ParseError` for remote-origin documents"). Only the `file://` scheme is actually blocked for remote origin today (`src/parser/layout.rs`, `parse_layout_with_urls`). This is flagged as a suspected parser bug/incomplete implementation, not a deliberate grammar change — see `walkthrough.md`'s "MNT-01" entry. Do not rely on relative-path rejection for remote-origin documents until this is resolved.
 - `event_attr` (`->`) consumes the rest of the line; trailing layout attributes are `ParseError`.
-- `conditional_class` expressions must be **pure**; effectful calls → `ParseError`.
-- `class` attribute values starting with `.` have the dot stripped.
+- `conditional_class` expressions must be **pure**; effectful calls → `ParseError`. This
+  applies to both forms: `toggle_class`'s `expr`, and `ternary_class`'s condition
+  (including any condition of a nested ternary in a branch).
+- `ternary_class`: disambiguated from `toggle_class` by peeking whether the token
+  right after the would-be class name is exactly `if` — if so, `toggle_class`;
+  otherwise the whole line is parsed as one expression and its root must be
+  `Expr::IfElse` (produced by either the `<cond> ? <then> : <else>` spelling or
+  the `if <cond> then <then> else <else>` spelling — both are accepted, and
+  either may nest inside a branch). Every leaf reachable without crossing into a
+  nested `IfElse`'s own condition (i.e. every `then`/`else` branch, recursively)
+  must be `Expr::Literal(Value::String(_))` — a variable, field access, function
+  call, or any other expression shape in a branch position is `ParseError`. This
+  is the load-bearing constraint that makes the feature safe: the complete set
+  of possible class names is fixed and visible in the source; only *which one*
+  is picked varies at runtime.
+- `class` attribute values (the inline, non-conditional form) starting with `.` → `ParseError` naming the dot-free form.
 - `bind` attribute → `ParseError` (removed).
 - `download -> alias` → `ParseError`; use `click -> download(alias)`.
 - `every <interval>` → `ParseError` (node-local timers removed).

@@ -17,7 +17,7 @@ use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
 use crate::parser::logic::{
     Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, RootTimer, TimerInterval,
 };
-use crate::parser::{EventBlock, MizuNode, StyleRules, UrlRegistry};
+use crate::parser::{ConditionalClass, EventBlock, MizuNode, StyleRules, UrlRegistry};
 use crate::render::inspector::log::{InspectorLog, NetOutcome};
 use crate::render::inspector::{InspectorState, InspectorTab};
 use crate::render::layout_bridge::EachExpansion;
@@ -338,27 +338,52 @@ fn style_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
         // side-effect free; the store clone isolates the instruction budget.
         let mut eval_store = src.store.clone();
         for cc in &node.conditional_classes {
-            let active = crate::parser::logic::evaluate(
-                cc.condition.root(),
-                &cc.condition.arena,
-                &mut eval_store,
-                src.logic_fns,
-                0,
-            );
-            let (status, kind) = match active {
-                Ok(Value::Bool(true)) => ("ON ", RowKind::Good),
-                Ok(_) => ("off", RowKind::Dim),
-                Err(_) => ("err", RowKind::Bad),
-            };
-            rows.push(Row::plain(
-                1,
-                format!(
-                    "[{status}] .{}  if {}",
-                    cc.class_name,
-                    format_expr(cc.condition.root(), &cc.condition.arena, &src.store.interner)
-                ),
-                kind,
-            ));
+            match cc {
+                ConditionalClass::Toggle { class_name, condition } => {
+                    let active = crate::parser::logic::evaluate(
+                        condition.root(),
+                        &condition.arena,
+                        &mut eval_store,
+                        src.logic_fns,
+                        0,
+                    );
+                    let (status, kind) = match active {
+                        Ok(Value::Bool(true)) => ("ON ", RowKind::Good),
+                        Ok(_) => ("off", RowKind::Dim),
+                        Err(_) => ("err", RowKind::Bad),
+                    };
+                    rows.push(Row::plain(
+                        1,
+                        format!(
+                            "[{status}] .{class_name}  if {}",
+                            format_expr(condition.root(), &condition.arena, &src.store.interner)
+                        ),
+                        kind,
+                    ));
+                }
+                ConditionalClass::Ternary { expr } => {
+                    let result = crate::parser::logic::evaluate(
+                        expr.root(),
+                        &expr.arena,
+                        &mut eval_store,
+                        src.logic_fns,
+                        0,
+                    );
+                    let (label, kind) = match result {
+                        Ok(Value::String(s)) => (format!(".{s}"), RowKind::Good),
+                        Ok(_) => ("<non-string result>".to_string(), RowKind::Bad),
+                        Err(_) => ("<error>".to_string(), RowKind::Bad),
+                    };
+                    rows.push(Row::plain(
+                        1,
+                        format!(
+                            "[ternary] {label}  = {}",
+                            format_expr(expr.root(), &expr.arena, &src.store.interner)
+                        ),
+                        kind,
+                    ));
+                }
+            }
         }
     }
 

@@ -34,7 +34,7 @@ use rustc_hash::FxHashMap;
 
 use crate::core::types::{Symbol, Value, VariableStore};
 use crate::parser::logic::MizuFunction;
-use crate::parser::{MizuNode, MizuOverflow, Primitive, StyleRules};
+use crate::parser::{ConditionalClass, MizuNode, MizuOverflow, Primitive, StyleRules};
 use crate::render::layout_bridge::{EachGroupEntries, EachIterationOverrides};
 
 /// Converts a `MizuColor` into a `vello::peniko::Color`.
@@ -178,22 +178,36 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
             ctx.store.state_machine.push_local(*sym, val.clone());
         }
 
-        let is_truthy = {
-            // Split-borrow: state_machine is mutably borrowed for evaluate();
-            // interner is immutably borrowed as a separate field of VariableStore.
-            // Rust allows this because they are distinct struct fields.
-            let sm = &mut ctx.store.state_machine;
-            let interner = &ctx.store.interner;
-            sm.evaluate(cc.condition.root(), 0, &empty_fns, interner, &cc.condition.arena)
-                .map(|v| matches!(v, Value::Bool(true)))
-                .unwrap_or(false)
+        // Split-borrow: state_machine is mutably borrowed for evaluate();
+        // interner is immutably borrowed as a separate field of VariableStore.
+        // Rust allows this because they are distinct struct fields.
+        let resolved_class_name: Option<std::sync::Arc<str>> = match cc {
+            ConditionalClass::Toggle { class_name, condition } => {
+                let sm = &mut ctx.store.state_machine;
+                let interner = &ctx.store.interner;
+                let is_truthy = sm
+                    .evaluate(condition.root(), 0, &empty_fns, interner, &condition.arena)
+                    .map(|v| matches!(v, Value::Bool(true)))
+                    .unwrap_or(false);
+                is_truthy.then(|| std::sync::Arc::from(class_name.as_str()))
+            }
+            ConditionalClass::Ternary { expr } => {
+                let sm = &mut ctx.store.state_machine;
+                let interner = &ctx.store.interner;
+                sm.evaluate(expr.root(), 0, &empty_fns, interner, &expr.arena)
+                    .ok()
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+            }
         };
 
         // Rewind — O(injected_bindings) pops, zero heap allocation.
         ctx.store.state_machine.truncate_locals(frame);
 
-        if is_truthy
-            && let Some(rules) = ctx.style_rules.get(&cc.class_name)
+        if let Some(class_name) = resolved_class_name
+            && let Some(rules) = ctx.style_rules.get(class_name.as_ref())
         {
             extra = extra.merge(rules.clone());
         }
@@ -1693,7 +1707,7 @@ mod tests {
             attributes: Default::default(),
             events: Default::default(),
             iterator_context: None,
-            conditional_classes: vec![ConditionalClass {
+            conditional_classes: vec![ConditionalClass::Toggle {
                 class_name: "active-style".to_string(),
                 // condition: `active` (a Variable reference)
                 condition: ExprTree { arena: cond_arena, root: cond_root },
@@ -1789,6 +1803,101 @@ mod tests {
         );
     }
 
+    /// The test that actually proves the ternary-class feature does what
+    /// it's for: `evaluate_conditional_classes` must resolve a
+    /// `ConditionalClass::Ternary` to whichever branch's style rules match
+    /// the runtime-evaluated class name — not just parse without error.
+    #[test]
+    fn ternary_conditional_class_resolves_to_the_evaluated_branch_style() {
+        use crate::parser::layout::ConditionalClass;
+        use crate::parser::logic::parse_expr_standalone;
+        use crate::core::types::{StringInterner, Value, VariableStore};
+        use crate::parser::{MizuNode, Primitive};
+
+        let mut interner = StringInterner::new();
+        let expr = parse_expr_standalone(r#"flag ? "on" : "off""#, &mut interner).unwrap();
+
+        let node = MizuNode {
+            primitive: Primitive::Box,
+            attributes: Default::default(),
+            events: Default::default(),
+            iterator_context: None,
+            conditional_classes: vec![ConditionalClass::Ternary { expr }],
+        };
+        let tree = ego_tree::Tree::new(node);
+
+        let mut taffy = taffy::TaffyTree::new();
+        let root_taffy = taffy.new_leaf(taffy::style::Style::default()).unwrap();
+        let mut node_to_taffy_id = HashMap::new();
+        node_to_taffy_id.insert(tree.root().id(), root_taffy);
+        taffy
+            .compute_layout(
+                root_taffy,
+                taffy::geometry::Size {
+                    width: taffy::style::AvailableSpace::Definite(800.0),
+                    height: taffy::style::AvailableSpace::Definite(600.0),
+                },
+            )
+            .unwrap();
+
+        let mut style_rules: HashMap<String, StyleRules> = HashMap::new();
+        style_rules.insert("on".to_string(), StyleRules { z_index: 1, ..Default::default() });
+        style_rules.insert("off".to_string(), StyleRules { z_index: 2, ..Default::default() });
+
+        let mut store = VariableStore::with_interner(interner);
+        store.set("flag", Value::Bool(true));
+
+        let mut font_cx = parley::FontContext::new();
+        let mut layout_cx = parley::LayoutContext::new();
+        let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
+        let mut image_cache = HashMap::new();
+        let mut fetching_images = std::collections::HashSet::new();
+        let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let text_layouts = HashMap::new();
+        let empty_each_groups = HashMap::new();
+
+        let mut ctx = PaintContext {
+            tree: &tree,
+            taffy: &taffy,
+            node_to_taffy_id: &node_to_taffy_id,
+            style_rules: &style_rules,
+            style_variants: &[],
+            render_env: crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize { width: 800.0, height: 600.0 },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
+            font_cx: &mut font_cx,
+            layout_cx: &mut layout_cx,
+            transform: vello::kurbo::Affine::IDENTITY,
+            store: &mut store,
+            scroll_offsets: &scroll_offsets,
+            focused_node: None,
+            image_cache: &mut image_cache,
+            fetching_images: &mut fetching_images,
+            network_tx: &network_tx,
+            chrome_url: "mizu://localhost/index.mizu",
+            elapsed_ms: 0,
+            has_animations: false,
+            text_layouts: &text_layouts,
+            item_bindings: HashMap::new(),
+            each_groups: &empty_each_groups,
+            taffy_id_overrides: HashMap::new(),
+        };
+
+        let resolved = evaluate_conditional_classes(tree.root().value(), &mut ctx);
+        assert_eq!(
+            resolved.z_index, 1,
+            "flag=true must resolve the ternary to the \"on\" branch's style rules"
+        );
+
+        ctx.store.set("flag", Value::Bool(false));
+        let resolved = evaluate_conditional_classes(tree.root().value(), &mut ctx);
+        assert_eq!(
+            resolved.z_index, 2,
+            "flag=false must resolve the ternary to the \"off\" branch's style rules"
+        );
+    }
+
     /// Verifies that item_bindings injected via `push_local` shadow global
     /// variables during conditional-class evaluation — the overlay semantics
     /// must be preserved by the push_local/truncate_locals approach.
@@ -1812,7 +1921,7 @@ mod tests {
             attributes: Default::default(),
             events: Default::default(),
             iterator_context: None,
-            conditional_classes: vec![ConditionalClass {
+            conditional_classes: vec![ConditionalClass::Toggle {
                 class_name: "highlight".to_string(),
                 condition: ExprTree { arena: cond_arena, root: cond_root },
             }],
