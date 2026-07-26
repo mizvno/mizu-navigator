@@ -72,6 +72,7 @@ fn role_for(primitive: Primitive) -> Role {
         Primitive::Input => Role::TextInput,
         Primitive::Image => Role::Image,
         Primitive::Form => Role::Form,
+        Primitive::Heading => Role::Heading,
     }
 }
 
@@ -164,6 +165,19 @@ fn build_node(
                 && !placeholder.is_empty()
             {
                 builder.set_name(placeholder.clone());
+            }
+        }
+        Primitive::Heading => {
+            // The parser's `h1`-`h6` match arm only ever writes `"1"`-`"6"`
+            // into this attribute (see `parser::layout::parse_primitive_and_attrs`),
+            // so the parse always succeeds; there is no invalid-level case
+            // to handle.
+            if let Some(level) = mizu_node
+                .attributes
+                .get("level")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                builder.set_hierarchical_level(level);
             }
         }
         _ => {}
@@ -291,6 +305,34 @@ mod tests {
             None,
             "an image with no alt must expose no accessible name"
         );
+    }
+
+    #[test]
+    fn heading_node_gets_heading_role_and_matching_hierarchical_level() {
+        let mut tree = Tree::new(node(Primitive::Doc, &[]));
+        let h1_id = tree
+            .root_mut()
+            .append(node(Primitive::Heading, &[("level", "1")]))
+            .id();
+        let h4_id = tree
+            .root_mut()
+            .append(node(Primitive::Heading, &[("level", "4")]))
+            .id();
+        let mut node_id_to_u32 = HashMap::new();
+        for (i, n) in tree.nodes().enumerate() {
+            node_id_to_u32.insert(n.id(), i as u32);
+        }
+        let store = VariableStore::new();
+        let update = build_a11y_tree(&tree, &node_id_to_u32, None, &store);
+        let by_id: HashMap<AccessNodeId, &AccessNode> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+
+        let h1_node = by_id[&access_id(node_id_to_u32[&h1_id])];
+        assert_eq!(h1_node.role(), Role::Heading);
+        assert_eq!(h1_node.hierarchical_level(), Some(1));
+
+        let h4_node = by_id[&access_id(node_id_to_u32[&h4_id])];
+        assert_eq!(h4_node.role(), Role::Heading);
+        assert_eq!(h4_node.hierarchical_level(), Some(4));
     }
 
     #[test]
