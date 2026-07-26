@@ -91,6 +91,23 @@ pub struct MizuNode {
     pub conditional_classes: Vec<ConditionalClass>,
 }
 
+impl MizuNode {
+    /// The tag name a bare (undotted) style selector matches this node
+    /// against. Identical to `self.primitive.as_str()` for every primitive
+    /// except `Heading`: `h1`-`h6` are six spellings of that one variant, so
+    /// they can't be told apart by `as_str()` alone -- this reads the parsed
+    /// `level` attribute back out to reconstruct the specific `h1`..`h6` key
+    /// a style selector was written against.
+    pub fn style_tag_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.primitive == Primitive::Heading {
+            let level = self.attributes.get("level").map(String::as_str).unwrap_or("1");
+            std::borrow::Cow::Owned(format!("h{level}"))
+        } else {
+            std::borrow::Cow::Borrowed(self.primitive.as_str())
+        }
+    }
+}
+
 /// A behavioral event block attached to a node.
 ///
 /// Note: there is intentionally no node-local timer. Recurring behaviour is

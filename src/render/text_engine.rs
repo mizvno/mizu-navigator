@@ -144,8 +144,8 @@ pub fn calculate_node_text(
     let mut text_color = vello::peniko::Color::BLACK;
 
     let mut merged = StyleRules::default();
-    let tag_name = mizu_node.primitive.as_str();
-    if let Some(tag_rules) = ctx.style_rules.get(tag_name) {
+    let tag_name = mizu_node.style_tag_name();
+    if let Some(tag_rules) = ctx.style_rules.get(tag_name.as_ref()) {
         merged = merged.merge(tag_rules.clone());
     }
     let class_attr = mizu_node.attributes.get("class").map(String::as_str);
@@ -154,15 +154,27 @@ pub fn calculate_node_text(
     {
         merged = merged.merge(rules.clone());
     }
-    // ux-6: breakpoint/color-scheme variants, applied last (after both
+    // Id styles — highest specificity, applied after tag and class (stored
+    // `#`-prefixed in the same rules map, so it can't collide with a
+    // same-named class or tag).
+    let id_key = mizu_node.attributes.get("id").map(|id| format!("#{id}"));
+    if let Some(ref id_key) = id_key
+        && let Some(rules) = ctx.style_rules.get(id_key.as_str())
+    {
+        merged = merged.merge(rules.clone());
+    }
+    // ux-6: breakpoint/color-scheme variants, applied last (after all three
     // bases), in source declaration order — see docs/design/responsive.md.
-    let variant_selectors: &[&str] = match class_attr {
-        Some(c) => &[tag_name, c],
-        None => &[tag_name],
-    };
+    let mut variant_selectors: Vec<&str> = vec![tag_name.as_ref()];
+    if let Some(c) = class_attr {
+        variant_selectors.push(c);
+    }
+    if let Some(ref k) = id_key {
+        variant_selectors.push(k.as_str());
+    }
     merged = merged.merge(crate::render::responsive::resolve_matching_variants(
         ctx.style_variants,
-        variant_selectors,
+        &variant_selectors,
         ctx.render_env,
     ));
 

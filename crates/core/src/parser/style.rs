@@ -598,10 +598,21 @@ pub fn parse_style_with_variants(
                         "line {line_num}: class name cannot be empty"
                     )));
                 }
+            } else if let Some(stripped) = selector_name.strip_prefix('#') {
+                if stripped.is_empty() {
+                    return Err(MizuError::ParseError(format!(
+                        "line {line_num}: id name cannot be empty"
+                    )));
+                }
+                // Kept `#`-prefixed in the stored key (unlike class, which
+                // strips its `.`) so an id selector can never collide with a
+                // class or tag of the same bare name in the shared rules map
+                // -- `#` is not a legal character in either.
             } else {
                 let is_valid_tag = matches!(
                     selector_name.to_lowercase().as_str(),
-                    "doc" | "box" | "text" | "button" | "input" | "image" | "markdown"
+                    "doc" | "box" | "text" | "button" | "input" | "image" | "markdown" | "form"
+                        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
                 );
                 if !is_valid_tag {
                     return Err(MizuError::ParseError(format!(
@@ -1751,6 +1762,53 @@ mod tests {
             matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("name")),
             "expected class-name error, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn id_selector_parses_and_is_stored_hash_prefixed() {
+        let block = "    #header\n        background #1a2b3c\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(
+            rules["#header"].background,
+            Some(MizuBackground::Solid(MizuColor::rgb(0x1A, 0x2B, 0x3C))),
+            "an id selector must be stored under its `#`-prefixed key"
+        );
+    }
+
+    #[test]
+    fn error_empty_id_name() {
+        let block = "    #\n        padding 10\n";
+        let result = parse_style(block);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("name")),
+            "expected id-name error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn id_and_class_of_the_same_bare_name_do_not_collide() {
+        let block = "    .card\n        background #111111\n    #card\n        background #222222\n";
+        let rules = parse_style(block).unwrap();
+        assert_eq!(
+            rules["card"].background,
+            Some(MizuBackground::Solid(MizuColor::rgb(0x11, 0x11, 0x11)))
+        );
+        assert_eq!(
+            rules["#card"].background,
+            Some(MizuBackground::Solid(MizuColor::rgb(0x22, 0x22, 0x22)))
+        );
+    }
+
+    #[test]
+    fn form_and_headings_are_valid_bare_tag_selectors() {
+        for tag in ["form", "h1", "h2", "h3", "h4", "h5", "h6"] {
+            let block = format!("    {tag}\n        padding 10\n");
+            let result = parse_style(&block);
+            assert!(
+                result.is_ok(),
+                "`{tag}` must be a valid bare tag selector, got: {result:?}"
+            );
+        }
     }
 
     #[test]

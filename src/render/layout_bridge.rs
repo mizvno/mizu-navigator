@@ -472,8 +472,8 @@ pub fn build_taffy_tree(
     let mut merged_rules = StyleRules::default();
 
     // 1. Tag styles
-    let tag_name = mizu_node.primitive.as_str();
-    if let Some(tag_rules) = ctx.style_rules_map.get(tag_name) {
+    let tag_name = mizu_node.style_tag_name();
+    if let Some(tag_rules) = ctx.style_rules_map.get(tag_name.as_ref()) {
         merged_rules = merged_rules.merge(tag_rules.clone());
     }
 
@@ -485,13 +485,26 @@ pub fn build_taffy_tree(
         merged_rules = merged_rules.merge(class_rules.clone());
     }
 
-    // 3. Breakpoint / color-scheme variants (ux-6) — applied last, after both
-    // bases, in source declaration order (see docs/design/responsive.md).
-    let selectors: &[&str] = match class_attr {
-        Some(c) => &[tag_name, c],
-        None => &[tag_name],
-    };
-    merged_rules = merged_rules.merge(resolve_matching_variants(ctx.variants, selectors, ctx.env));
+    // 3. Id styles — highest specificity, applied after tag and class (an
+    // id selector is stored `#`-prefixed in the same rules map, so it can
+    // never collide with a same-named class or tag).
+    let id_key = mizu_node.attributes.get("id").map(|id| format!("#{id}"));
+    if let Some(ref id_key) = id_key
+        && let Some(id_rules) = ctx.style_rules_map.get(id_key.as_str())
+    {
+        merged_rules = merged_rules.merge(id_rules.clone());
+    }
+
+    // 4. Breakpoint / color-scheme variants (ux-6) — applied last, after all
+    // three bases, in source declaration order (see docs/design/responsive.md).
+    let mut selectors: Vec<&str> = vec![tag_name.as_ref()];
+    if let Some(c) = class_attr {
+        selectors.push(c);
+    }
+    if let Some(ref k) = id_key {
+        selectors.push(k.as_str());
+    }
+    merged_rules = merged_rules.merge(resolve_matching_variants(ctx.variants, &selectors, ctx.env));
 
     // ux-7: resolved once per node via `dir` attribute inheritance (an
     // O(depth) ancestor walk — see `render::bidi`'s doc for the cost class).
@@ -897,6 +910,75 @@ mod tests {
             resolved_style.flex_direction,
             FlexDirection::RowReverse,
             "the root doc's dir=\"rtl\" must inherit down to the row box and mirror it"
+        );
+    }
+
+    #[test]
+    fn id_selector_wins_over_class_which_wins_over_tag() {
+        let style = r"
+    box
+        width 100
+    .card
+        width 200
+    #hero
+        width 300
+";
+        let (style_rules, variants) = parse_style_with_variants(style).unwrap();
+        let mut interner = StringInterner::new();
+        let dom = parse_layout(
+            "doc\n    box class card id hero\n    box class card\n    box\n",
+            &mut interner,
+        )
+        .unwrap();
+        let image_cache = HashMap::new();
+        let env = RenderEnvironment {
+            viewport: ViewportSize {
+                width: 800.0,
+                height: 600.0,
+            },
+            color_scheme: ColorScheme::Dark,
+        };
+
+        let mut taffy = TaffyTree::new();
+        let mut node_map = HashMap::new();
+        build_taffy_tree(
+            dom.root(),
+            &mut TaffyBuildContext {
+                style_rules_map: &style_rules,
+                taffy: &mut taffy,
+                node_to_taffy_id: &mut node_map,
+                image_cache: &image_cache,
+                chrome_url: "mizu://test/index.mizu",
+                variants: &variants,
+                env: &env,
+            },
+        )
+        .unwrap();
+
+        let mut children = dom.root().children();
+        let id_and_class_box = children.next().unwrap().id();
+        let class_only_box = children.next().unwrap().id();
+        let tag_only_box = children.next().unwrap().id();
+
+        let width_of = |id: EgoNodeId| {
+            let taffy_id = *node_map.get(&id).unwrap();
+            taffy.style(taffy_id).unwrap().size.width
+        };
+
+        assert_eq!(
+            width_of(id_and_class_box),
+            taffy::style::Dimension::Length(300.0),
+            "an id selector must win over a class selector on the same node"
+        );
+        assert_eq!(
+            width_of(class_only_box),
+            taffy::style::Dimension::Length(200.0),
+            "a class selector must win over a tag selector on the same node"
+        );
+        assert_eq!(
+            width_of(tag_only_box),
+            taffy::style::Dimension::Length(100.0),
+            "with neither class nor id, the tag selector applies"
         );
     }
 }
