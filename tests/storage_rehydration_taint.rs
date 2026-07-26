@@ -28,7 +28,9 @@ use mizu::core::storage::{ValidatedDomain, StorageEngine, read_storage};
 use mizu::core::types::{StringInterner, Symbol, Value, StateMachine};
 use mizu::parser::flow::check_information_flow;
 use mizu::parser::layout::parse_layout_with_urls;
-use mizu::parser::logic::{parse_computed_with_functions, parse_logic, parse_root_timers, Expr};
+use mizu::parser::logic::{
+    ExprArena, parse_computed_with_functions, parse_logic, parse_root_timers, Expr,
+};
 use mizu::parser::splitter::split_source_with_origin;
 use mizu::parser::urls::parse_urls;
 use mizu::parser::Origin;
@@ -122,14 +124,17 @@ fn storage_rehydration_taint_end_to_end() {
     // like calling any other undeclared function.
     let mut interner = StringInterner::new();
     let read_local_sym: Symbol = interner.get_or_intern("read_local");
-    let key_arg = Expr::Literal(Value::from("saved"));
+    let mut arena = ExprArena::new();
+    let key_arg = arena.alloc(Expr::Literal(Value::from("saved")));
+    let (args_start, args_len) = arena.push_args(&[key_arg]).expect("push_args");
     let call = Expr::FunctionCall {
         name: read_local_sym,
-        args: vec![key_arg],
+        args_start,
+        args_len,
     };
     let mut machine = StateMachine::new();
     let no_functions = Default::default();
-    let result = machine.evaluate(&call, 0, &no_functions, &interner);
+    let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);
     assert!(
         result.is_err(),
         "a document must not be able to name any function that reads storage back"
