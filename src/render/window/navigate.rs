@@ -10,7 +10,7 @@ use crate::render::security::CapabilityPolicy;
 
 use super::AssetSlot;
 use super::history::HistoryEntry;
-use super::manager::{MAX_REDIRECTS, MizuWindowManager};
+use super::manager::{MAX_REDIRECTS, MizuWindowManager, ReloadedDocument};
 
 /// Resolves and validates a navigation URL given the current document's URL.
 ///
@@ -226,15 +226,15 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                     }
 
                     manager.url_registry = new_url_registry;
-                    if let Err(e) = manager.reload_document(
+                    if let Err(e) = manager.reload_document(ReloadedDocument {
                         dom,
                         style_rules,
                         style_variants,
                         logic_fns,
-                        new_interner,
-                        new_computed,
-                        new_root_timers,
-                    ) {
+                        interner: new_interner,
+                        computed_bindings: new_computed,
+                        root_timers: new_root_timers,
+                    }) {
                         tracing::error!(error = ?e, "document reload error");
                     } else {
                         tracing::debug!("document reloaded");

@@ -161,6 +161,29 @@ pub struct MizuWindowManager {
     pub preferences: UserPreferences,
 }
 
+/// A freshly parsed document to replace the currently loaded one, passed to
+/// [`MizuWindowManager::reload_document`]. Replaces that method's prior
+/// 7-parameter positional argument list; shaped like `event_loop`'s
+/// `InitialDocument` (the initial-load equivalent) minus the two fields
+/// (`url_registry`, `initial_url`) the navigation caller already applies to
+/// the manager separately before calling `reload_document`.
+pub struct ReloadedDocument {
+    /// The newly parsed DOM tree.
+    pub dom: Tree<MizuNode>,
+    /// Tag/class style rules from the new document's `style` block.
+    pub style_rules: HashMap<String, StyleRules>,
+    /// Breakpoint/color-scheme style variants (ux-6) for the new document.
+    pub style_variants: Vec<StyleVariant>,
+    /// The new document's declared `logic` functions.
+    pub logic_fns: FxHashMap<Symbol, MizuFunction>,
+    /// The string interner for the new document (replaces the old one).
+    pub interner: StringInterner,
+    /// The new document's `comp`-declared computed/derived bindings.
+    pub computed_bindings: Vec<ComputedBinding>,
+    /// The new document's declared root-scope `timer` blocks.
+    pub root_timers: Vec<RootTimer>,
+}
+
 impl MizuWindowManager {
     /// Creates a new manager by compiling the DOM styles into Taffy layout components.
     ///
@@ -419,17 +442,17 @@ impl MizuWindowManager {
     }
 
     /// Reloads the document completely, resetting layout and logic state.
-    #[allow(clippy::too_many_arguments)]
-    pub fn reload_document(
-        &mut self,
-        dom: Tree<MizuNode>,
-        style_rules: HashMap<String, StyleRules>,
-        style_variants: Vec<StyleVariant>,
-        logic_fns: FxHashMap<Symbol, MizuFunction>,
-        interner: StringInterner,
-        computed_bindings: Vec<ComputedBinding>,
-        root_timers: Vec<RootTimer>,
-    ) -> Result<(), MizuError> {
+    pub fn reload_document(&mut self, doc: ReloadedDocument) -> Result<(), MizuError> {
+        let ReloadedDocument {
+            dom,
+            style_rules,
+            style_variants,
+            logic_fns,
+            interner,
+            computed_bindings,
+            root_timers,
+        } = doc;
+
         self.root_timers = root_timers;
         // Old node ids die with the old tree — drop inspector selection state.
         self.inspector.reset_document_state();
