@@ -531,7 +531,24 @@ impl MizuWindowManager {
     }
 
     /// Recomputes the entire Taffy layout relative to the newly requested viewport boundary.
+    ///
+    /// Equivalent to `resize_viewport_with_dirty_lists(width, height, None)`: every
+    /// `Each` block is fully rebuilt. Use this for physical window resizes and
+    /// inspector toggle, where the `TaffyTree` is recreated from scratch.
     pub fn resize_viewport(&mut self, width: f32, height: f32) -> Result<(), MizuError> {
+        self.resize_viewport_with_dirty_lists(width, height, None)
+    }
+
+    /// Inner implementation of viewport recomputation. `dirty_list_names`
+    /// controls whether `expand_each_nodes` does a full rebuild (`None`) or
+    /// only rebuilds the `Each` blocks whose backing list variables are in the
+    /// provided set (`Some(set)`). See [`expand_each_nodes`] for the contract.
+    pub fn resize_viewport_with_dirty_lists(
+        &mut self,
+        width: f32,
+        height: f32,
+        dirty_list_names: Option<std::collections::HashSet<String>>,
+    ) -> Result<(), MizuError> {
         if width <= 0.0 || height <= 0.0 {
             return Ok(());
         }
@@ -613,6 +630,7 @@ impl MizuWindowManager {
             &mut self.taffy,
             &self.node_to_taffy_id,
             &self.each_expansion,
+            dirty_list_names.as_ref(), // None = full rebuild; Some(set) = granular
         )?;
 
         for (node_id, &new_count) in &new_expansion.truncated {

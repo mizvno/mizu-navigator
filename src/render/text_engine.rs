@@ -47,6 +47,7 @@ use crate::core::types::VariableStore;
 use crate::parser::{MizuFontFamily, MizuFontStyle, MizuNode, MizuTextAlign, Primitive, StyleRules};
 use crate::render::vello_pipeline::to_vello_color;
 use ego_tree::{NodeId as EgoNodeId, Tree};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Extracts placeholder variable names within curly braces `{name}` from a string.
@@ -146,22 +147,34 @@ pub fn calculate_node_text(
     let mut merged = StyleRules::default();
     let tag_name = mizu_node.style_tag_name();
     if let Some(tag_rules) = ctx.style_rules.get(tag_name.as_ref()) {
-        merged = merged.merge(tag_rules.clone());
+        // merge_from(&ref) clones only the fields that actually win rather
+        // than the entire StyleRules struct (avoids 3× full-clone in the
+        // common tag + class + id cascade — see style.rs::merge_from).
+        merged.merge_from(tag_rules);
     }
     let class_attr = mizu_node.attributes.get("class").map(String::as_str);
     if let Some(class_attr) = class_attr
         && let Some(rules) = ctx.style_rules.get(class_attr)
     {
-        merged = merged.merge(rules.clone());
+        merged.merge_from(rules);
     }
     // Id styles — highest specificity, applied after tag and class (stored
     // `#`-prefixed in the same rules map, so it can't collide with a
     // same-named class or tag).
-    let id_key = mizu_node.attributes.get("id").map(|id| format!("#{id}"));
+    //
+    // Build the "#id" lookup key on a small heap String whose capacity is
+    // pre-sized to id.len()+1 — avoids the generic format!("#{id}") which
+    // always allocates a brand-new buffer of unknown size.
+    let id_key: Option<String> = mizu_node.attributes.get("id").map(|id| {
+        let mut k = String::with_capacity(id.len() + 1);
+        k.push('#');
+        k.push_str(id);
+        k
+    });
     if let Some(ref id_key) = id_key
         && let Some(rules) = ctx.style_rules.get(id_key.as_str())
     {
-        merged = merged.merge(rules.clone());
+        merged.merge_from(rules);
     }
     // ux-6: breakpoint/color-scheme variants, applied last (after all three
     // bases), in source declaration order — see docs/design/responsive.md.
@@ -172,7 +185,7 @@ pub fn calculate_node_text(
     if let Some(ref k) = id_key {
         variant_selectors.push(k.as_str());
     }
-    merged = merged.merge(crate::render::responsive::resolve_matching_variants(
+    merged.merge_from(&crate::render::responsive::resolve_matching_variants(
         ctx.style_variants,
         &variant_selectors,
         ctx.render_env,
@@ -189,25 +202,45 @@ pub fn calculate_node_text(
         text_color = vello::peniko::Color::rgba8(text_color.r, text_color.g, text_color.b, 120);
     }
 
-    let mut text_to_draw = if mizu_node.primitive == Primitive::Input {
-        raw_text
-    } else {
-        ctx.store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
-            MizuError::BindingNotFound(name) => format!("{{missing: {}}}", name),
-            _ => format!("{{error: {}}}", e),
-        })
-    };
-
+    let interpolated: String;
     // ux-7: resolved once per node via `dir` attribute inheritance.
     let dir = crate::render::bidi::resolve_direction(node_ref);
+
+    // Build `text_to_draw` as a `Cow<'_, str>` so that:
+    //  * Nodes without a bidi-mark prepend pay zero allocation (Borrowed).
+    //  * Nodes that need the mark allocate exactly one String of the right
+    //    capacity instead of the old `insert(0, mark)` which shifted O(N)
+    //    bytes in an already-allocated buffer.
     // An explicit `dir="ltr"`/`dir="rtl"` prepends a zero-width strong mark
     // so parley's own (always-running) bidi auto-detection resolves to the
     // declared direction instead of whatever the text's first strong
     // character would otherwise imply — parley 0.10 has no public base-
     // direction override; see docs/design/bidi.md and render::bidi's doc.
-    if let Some(mark) = dir.prepend_mark() {
-        text_to_draw.insert(0, mark);
-    }
+    let text_to_draw: Cow<'_, str> = if mizu_node.primitive == Primitive::Input {
+        match dir.prepend_mark() {
+            Some(mark) => {
+                let mut s = String::with_capacity(raw_text.len() + mark.len_utf8());
+                s.push(mark);
+                s.push_str(&raw_text);
+                Cow::Owned(s)
+            }
+            None => Cow::Owned(raw_text),
+        }
+    } else {
+        interpolated = ctx.store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
+            MizuError::BindingNotFound(name) => format!("{{missing: {}}}", name),
+            _ => format!("{{error: {}}}", e),
+        });
+        match dir.prepend_mark() {
+            Some(mark) => {
+                let mut s = String::with_capacity(interpolated.len() + mark.len_utf8());
+                s.push(mark);
+                s.push_str(&interpolated);
+                Cow::Owned(s)
+            }
+            None => Cow::Borrowed(interpolated.as_str()),
+        }
+    };
 
     let mut builder = ctx.layout_cx.ranged_builder(ctx.font_cx, &text_to_draw, 1.0, true);
 

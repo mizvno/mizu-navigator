@@ -157,7 +157,7 @@ pub enum MizuOverflow {
 ///   chrome bar for `vh`) rather than the parent. Resolved in
 ///   `render::layout_bridge` against the current window size — see
 ///   `docs/design/responsive.md`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MizuDimension {
     /// A fixed pixel value.
     Pixels(f32),
@@ -364,6 +364,44 @@ pub struct StyleRules {
 }
 
 impl StyleRules {
+    /// Merges a borrowed set of rules into this one. `other` rules take
+    /// precedence (e.g. class styles overriding tag styles).
+    ///
+    /// Prefer this over [`Self::merge`] when the caller holds a reference to
+    /// the incoming rules (e.g. a `HashMap` lookup) — it clones only the
+    /// individual fields that actually win, rather than the entire struct.
+    pub fn merge_from(&mut self, other: &Self) {
+        if other.width.is_some() { self.width = other.width; }
+        if other.height.is_some() { self.height = other.height; }
+        if other.padding.is_some() { self.padding = other.padding; }
+        if other.margin.is_some() { self.margin = other.margin; }
+        if other.gap.is_some() { self.gap = other.gap; }
+        if other.margin_inline_start.is_some() { self.margin_inline_start = other.margin_inline_start; }
+        if other.margin_inline_end.is_some() { self.margin_inline_end = other.margin_inline_end; }
+        if other.padding_inline_start.is_some() { self.padding_inline_start = other.padding_inline_start; }
+        if other.padding_inline_end.is_some() { self.padding_inline_end = other.padding_inline_end; }
+        if other.flex_direction.is_some() { self.flex_direction = other.flex_direction; }
+        if other.justify.is_some() { self.justify = other.justify; }
+        if other.align.is_some() { self.align = other.align; }
+        if other.background.is_some() { self.background = other.background.clone(); }
+        if other.background_image.is_some() { self.background_image = other.background_image.clone(); }
+        if other.background_size.is_some() { self.background_size = other.background_size; }
+        if other.color.is_some() { self.color = other.color.clone(); }
+        if other.font_size.is_some() { self.font_size = other.font_size; }
+        if other.border_radius.is_some() { self.border_radius = other.border_radius; }
+        if other.border_width.is_some() { self.border_width = other.border_width; }
+        if other.border_color.is_some() { self.border_color = other.border_color.clone(); }
+        if other.font_family.is_some() { self.font_family = other.font_family; }
+        if other.font_weight.is_some() { self.font_weight = other.font_weight; }
+        if other.font_style.is_some() { self.font_style = other.font_style; }
+        if other.text_align.is_some() { self.text_align = other.text_align; }
+        if other.line_height.is_some() { self.line_height = other.line_height; }
+        if other.underline.is_some() { self.underline = other.underline; }
+        if other.overflow != MizuOverflow::Visible { self.overflow = other.overflow; }
+        if other.z_index != 0 { self.z_index = other.z_index; }
+        if other.display.is_some() { self.display = other.display; }
+    }
+
     /// Merges another set of rules into this one. `other` rules take precedence
     /// (e.g. class styles overriding tag styles).
     pub fn merge(mut self, other: Self) -> Self {

@@ -1348,6 +1348,7 @@ mod tests {
             &mut taffy,
             &node_to_taffy_id,
             &EachExpansion::default(),
+            None, // full rebuild in tests
         )
         .unwrap();
 
@@ -1510,6 +1511,7 @@ mod tests {
             &mut taffy,
             &node_to_taffy_id,
             &EachExpansion::default(),
+            None, // full rebuild in tests
         )
         .unwrap();
 

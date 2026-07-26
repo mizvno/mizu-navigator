@@ -1287,6 +1287,26 @@ fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, muta
     let mut layout_dirty = manager.typing_layout_dirty;
     manager.typing_layout_dirty = false;
 
+    // Resolve mutated symbol names for the Each-granularity check below.
+    // Only allocate if there are actually mutated symbols; the common idle
+    // case pays zero cost.
+    let mut dirty_list_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sym in &mutated_symbols {
+        // Check if any Each node's backing list variable matches this symbol.
+        if let Some(name) = manager.store.interner.resolve(*sym) {
+            for node in manager.dom.nodes() {
+                if node.value().primitive == crate::parser::Primitive::Each {
+                    if let Some((_, list_name)) = &node.value().iterator_context {
+                        if list_name == name {
+                            dirty_list_names.insert(list_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for sym in mutated_symbols {
         if let Some(nodes) = manager.dependency_index.get(&sym) {
             for &node_id in nodes {
@@ -1350,7 +1370,14 @@ fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, muta
         let physical_size = window.inner_size();
         let logical_width = physical_size.width as f32 / window.scale_factor() as f32;
         let logical_height = physical_size.height as f32 / window.scale_factor() as f32;
-        if let Err(e) = manager.resize_viewport(logical_width, logical_height) {
+        // Pass the set of dirty list names so resize_viewport → expand_each_nodes
+        // only rebuilds the affected Each blocks instead of all of them.
+        let dirty_lists = if dirty_list_names.is_empty() {
+            None
+        } else {
+            Some(dirty_list_names)
+        };
+        if let Err(e) = manager.resize_viewport_with_dirty_lists(logical_width, logical_height, dirty_lists) {
             tracing::error!("layout recalculation failed after state update: {e}");
         }
     }

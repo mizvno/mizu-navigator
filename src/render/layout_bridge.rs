@@ -66,29 +66,117 @@ pub struct EachExpansion {
 /// so that Taffy computes the expanded positions.
 ///
 /// `prev` is the expansion from the previous frame; its synthetic nodes are
-/// restored / removed before the new expansion is built.
+/// restored / removed before the new expansion is built **for the dirty
+/// blocks only** — see `dirty_list_names` below.
+///
+/// `dirty_list_names` controls granular invalidation:
+///
+/// * `None` — full rebuild: tear down *all* previous synthetic nodes and
+///   re-expand every `Each` block from scratch. Use this after
+///   `build_taffy_tree` creates a brand-new `TaffyTree` (e.g. on a window
+///   resize), where the old synthetic IDs no longer exist.
+/// * `Some(set)` — partial rebuild: only the `Each` blocks whose backing
+///   list variable name is in `set` are torn down and re-expanded; all other
+///   blocks are carried forward from `prev` as-is. Use this after a store
+///   mutation so that unaffected lists pay zero Taffy allocation cost.
 pub fn expand_each_nodes(
     dom: &Tree<MizuNode>,
     store: &VariableStore,
     taffy: &mut TaffyTree<EgoNodeId>,
     node_to_taffy_id: &HashMap<EgoNodeId, taffy::prelude::NodeId>,
     prev: &EachExpansion,
+    dirty_list_names: Option<&std::collections::HashSet<String>>,
 ) -> Result<EachExpansion, MizuError> {
     // ── Step 1: restore the previous expansion ────────────────────────────
-    // Put the original template nodes back as Each's Taffy children, then
-    // free every synthetic node from the arena.
+    // When `dirty_list_names` is `Some(set)`, only restore (and free) the
+    // synthetic nodes belonging to the dirty blocks; the rest stay in place.
+    // When `None` (full rebuild), restore everything — old IDs are stale.
     for (&each_dom_id, orig_children) in &prev.original_children {
-        if let Some(&each_taffy_id) = node_to_taffy_id.get(&each_dom_id) {
-            let _ = taffy.set_children(each_taffy_id, orig_children);
+        let should_rebuild = dirty_list_names
+            .map(|set| {
+                // Look up this Each node's list_name to decide whether it's dirty.
+                dom.get(each_dom_id)
+                    .and_then(|n| n.value().iterator_context.as_ref())
+                    .map(|(_, name)| set.contains(name))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true); // None = full rebuild, always restore
+
+        if should_rebuild {
+            if let Some(&each_taffy_id) = node_to_taffy_id.get(&each_dom_id) {
+                let _ = taffy.set_children(each_taffy_id, orig_children);
+            }
         }
     }
-    for &synth_id in &prev.all_synthetic_ids {
-        let _ = taffy.remove(synth_id);
+    // Free synthetic nodes only for the dirty (or all, on full rebuild) blocks.
+    if let Some(set) = dirty_list_names {
+        // `all_synthetic_ids` is a flat list with no per-block grouping, so we
+        // build a set of the IDs that belong to dirty blocks by iterating
+        // `prev.groups`, then free only those.
+        let mut dirty_synth_ids: std::collections::HashSet<taffy::prelude::NodeId> =
+            std::collections::HashSet::new();
+        for (each_dom_id, groups) in &prev.groups {
+            let is_dirty = dom
+                .get(*each_dom_id)
+                .and_then(|n| n.value().iterator_context.as_ref())
+                .map(|(_, name)| set.contains(name))
+                .unwrap_or(false);
+            if is_dirty {
+                for (row_id, _) in groups {
+                    dirty_synth_ids.insert(*row_id);
+                }
+            }
+        }
+        for &synth_id in &prev.all_synthetic_ids {
+            if dirty_synth_ids.contains(&synth_id) {
+                let _ = taffy.remove(synth_id);
+            }
+        }
+    } else {
+        // Full rebuild: free every synthetic node unconditionally.
+        for &synth_id in &prev.all_synthetic_ids {
+            let _ = taffy.remove(synth_id);
+        }
     }
 
     // ── Step 2: build the new expansion ───────────────────────────────────
-    let mut expansion = EachExpansion::default();
-    let mut remaining_budget = *MAX_SYNTHETIC_LAYOUT_NODES;
+    // Start from a copy of the previous expansion for the blocks we are NOT
+    // rebuilding (only meaningful when dirty_list_names is Some).
+    let mut expansion = if let Some(set) = dirty_list_names {
+        // Carry forward everything from prev, then overwrite the dirty blocks.
+        let mut carried = EachExpansion {
+            groups: HashMap::new(),
+            original_children: HashMap::new(),
+            all_synthetic_ids: Vec::new(),
+            truncated: HashMap::new(),
+        };
+        for (each_dom_id, groups) in &prev.groups {
+            let is_dirty = dom
+                .get(*each_dom_id)
+                .and_then(|n| n.value().iterator_context.as_ref())
+                .map(|(_, name)| set.contains(name))
+                .unwrap_or(false);
+            if !is_dirty {
+                carried.groups.insert(*each_dom_id, groups.clone());
+                if let Some(orig) = prev.original_children.get(each_dom_id) {
+                    carried.original_children.insert(*each_dom_id, orig.clone());
+                }
+                if let Some(&trunc) = prev.truncated.get(each_dom_id) {
+                    carried.truncated.insert(*each_dom_id, trunc);
+                }
+                // Carry their synthetic IDs so future full-rebuild teardowns work.
+                for (row_id, _) in groups {
+                    carried.all_synthetic_ids.push(*row_id);
+                }
+            }
+        }
+        carried
+    } else {
+        EachExpansion::default()
+    };
+
+    let mut remaining_budget = MAX_SYNTHETIC_LAYOUT_NODES
+        .saturating_sub(expansion.all_synthetic_ids.len());
 
     // Collect Each-node metadata without holding tree borrows.
     let each_nodes: Vec<(EgoNodeId, String)> = dom
@@ -99,6 +187,12 @@ pub fn expand_each_nodes(
                 return None;
             }
             let (_, list_name) = v.iterator_context.as_ref()?;
+            // Skip blocks that are not in the dirty set (they were carried above).
+            if let Some(set) = dirty_list_names {
+                if !set.contains(list_name) {
+                    return None;
+                }
+            }
             Some((node_ref.id(), list_name.clone()))
         })
         .collect();
@@ -131,15 +225,15 @@ pub fn expand_each_nodes(
         for &tmpl_dom_id in &template_dom_children {
             template_size += count_dom_subtree_size(dom, tmpl_dom_id);
         }
-        
+
         let budget_per_row = template_size + 1; // +1 for the row container
-        let max_rows = remaining_budget / budget_per_row;
+        let max_rows = if budget_per_row == 0 { 0 } else { remaining_budget / budget_per_row };
         let clamped_n = n.min(max_rows);
 
         if clamped_n < n {
             expansion.truncated.insert(each_dom_id, n - clamped_n);
         }
-        remaining_budget -= clamped_n * budget_per_row;
+        remaining_budget = remaining_budget.saturating_sub(clamped_n * budget_per_row);
 
         // Save the original Taffy children for restoration next frame.
         let orig_taffy_children: Vec<taffy::prelude::NodeId> = template_dom_children
@@ -474,7 +568,8 @@ pub fn build_taffy_tree(
     // 1. Tag styles
     let tag_name = mizu_node.style_tag_name();
     if let Some(tag_rules) = ctx.style_rules_map.get(tag_name.as_ref()) {
-        merged_rules = merged_rules.merge(tag_rules.clone());
+        // merge_from(&ref) clones only winning fields, not the whole struct.
+        merged_rules.merge_from(tag_rules);
     }
 
     // 2. Class styles
@@ -482,17 +577,23 @@ pub fn build_taffy_tree(
     if let Some(class_attr) = class_attr
         && let Some(class_rules) = ctx.style_rules_map.get(class_attr)
     {
-        merged_rules = merged_rules.merge(class_rules.clone());
+        merged_rules.merge_from(class_rules);
     }
 
     // 3. Id styles — highest specificity, applied after tag and class (an
     // id selector is stored `#`-prefixed in the same rules map, so it can
-    // never collide with a same-named class or tag).
-    let id_key = mizu_node.attributes.get("id").map(|id| format!("#{id}"));
+    // never collide with a same-named class or tag). Build the key on a
+    // pre-sized String to avoid the alloc overhead of format!("#{id}").
+    let id_key: Option<String> = mizu_node.attributes.get("id").map(|id| {
+        let mut k = String::with_capacity(id.len() + 1);
+        k.push('#');
+        k.push_str(id);
+        k
+    });
     if let Some(ref id_key) = id_key
         && let Some(id_rules) = ctx.style_rules_map.get(id_key.as_str())
     {
-        merged_rules = merged_rules.merge(id_rules.clone());
+        merged_rules.merge_from(id_rules);
     }
 
     // 4. Breakpoint / color-scheme variants (ux-6) — applied last, after all
@@ -504,7 +605,7 @@ pub fn build_taffy_tree(
     if let Some(ref k) = id_key {
         selectors.push(k.as_str());
     }
-    merged_rules = merged_rules.merge(resolve_matching_variants(ctx.variants, &selectors, ctx.env));
+    merged_rules.merge_from(&resolve_matching_variants(ctx.variants, &selectors, ctx.env));
 
     // ux-7: resolved once per node via `dir` attribute inheritance (an
     // O(depth) ancestor walk — see `render::bidi`'s doc for the cost class).
@@ -699,7 +800,7 @@ mod tests {
         }
         
         let prev = EachExpansion::default();
-        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev).unwrap();
+        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev, None).unwrap();
         
         assert!(expansion.truncated.is_empty(), "Small list should not be truncated");
         let each_node = dom.root().children().next().unwrap().id();
@@ -718,7 +819,7 @@ mod tests {
         }
         
         let prev = EachExpansion::default();
-        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev).unwrap();
+        let expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &prev, None).unwrap();
         
         let each_node = dom.root().children().next().unwrap().id();
         let truncated = expansion.truncated.get(&each_node).copied().unwrap_or(0);
@@ -741,7 +842,7 @@ mod tests {
         let mut base_node_count = 0;
         
         for i in 0..5 {
-            expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &expansion).unwrap();
+            expansion = expand_each_nodes(&dom, &store, &mut taffy, &node_to_taffy, &expansion, None).unwrap();
             let total_nodes = taffy.total_node_count();
             if i == 0 {
                 base_node_count = total_nodes;
