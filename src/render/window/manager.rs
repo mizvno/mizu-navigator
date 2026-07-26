@@ -674,17 +674,19 @@ impl MizuWindowManager {
                         if let Some((dims, layout)) =
                             crate::render::text_engine::calculate_node_text(
                                 node_id,
-                                dom,
-                                style_rules,
-                                font_cx,
-                                layout_cx,
-                                store,
                                 available_width,
-                                local_inputs,
-                                node_id_to_u32,
-                                focused_input,
-                                style_variants,
-                                &render_env,
+                                &mut crate::render::text_engine::TextLayoutContext {
+                                    dom,
+                                    style_rules,
+                                    font_cx: &mut *font_cx,
+                                    layout_cx: &mut *layout_cx,
+                                    store,
+                                    local_inputs,
+                                    node_id_to_u32,
+                                    focused_input,
+                                    style_variants,
+                                    render_env: &render_env,
+                                },
                             )
                         {
                             text_dimensions.insert(node_id, dims);

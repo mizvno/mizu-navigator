@@ -66,6 +66,33 @@ pub fn extract_placeholders(text: &str) -> Vec<String> {
     placeholders
 }
 
+/// Context for [`calculate_node_text`], bundling everything loop-invariant
+/// across the many nodes a single dirty-layout pass recomputes text for.
+/// `node_id` and `available_width` stay direct parameters since they vary
+/// per call within that pass.
+pub struct TextLayoutContext<'a> {
+    /// The DOM tree `node_id` is looked up against.
+    pub dom: &'a Tree<MizuNode>,
+    /// Active tag/class style rules.
+    pub style_rules: &'a HashMap<String, StyleRules>,
+    /// Parley font context.
+    pub font_cx: &'a mut parley::FontContext,
+    /// Parley layout context.
+    pub layout_cx: &'a mut parley::LayoutContext<vello::peniko::Color>,
+    /// The runtime variable store, for `{var}` interpolation.
+    pub store: &'a VariableStore,
+    /// Live per-node typing buffers for `input` nodes, keyed by u32 id.
+    pub local_inputs: &'a rustc_hash::FxHashMap<u32, String>,
+    /// Mapping of DOM node IDs to their u32 id (the `local_inputs` key space).
+    pub node_id_to_u32: &'a HashMap<EgoNodeId, u32>,
+    /// The currently keyboard-focused node, if any.
+    pub focused_input: Option<EgoNodeId>,
+    /// ux-6 breakpoint/color-scheme style variants.
+    pub style_variants: &'a [crate::parser::style::StyleVariant],
+    /// Current viewport size / color-scheme snapshot variants resolve against.
+    pub render_env: &'a crate::render::responsive::RenderEnvironment,
+}
+
 /// Computes logical size and Parley text layout for a DOM node.
 ///
 /// For `input` nodes the rendered text comes from `local_inputs` (the live
@@ -73,22 +100,12 @@ pub fn extract_placeholders(text: &str) -> Vec<String> {
 /// shows its `placeholder` attribute dimmed; an empty focused input renders a
 /// single space so the line metrics — and therefore the box height — stay
 /// stable across the empty ↔ non-empty transition.
-#[allow(clippy::too_many_arguments)]
 pub fn calculate_node_text(
     node_id: EgoNodeId,
-    dom: &Tree<MizuNode>,
-    style_rules: &HashMap<String, StyleRules>,
-    font_cx: &mut parley::FontContext,
-    layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
-    store: &VariableStore,
     available_width: Option<f32>,
-    local_inputs: &rustc_hash::FxHashMap<u32, String>,
-    node_id_to_u32: &HashMap<EgoNodeId, u32>,
-    focused_input: Option<EgoNodeId>,
-    style_variants: &[crate::parser::style::StyleVariant],
-    render_env: &crate::render::responsive::RenderEnvironment,
+    ctx: &mut TextLayoutContext<'_>,
 ) -> Option<((f32, f32), parley::Layout<vello::peniko::Color>)> {
-    let node_ref = dom.get(node_id)?;
+    let node_ref = ctx.dom.get(node_id)?;
     let mizu_node = node_ref.value();
 
     if mizu_node.primitive == Primitive::Window {
@@ -98,14 +115,15 @@ pub fn calculate_node_text(
     let is_input = mizu_node.primitive == Primitive::Input;
     let mut is_placeholder = false;
     let raw_text = if is_input {
-        let typed = node_id_to_u32
+        let typed = ctx
+            .node_id_to_u32
             .get(&node_id)
-            .and_then(|u| local_inputs.get(u))
+            .and_then(|u| ctx.local_inputs.get(u))
             .map(String::as_str)
             .unwrap_or("");
         if !typed.is_empty() {
             typed.to_string()
-        } else if focused_input != Some(node_id)
+        } else if ctx.focused_input != Some(node_id)
             && let Some(ph) = mizu_node.attributes.get("placeholder")
             && !ph.is_empty()
         {
@@ -127,12 +145,12 @@ pub fn calculate_node_text(
 
     let mut merged = StyleRules::default();
     let tag_name = mizu_node.primitive.as_str();
-    if let Some(tag_rules) = style_rules.get(tag_name) {
+    if let Some(tag_rules) = ctx.style_rules.get(tag_name) {
         merged = merged.merge(tag_rules.clone());
     }
     let class_attr = mizu_node.attributes.get("class").map(String::as_str);
     if let Some(class_attr) = class_attr
-        && let Some(rules) = style_rules.get(class_attr)
+        && let Some(rules) = ctx.style_rules.get(class_attr)
     {
         merged = merged.merge(rules.clone());
     }
@@ -143,9 +161,9 @@ pub fn calculate_node_text(
         None => &[tag_name],
     };
     merged = merged.merge(crate::render::responsive::resolve_matching_variants(
-        style_variants,
+        ctx.style_variants,
         variant_selectors,
-        render_env,
+        ctx.render_env,
     ));
 
     if let Some(fs) = merged.font_size {
@@ -162,7 +180,7 @@ pub fn calculate_node_text(
     let mut text_to_draw = if mizu_node.primitive == Primitive::Input {
         raw_text
     } else {
-        store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
+        ctx.store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
             MizuError::BindingNotFound(name) => format!("{{missing: {}}}", name),
             _ => format!("{{error: {}}}", e),
         })
@@ -179,7 +197,7 @@ pub fn calculate_node_text(
         text_to_draw.insert(0, mark);
     }
 
-    let mut builder = layout_cx.ranged_builder(font_cx, &text_to_draw, 1.0, true);
+    let mut builder = ctx.layout_cx.ranged_builder(ctx.font_cx, &text_to_draw, 1.0, true);
 
     // Resolve the author's generic (`sans-serif`/`serif`/`monospace`, default
     // sans-serif) to a *single* `parley::GenericFamily` entry rather than a
@@ -324,22 +342,24 @@ mod tests {
             let node_id = tree.root().id();
             let Some((_dims, layout)) = calculate_node_text(
                 node_id,
-                &tree,
-                &style_rules,
-                &mut font_cx,
-                &mut layout_cx,
-                &store,
                 None,
-                &local_inputs,
-                &node_id_to_u32,
-                None,
-                &[],
-                &crate::render::responsive::RenderEnvironment {
-                    viewport: crate::render::responsive::ViewportSize {
-                        width: 800.0,
-                        height: 600.0,
+                &mut TextLayoutContext {
+                    dom: &tree,
+                    style_rules: &style_rules,
+                    font_cx: &mut font_cx,
+                    layout_cx: &mut layout_cx,
+                    store: &store,
+                    local_inputs: &local_inputs,
+                    node_id_to_u32: &node_id_to_u32,
+                    focused_input: None,
+                    style_variants: &[],
+                    render_env: &crate::render::responsive::RenderEnvironment {
+                        viewport: crate::render::responsive::ViewportSize {
+                            width: 800.0,
+                            height: 600.0,
+                        },
+                        color_scheme: crate::render::preferences::ColorScheme::Dark,
                     },
-                    color_scheme: crate::render::preferences::ColorScheme::Dark,
                 },
             ) else {
                 failures.push(format!("{label}: calculate_node_text returned None"));
@@ -408,22 +428,24 @@ mod tests {
             let node_id = tree.root().id();
             let result = calculate_node_text(
                 node_id,
-                &tree,
-                &style_rules,
-                &mut font_cx,
-                &mut layout_cx,
-                &store,
                 None,
-                &local_inputs,
-                &node_id_to_u32,
-                None,
-                &[],
-                &crate::render::responsive::RenderEnvironment {
-                    viewport: crate::render::responsive::ViewportSize {
-                        width: 800.0,
-                        height: 600.0,
+                &mut TextLayoutContext {
+                    dom: &tree,
+                    style_rules: &style_rules,
+                    font_cx: &mut font_cx,
+                    layout_cx: &mut layout_cx,
+                    store: &store,
+                    local_inputs: &local_inputs,
+                    node_id_to_u32: &node_id_to_u32,
+                    focused_input: None,
+                    style_variants: &[],
+                    render_env: &crate::render::responsive::RenderEnvironment {
+                        viewport: crate::render::responsive::ViewportSize {
+                            width: 800.0,
+                            height: 600.0,
+                        },
+                        color_scheme: crate::render::preferences::ColorScheme::Dark,
                     },
-                    color_scheme: crate::render::preferences::ColorScheme::Dark,
                 },
             );
             assert!(
@@ -488,33 +510,37 @@ mod tests {
 
         let (dark_dims, _) = calculate_node_text(
             node_id,
-            &tree,
-            &style_rules,
-            &mut font_cx,
-            &mut layout_cx,
-            &store,
             None,
-            &local_inputs,
-            &node_id_to_u32,
-            None,
-            &style_variants,
-            &dark_env,
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &style_variants,
+                render_env: &dark_env,
+            },
         )
         .expect("dark: expected a layout");
 
         let (light_dims, _) = calculate_node_text(
             node_id,
-            &tree,
-            &style_rules,
-            &mut font_cx,
-            &mut layout_cx,
-            &store,
             None,
-            &local_inputs,
-            &node_id_to_u32,
-            None,
-            &style_variants,
-            &light_env,
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &style_variants,
+                render_env: &light_env,
+            },
         )
         .expect("light: expected a layout");
 
@@ -580,17 +606,19 @@ mod tests {
 
         let (_dims, layout) = calculate_node_text(
             node_id,
-            &tree,
-            &style_rules,
-            &mut font_cx,
-            &mut layout_cx,
-            &store,
             None,
-            &local_inputs,
-            &node_id_to_u32,
-            None,
-            &[],
-            &no_op_render_env(),
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &[],
+                render_env: &no_op_render_env(),
+            },
         )
         .expect("mixed bidi text must still produce a layout");
 
@@ -642,17 +670,19 @@ mod tests {
 
         let result = calculate_node_text(
             node_id,
-            &tree,
-            &style_rules,
-            &mut font_cx,
-            &mut layout_cx,
-            &store,
             None,
-            &local_inputs,
-            &node_id_to_u32,
-            None,
-            &[],
-            &no_op_render_env(),
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &[],
+                render_env: &no_op_render_env(),
+            },
         );
         assert!(
             result.is_some(),
@@ -685,17 +715,19 @@ mod tests {
             let node_id = tree.root().id();
             let (_dims, layout) = calculate_node_text(
                 node_id,
-                &tree,
-                &style_rules,
-                &mut font_cx,
-                &mut layout_cx,
-                &store,
                 Some(400.0),
-                &local_inputs,
-                &node_id_to_u32,
-                None,
-                &[],
-                &env,
+                &mut TextLayoutContext {
+                    dom: &tree,
+                    style_rules: &style_rules,
+                    font_cx: &mut font_cx,
+                    layout_cx: &mut layout_cx,
+                    store: &store,
+                    local_inputs: &local_inputs,
+                    node_id_to_u32: &node_id_to_u32,
+                    focused_input: None,
+                    style_variants: &[],
+                    render_env: &env,
+                },
             )
             .expect("expected a layout");
             for line in layout.lines() {

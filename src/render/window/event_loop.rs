@@ -1307,17 +1307,19 @@ fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, muta
                 };
                 if let Some((new_dims, layout)) = crate::render::text_engine::calculate_node_text(
                     node_id,
-                    &manager.dom,
-                    &manager.style_rules,
-                    &mut manager.font_cx,
-                    &mut manager.layout_cx,
-                    &manager.store,
                     current_width,
-                    &manager.local_inputs,
-                    &manager.node_id_to_u32,
-                    manager.focused_node,
-                    &manager.style_variants,
-                    &render_env,
+                    &mut crate::render::text_engine::TextLayoutContext {
+                        dom: &manager.dom,
+                        style_rules: &manager.style_rules,
+                        font_cx: &mut manager.font_cx,
+                        layout_cx: &mut manager.layout_cx,
+                        store: &manager.store,
+                        local_inputs: &manager.local_inputs,
+                        node_id_to_u32: &manager.node_id_to_u32,
+                        focused_input: manager.focused_node,
+                        style_variants: &manager.style_variants,
+                        render_env: &render_env,
+                    },
                 ) {
                     manager.text_layouts.insert(node_id, layout);
                     manager.text_dimensions.insert(node_id, new_dims);
