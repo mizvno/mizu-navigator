@@ -15,6 +15,9 @@ enumerated guarantees this is built to hold.
 [![Kani Verification](https://github.com/mizvno/mizu-navigator/actions/workflows/kani.yml/badge.svg)](https://github.com/mizvno/mizu-navigator/actions/workflows/kani.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
+> **⚠ Pre-1.0.** Mizu is still evolving — the language, the format, and the
+> APIs can change in breaking ways without notice. Nothing here is stable yet.
+
 ---
 
 ## Contents
