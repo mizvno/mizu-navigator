@@ -18,6 +18,12 @@
 //!   they're dropped instead of lingering (swap, core dumps, debugger
 //!   access) â€” this matters most for `StorageEngine::master_key`, which is
 //!   cached and kept alive for the life of the process by `StoragePool`.
+//! * `MIZU_MASTER_KEY` (read by [`derive_or_create_key`]) is a headless/
+//!   recovery **break-glass** mechanism, not a supported production
+//!   key-management path: it bypasses the OS keyring entirely, so the key
+//!   is exposed to anything that can read this process's environment
+//!   (`/proc/<pid>/environ`, child-process inheritance, crash dumps). Every
+//!   use of it is logged with `tracing::warn!` for exactly that reason.
 
 #![forbid(unsafe_code)]
 
@@ -141,15 +147,48 @@ fn derive_domain_key(
     Ok(Zeroizing::new(digest))
 }
 
+/// The `MIZU_MASTER_KEY` branch of [`derive_or_create_key`], factored out so
+/// the warning-on-use behavior is testable without mutating the real process
+/// environment (which would need `unsafe { std::env::set_var(..) }` —
+/// forbidden crate-wide), mirroring how [`crate::core::config::resolve_override`]
+/// is factored out of `env_override` for the same reason.
+///
+/// Returns `Ok(None)` when `raw` is `None` (the caller falls through to the
+/// keyring path); `Ok(Some(key))` when `raw` was present and successfully
+/// decoded, after logging the break-glass warning; `Err` when present but
+/// malformed.
+///
+/// `MIZU_MASTER_KEY` is a headless/recovery break-glass mechanism, not a
+/// supported production key-management path (see the module doc comment and
+/// `SECURITY-INVARIANTS.md`) — every use of it bypasses the OS keyring
+/// entirely, so it is logged every time it is taken, the same way a bad
+/// `MIZU_*` budget override already logs instead of failing silently.
+fn derive_key_from_env_override(
+    raw: Option<String>,
+    domain: &ValidatedDomain,
+) -> Result<Option<Zeroizing<[u8; 32]>>, MizuError> {
+    let Some(hex) = raw else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        domain = domain.as_str(),
+        "storage master key sourced from MIZU_MASTER_KEY environment variable, not the OS \
+         keyring — this is a headless/recovery break-glass path; the key is exposed to \
+         anything that can read this process's environment (e.g. /proc/<pid>/environ, \
+         child-process inheritance, crash dumps)"
+    );
+    // RM-10: `master` (the raw domain-wide master key) is only needed to
+    // derive this domain's key below; it scrubs itself (`Zeroizing`) the
+    // moment this call returns, rather than lingering in memory for the
+    // life of the process the way the *result* of `derive_or_create_key`
+    // does inside `StorageEngine`.
+    let master = parse_master_key_hex(&hex)?;
+    Ok(Some(derive_domain_key(&master, domain)?))
+}
+
 pub fn derive_or_create_key(domain: &ValidatedDomain) -> Result<Zeroizing<[u8; 32]>, MizuError> {
-    if let Ok(hex) = std::env::var("MIZU_MASTER_KEY") {
-        // RM-10: `master` (the raw domain-wide master key) is only needed to
-        // derive this domain's key below; it scrubs itself (`Zeroizing`) the
-        // moment this call returns, rather than lingering in memory for the
-        // life of the process the way the *result* of `derive_or_create_key`
-        // does inside `StorageEngine`.
-        let master = parse_master_key_hex(&hex)?;
-        return derive_domain_key(&master, domain);
+    if let Some(key) = derive_key_from_env_override(std::env::var("MIZU_MASTER_KEY").ok(), domain)? {
+        return Ok(key);
     }
 
     let entry = match keyring::Entry::new(KEYRING_SERVICE, domain.as_str()) {
@@ -584,6 +623,90 @@ mod tests {
         let hex_master = hex::encode(master);
         let parsed = parse_master_key_hex(&hex_master).unwrap();
         assert_zeroize_on_drop(&parsed);
+    }
+
+    #[test]
+    fn env_override_absent_falls_through_to_keyring_path() {
+        let domain = ValidatedDomain::from_raw("env-override-absent.local");
+        let result = derive_key_from_env_override(None, &domain).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn env_override_present_derives_the_domain_key_without_the_keyring() {
+        let domain = ValidatedDomain::from_raw("env-override-present.local");
+        let master = [0x22u8; 32];
+        let hex_master = hex::encode(master);
+
+        let result = derive_key_from_env_override(Some(hex_master), &domain)
+            .unwrap()
+            .expect("Some(hex) must yield a derived key, not fall through");
+
+        let expected = derive_domain_key(&master, &domain).unwrap();
+        assert_eq!(result.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn env_override_malformed_hex_is_rejected() {
+        let domain = ValidatedDomain::from_raw("env-override-malformed.local");
+        let err = derive_key_from_env_override(Some("not hex".to_string()), &domain).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+    }
+
+    /// Hand-rolled `tracing::Subscriber` capturing event messages into a
+    /// shared buffer, installed only for the duration of one test closure
+    /// via `tracing::subscriber::with_default` — this crate has no
+    /// `tracing-subscriber`/`tracing-test` dev-dependency to pull in, and
+    /// this is small enough not to warrant adding one for a single test.
+    struct WarnCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn mizu_master_key_env_path_logs_a_warning() {
+        let messages: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let subscriber = WarnCapture {
+            messages: messages.clone(),
+        };
+        let domain = ValidatedDomain::from_raw("warn-capture-test.local");
+        let hex_master = hex::encode([0x33u8; 32]);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = derive_key_from_env_override(Some(hex_master), &domain);
+            assert!(result.unwrap().is_some());
+        });
+
+        let logged = messages.lock().unwrap();
+        assert!(
+            logged.iter().any(|m| m.contains("MIZU_MASTER_KEY")),
+            "expected a warning mentioning MIZU_MASTER_KEY; got: {logged:?}"
+        );
     }
 
     #[test]

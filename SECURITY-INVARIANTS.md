@@ -164,6 +164,23 @@ non-debounced `StoragePool::write_record` bypasses this entirely).
 by both time and key count; no document-observable correctness property
 depends on write timing (see S1).
 
+**S3 — `MIZU_MASTER_KEY` is a visible break-glass path, not a key-management
+option:** `derive_or_create_key` (`crates/core/src/core/storage.rs`) reads the
+`MIZU_MASTER_KEY` environment variable as a full bypass of the OS keyring for
+a domain's storage master key, for headless/recovery operation only. Every
+use of this path is logged via `tracing::warn!` before the key is derived,
+naming it as a break-glass mechanism — the same "log rather than fail
+silently" discipline `core::config::resolve_override` already applies to a
+bad `MIZU_*` budget override. This does not close the underlying exposure
+(an env var is readable via `/proc/<pid>/environ`, inherited by child
+processes, and can end up in crash dumps) — it is intentionally scoped to
+observability only, not prevention.
+*Source constructs:* `derive_key_from_env_override` in
+`crates/core/src/core/storage.rs`.
+*Enforcement:* **Runtime (logged, not blocked)** — the OS-keyring path
+remains the only enforced default; the env override is always available and
+always visible in logs when taken.
+
 ---
 
 ## 5. Purity Invariants
@@ -293,6 +310,7 @@ gate is a compile error.
 | E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
 | S1 | Write-only storage | Code boundary | `types.rs` (no `read_local`) |
 | S2 | Debounced writes are eventually (not immediately) durable | Design boundary | `StorageWriteDebouncer` in `worker.rs` |
+| S3 | `MIZU_MASTER_KEY` break-glass path is logged, not silent | Runtime (logged) | `derive_key_from_env_override` in `core/storage.rs` |
 | P1 | Purity in observation contexts | Parse-time | `find_effectful_call` in `logic.rs` |
 | F1 | Gated information flow | Load-time | `check_information_flow` in `flow.rs` |
 
