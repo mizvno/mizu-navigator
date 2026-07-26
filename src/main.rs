@@ -17,7 +17,7 @@ use mizu::parser::logic::{parse_computed_with_functions, parse_root_timers};
 use mizu::parser::{
     parse_layout_with_urls, parse_logic, parse_style_with_variants, parse_urls, split_source,
 };
-use mizu::render::run_window_loop;
+use mizu::render::{InitialDocument, run_window_loop};
 use tracing_subscriber::EnvFilter;
 
 /// Built-in start page shown when the navigator is launched without a file
@@ -139,17 +139,19 @@ fn run() -> Result<(), MizuError> {
 
     // Phase 8: Start native window and event loop
     run_window_loop(
-        dom_tree,
-        style_rules,
-        style_variants,
-        logic_fns,
-        interner,
-        url_registry,
-        window_url,
+        InitialDocument {
+            dom: dom_tree,
+            style_rules,
+            style_variants,
+            logic_fns,
+            interner,
+            url_registry,
+            initial_url: window_url,
+            computed_bindings,
+            root_timers,
+        },
         #[cfg(feature = "insecure-dev")]
         allow_insecure,
-        computed_bindings,
-        root_timers,
     )?;
 
     Ok(())

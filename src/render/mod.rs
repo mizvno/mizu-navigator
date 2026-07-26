@@ -41,4 +41,4 @@ pub mod vello_pipeline;
 /// Window creation, event loop, and resizing management.
 pub mod window;
 
-pub use window::run_window_loop;
+pub use window::{InitialDocument, run_window_loop};
