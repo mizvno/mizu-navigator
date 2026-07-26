@@ -104,6 +104,103 @@ pub struct PaintContext<'a> {
     pub taffy_id_overrides: EachIterationOverrides,
 }
 
+/// Resolves a `background-image`/`image src` path to the absolute URL used
+/// as the image-cache/fetch key.
+///
+/// An absolute `mizu://` or `file://` path passes through unchanged.
+/// Anything else is resolved relative to the current document's origin: a
+/// `mizu://<domain>` path if the document itself is `mizu://`-hosted, or a
+/// filesystem-relative path against the document's own directory if it's a
+/// `file://` document. Shared by the background-image and inline-`image`
+/// paint paths, which previously duplicated this resolution byte-for-byte.
+fn resolve_media_url(path: &str, chrome_url: &str) -> String {
+    if path.starts_with("mizu://") || path.starts_with("file://") {
+        return path.to_string();
+    }
+    if let Ok(base_uri) = crate::network::uri::MizuUri::parse(chrome_url) {
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        return format!("mizu://{}{}", base_uri.domain, full_path);
+    }
+    if let Some(file_path) = chrome_url.strip_prefix("file:///") {
+        let base = std::path::Path::new(file_path);
+        if let Some(parent) = base.parent() {
+            let resolved = parent.join(path);
+            return format!("file:///{}", resolved.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    path.to_string()
+}
+
+/// Evaluates every conditional class (`class X if <expr>`) on `mizu_node`
+/// against the current evaluator state and returns the merged style rules of
+/// every truthy one, in declaration order.
+///
+/// This is the *only* place `paint_node` invokes the logic evaluator. Kept
+/// as its own function (rather than inlined in the paint walk) so that the
+/// paint/evaluator integration seam — exactly the class of "individually
+/// correct pieces, wired together wrong" mistake this project has already
+/// paid for once at the navigation choke point — has one function's worth of
+/// surface to read and test, not a few hundred lines of surrounding paint
+/// logic to read around it.
+///
+/// Injects `ctx.item_bindings` (the current `each`-iteration bindings) as
+/// *local* variables (`push_local`) rather than deep-cloning the global
+/// store, which caused O(N×G) heap allocation per frame where N = conditional
+/// classes and G = global variable count. Protocol: snapshot the local-stack
+/// height, push bindings, reset the per-condition instruction budget,
+/// evaluate, then truncate back to the snapshot — zero heap allocation.
+fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>) -> StyleRules {
+    let mut extra = StyleRules::default();
+    if mizu_node.conditional_classes.is_empty() {
+        return extra;
+    }
+
+    let empty_fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
+    // Collect item_binding (name → sym, val) pairs ahead of the loop so that
+    // we can split-borrow `ctx.store.state_machine` (mut) from `ctx.store.interner`
+    // (immutable) without the borrow checker seeing overlapping &mut / & on the
+    // same struct through the ctx.item_bindings reference.
+    let binding_pairs: Vec<(Symbol, Value)> = ctx
+        .item_bindings
+        .iter()
+        .filter_map(|(name, val)| ctx.store.interner.get(name).map(|sym| (sym, val.clone())))
+        .collect();
+
+    for cc in &mizu_node.conditional_classes {
+        let frame = ctx.store.state_machine.local_stack.len();
+        ctx.store.state_machine.instruction_count = 0;
+
+        for (sym, val) in &binding_pairs {
+            ctx.store.state_machine.push_local(*sym, val.clone());
+        }
+
+        let is_truthy = {
+            // Split-borrow: state_machine is mutably borrowed for evaluate();
+            // interner is immutably borrowed as a separate field of VariableStore.
+            // Rust allows this because they are distinct struct fields.
+            let sm = &mut ctx.store.state_machine;
+            let interner = &ctx.store.interner;
+            sm.evaluate(cc.condition.root(), 0, &empty_fns, interner, &cc.condition.arena)
+                .map(|v| matches!(v, Value::Bool(true)))
+                .unwrap_or(false)
+        };
+
+        // Rewind — O(injected_bindings) pops, zero heap allocation.
+        ctx.store.state_machine.truncate_locals(frame);
+
+        if is_truthy
+            && let Some(rules) = ctx.style_rules.get(&cc.class_name)
+        {
+            extra = extra.merge(rules.clone());
+        }
+    }
+    extra
+}
+
 /// Recursively paints the DOM node and its children into the given `vello::Scene`.
 ///
 /// ## Phase 11 behaviour
@@ -196,60 +293,11 @@ pub fn paint_node(
     ));
 
     // ── Evaluate conditional classes ──────────────────────────────────────
-    // Evaluate each condition in-place using the existing StateMachine, injecting
-    // per-iteration `each`-loop bindings as *local* variables (push_local) rather
-    // than deep-cloning the global_store (which caused O(N×G) heap allocation per
-    // frame where N = conditional classes and G = global variable count).
-    //
-    // Protocol:
-    //   1. Record the stack height before injection.
-    //   2. Push item_bindings as local bindings — they shadow globals during eval.
-    //   3. Reset the instruction budget (per-action, not cumulative).
-    //   4. Evaluate; local lookup takes precedence over global via frame_pointer=0.
-    //   5. Truncate the local stack back to the snapshot height — zero allocation.
-    if !mizu_node.conditional_classes.is_empty() {
-        let empty_fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
-        // Collect item_binding (name → sym, val) pairs ahead of the loop so that
-        // we can split-borrow `ctx.store.state_machine` (mut) from `ctx.store.interner`
-        // (immutable) without the borrow checker seeing overlapping &mut / & on the
-        // same struct through the ctx.item_bindings reference.
-        let binding_pairs: Vec<(Symbol, Value)> = ctx
-            .item_bindings
-            .iter()
-            .filter_map(|(name, val)| {
-                ctx.store.interner.get(name).map(|sym| (sym, val.clone()))
-            })
-            .collect();
-
-        for cc in &mizu_node.conditional_classes {
-            let frame = ctx.store.state_machine.local_stack.len();
-            ctx.store.state_machine.instruction_count = 0;
-
-            for (sym, val) in &binding_pairs {
-                ctx.store.state_machine.push_local(*sym, val.clone());
-            }
-
-            let is_truthy = {
-                // Split-borrow: state_machine is mutably borrowed for evaluate();
-                // interner is immutably borrowed as a separate field of VariableStore.
-                // Rust allows this because they are distinct struct fields.
-                let sm = &mut ctx.store.state_machine;
-                let interner = &ctx.store.interner;
-                sm.evaluate(cc.condition.root(), 0, &empty_fns, interner, &cc.condition.arena)
-                    .map(|v| matches!(v, Value::Bool(true)))
-                    .unwrap_or(false)
-            };
-
-            // Rewind — O(injected_bindings) pops, zero heap allocation.
-            ctx.store.state_machine.truncate_locals(frame);
-
-            if is_truthy
-                && let Some(rules) = ctx.style_rules.get(&cc.class_name)
-            {
-                merged = merged.merge(rules.clone());
-            }
-        }
-    }
+    // The one place `paint_node` invokes the logic evaluator; kept as its own
+    // function so this evaluator-integration seam has exactly one place to
+    // audit (see `evaluate_conditional_classes`'s doc comment for why that's
+    // worth doing deliberately rather than leaving it inlined here).
+    merged = merged.merge(evaluate_conditional_classes(mizu_node, ctx));
 
     let background = merged.background.clone();
     let background_image = merged.background_image.clone();
@@ -282,27 +330,7 @@ pub fn paint_node(
 
         // Background Image
         if let Some(img_path) = background_image {
-            let abs_url = if img_path.starts_with("mizu://") || img_path.starts_with("file://") {
-                img_path.clone()
-            } else if let Ok(base_uri) = crate::network::uri::MizuUri::parse(ctx.chrome_url) {
-                // simple relative resolution
-                let path = if img_path.starts_with('/') {
-                    img_path.clone()
-                } else {
-                    format!("/{}", img_path)
-                };
-                format!("mizu://{}{}", base_uri.domain, path)
-            } else if let Some(file_path) = ctx.chrome_url.strip_prefix("file:///") {
-                let path = std::path::Path::new(file_path);
-                if let Some(parent) = path.parent() {
-                    let resolved = parent.join(&img_path);
-                    format!("file:///{}", resolved.to_string_lossy().replace('\\', "/"))
-                } else {
-                    img_path.clone()
-                }
-            } else {
-                img_path.clone()
-            };
+            let abs_url = resolve_media_url(&img_path, ctx.chrome_url);
 
             let animated_img = match ctx.image_cache.get(&abs_url) {
                 Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
@@ -712,26 +740,7 @@ pub fn paint_node(
     if mizu_node.primitive == Primitive::Image
         && let Some(src) = mizu_node.attributes.get("src")
     {
-        let abs_url = if src.starts_with("mizu://") || src.starts_with("file://") {
-            src.clone()
-        } else if let Ok(base_uri) = crate::network::uri::MizuUri::parse(ctx.chrome_url) {
-            let path = if src.starts_with('/') {
-                src.clone()
-            } else {
-                format!("/{}", src)
-            };
-            format!("mizu://{}{}", base_uri.domain, path)
-        } else if let Some(file_path) = ctx.chrome_url.strip_prefix("file:///") {
-            let path = std::path::Path::new(file_path);
-            if let Some(parent) = path.parent() {
-                let resolved = parent.join(src);
-                format!("file:///{}", resolved.to_string_lossy().replace('\\', "/"))
-            } else {
-                src.clone()
-            }
-        } else {
-            src.clone()
-        };
+        let abs_url = resolve_media_url(src, ctx.chrome_url);
 
         let peniko_img = match ctx.image_cache.get(&abs_url) {
             Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
@@ -1070,6 +1079,36 @@ mod tests {
         assert_eq!(vello_c.g, 20);
         assert_eq!(vello_c.b, 30);
         assert_eq!(vello_c.a, 50);
+    }
+
+    #[test]
+    fn resolve_media_url_passes_through_absolute_schemes() {
+        assert_eq!(
+            resolve_media_url("mizu://other.example/x.png", "mizu://example.mizu/page"),
+            "mizu://other.example/x.png"
+        );
+        assert_eq!(
+            resolve_media_url("file:///C:/img.png", "mizu://example.mizu/page"),
+            "file:///C:/img.png"
+        );
+    }
+
+    #[test]
+    fn resolve_media_url_resolves_relative_to_mizu_origin() {
+        assert_eq!(
+            resolve_media_url("img.png", "mizu://example.mizu/page"),
+            "mizu://example.mizu/img.png"
+        );
+        assert_eq!(
+            resolve_media_url("/assets/img.png", "mizu://example.mizu/page"),
+            "mizu://example.mizu/assets/img.png"
+        );
+    }
+
+    #[test]
+    fn resolve_media_url_resolves_relative_to_file_origin() {
+        let resolved = resolve_media_url("img.png", "file:///C:/docs/page.mizu");
+        assert_eq!(resolved, "file:///C:/docs/img.png");
     }
 
     #[test]
