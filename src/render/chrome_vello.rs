@@ -568,6 +568,15 @@ fn draw_text_layout(
     }
 }
 
+/// Context for [`paint_nav_button`]: everything shared across both the
+/// Back and Forward button paint calls in a single `paint_chrome` pass.
+struct NavButtonContext<'a> {
+    palette: &'a ChromePalette,
+    font_cx: &'a mut parley::FontContext,
+    layout_cx: &'a mut parley::LayoutContext<vello::peniko::Color>,
+    transform: Affine,
+}
+
 /// Paints a single square nav button (Back/Forward) at logical X `x`
 /// containing the centered glyph `label`. When `enabled` is `false`, both the
 /// button background and glyph render at reduced alpha — the dimmed
@@ -575,21 +584,17 @@ fn draw_text_layout(
 /// caller is responsible for actually ignoring clicks on it (`window::history`
 /// already makes a Back/Forward step a no-op when its stack is empty, so
 /// this dimming is purely visual confirmation, not the enforcement point).
-#[allow(clippy::too_many_arguments)]
 fn paint_nav_button(
     scene: &mut Scene,
     x: f32,
     label: &str,
     enabled: bool,
-    palette: &ChromePalette,
-    font_cx: &mut parley::FontContext,
-    layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
-    transform: Affine,
+    ctx: &mut NavButtonContext<'_>,
 ) {
     let (bg, text_color) = if enabled {
-        (palette.btn_bg, palette.btn_text)
+        (ctx.palette.btn_bg, ctx.palette.btn_text)
     } else {
-        (palette.btn_bg_disabled, palette.btn_text_disabled)
+        (ctx.palette.btn_bg_disabled, ctx.palette.btn_text_disabled)
     };
     let rect = RoundedRect::new(
         x as f64,
@@ -598,39 +603,62 @@ fn paint_nav_button(
         (BTN_Y + BTN_H) as f64,
         3.0,
     );
-    scene.fill(Fill::NonZero, transform, bg, None, &rect);
-    let layout = build_chrome_text_layout(label, font_cx, layout_cx);
+    scene.fill(Fill::NonZero, ctx.transform, bg, None, &rect);
+    let layout = build_chrome_text_layout(label, ctx.font_cx, ctx.layout_cx);
     let text_x = x + (BTN_W - layout.width()) / 2.0;
     let text_y = BTN_Y + (BTN_H - layout.height()) / 2.0;
-    draw_text_layout(scene, &layout, text_x, text_y, text_color, transform);
+    draw_text_layout(scene, &layout, text_x, text_y, text_color, ctx.transform);
 }
 
 // ── Main paint function ───────────────────────────────────────────────────────
 
+/// Context for [`paint_chrome`], bundling everything but the `Scene` it
+/// draws into.
+pub struct ChromePaintContext<'a> {
+    /// URL bar text/focus/selection/loading state.
+    pub state: &'a ChromeState,
+    /// Logical window width.
+    pub window_width: f32,
+    /// `Affine::scale(dpi_scale)`, so the chrome scales on high-DPI displays.
+    pub transform: Affine,
+    /// Elapsed time in milliseconds, for the URL-bar cursor blink and the
+    /// loading-indicator pulse animation.
+    pub elapsed_ms: u64,
+    /// Parley font context.
+    pub font_cx: &'a mut parley::FontContext,
+    /// Parley layout context.
+    pub layout_cx: &'a mut parley::LayoutContext<vello::peniko::Color>,
+    /// Whether the Back button is enabled (non-empty back-navigation stack).
+    pub can_go_back: bool,
+    /// Whether the Forward button is enabled (non-empty forward stack).
+    pub can_go_forward: bool,
+    /// Resolved light/dark color palette.
+    pub palette: &'a ChromePalette,
+}
+
 /// Renders the browser chrome bar into `scene`.
 ///
-/// All coordinates are **logical pixels**. `transform` should be
+/// All coordinates are **logical pixels**. `ctx.transform` should be
 /// `Affine::scale(dpi_scale)` so the chrome scales on high-DPI displays.
-#[allow(clippy::too_many_arguments)]
-pub fn paint_chrome(
-    scene: &mut Scene,
-    state: &ChromeState,
-    window_width: f32,
-    transform: Affine,
-    elapsed_ms: u64,
-    font_cx: &mut parley::FontContext,
-    layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
-    can_go_back: bool,
-    can_go_forward: bool,
-    palette: &ChromePalette,
-) {
+pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
+    let transform = ctx.transform;
+
     // ── Bar background ────────────────────────────────────────────────────────
-    let bar_rect = Rect::new(0.0, 0.0, window_width as f64, CHROME_HEIGHT as f64);
-    scene.fill(Fill::NonZero, transform, palette.bar_bg, None, &bar_rect);
+    let bar_rect = Rect::new(0.0, 0.0, ctx.window_width as f64, CHROME_HEIGHT as f64);
+    scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &bar_rect);
 
     // ── Back button (dimmed + inert when the back stack is empty) ────────────
     paint_nav_button(
-        scene, BACK_X, "←", can_go_back, palette, font_cx, layout_cx, transform,
+        scene,
+        BACK_X,
+        "←",
+        ctx.can_go_back,
+        &mut NavButtonContext {
+            palette: ctx.palette,
+            font_cx: ctx.font_cx,
+            layout_cx: ctx.layout_cx,
+            transform,
+        },
     );
 
     // ── Reload button ─────────────────────────────────────────────────────────
@@ -641,8 +669,8 @@ pub fn paint_chrome(
         (BTN_Y + BTN_H) as f64,
         3.0,
     );
-    scene.fill(Fill::NonZero, transform, palette.btn_bg, None, &reload_rect);
-    let reload_layout = build_chrome_text_layout("↻", font_cx, layout_cx);
+    scene.fill(Fill::NonZero, transform, ctx.palette.btn_bg, None, &reload_rect);
+    let reload_layout = build_chrome_text_layout("↻", ctx.font_cx, ctx.layout_cx);
     let btn2_text_x = RELOAD_X + (BTN_W - reload_layout.width()) / 2.0;
     let btn2_text_y = BTN_Y + (BTN_H - reload_layout.height()) / 2.0;
     draw_text_layout(
@@ -650,7 +678,7 @@ pub fn paint_chrome(
         &reload_layout,
         btn2_text_x,
         btn2_text_y,
-        palette.btn_text,
+        ctx.palette.btn_text,
         transform,
     );
 
@@ -659,15 +687,17 @@ pub fn paint_chrome(
         scene,
         FORWARD_X,
         "→",
-        can_go_forward,
-        palette,
-        font_cx,
-        layout_cx,
-        transform,
+        ctx.can_go_forward,
+        &mut NavButtonContext {
+            palette: ctx.palette,
+            font_cx: ctx.font_cx,
+            layout_cx: ctx.layout_cx,
+            transform,
+        },
     );
 
     // ── URL bar ───────────────────────────────────────────────────────────────
-    let url_bar_right = (window_width - STATUS_W).max(URL_BAR_X + 10.0);
+    let url_bar_right = (ctx.window_width - STATUS_W).max(URL_BAR_X + 10.0);
     let url_bar_rect = RoundedRect::new(
         URL_BAR_X as f64,
         URL_BAR_Y as f64,
@@ -675,13 +705,13 @@ pub fn paint_chrome(
         (URL_BAR_Y + URL_BAR_H) as f64,
         4.0,
     );
-    scene.fill(Fill::NonZero, transform, palette.url_bg, None, &url_bar_rect);
+    scene.fill(Fill::NonZero, transform, ctx.palette.url_bg, None, &url_bar_rect);
 
     // Border (thicker / brighter when focused)
-    let border_color = if state.focused {
-        palette.url_border_focused
+    let border_color = if ctx.state.focused {
+        ctx.palette.url_border_focused
     } else {
-        palette.url_border_idle
+        ctx.palette.url_border_idle
     };
     let border_stroke = Stroke::new(1.0);
     scene.stroke(&border_stroke, transform, border_color, None, &url_bar_rect);
@@ -704,37 +734,37 @@ pub fn paint_chrome(
     let text_top = URL_BAR_Y + (URL_BAR_H - CHROME_FONT_SIZE) / 2.0 - 1.0;
 
     // Selection highlight
-    if state.focused
-        && let Some((lo, hi)) = state.selection_range()
+    if ctx.state.focused
+        && let Some((lo, hi)) = ctx.state.selection_range()
         && lo < hi
     {
-        let x0 = url_cursor_x(&state.url, lo, font_cx, layout_cx);
-        let x1 = url_cursor_x(&state.url, hi, font_cx, layout_cx);
+        let x0 = url_cursor_x(&ctx.state.url, lo, ctx.font_cx, ctx.layout_cx);
+        let x1 = url_cursor_x(&ctx.state.url, hi, ctx.font_cx, ctx.layout_cx);
         let sel_rect = Rect::new(
             (text_left + x0) as f64,
             URL_BAR_Y as f64,
             (text_left + x1) as f64,
             (URL_BAR_Y + URL_BAR_H) as f64,
         );
-        scene.fill(Fill::NonZero, transform, palette.select, None, &sel_rect);
+        scene.fill(Fill::NonZero, transform, ctx.palette.select, None, &sel_rect);
     }
 
     // URL text
-    if !state.url.is_empty() {
-        let url_layout = build_chrome_text_layout(&state.url, font_cx, layout_cx);
+    if !ctx.state.url.is_empty() {
+        let url_layout = build_chrome_text_layout(&ctx.state.url, ctx.font_cx, ctx.layout_cx);
         draw_text_layout(
             scene,
             &url_layout,
             text_left,
             text_top,
-            palette.url_text,
+            ctx.palette.url_text,
             transform,
         );
     }
 
     // Cursor (blinking via elapsed_ms)
-    if state.focused && elapsed_ms % 1000 < 500 {
-        let cx = url_cursor_x(&state.url, state.cursor, font_cx, layout_cx);
+    if ctx.state.focused && ctx.elapsed_ms % 1000 < 500 {
+        let cx = url_cursor_x(&ctx.state.url, ctx.state.cursor, ctx.font_cx, ctx.layout_cx);
         let cursor_x = text_left + cx;
         let cursor_rect = Rect::new(
             cursor_x as f64,
@@ -742,18 +772,18 @@ pub fn paint_chrome(
             (cursor_x + 1.5) as f64,
             (URL_BAR_Y + URL_BAR_H - 3.0) as f64,
         );
-        scene.fill(Fill::NonZero, transform, palette.cursor, None, &cursor_rect);
+        scene.fill(Fill::NonZero, transform, ctx.palette.cursor, None, &cursor_rect);
     }
 
     scene.pop_layer(); // end URL bar clip
 
     // ── Status indicator ──────────────────────────────────────────────────────
-    let indicator_cx = window_width - STATUS_W / 2.0;
+    let indicator_cx = ctx.window_width - STATUS_W / 2.0;
     let indicator_cy = CHROME_HEIGHT / 2.0;
 
-    if state.loading {
+    if ctx.state.loading {
         // Three pulsing dots
-        let active_dot = ((elapsed_ms / 300) % 3) as usize;
+        let active_dot = ((ctx.elapsed_ms / 300) % 3) as usize;
         for i in 0..3 {
             let dot_x = indicator_cx - 12.0 + (i as f32) * 12.0;
             let alpha = if i == active_dot { 255u8 } else { 80u8 };
@@ -764,7 +794,7 @@ pub fn paint_chrome(
         // Request continuous redraw (caller checks chrome_state.loading)
     } else {
         let ok_dot = Circle::new((indicator_cx as f64, indicator_cy as f64), 5.0);
-        scene.fill(Fill::NonZero, transform, palette.ok_dot, None, &ok_dot);
+        scene.fill(Fill::NonZero, transform, ctx.palette.ok_dot, None, &ok_dot);
     }
 }
 
