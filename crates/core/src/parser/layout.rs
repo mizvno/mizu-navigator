@@ -209,7 +209,7 @@ fn is_valid_lang_tag(value: &str) -> bool {
     primary_ok && region_ok
 }
 
-/// Parses inline attribute key-value pairs (e.g. `type "text" class .input`) and inline events.
+/// Parses inline attribute key-value pairs (e.g. `type "text" class input`) and inline events.
 pub type AttrsAndEvents = (FxHashMap<String, String>, FxHashMap<String, EventBlock>);
 fn parse_attributes_and_events(
     mut s: &str,
@@ -328,11 +328,13 @@ fn parse_attributes_and_events(
             )));
         }
 
-        let final_value = if key == "class" && value.starts_with('.') {
-            value[1..].to_string()
-        } else {
-            value
-        };
+        if key == "class" && value.starts_with('.') {
+            return Err(MizuError::ParseError(format!(
+                "class value `{value}` must not start with `.`; write `class {}` instead",
+                &value[1..]
+            )));
+        }
+        let final_value = value;
 
         // `dir` (ux-7): base text/layout direction, inherited down the
         // tree â€” see `render::bidi` and `docs/design/bidi.md`. Validated
@@ -1068,7 +1070,7 @@ mod tests {
     fn test_multi_tiered_dom_tree() {
         let layout = r#"
     doc title "Mizu App"
-        box class .container
+        box class container
             text "Welcome to Mizu"
             button "Submit"
                 click -> Redirect("/home")
@@ -1169,7 +1171,7 @@ mod tests {
     fn test_attribute_extraction() {
         let layout = r#"
     doc
-        input type "text" placeholder "Enter Username" class .input-field val 42
+        input type "text" placeholder "Enter Username" class input-field val 42
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let input_node = tree
@@ -1185,6 +1187,31 @@ mod tests {
         );
         assert_eq!(attrs.get("class").map(|s| s.as_str()), Some("input-field"));
         assert_eq!(attrs.get("val").map(|s| s.as_str()), Some("42"));
+    }
+
+    #[test]
+    fn class_with_leading_dot_is_a_parse_error() {
+        let layout = "\n    doc\n        box class .foo\n";
+        let result = parse_layout(layout, &mut StringInterner::new());
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains(".foo") && m.contains("class foo")),
+            "expected a ParseError pointing to the dot-free form, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn class_without_leading_dot_still_parses() {
+        let layout = "\n    doc\n        box class foo\n";
+        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
+        let box_node = tree
+            .root()
+            .children()
+            .find(|n| n.value().primitive == Primitive::Box)
+            .unwrap();
+        assert_eq!(
+            box_node.value().attributes.get("class").map(|s| s.as_str()),
+            Some("foo")
+        );
     }
 
     #[test]
@@ -1383,7 +1410,7 @@ mod tests {
     fn test_case_insensitive_primitives_and_equal_sign_attributes() {
         let layout = r#"
     DOC class=title-bar
-        BOX class = ".container"
+        BOX class = container
             text "Hello"
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
