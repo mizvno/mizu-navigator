@@ -169,10 +169,11 @@ fn infer(
         Expr::FunctionCall { name, args_start, args_len } => {
             let args = arena.args(*args_start, *args_len);
             let func_name = interner.resolve(*name).unwrap_or("");
-            if func_name == "filter" && args.len() == 3 {
+            if func_name == "filter" && args.len() == 4 {
                 let list_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
                 infer(&arena[args[1]], arena, env, functions, interner)?;
                 infer(&arena[args[2]], arena, env, functions, interner)?;
+                infer(&arena[args[3]], arena, env, functions, interner)?;
                 match list_ty {
                     Some(ValueType::List(inner)) => Ok(Some(ValueType::List(inner))),
                     Some(other) => Err(MizuError::StaticTypeError(format!(

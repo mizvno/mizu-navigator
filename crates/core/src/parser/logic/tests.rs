@@ -920,7 +920,7 @@
     #[test]
     fn find_side_effect_call_allows_known_pure_builtins() {
         let mut interner = StringInterner::new();
-        for src in ["filter(list, x, x)", "count(list, x, x)", "sort(list, x, x)"] {
+        for src in ["filter(list, x, x)", "count(list, x, x)", "sort(list, x, asc)"] {
             let expr = super::parse_expr_standalone(src, &mut interner).unwrap();
             assert_eq!(
                 super::find_side_effect_call(expr.root(), &expr.arena, &interner, &Default::default()),
@@ -1298,8 +1298,23 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
     // ────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn error_lt_on_strings_is_type_error() {
-        let result = eval_src(r#""a" < "b""#);
+    fn string_lt_is_lexicographic_ordering() {
+        // Strings gained ordering-operator support (previously a TypeError)
+        // so `filter`/`sort`'s new comparison-operator forms can reuse the
+        // language's own `<`/`>`/`<=`/`>=` instead of a separate,
+        // filter-only comparison implementation.
+        assert_eq!(eval_src(r#""a" < "b""#).unwrap(), Value::Bool(true));
+        assert_eq!(eval_src(r#""b" < "a""#).unwrap(), Value::Bool(false));
+        assert_eq!(eval_src(r#""a" > "b""#).unwrap(), Value::Bool(false));
+        assert_eq!(eval_src(r#""a" <= "a""#).unwrap(), Value::Bool(true));
+        assert_eq!(eval_src(r#""a" >= "a""#).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn error_lt_on_string_and_int_is_type_error() {
+        // Ordering across *different* types is still rejected — only
+        // String×String and Int×Int are defined.
+        let result = eval_src(r#""a" < 1"#);
         assert!(matches!(result, Err(MizuError::TypeError { .. })));
     }
 
