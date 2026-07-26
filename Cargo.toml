@@ -57,6 +57,7 @@ h3-quinn = "0.0.10"
 http = "1"
 url = "2"
 redb = "2.1"
+lru = "0.12"
 hkdf = "0.12"
 zeroize = "1"
 

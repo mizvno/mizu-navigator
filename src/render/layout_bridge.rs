@@ -541,7 +541,10 @@ pub struct TaffyBuildContext<'a> {
     /// Mapping of DOM node IDs to the Taffy node IDs created for them.
     pub node_to_taffy_id: &'a mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
     /// Cache of decoded images, consulted for intrinsic aspect ratio.
-    pub image_cache: &'a HashMap<String, AssetSlot>,
+    ///
+    /// `&mut` because `LruCache::get` promotes the entry to
+    /// most-recently-used, which requires mutable access.
+    pub image_cache: &'a mut lru::LruCache<String, AssetSlot>,
     /// The current document's base URL, used to resolve relative `image src`.
     pub chrome_url: &'a str,
     /// ux-6 breakpoint/color-scheme style variants. Pass `&[]` for callers
@@ -718,7 +721,7 @@ mod tests {
             &mut interner,
         )
         .unwrap();
-        let image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
 
         let narrow_env = RenderEnvironment {
             viewport: ViewportSize {
@@ -743,7 +746,7 @@ mod tests {
                 style_rules_map: &style_rules,
                 taffy: &mut narrow_taffy,
                 node_to_taffy_id: &mut narrow_map,
-                image_cache: &image_cache,
+                image_cache: &mut image_cache,
                 chrome_url: "mizu://test/index.mizu",
                 variants: &variants,
                 env: &narrow_env,
@@ -759,7 +762,7 @@ mod tests {
                 style_rules_map: &style_rules,
                 taffy: &mut wide_taffy,
                 node_to_taffy_id: &mut wide_map,
-                image_cache: &image_cache,
+                image_cache: &mut image_cache,
                 chrome_url: "mizu://test/index.mizu",
                 variants: &variants,
                 env: &wide_env,
@@ -979,7 +982,7 @@ mod tests {
         .unwrap();
         let style = "    .row\n        flex-direction row\n";
         let (style_rules, variants) = parse_style_with_variants(style).unwrap();
-        let image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let env = RenderEnvironment {
             viewport: ViewportSize {
                 width: 800.0,
@@ -996,7 +999,7 @@ mod tests {
                 style_rules_map: &style_rules,
                 taffy: &mut taffy,
                 node_to_taffy_id: &mut node_map,
-                image_cache: &image_cache,
+                image_cache: &mut image_cache,
                 chrome_url: "mizu://test/index.mizu",
                 variants: &variants,
                 env: &env,
@@ -1031,7 +1034,7 @@ mod tests {
             &mut interner,
         )
         .unwrap();
-        let image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let env = RenderEnvironment {
             viewport: ViewportSize {
                 width: 800.0,
@@ -1048,7 +1051,7 @@ mod tests {
                 style_rules_map: &style_rules,
                 taffy: &mut taffy,
                 node_to_taffy_id: &mut node_map,
-                image_cache: &image_cache,
+                image_cache: &mut image_cache,
                 chrome_url: "mizu://test/index.mizu",
                 variants: &variants,
                 env: &env,

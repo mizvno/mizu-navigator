@@ -31,6 +31,10 @@ use crate::render::security::CapabilityPolicy;
 pub(super) static MAX_REDIRECTS: LazyLock<u32> =
     LazyLock::new(|| crate::core::config::CONFIG.max_redirects);
 
+/// Maximum number of decoded images kept in `image_cache` before the least
+/// recently used entry is evicted.
+const IMAGE_CACHE_CAPACITY: usize = 200;
+
 /// Encapsulates the application state, DOM, and Layout definitions.
 pub struct MizuWindowManager {
     /// The active winit window instance.
@@ -75,7 +79,9 @@ pub struct MizuWindowManager {
     /// Keyboard modifiers state.
     pub modifiers: winit::keyboard::ModifiersState,
     /// Cache for decoded images used in `background-image` and `image` tags.
-    pub image_cache: HashMap<String, AssetSlot>,
+    /// Bounded (see `IMAGE_CACHE_CAPACITY`) so long browsing sessions with many
+    /// distinct images (e.g. scrolling a long thread) can't grow this without limit.
+    pub image_cache: lru::LruCache<String, AssetSlot>,
     /// Track currently fetching images to avoid duplicate requests.
     pub fetching_images: std::collections::HashSet<String>,
     /// Global start time of the engine for animations.
@@ -199,7 +205,8 @@ impl MizuWindowManager {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy_id = HashMap::new();
 
-        let empty_cache = HashMap::new();
+        let mut empty_cache =
+            lru::LruCache::new(std::num::NonZeroUsize::new(IMAGE_CACHE_CAPACITY).unwrap());
         let default_chrome_url = "mizu://localhost/index.mizu";
         // Placeholder viewport: the real window doesn't exist yet at this
         // point in startup. `resize_viewport` rebuilds the taffy tree's
@@ -219,7 +226,7 @@ impl MizuWindowManager {
                 style_rules_map: &style_rules,
                 taffy: &mut taffy,
                 node_to_taffy_id: &mut node_to_taffy_id,
-                image_cache: &empty_cache,
+                image_cache: &mut empty_cache,
                 chrome_url: default_chrome_url,
                 variants: &style_variants,
                 env: &initial_env,
@@ -262,7 +269,9 @@ impl MizuWindowManager {
             chrome_state: ChromeState::default(),
             root_scroll_offset_y: 0.0,
             modifiers: winit::keyboard::ModifiersState::default(),
-            image_cache: HashMap::new(),
+            image_cache: lru::LruCache::new(
+                std::num::NonZeroUsize::new(IMAGE_CACHE_CAPACITY).unwrap(),
+            ),
             fetching_images: std::collections::HashSet::new(),
             start_time: std::time::Instant::now(),
             last_layout_time: std::time::Instant::now(),
@@ -470,7 +479,7 @@ impl MizuWindowManager {
                 style_rules_map: &style_rules,
                 taffy: &mut taffy,
                 node_to_taffy_id: &mut node_to_taffy_id,
-                image_cache: &self.image_cache,
+                image_cache: &mut self.image_cache,
                 chrome_url: &self.chrome_state.url,
                 variants: &style_variants,
                 env: &env,
@@ -593,7 +602,7 @@ impl MizuWindowManager {
                 style_rules_map: &self.style_rules,
                 taffy: &mut new_taffy,
                 node_to_taffy_id: &mut new_node_to_taffy_id,
-                image_cache: &self.image_cache,
+                image_cache: &mut self.image_cache,
                 chrome_url: &self.chrome_state.url,
                 variants: &self.style_variants,
                 env: &env,

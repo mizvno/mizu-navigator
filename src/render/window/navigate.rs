@@ -381,7 +381,7 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
             manager.fetching_images.remove(&url);
             manager
                 .image_cache
-                .insert(url.clone(), AssetSlot::Ready(image));
+                .put(url.clone(), AssetSlot::Ready(image));
             let mut new_taffy = taffy::TaffyTree::new();
             let mut new_node_map = HashMap::new();
             let env = crate::render::responsive::RenderEnvironment {
@@ -394,7 +394,7 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                     style_rules_map: &manager.style_rules,
                     taffy: &mut new_taffy,
                     node_to_taffy_id: &mut new_node_map,
-                    image_cache: &manager.image_cache,
+                    image_cache: &mut manager.image_cache,
                     chrome_url: &manager.chrome_state.url,
                     variants: &manager.style_variants,
                     env: &env,
@@ -415,7 +415,7 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                 .inspector_log
                 .push_net_done("IMG", &url, NetOutcome::Failed(error.to_string()));
             manager.fetching_images.remove(&url);
-            manager.image_cache.insert(url.clone(), AssetSlot::Failed);
+            manager.image_cache.put(url.clone(), AssetSlot::Failed);
             tracing::error!(url = %url, error = ?error, "image load failed");
         }
     }

@@ -74,7 +74,7 @@ pub struct PaintContext<'a> {
     /// Currently focused node for text input.
     pub focused_node: Option<EgoNodeId>,
     /// Cache for decoded images.
-    pub image_cache: &'a mut HashMap<String, crate::render::window::AssetSlot>,
+    pub image_cache: &'a mut lru::LruCache<String, crate::render::window::AssetSlot>,
     /// Track currently fetching images.
     pub fetching_images: &'a mut std::collections::HashSet<String>,
     /// Elapsed time in milliseconds.
@@ -364,7 +364,7 @@ pub fn paint_node(
                 Some(crate::render::window::AssetSlot::Failed) => None,
                 None => {
                     ctx.image_cache
-                        .insert(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                        .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
                     let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
                         url: abs_url.clone(),
                         is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
@@ -774,7 +774,7 @@ pub fn paint_node(
             Some(crate::render::window::AssetSlot::Failed) => None,
             None => {
                 ctx.image_cache
-                    .insert(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                    .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
                 let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
                     url: abs_url.clone(),
                     is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
@@ -1208,7 +1208,7 @@ mod tests {
         let mut layout_cx = parley::LayoutContext::new();
         let mut store = VariableStore::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
-        let mut image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
 
         let mut fetching_images = std::collections::HashSet::new();
         let (network_tx, _network_rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
@@ -1366,7 +1366,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
-        let mut image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = std::collections::HashSet::new();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
@@ -1752,7 +1752,7 @@ mod tests {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
-        let mut image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = std::collections::HashSet::new();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
@@ -1852,7 +1852,7 @@ mod tests {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
-        let mut image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = std::collections::HashSet::new();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
@@ -1956,7 +1956,7 @@ mod tests {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
-        let mut image_cache = HashMap::new();
+        let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = std::collections::HashSet::new();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
