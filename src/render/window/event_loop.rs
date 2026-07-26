@@ -1102,15 +1102,17 @@ fn dispatch_redraw_requested(
         let lc = &mut manager.layout_cx;
         paint_chrome(
             &mut scene,
-            cs,
-            logical_width,
-            Affine::scale(scale),
-            elapsed_ms,
-            fc,
-            lc,
-            can_go_back,
-            can_go_forward,
-            &palette,
+            &mut crate::render::chrome_vello::ChromePaintContext {
+                state: cs,
+                window_width: logical_width,
+                transform: Affine::scale(scale),
+                elapsed_ms,
+                font_cx: fc,
+                layout_cx: lc,
+                can_go_back,
+                can_go_forward,
+                palette: &palette,
+            },
         );
     }
 
