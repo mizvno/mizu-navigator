@@ -686,6 +686,7 @@
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("done"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Bool(true)),
         ];
         let result = eval_builtin(&mut store, "filter", args).unwrap();
@@ -707,6 +708,7 @@
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::String(Arc::from("gamma"))),
         ];
         let result = eval_builtin(&mut store, "filter", args).unwrap();
@@ -726,6 +728,7 @@
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("priority"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Int(1)),
         ];
         let result = eval_builtin(&mut store, "filter", args).unwrap();
@@ -744,6 +747,7 @@
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("priority"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Int(99)),
         ];
         let result = eval_builtin(&mut store, "filter", args).unwrap();
@@ -774,11 +778,10 @@
         let mut store = VariableStore::new();
         store.set("tasks", make_task_list());
         let tasks_sym = store.interner.get_or_intern("tasks");
-        let asc_sym = store.interner.get_or_intern("asc");
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("priority"))),
-            Expr::Variable(asc_sym),
+            Expr::Literal(Value::String(Arc::from("asc"))),
         ];
         let result = eval_builtin(&mut store, "sort", args).unwrap();
         let Value::List(items) = result else {
@@ -803,11 +806,10 @@
         let mut store = VariableStore::new();
         store.set("tasks", make_task_list());
         let tasks_sym = store.interner.get_or_intern("tasks");
-        let desc_sym = store.interner.get_or_intern("desc");
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("priority"))),
-            Expr::Variable(desc_sym),
+            Expr::Literal(Value::String(Arc::from("desc"))),
         ];
         let result = eval_builtin(&mut store, "sort", args).unwrap();
         let Value::List(items) = result else {
@@ -855,6 +857,200 @@
     }
 
     #[test]
+    fn test_sort_direction_keyword_is_never_shadowed_by_a_real_variable() {
+        // Regression test for the fixed bug: `sort`'s third argument used to
+        // be evaluated as a normal expression *except* when its resolved
+        // variable name happened to be literally "asc"/"desc", in which case
+        // the keyword interpretation silently won over the variable's real
+        // value. Now `asc`/`desc` in this position are hard parse-time
+        // keywords (parse_sort_call_args) — never `Expr::Variable` at all —
+        // so a real variable named `asc`, bound to something completely
+        // unrelated to sort direction, must have zero effect on the result.
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        // A real variable literally named `asc`, bound to a value that is
+        // not `"asc"`/`"desc"` at all — if the old bug were still present in
+        // spirit, this is the exact scenario it would have mishandled.
+        store.set("asc", Value::Int(999));
+
+        let result = eval_parsed(&mut store, r#"sort(tasks, "priority", asc)"#).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        let priorities: Vec<i64> = items
+            .iter()
+            .map(|item| match item.get_field("priority") {
+                Some(&Value::Int(p)) => p,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(
+            priorities,
+            vec![1, 1, 1, 2, 3],
+            "sort(tasks, \"priority\", asc) must sort ascending regardless of \
+             the unrelated in-scope variable named `asc`"
+        );
+
+        // The variable itself must still be untouched/unread by this call —
+        // sort's third argument never becomes a variable lookup at all.
+        assert_eq!(store.get("asc").unwrap(), &Value::Int(999));
+    }
+
+    /// Parses `src` as a standalone expression through the real parser (so
+    /// it exercises `parse_filter_call_args`/`parse_sort_call_args`'s
+    /// keyword-recognition logic, unlike `eval_builtin`'s hand-built
+    /// `Expr::FunctionCall`) and evaluates it against `store`.
+    fn eval_parsed(store: &mut VariableStore, src: &str) -> Result<Value, MizuError> {
+        use crate::parser::logic::{MizuFunction, parse_expr_standalone};
+        use rustc_hash::FxHashMap;
+        let expr_tree = parse_expr_standalone(src, &mut store.interner)?;
+        let fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
+        store.state_machine.instruction_count = 0;
+        store.state_machine.evaluate(
+            expr_tree.root(),
+            0,
+            &fns,
+            &store.interner,
+            &expr_tree.arena,
+        )
+    }
+
+    #[test]
+    fn test_filter_op_ne() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("priority"))),
+            Expr::Literal(Value::String(Arc::from("ne"))),
+            Expr::Literal(Value::Int(1)),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 2, "alpha (3) and gamma (2) have priority != 1");
+    }
+
+    #[test]
+    fn test_filter_op_lt() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("lt"))),
+            Expr::Literal(Value::String(Arc::from("delta"))),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 2, "alpha, beta < \"delta\" lexicographically");
+    }
+
+    #[test]
+    fn test_filter_op_le() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("le"))),
+            Expr::Literal(Value::String(Arc::from("delta"))),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 3, "alpha, beta, delta <= \"delta\"");
+    }
+
+    #[test]
+    fn test_filter_op_gt() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("gt"))),
+            Expr::Literal(Value::String(Arc::from("delta"))),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 2, "gamma, epsilon > \"delta\" lexicographically");
+    }
+
+    #[test]
+    fn test_filter_op_ge() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("ge"))),
+            Expr::Literal(Value::String(Arc::from("delta"))),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 3, "delta, gamma, epsilon >= \"delta\"");
+    }
+
+    #[test]
+    fn test_filter_op_contains() {
+        use crate::parser::logic::Expr;
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+        let tasks_sym = store.interner.get_or_intern("tasks");
+        let args = vec![
+            Expr::Variable(tasks_sym),
+            Expr::Literal(Value::String(Arc::from("name"))),
+            Expr::Literal(Value::String(Arc::from("contains"))),
+            Expr::Literal(Value::String(Arc::from("am"))),
+        ];
+        let result = eval_builtin(&mut store, "filter", args).unwrap();
+        let Value::List(items) = result else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 1, "only \"gamma\" contains \"am\"");
+        assert_eq!(items[0].get_field("name"), Some(&Value::String(Arc::from("gamma"))));
+    }
+
+    #[test]
+    fn test_filter_three_argument_form_still_behaves_as_eq() {
+        // Backward compatibility: the pre-existing 3-argument surface
+        // syntax `filter(list, field, value)` must still parse and behave
+        // identically to the explicit 4-argument `op = eq` form — this
+        // drives the *real* parser (parse_filter_call_args), not a
+        // hand-built Expr, so it actually exercises the 3-arg desugaring.
+        let mut store = VariableStore::new();
+        store.set("tasks", make_task_list());
+
+        let three_arg = eval_parsed(&mut store, r#"filter(tasks, "done", true)"#).unwrap();
+        let four_arg = eval_parsed(&mut store, r#"filter(tasks, "done", eq, true)"#).unwrap();
+        assert_eq!(three_arg, four_arg);
+
+        let Value::List(items) = three_arg else {
+            panic!("expected list")
+        };
+        assert_eq!(items.len(), 3, "alpha, gamma, epsilon have done = true");
+    }
+
+    #[test]
     fn test_filter_on_non_list() {
         use crate::parser::logic::Expr;
         let mut store = VariableStore::new();
@@ -863,6 +1059,7 @@
         let args = vec![
             Expr::Variable(sym),
             Expr::Literal(Value::String(Arc::from("field"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Bool(true)),
         ];
         let result = eval_builtin(&mut store, "filter", args);
@@ -891,6 +1088,7 @@
         let args = vec![
             Expr::Variable(sym),
             Expr::Literal(Value::String(Arc::from("v"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Int(1)),
         ];
         let result = eval_builtin(&mut store, "filter", args);
@@ -926,11 +1124,10 @@
         let mut store = VariableStore::new();
         store.set("big", make_large_list(2_000));
         let sym = store.interner.get_or_intern("big");
-        let asc_sym = store.interner.get_or_intern("asc");
         let args = vec![
             Expr::Variable(sym),
             Expr::Literal(Value::String(Arc::from("v"))),
-            Expr::Variable(asc_sym),
+            Expr::Literal(Value::String(Arc::from("asc"))),
         ];
         let result = eval_builtin(&mut store, "sort", args);
         assert!(
@@ -1001,6 +1198,7 @@
         let args = vec![
             Expr::Variable(tasks_sym),
             Expr::Literal(Value::String(Arc::from("done"))),
+            Expr::Literal(Value::String(Arc::from("eq"))),
             Expr::Literal(Value::Bool(true)),
         ];
         let result = eval_builtin(&mut store, "filter", args).unwrap();

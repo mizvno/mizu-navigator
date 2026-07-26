@@ -218,11 +218,21 @@ pub(crate) fn apply_binop(
         (BinOp::Ne, Value::Null, _) => Ok(Value::Bool(true)),
         (BinOp::Ne, _, Value::Null) => Ok(Value::Bool(true)),
 
-        // Ordering — numeric types only
+        // Ordering — numeric types, and strings (lexicographic byte order,
+        // Rust's default `Ord` for `&str`/`String` — the same ordering
+        // `core::types::eval::compare_values` already uses for `sort`'s
+        // String field values, kept consistent here rather than diverging).
+        // No instruction charge: comparison is read-only and doesn't
+        // allocate, matching Eq/Ne's existing (uncharged) String arms above
+        // — only Add charges, because only Add allocates.
         (BinOp::Lt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l < r)),
         (BinOp::Gt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l > r)),
         (BinOp::Le, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l <= r)),
         (BinOp::Ge, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l >= r)),
+        (BinOp::Lt, Value::String(l), Value::String(r)) => Ok(Value::Bool(l < r)),
+        (BinOp::Gt, Value::String(l), Value::String(r)) => Ok(Value::Bool(l > r)),
+        (BinOp::Le, Value::String(l), Value::String(r)) => Ok(Value::Bool(l <= r)),
+        (BinOp::Ge, Value::String(l), Value::String(r)) => Ok(Value::Bool(l >= r)),
 
         // Logical AND / OR — bool operands only
         (BinOp::And, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l && r)),

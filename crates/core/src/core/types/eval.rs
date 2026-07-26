@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::core::errors::MizuError;
-use crate::parser::logic::{Expr, ExprArena, MizuFunction, apply_binop, check_type, type_name};
+use crate::parser::logic::{BinOp, Expr, ExprArena, MizuFunction, apply_binop, check_type, type_name};
 
 use super::interner::{StringInterner, Symbol};
 use super::value::Value;
@@ -506,12 +506,18 @@ impl StateMachine {
                             });
                         return Ok(Value::Bool(true));
                     }
-                    "filter" if args.len() == 3 => {
+                    "filter" if args.len() == 4 => {
                         let list_val =
                             self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let field_val =
                             self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
-                        let target = self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?;
+                        // args[2] is always Expr::Literal(Value::String(op)) — the
+                        // parser desugars filter's 3-argument surface form to
+                        // `op = "eq"` and only ever accepts one of FILTER_OPS as a
+                        // bare keyword for the 4-argument form (parser/logic/parse.rs).
+                        // Evaluating it here is a formality, never a variable lookup.
+                        let op_val = self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?;
+                        let target = self.evaluate(&arena[args[3]], frame_pointer, functions, interner, arena)?;
                         let list = match list_val {
                             Value::List(l) => l,
                             other => {
@@ -521,13 +527,6 @@ impl StateMachine {
                                 });
                             }
                         };
-                        // Charge the instruction budget before the native iteration to prevent
-                        // large lists from bypassing MAX_INSTRUCTIONS via unmetered CPU work.
-                        self.instruction_count =
-                            self.instruction_count.saturating_add(list.len() as u64);
-                        if self.instruction_count > *MAX_INSTRUCTIONS {
-                            return Err(MizuError::Timeout);
-                        }
                         let field = match field_val {
                             Value::String(s) => s,
                             other => {
@@ -537,15 +536,71 @@ impl StateMachine {
                                 });
                             }
                         };
+                        let op = match op_val {
+                            Value::String(s) => s,
+                            other => {
+                                return Err(MizuError::TypeError {
+                                    expected: Box::new("string".to_string()),
+                                    found: type_name(&other),
+                                });
+                            }
+                        };
+                        // Charge the instruction budget before the native iteration to prevent
+                        // large lists from bypassing MAX_INSTRUCTIONS via unmetered CPU work.
+                        self.instruction_count =
+                            self.instruction_count.saturating_add(list.len() as u64);
+                        // `contains` does an O(field length) substring scan per item on
+                        // top of the flat per-item charge above — pre-charge that too,
+                        // mirroring the standalone `contains` builtin's own charge.
+                        if op.as_ref() == "contains" {
+                            let extra: u64 = list
+                                .iter()
+                                .filter_map(|item| item.get_field(field.as_ref()))
+                                .filter_map(|v| match v {
+                                    Value::String(s) => Some(s.len() as u64),
+                                    _ => None,
+                                })
+                                .sum();
+                            self.instruction_count = self.instruction_count.saturating_add(extra);
+                        }
+                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                            return Err(MizuError::Timeout);
+                        }
+                        let binop = match op.as_ref() {
+                            "eq" => Some(BinOp::Eq),
+                            "ne" => Some(BinOp::Ne),
+                            "lt" => Some(BinOp::Lt),
+                            "le" => Some(BinOp::Le),
+                            "gt" => Some(BinOp::Gt),
+                            "ge" => Some(BinOp::Ge),
+                            "contains" => None,
+                            other => {
+                                return Err(MizuError::ExecutionError(format!(
+                                    "filter: unknown operator `{other}` — expected one of \
+                                     eq, ne, lt, le, gt, ge, contains"
+                                )));
+                            }
+                        };
+                        let mut ic = self.instruction_count;
                         let filtered: Vec<Value> = list
                             .iter()
                             .filter(|item| {
-                                item.get_field(field.as_ref())
-                                    .map(|v| v == &target)
-                                    .unwrap_or(false)
+                                let Some(field_v) = item.get_field(field.as_ref()) else {
+                                    return false;
+                                };
+                                match &binop {
+                                    Some(op) => apply_binop(op, field_v.clone(), target.clone(), &mut ic)
+                                        .map(|v| matches!(v, Value::Bool(true)))
+                                        .unwrap_or(false),
+                                    None => match (field_v, &target) {
+                                        (Value::String(h), Value::String(n)) => h.contains(n.as_ref()),
+                                        _ => false,
+                                    },
+                                }
                             })
                             .cloned()
                             .collect();
+                        self.instruction_count = ic;
                         return Ok(Value::List(Arc::new(filtered)));
                     }
                     "count" if args.len() == 3 => {
@@ -609,17 +664,13 @@ impl StateMachine {
                             self.evaluate(&arena[args[0]], frame_pointer, functions, interner, arena)?;
                         let field_val =
                             self.evaluate(&arena[args[1]], frame_pointer, functions, interner, arena)?;
-                        let direction_val = match &arena[args[2]] {
-                            Expr::Variable(sym) => {
-                                let name = interner.resolve(*sym).unwrap_or("");
-                                if name == "asc" || name == "desc" {
-                                    Value::String(Arc::from(name))
-                                } else {
-                                    self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?
-                                }
-                            }
-                            _ => self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?,
-                        };
+                        // args[2] is always Expr::Literal(Value::String("asc"|"desc"))
+                        // — the parser accepts nothing else in this position
+                        // (parser/logic/parse.rs's parse_sort_call_args), so this is
+                        // never a variable lookup and can never be shadowed by an
+                        // in-scope variable literally named `asc`/`desc`.
+                        let direction_val =
+                            self.evaluate(&arena[args[2]], frame_pointer, functions, interner, arena)?;
                         let list = match list_val {
                             Value::List(l) => l,
                             other => {

@@ -274,6 +274,12 @@ impl<'a> Cursor<'a> {
         self.tokens.get(self.pos)
     }
 
+    /// Looks `offset` tokens past the current position without consuming
+    /// anything. `peek_at(0)` is equivalent to [`Self::peek`].
+    pub(super) fn peek_at(&self, offset: usize) -> Option<&Token<'a>> {
+        self.tokens.get(self.pos + offset)
+    }
+
     pub(super) fn next(&mut self) -> Option<&Token<'a>> {
         let tok = self.tokens.get(self.pos)?;
         self.pos += 1;
