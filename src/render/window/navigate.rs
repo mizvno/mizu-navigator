@@ -390,13 +390,15 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
             };
             match crate::render::layout_bridge::build_taffy_tree(
                 manager.dom.root(),
-                &manager.style_rules,
-                &mut new_taffy,
-                &mut new_node_map,
-                &manager.image_cache,
-                &manager.chrome_state.url,
-                &manager.style_variants,
-                &env,
+                &mut crate::render::layout_bridge::TaffyBuildContext {
+                    style_rules_map: &manager.style_rules,
+                    taffy: &mut new_taffy,
+                    node_to_taffy_id: &mut new_node_map,
+                    image_cache: &manager.image_cache,
+                    chrome_url: &manager.chrome_state.url,
+                    variants: &manager.style_variants,
+                    env: &env,
+                },
             ) {
                 Ok(new_root) => {
                     manager.taffy = new_taffy;
