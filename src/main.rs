@@ -137,6 +137,30 @@ fn run() -> Result<(), MizuError> {
         window_url.starts_with("mizu://"),
     )?;
 
+    // Phase 6: Check Static Types (Phase B) — same gate
+    // src/render/window/navigate.rs applies on every subsequent navigation
+    // (see navigate.rs's `handle_navigate_success`). The initial load must
+    // not be a weaker trust boundary than a navigated-to document: a
+    // document opened via `cargo run -- <file>` gets exactly the same
+    // Phase B treatment as one reached by clicking a link.
+    mizu::parser::typecheck::check_types(
+        &dom_tree,
+        &root_timers,
+        &logic_fns,
+        &computed_bindings,
+        &interner,
+    )?;
+
+    // Phase 7: Check Information Flow (Invariant F1) — same gate as above.
+    mizu::parser::flow::check_information_flow(
+        &dom_tree,
+        &root_timers,
+        &logic_fns,
+        &computed_bindings,
+        &url_registry,
+        &interner,
+    )?;
+
     // Phase 8: Start native window and event loop
     run_window_loop(
         InitialDocument {
