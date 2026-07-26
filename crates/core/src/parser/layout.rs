@@ -50,6 +50,12 @@ pub enum Primitive {
     /// A form container that batches input values and submits them atomically.
     /// Recognised attributes: `submit -> action`.
     Form,
+    /// A section heading, `h1` through `h6`. All six spellings share this one
+    /// variant; the level (1-6) is stored as the `"level"` string attribute
+    /// rather than as enum payload, matching how `class`/`id`/`dir` are
+    /// already represented. No default visual styling — document authors
+    /// style headings themselves via `h1`-`h6` tag selectors.
+    Heading,
 }
 
 impl Primitive {
@@ -65,6 +71,7 @@ impl Primitive {
             Primitive::Markdown => "markdown",
             Primitive::Each => "each",
             Primitive::Form => "form",
+            Primitive::Heading => "heading",
         }
     }
 }
@@ -412,6 +419,7 @@ fn parse_primitive_and_attrs(
         "image" => Primitive::Image,
         "markdown" => Primitive::Markdown,
         "form" => Primitive::Form,
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Primitive::Heading,
         _ => {
             return Err(MizuError::ParseError(format!(
                 "line {line_num}: Illegal primitive name `{prim_name}`"
@@ -435,6 +443,14 @@ fn parse_primitive_and_attrs(
 
     let (mut attributes, events) = parse_attributes_and_events(attrs_str, interner)
         .map_err(|e| MizuError::ParseError(format!("line {line_num}: {e}")))?;
+
+    // `h1`-`h6` are six spellings of one `Heading` primitive; the digit is
+    // the only difference between them, so it's stored as the `level`
+    // attribute — the match arm above only accepts these six literal
+    // spellings, so `prim_lower[1..]` always parses as `1..=6`.
+    if primitive == Primitive::Heading {
+        attributes.insert("level".to_string(), prim_lower[1..].to_string());
+    }
 
     // `title` is only meaningful on `doc` (it sets the OS window title, not
     // visible page content) — reject it loudly on any other primitive
@@ -491,7 +507,7 @@ fn parse_primitive_and_attrs(
 /// # Errors
 ///
 /// * [`MizuError::ParseError`] â€” if structural constraints are violated (e.g. root node
-///   is not `window`, multiple roots are defined, or bad syntax), or if a media
+///   is not `doc`, multiple roots are defined, or bad syntax), or if a media
 ///   alias is undeclared or points to a non-media endpoint.
 pub fn parse_layout(
     layout_content: &str,
@@ -1212,6 +1228,39 @@ mod tests {
             box_node.value().attributes.get("class").map(|s| s.as_str()),
             Some("foo")
         );
+    }
+
+    #[test]
+    fn h1_through_h6_parse_as_heading_with_correct_level() {
+        for (tag, expected_level) in [
+            ("h1", "1"),
+            ("h2", "2"),
+            ("h3", "3"),
+            ("h4", "4"),
+            ("h5", "5"),
+            ("h6", "6"),
+        ] {
+            let layout = format!("\n    doc\n        {tag} \"Section title\"\n");
+            let tree = parse_layout(&layout, &mut StringInterner::new()).unwrap();
+            let heading = tree
+                .root()
+                .children()
+                .find(|n| n.value().primitive == Primitive::Heading)
+                .unwrap_or_else(|| panic!("{tag} did not parse as Primitive::Heading"));
+            assert_eq!(
+                heading.value().attributes.get("level").map(|s| s.as_str()),
+                Some(expected_level),
+                "{tag} must set level={expected_level}"
+            );
+            let text_child = heading
+                .children()
+                .find(|n| n.value().primitive == Primitive::Text)
+                .expect("inline text must become a child Text node, like every non-doc primitive");
+            assert_eq!(
+                text_child.value().attributes.get("content").map(|s| s.as_str()),
+                Some("Section title")
+            );
+        }
     }
 
     #[test]
