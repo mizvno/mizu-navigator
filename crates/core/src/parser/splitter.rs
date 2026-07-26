@@ -210,8 +210,14 @@ pub fn split_source_with_origin(
                 "layout" => {
                     active = ActiveBlock::Layout;
                 }
-                "urls" => {
+                "reach" => {
                     active = ActiveBlock::Urls;
+                }
+                "urls" => {
+                    return Err(MizuError::ParseError(format!(
+                        "line {}: `urls` is no longer supported; use `reach` instead",
+                        line_idx + 1
+                    )));
                 }
                 _ if is_import_directive(trimmed) => match origin {
                     Origin::Network => {
@@ -232,7 +238,7 @@ pub fn split_source_with_origin(
                 _ => {
                     return Err(MizuError::ParseError(format!(
                         "line {}: unexpected root-level token `{trimmed}`; \
-                         expected `logic`, `style`, `layout`, `urls`, or `import \"…\"`",
+                         expected `logic`, `style`, `layout`, `reach`, or `import \"…\"`",
                         line_idx + 1
                     )));
                 }
@@ -753,9 +759,24 @@ logic
     }
 
     #[test]
-    fn split_urls_block_parsed_correctly() {
+    fn old_urls_keyword_is_a_clear_parse_error_naming_reach() {
         let source = "\
 urls
+    api login /api/v1/login
+layout
+    window
+";
+        let result = split_source(source, Path::new(NO_IMPORT_DIR));
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("urls") && m.contains("reach")),
+            "expected a ParseError naming both `urls` and `reach`, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn split_urls_block_parsed_correctly() {
+        let source = "\
+reach
     api login /api/v1/login
     media logo mizu://cdn.example.com/logo.png
 layout
