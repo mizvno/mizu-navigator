@@ -440,14 +440,20 @@ pub fn translate_style(rules: &StyleRules, viewport: ViewportSize, dir: Resolved
 /// pass. Mirrors the `PaintContext` pattern already used for the analogous
 /// recursive paint walk (`render::vello_pipeline`).
 pub struct TaffyBuildContext<'a> {
+    /// Active tag/class style rules.
     pub style_rules_map: &'a HashMap<String, StyleRules>,
+    /// The Taffy tree being built.
     pub taffy: &'a mut TaffyTree<EgoNodeId>,
+    /// Mapping of DOM node IDs to the Taffy node IDs created for them.
     pub node_to_taffy_id: &'a mut HashMap<EgoNodeId, taffy::prelude::NodeId>,
+    /// Cache of decoded images, consulted for intrinsic aspect ratio.
     pub image_cache: &'a HashMap<String, AssetSlot>,
+    /// The current document's base URL, used to resolve relative `image src`.
     pub chrome_url: &'a str,
     /// ux-6 breakpoint/color-scheme style variants. Pass `&[]` for callers
     /// that don't need responsive behavior (e.g. tests).
     pub variants: &'a [StyleVariant],
+    /// Current viewport size / color-scheme snapshot variants resolve against.
     pub env: &'a RenderEnvironment,
 }
 
