@@ -17,9 +17,10 @@ use ego_tree::{NodeId, Tree};
 use rustc_hash::FxHashMap;
 
 use crate::core::errors::MizuError;
-use crate::core::types::StringInterner;
+use crate::core::types::{StringInterner, Symbol};
 use crate::parser::logic::{
-    Action, ExprTree, find_side_effect_call, parse_action_with_urls, parse_expr_standalone,
+    Action, ExprTree, MizuFunction, find_side_effect_call, parse_action_with_urls,
+    parse_expr_standalone,
 };
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
@@ -441,16 +442,24 @@ pub fn parse_layout(
     layout_content: &str,
     interner: &mut StringInterner,
 ) -> Result<Tree<MizuNode>, MizuError> {
-    parse_layout_with_urls(layout_content, interner, None, false)
+    parse_layout_with_urls(layout_content, interner, None, false, &rustc_hash::FxHashMap::default())
 }
 
 /// Like [`parse_layout`] but accepts an optional [`UrlRegistry`] for media alias validation
 /// and an `is_remote_origin` flag that blocks `file://` asset references at parse time.
+///
+/// `functions` is the document's user-defined-function table (from
+/// `parse_logic`, parsed before the layout block) — needed by the P1 purity
+/// checker (`find_side_effect_call`) to recognise a call to a user-defined
+/// function inside a conditional class condition as pure-by-construction,
+/// as opposed to an unknown name (rejected fail-secure). Callers with no
+/// functions in scope (most tests) may pass `&FxHashMap::default()`.
 pub fn parse_layout_with_urls(
     layout_content: &str,
     interner: &mut StringInterner,
     url_registry: Option<&UrlRegistry>,
     is_remote_origin: bool,
+    functions: &FxHashMap<Symbol, MizuFunction>,
 ) -> Result<Tree<MizuNode>, MizuError> {
     let all_lines: Vec<&str> = layout_content.lines().collect();
 
@@ -623,7 +632,9 @@ pub fn parse_layout_with_urls(
                     line_idx + 1
                 ))
             })?;
-            if let Some(bad_fn) = find_side_effect_call(condition.root(), &condition.arena, interner) {
+            if let Some(bad_fn) =
+                find_side_effect_call(condition.root(), &condition.arena, interner, functions)
+            {
                 return Err(MizuError::ParseError(format!(
                     "line {}: conditional class condition must be pure â€” \
                      `{bad_fn}` is a side-effecting call",
@@ -858,7 +869,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"undeclared_alias\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -887,7 +898,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"test.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
             "direct filename with extension must bypass guard: {result:?}"
@@ -900,7 +911,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"./img/logo.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
             "relative path with slash must bypass guard: {result:?}"
@@ -914,7 +925,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"file:///etc/passwd\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), true);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), true, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -937,7 +948,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"file:///home/user/img.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
             "file:// must be allowed in local-origin documents: {result:?}"
@@ -951,7 +962,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"mizu://cdn.example.com/img.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
             "mizu:// URL in src must be rejected: {result:?}"
@@ -965,7 +976,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "window \"App\"\n    image src \"cdn_icons\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -1482,7 +1493,7 @@ mod tests {
         );
 
         let layout = "window \"App\"\n    image src \"logo\"\n";
-        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false).unwrap();
+        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
         let img = tree
             .root()
             .children()
@@ -1520,7 +1531,7 @@ mod tests {
         // Same rejection even when a registry is supplied.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let with_registry = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let with_registry = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             matches!(with_registry, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
             "absolute src must be rejected with a registry too, got: {with_registry:?}"
@@ -1561,7 +1572,7 @@ mod tests {
         );
 
         let layout = "window \"App\"\n    button\n        click -> download(backup_alias)\n";
-        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false).unwrap();
+        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
         let btn = tree
             .root()
             .children()
@@ -1628,7 +1639,7 @@ mod tests {
         );
 
         let layout = "window \"App\"\n    button\n        click -> download(api_alias)\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false);
+        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(

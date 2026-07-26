@@ -135,6 +135,7 @@ fn run() -> Result<(), MizuError> {
         &mut interner,
         Some(&url_registry),
         window_url.starts_with("mizu://"),
+        &logic_fns,
     )?;
 
     // Phase 6: Check Static Types (Phase B) — same gate
