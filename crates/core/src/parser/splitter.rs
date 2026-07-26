@@ -152,12 +152,12 @@ fn is_import_directive(trimmed: &str) -> bool {
 /// logic
 ///     tax(p: num) : p * 1.10
 /// layout
-///     window "App"
+///     doc "App"
 /// "#;
 ///
 /// let parsed = split_source(source, Path::new(".")).unwrap();
 /// assert!(parsed.logic_block.contains("tax"));
-/// assert!(parsed.layout_block.contains("window"));
+/// assert!(parsed.layout_block.contains("doc"));
 /// assert!(parsed.style_block.trim().is_empty());
 /// assert!(parsed.urls_block.trim().is_empty());
 /// ```
@@ -606,13 +606,13 @@ style
     .card
         padding 20
 layout
-    window \"App\"
+    doc \"App\"
 ";
         let parsed = split_source(source, Path::new(NO_IMPORT_DIR)).unwrap();
         assert_eq!(parsed.logic_block.trim(), "tax(p: num) : p * 1.10");
         assert!(parsed.style_block.contains(".card"));
         assert!(parsed.style_block.contains("padding 20"));
-        assert_eq!(parsed.layout_block.trim(), "window \"App\"");
+        assert_eq!(parsed.layout_block.trim(), "doc \"App\"");
     }
 
     #[test]
@@ -620,7 +620,7 @@ layout
         // The spec says declaration order is free.
         let source = "\
 layout
-    window \"Dashboard\"
+    doc \"Dashboard\"
 logic
     gross(p: num, q: num) : p * q
 style
@@ -630,7 +630,7 @@ style
         let parsed = split_source(source, Path::new(NO_IMPORT_DIR)).unwrap();
         assert!(parsed.logic_block.contains("gross"));
         assert!(parsed.style_block.contains(".btn"));
-        assert!(parsed.layout_block.contains("window"));
+        assert!(parsed.layout_block.contains("doc"));
     }
 
     #[test]
@@ -764,7 +764,7 @@ logic
 urls
     api login /api/v1/login
 layout
-    window
+    doc
 ";
         let result = split_source(source, Path::new(NO_IMPORT_DIR));
         assert!(
@@ -780,7 +780,7 @@ reach
     api login /api/v1/login
     media logo mizu://cdn.example.com/logo.png
 layout
-    window \"App\"
+    doc \"App\"
 ";
         let parsed = split_source(source, Path::new(NO_IMPORT_DIR)).unwrap();
         assert!(
@@ -794,7 +794,7 @@ layout
             parsed.urls_block
         );
         assert!(
-            parsed.layout_block.contains("window"),
+            parsed.layout_block.contains("doc"),
             "layout block must still be populated"
         );
     }

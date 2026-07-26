@@ -3,5 +3,5 @@ logic
     count = 0
     double(x: num) : x * 2
 layout
-    window "Logic Demo"
+    doc title "Logic Demo"
         text "{greeting}"

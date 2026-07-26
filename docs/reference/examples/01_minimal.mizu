@@ -1,3 +1,3 @@
 layout
-    window "Hello, Mizu!"
+    doc title "Hello, Mizu!"
         text "Hello, Mizu!"

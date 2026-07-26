@@ -94,7 +94,7 @@ logic
     timer 1s -> GET(endpoint) -> data
     timer 2s -> navigate data
 layout
-    window
+    doc
 "#;
 
 #[test]

@@ -2,5 +2,5 @@ logic
     tick = 0
     timer 1000ms -> tick = tick + 1
 layout
-    window "Clock"
+    doc title "Clock"
         text "Seconds elapsed: {tick}"

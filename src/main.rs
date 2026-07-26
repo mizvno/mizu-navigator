@@ -26,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 /// It carries no logic, no urls, and no event handlers: it can only be looked
 /// at, and the user navigates away via the URL bar.
 const START_PAGE: &str = r#"style
-  window
+  doc
     background #0f1115
     flex-direction column
     align center
@@ -42,7 +42,7 @@ const START_PAGE: &str = r#"style
     font-size 15
 
 layout
-  window "Mizu"
+  doc title "Mizu"
     t "Mizu" class "brand"
     t "Type a mizu:// address in the bar above to begin" class "hint"
 "#;

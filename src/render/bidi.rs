@@ -93,6 +93,26 @@ pub fn resolve_direction(node: NodeRef<'_, MizuNode>) -> ResolvedDirection {
     ResolvedDirection::Auto
 }
 
+/// Resolves `node`'s language by walking `lang` attribute inheritance:
+/// checks `node` itself, then each ancestor in turn, for an explicit `lang`
+/// value (shape-validated at parse time by `parser::layout::is_valid_lang_tag`
+/// — never re-validated here). Returns `None` if no ancestor (including the
+/// document root) set one.
+///
+/// Mirrors [`resolve_direction`]'s ancestor walk exactly; the only
+/// difference is the return type, since `lang` has no closed set of values
+/// to collapse onto (unlike `dir`'s `Ltr`/`Rtl`/`Auto`).
+pub fn resolve_lang(node: NodeRef<'_, MizuNode>) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if let Some(lang) = n.value().attributes.get("lang") {
+            return Some(lang.clone());
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// Unicode bidi embedding/override controls (U+202A–U+202E) and isolates
 /// (U+2066–U+2069) — see the design memo §4 for why these two ranges
 /// specifically, and why they're stripped here but not from document text.
@@ -126,6 +146,20 @@ mod tests {
         let mut attributes = FxHashMap::default();
         if let Some(d) = dir {
             attributes.insert("dir".to_string(), d.to_string());
+        }
+        MizuNode {
+            primitive: crate::parser::Primitive::Box,
+            attributes,
+            events: FxHashMap::default(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn lang_node(lang: Option<&str>) -> MizuNode {
+        let mut attributes = FxHashMap::default();
+        if let Some(l) = lang {
+            attributes.insert("lang".to_string(), l.to_string());
         }
         MizuNode {
             primitive: crate::parser::Primitive::Box,
@@ -190,6 +224,37 @@ mod tests {
         assert_eq!(ResolvedDirection::Ltr.prepend_mark(), Some('\u{200E}'));
         assert_eq!(ResolvedDirection::Rtl.prepend_mark(), Some('\u{200F}'));
         assert_eq!(ResolvedDirection::Auto.prepend_mark(), None);
+    }
+
+    #[test]
+    fn resolve_lang_finds_explicit_lang_on_self() {
+        let tree = ego_tree::Tree::new(lang_node(Some("en")));
+        assert_eq!(resolve_lang(tree.root()), Some("en".to_string()));
+    }
+
+    #[test]
+    fn resolve_lang_inherits_from_ancestor() {
+        let mut tree = ego_tree::Tree::new(lang_node(Some("it")));
+        let child_id = tree.root_mut().append(lang_node(None)).id();
+        let grandchild_id = tree.get_mut(child_id).unwrap().append(lang_node(None)).id();
+        assert_eq!(
+            resolve_lang(tree.get(grandchild_id).unwrap()),
+            Some("it".to_string()),
+            "an unset lang must inherit from the nearest ancestor that set one"
+        );
+    }
+
+    #[test]
+    fn resolve_lang_child_overrides_ancestor() {
+        let mut tree = ego_tree::Tree::new(lang_node(Some("en")));
+        let child_id = tree.root_mut().append(lang_node(Some("ja"))).id();
+        assert_eq!(resolve_lang(tree.get(child_id).unwrap()), Some("ja".to_string()));
+    }
+
+    #[test]
+    fn resolve_lang_defaults_to_none_with_no_lang_anywhere() {
+        let tree = ego_tree::Tree::new(lang_node(None));
+        assert_eq!(resolve_lang(tree.root()), None);
     }
 
     #[test]

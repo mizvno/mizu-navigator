@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn test_hit_test_inside() {
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,

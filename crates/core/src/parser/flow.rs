@@ -480,7 +480,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> navigate data
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Expected flow violation");
@@ -495,7 +495,7 @@ layout
 logic
     timer 1s -> navigate "mizu://safe.com/"
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_ok(), "Expected flow allowed");
@@ -507,7 +507,7 @@ layout
 logic
     timer 1s -> navigate $form.dest
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Expected flow violation from form field");
@@ -523,7 +523,7 @@ reach
 logic
     timer 1s -> GET(api) -> data
 layout
-    window
+    doc
         button
             click -> navigate data
         "#;
@@ -545,7 +545,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> GET(api, data) -> profile
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_ok(), "path_param should be allowed (gated by construction)");
@@ -564,7 +564,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> navigate data.url
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "FieldAccess on tainted var should propagate taint");
@@ -577,7 +577,7 @@ layout
 logic
     timer 1s -> navigate "mizu://pure.example.com/"
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_ok(), "Pure literal should not be tainted");
@@ -595,7 +595,7 @@ logic
     comp derived = data
     timer 2s -> navigate derived
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Taint through comp chain should be rejected");
@@ -612,7 +612,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> navigate passthrough(data)
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Function returning tainted arg should propagate taint");
@@ -629,7 +629,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> navigate read_data()
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Function reading tainted global should propagate taint");
@@ -650,7 +650,7 @@ logic
     timer 1s -> GET(api) -> data
     timer 2s -> navigate if true then "mizu://safe.com/" else data
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         // This SHOULD be rejected by the conservative checker (over-approximation)
@@ -670,7 +670,7 @@ logic
     comp derived = 1 + 1
     timer 1s -> get_system_time(derived)
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(
@@ -691,7 +691,7 @@ layout
 logic
     timer 1s -> get_system_time(elapsed)
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(
@@ -710,7 +710,7 @@ logic
     comp derived = 1 + 1
     timer 1s -> result = get_system_time(derived)
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(
@@ -730,7 +730,7 @@ logic
     timer 1s -> GET(feed) -> next
     timer 2s -> navigate next
 layout
-    window
+    doc
         "#;
         let res = check_flow_doc(doc);
         assert!(res.is_err());

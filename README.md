@@ -64,10 +64,10 @@ cargo run
 
 ## The language, in brief
 
-A `.mizu` document is four optional blocks — `urls`, `logic`, `style`,
+A `.mizu` document is four optional blocks — `reach`, `logic`, `style`,
 `layout` — parsed in that order, then bound together into a live document:
 
-- **`urls`** declares every network endpoint and media alias the document
+- **`reach`** declares every network endpoint and media alias the document
   will ever touch, by name, up front. Nothing reaches the network through an
   address that wasn't declared here.
 - **`logic`** declares variables, pure functions (checked acyclic — no
@@ -76,7 +76,7 @@ A `.mizu` document is four optional blocks — `urls`, `logic`, `style`,
 - **`style`** is a CSS-like cascade: tag/class selectors, a fixed and
   intentionally small property set, and environment-gated variants
   (`@dark`, `@min-width 600`, …).
-- **`layout`** is the DOM: `window`, `box`, `text`, `button`, `input`,
+- **`layout`** is the DOM: `doc`, `box`, `text`, `button`, `input`,
   `image`, `form`, `each`, conditional classes, and `click`/`submit` actions
   that can assign state, navigate, or call a declared endpoint.
 

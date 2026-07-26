@@ -511,7 +511,7 @@ pub fn paint_node(
     }
 
     // ── Paint inline text (not for Window nodes) ──────────────────────────────
-    if mizu_node.primitive != Primitive::Window
+    if mizu_node.primitive != Primitive::Doc
         && let Some(text) = mizu_node.attributes.get("content")
     {
         let mut font_size = 16.0f32;
@@ -1117,7 +1117,7 @@ mod tests {
 
         // Build a DOM tree: Window -> Text
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,
@@ -1261,7 +1261,7 @@ mod tests {
 
         // Build DOM: Window -> Each(item in lista) -> Text("{item.name}")
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,
@@ -1413,7 +1413,7 @@ mod tests {
 
         // DOM: Window → Each → Box
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,
@@ -1568,7 +1568,7 @@ mod tests {
 
         // Build: Window -> (low, high, mid)
         let mut tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,

@@ -28,8 +28,11 @@ use crate::parser::urls::{EndpointKind, UrlRegistry};
 /// The valid structural primitives in Mizu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Primitive {
-    /// Root window node.
-    Window,
+    /// Root document node. Was named `Window` before the `doc` keyword
+    /// rename — kept as a plain, OS-window-agnostic document root so the
+    /// name stays accurate if Mizu is ever embedded somewhere that doesn't
+    /// own a native OS window.
+    Doc,
     /// Structural container.
     Box,
     /// Text leaf or block.
@@ -53,7 +56,7 @@ impl Primitive {
     /// Returns the string representation of the primitive.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Primitive::Window => "window",
+            Primitive::Doc => "doc",
             Primitive::Box => "box",
             Primitive::Text => "text",
             Primitive::Button => "button",
@@ -185,6 +188,25 @@ fn find_trailing_layout_keyword(action_str: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Shape-checks a `lang` attribute value: a lowercase 2-3-letter primary
+/// language subtag, optionally followed by `-` and an uppercase 2-letter
+/// region subtag (e.g. `it`, `en`, `en-US`, `zh-CN`). This is a shape check
+/// (BCP-47-ish), not a full BCP-47 validator — it does not check the
+/// subtag against the IANA language/region registries, only the syntax.
+fn is_valid_lang_tag(value: &str) -> bool {
+    let (primary, region) = match value.split_once('-') {
+        Some((p, r)) => (p, Some(r)),
+        None => (value, None),
+    };
+    let primary_ok =
+        (2..=3).contains(&primary.len()) && primary.chars().all(|c| c.is_ascii_lowercase());
+    let region_ok = match region {
+        Some(r) => r.len() == 2 && r.chars().all(|c| c.is_ascii_uppercase()),
+        None => true,
+    };
+    primary_ok && region_ok
 }
 
 /// Parses inline attribute key-value pairs (e.g. `type "text" class .input`) and inline events.
@@ -323,6 +345,19 @@ fn parse_attributes_and_events(
             )));
         }
 
+        // `lang`: settable on `doc` as the document-wide default and
+        // overridable on any node, inherited down the tree exactly like
+        // `dir` (see `render::bidi::resolve_lang`) — but unlike `dir`'s
+        // fixed 3-value set, language subtags are open-ended, so this is a
+        // shape check (BCP-47-ish), not an exhaustive allowlist.
+        if key == "lang" && !is_valid_lang_tag(&final_value) {
+            return Err(MizuError::ParseError(format!(
+                "invalid value `{final_value}` for `lang`; expected a lowercase 2-3-letter \
+                 language subtag, optionally followed by `-` and an uppercase 2-letter \
+                 region subtag (e.g. `it`, `en`, `en-US`, `zh-CN`)"
+            )));
+        }
+
         attrs.insert(key.to_string(), final_value);
         s = rest_s;
     }
@@ -362,7 +397,12 @@ fn parse_primitive_and_attrs(
     }
 
     let primitive = match prim_lower.as_str() {
-        "window" => Primitive::Window,
+        "doc" => Primitive::Doc,
+        "window" => {
+            return Err(MizuError::ParseError(format!(
+                "line {line_num}: `window` is no longer supported as the root primitive; use `doc` instead"
+            )));
+        }
         "box" => Primitive::Box,
         "t" | "text" => Primitive::Text,
         "button" => Primitive::Button,
@@ -394,20 +434,33 @@ fn parse_primitive_and_attrs(
     let (mut attributes, events) = parse_attributes_and_events(attrs_str, interner)
         .map_err(|e| MizuError::ParseError(format!("line {line_num}: {e}")))?;
 
-    // For Text nodes, store inline text directly in "content" attribute (no child node).
-    // For Window, inline text sets the OS window title (not visible page content) â€”
-    // an explicit `title="..."` attribute, if present, wins over the positional form.
-    // For other primitives, the inline_text is returned to the caller which will create a child.
+    // `title` is only meaningful on `doc` (it sets the OS window title, not
+    // visible page content) — reject it loudly on any other primitive
+    // instead of silently ignoring it.
+    if attributes.contains_key("title") && primitive != Primitive::Doc {
+        return Err(MizuError::ParseError(format!(
+            "line {line_num}: `title` is only valid on `doc`, found on `{}`",
+            primitive.as_str()
+        )));
+    }
+
+    // For Text nodes, store inline text directly in "content" attribute (no
+    // child node). `doc` no longer accepts positional inline text at all —
+    // the OS window title must be set via the explicit `title "..."`
+    // attribute; this closes the "bare string after the tag means
+    // something different per primitive" inconsistency the old sugar had.
+    // For other primitives, the inline_text is returned to the caller,
+    // which will create a child node.
     let child_inline_text = if primitive == Primitive::Text {
         if let Some(text) = inline_text {
             attributes.insert("content".to_string(), text);
         }
         None
-    } else if primitive == Primitive::Window {
-        if let Some(text) = inline_text {
-            attributes.entry("title".to_string()).or_insert(text);
-        }
-        None
+    } else if primitive == Primitive::Doc && inline_text.is_some() {
+        return Err(MizuError::ParseError(format!(
+            "line {line_num}: `doc` no longer accepts positional inline text for the window \
+             title; use an explicit `title \"...\"` attribute instead"
+        )));
     } else {
         inline_text
     };
@@ -491,9 +544,9 @@ pub fn parse_layout_with_urls(
 
     let (first_node, _, first_inline_text) =
         parse_primitive_and_attrs(trimmed_first, first_line_idx + 1, interner)?;
-    if first_node.primitive != Primitive::Window {
+    if first_node.primitive != Primitive::Doc {
         return Err(MizuError::ParseError(format!(
-            "line {}: root element must be `window`, found `{}`",
+            "line {}: root element must be `doc`, found `{}`",
             first_line_idx + 1,
             trimmed_first.split_whitespace().next().unwrap_or("")
         )));
@@ -868,7 +921,7 @@ mod tests {
         // in the (here empty) `urls` registry must be rejected at parse time.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"undeclared_alias\"\n";
+        let layout = "doc\n    image src \"undeclared_alias\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
@@ -886,7 +939,7 @@ mod tests {
         // Without a registry (`None`), the guard must not fire â€” `parse_layout`
         // keeps its lenient behaviour.
         let mut interner = StringInterner::new();
-        let layout = "window \"App\"\n    image src \"anything\"\n";
+        let layout = "doc\n    image src \"anything\"\n";
         let result = parse_layout(layout, &mut interner);
         assert!(result.is_ok(), "no registry â†’ no media guard: {result:?}");
     }
@@ -897,7 +950,7 @@ mod tests {
         // the registry guard must not fire even when a registry is present.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"test.png\"\n";
+        let layout = "doc\n    image src \"test.png\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
@@ -910,7 +963,7 @@ mod tests {
         // A path containing `/` is always a direct path â€” guard skipped.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"./img/logo.png\"\n";
+        let layout = "doc\n    image src \"./img/logo.png\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
@@ -924,7 +977,7 @@ mod tests {
         // at parse time with a SecurityViolation message.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"file:///etc/passwd\"\n";
+        let layout = "doc\n    image src \"file:///etc/passwd\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), true, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
@@ -947,7 +1000,7 @@ mod tests {
         // a direct path and not trigger the registry validation error.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"file:///home/user/img.png\"\n";
+        let layout = "doc\n    image src \"file:///home/user/img.png\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             result.is_ok(),
@@ -961,7 +1014,7 @@ mod tests {
         // compile error (see test_absolute_url_src_is_rejected for the message).
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"mizu://cdn.example.com/img.png\"\n";
+        let layout = "doc\n    image src \"mizu://cdn.example.com/img.png\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         assert!(
             matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
@@ -975,7 +1028,7 @@ mod tests {
         // must still be rejected when absent from the registry.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let layout = "window \"App\"\n    image src \"cdn_icons\"\n";
+        let layout = "doc\n    image src \"cdn_icons\"\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
@@ -995,17 +1048,26 @@ mod tests {
     }
 
     #[test]
-    fn test_root_must_be_window() {
+    fn test_root_must_be_doc() {
         let result = parse_layout("    box\n", &mut StringInterner::new());
         assert!(
-            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("root element must be `window`"))
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("root element must be `doc`"))
+        );
+    }
+
+    #[test]
+    fn old_window_root_keyword_is_a_clear_parse_error_naming_doc() {
+        let result = parse_layout("    window\n", &mut StringInterner::new());
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("window") && m.contains("doc")),
+            "expected a ParseError naming both `window` and `doc`, got: {result:?}"
         );
     }
 
     #[test]
     fn test_multi_tiered_dom_tree() {
         let layout = r#"
-    window "Mizu App"
+    doc title "Mizu App"
         box class .container
             text "Welcome to Mizu"
             button "Submit"
@@ -1013,8 +1075,7 @@ mod tests {
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let root = tree.root();
-        assert_eq!(root.value().primitive, Primitive::Window);
-        // "Mizu App" sets the OS window title attribute, not a visible child node.
+        assert_eq!(root.value().primitive, Primitive::Doc);
         assert_eq!(
             root.value().attributes.get("title").map(|s| s.as_str()),
             Some("Mizu App")
@@ -1023,7 +1084,7 @@ mod tests {
             !root
                 .children()
                 .any(|n| n.value().primitive == Primitive::Text),
-            "window's inline text must not create a visible child Text node"
+            "the explicit `title` attribute must not create a visible child Text node"
         );
 
         let mut children = root.children();
@@ -1068,32 +1129,46 @@ mod tests {
     }
 
     #[test]
-    fn window_inline_text_sets_title_attribute_and_no_visible_child() {
-        let layout = "\n    window \"Hello, Mizu!\"\n";
-        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
-        let root = tree.root();
-        assert_eq!(
-            root.value().attributes.get("title").map(|s| s.as_str()),
-            Some("Hello, Mizu!")
+    fn doc_positional_inline_text_is_a_parse_error() {
+        // The old `window "Title"` positional-text-sets-title sugar is
+        // removed: `doc` no longer accepts positional inline text at all,
+        // closing the "bare string after the tag means something different
+        // per primitive" inconsistency. `title` must be an explicit
+        // attribute.
+        let layout = "\n    doc \"Hello, Mizu!\"\n";
+        let result = parse_layout(layout, &mut StringInterner::new());
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("title")),
+            "expected a ParseError pointing to the explicit `title` attribute, got: {result:?}"
         );
-        assert_eq!(root.children().count(), 0);
     }
 
     #[test]
-    fn window_explicit_title_attribute_wins_over_inline_text() {
-        let layout = "\n    window \"Positional\" title \"Explicit\"\n";
+    fn doc_explicit_title_attribute_sets_title_and_no_visible_child() {
+        let layout = "\n    doc title \"Explicit\"\n";
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let root = tree.root();
         assert_eq!(
             root.value().attributes.get("title").map(|s| s.as_str()),
             Some("Explicit")
         );
+        assert_eq!(root.children().count(), 0);
+    }
+
+    #[test]
+    fn title_attribute_rejected_on_non_doc_primitive() {
+        let layout = "\n    doc\n        box title \"not allowed here\"\n";
+        let result = parse_layout(layout, &mut StringInterner::new());
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("title") && m.contains("doc")),
+            "expected a ParseError naming `title` and `doc`, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_attribute_extraction() {
         let layout = r#"
-    window "App"
+    doc
         input type "text" placeholder "Enter Username" class .input-field val 42
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
@@ -1115,7 +1190,7 @@ mod tests {
     #[test]
     fn test_event_blocks() {
         let layout = r#"
-    window "App"
+    doc
         button "Submit"
             click -> ActionPerform
         box
@@ -1149,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_bind_keyword_produces_error() {
-        let layout = "window \"App\"\n    input\n        bind -> user.name\n";
+        let layout = "doc\n    input\n        bind -> user.name\n";
         let result = parse_layout(layout, &mut StringInterner::new());
         assert!(
             matches!(result, Err(MizuError::ParseError(msg)) if msg.contains("bind is no longer supported"))
@@ -1161,7 +1236,7 @@ mod tests {
         // Node timers were removed: the child-line form must be a hard error
         // that carries the offending line number and points at root timers.
         let layout = r#"
-    window "App"
+    doc
         box
             every 500ms -> count = count + 1
 "#;
@@ -1189,7 +1264,7 @@ mod tests {
     fn test_every_inline_is_rejected() {
         // The inline form (`t "x" every 1s -> â€¦`) must be rejected too.
         let layout = r#"
-    window "App"
+    doc
         text "Time" every 1s -> ticks = ticks + 1
 "#;
         let result = parse_layout(layout, &mut StringInterner::new());
@@ -1210,7 +1285,7 @@ mod tests {
         // nested in an `each` would have multiplied into one timer per list
         // element, driven by remote data. It must fail to compile.
         let layout = r#"
-    window "App"
+    doc
         each item in items
             box
                 every 100ms -> n = n + 1
@@ -1234,7 +1309,7 @@ mod tests {
     #[test]
     fn test_markdown_multiline_block() {
         let layout = r#"
-    window "App"
+    doc
         markdown """
             # Header
             This is a multi-line markdown block.
@@ -1258,7 +1333,7 @@ mod tests {
     #[test]
     fn test_illegal_primitive_fails() {
         let layout = r#"
-    window "App"
+    doc
         invalid_primitive "Error"
 "#;
         let result = parse_layout(layout, &mut StringInterner::new());
@@ -1270,7 +1345,7 @@ mod tests {
     #[test]
     fn test_multiple_roots_fail() {
         let layout = r#"
-    window "App"
+    doc
     box
 "#;
         let result = parse_layout(layout, &mut StringInterner::new());
@@ -1282,7 +1357,7 @@ mod tests {
     #[test]
     fn test_badly_formatted_attributes_fail() {
         let layout = r#"
-    window "App"
+    doc
         button class.btn
 "#;
         let result = parse_layout(layout, &mut StringInterner::new());
@@ -1294,7 +1369,7 @@ mod tests {
     #[test]
     fn test_missing_event_payload_fails() {
         let layout = r#"
-    window "App"
+    doc
         button
             click ->
 "#;
@@ -1307,16 +1382,16 @@ mod tests {
     #[test]
     fn test_case_insensitive_primitives_and_equal_sign_attributes() {
         let layout = r#"
-    WINDOW "App" class=".window"
+    DOC class=title-bar
         BOX class = ".container"
             text "Hello"
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let root = tree.root();
-        assert_eq!(root.value().primitive, Primitive::Window);
+        assert_eq!(root.value().primitive, Primitive::Doc);
         assert_eq!(
             root.value().attributes.get("class").map(|s| s.as_str()),
-            Some("window")
+            Some("title-bar")
         );
 
         let box_node = root
@@ -1338,7 +1413,7 @@ mod tests {
     fn test_trailing_class_after_click_action_is_error() {
         // Before the fix this silently dropped `class "btn"`.
         let layout = r#"
-    window "App"
+    doc
         button class "expected-btn"
             click -> count = count + 1 class "wrong"
 "#;
@@ -1358,7 +1433,7 @@ mod tests {
     #[test]
     fn test_trailing_id_after_click_action_is_error() {
         let layout = r#"
-    window "App"
+    doc
         button
             click -> x = 1 id "my-btn"
 "#;
@@ -1372,7 +1447,7 @@ mod tests {
     #[test]
     fn test_trailing_src_after_click_action_is_error() {
         let layout = r#"
-    window "App"
+    doc
         button
             click -> x = 1 src "image.png"
 "#;
@@ -1388,7 +1463,7 @@ mod tests {
         // `every` is rejected outright now; the error must still be a clean
         // ParseError (not a panic) even with trailing garbage on the line.
         let layout = r#"
-    window "App"
+    doc
         box class "timer"
             every 1s -> tick = tick + 1 class "wrong"
 "#;
@@ -1403,7 +1478,7 @@ mod tests {
     fn test_clean_action_with_class_on_element_line_is_ok() {
         // Regression: the correct form must still parse successfully.
         let layout = r#"
-    window "App"
+    doc
         button class "btn"
             click -> count = count + 1
 "#;
@@ -1425,7 +1500,7 @@ mod tests {
     fn test_t_alias_for_text() {
         // Use window without inline text so the only Text child is the one from `t "hello"`
         let layout = r#"
-    window
+    doc
         t "hello"
 "#;
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
@@ -1446,7 +1521,7 @@ mod tests {
     #[test]
     fn test_each_parsing() {
         let layout = r#"
-    window "App"
+    doc
         each article in articles
             text "item"
 "#;
@@ -1466,7 +1541,7 @@ mod tests {
     #[test]
     fn test_each_invalid_syntax_fails() {
         let layout = r#"
-    window "App"
+    doc
         each item
 "#;
         let result = parse_layout(layout, &mut StringInterner::new());
@@ -1492,7 +1567,7 @@ mod tests {
             },
         );
 
-        let layout = "window \"App\"\n    image src \"logo\"\n";
+        let layout = "doc\n    image src \"logo\"\n";
         let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
         let img = tree
             .root()
@@ -1510,7 +1585,7 @@ mod tests {
     fn test_absolute_url_src_is_rejected() {
         // A literal absolute network URL in `src` bypasses the urls registry
         // and must be a hard compile error, with or without a registry present.
-        let layout = "window \"App\"\n    image src \"mizu://evil.example/pixel.png\"\n";
+        let layout = "doc\n    image src \"mizu://evil.example/pixel.png\"\n";
 
         let no_registry = parse_layout(layout, &mut StringInterner::new());
         match no_registry {
@@ -1541,7 +1616,7 @@ mod tests {
     #[test]
     fn test_relative_src_still_allowed() {
         // A relative path must keep working (used as-is by the renderer).
-        let layout = "window \"App\"\n    image src \"assets/logo.png\"\n";
+        let layout = "doc\n    image src \"assets/logo.png\"\n";
         let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
         let img = tree
             .root()
@@ -1571,7 +1646,7 @@ mod tests {
             },
         );
 
-        let layout = "window \"App\"\n    button\n        click -> download(backup_alias)\n";
+        let layout = "doc\n    button\n        click -> download(backup_alias)\n";
         let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
         let btn = tree
             .root()
@@ -1609,7 +1684,7 @@ mod tests {
     #[test]
     fn test_download_old_syntax_error() {
         // `button download -> backup_alias` â†’ ParseError with migration hint
-        let layout = "window \"App\"\n    button download -> backup_alias\n";
+        let layout = "doc\n    button download -> backup_alias\n";
         let mut interner = StringInterner::new();
         let result = parse_layout(layout, &mut interner);
         match result {
@@ -1638,7 +1713,7 @@ mod tests {
             },
         );
 
-        let layout = "window \"App\"\n    button\n        click -> download(api_alias)\n";
+        let layout = "doc\n    button\n        click -> download(api_alias)\n";
         let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
         match result {
             Err(MizuError::ParseError(msg)) => {
@@ -1659,7 +1734,7 @@ mod tests {
     fn test_conditional_class_parsed() {
         // A `class active if flag` child line should produce a non-empty
         // conditional_classes vec on the parent box node.
-        let layout = "window\n    box class base\n        class active if flag\n";
+        let layout = "doc\n    box class base\n        class active if flag\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -1682,7 +1757,7 @@ mod tests {
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;
 
-        let layout = "window\n    box class base\n        class active if flag\n";
+        let layout = "doc\n    box class base\n        class active if flag\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -1709,7 +1784,7 @@ mod tests {
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;
 
-        let layout = "window\n    box class base\n        class active if flag\n";
+        let layout = "doc\n    box class base\n        class active if flag\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -1736,7 +1811,7 @@ mod tests {
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;
 
-        let layout = "window\n    box\n        class a if flag_a\n        class b if flag_b\n        class c if flag_c\n";
+        let layout = "doc\n    box\n        class a if flag_a\n        class b if flag_b\n        class c if flag_c\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -1773,7 +1848,7 @@ mod tests {
         use rustc_hash::FxHashMap;
         use std::sync::Arc;
 
-        let layout = "window\n    box\n        class active if item.done\n";
+        let layout = "doc\n    box\n        class active if item.done\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -1802,7 +1877,7 @@ mod tests {
     #[test]
     fn test_conditional_class_with_action_rejected() {
         // A condition that calls a side-effecting built-in must produce ParseError.
-        let layout = "window\n    box\n        class active if GET(api_alias)\n";
+        let layout = "doc\n    box\n        class active if GET(api_alias)\n";
         let mut interner = StringInterner::new();
         let result = parse_layout(layout, &mut interner);
         match result {

@@ -13,7 +13,7 @@
     #[test]
     fn test_manager_resize_viewport() {
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut attrs = FxHashMap::default();
                 attrs.insert("class".to_string(), "window".to_string());
@@ -66,7 +66,7 @@
 
     fn make_minimal_manager() -> MizuWindowManager {
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut attrs = FxHashMap::default();
                 attrs.insert("class".to_string(), "window".to_string());
@@ -225,7 +225,7 @@
         // qualifying user gesture — stealth exfiltration via background timers
         // is the primary threat for file:// origins.
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "sensitive-data".to_string());
@@ -260,7 +260,7 @@
     #[test]
     fn test_clipboard_copy_without_user_gesture_fails() {
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "my-node".to_string());
@@ -291,7 +291,7 @@
         // The builtin only accepts a DOM node id — a non-existent id must fail
         // even when a gesture is present (no arbitrary text can be injected).
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,
@@ -315,7 +315,7 @@
     #[test]
     fn test_clipboard_extracts_text_node_content() {
         let tree = Tree::new(MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: {
                 let mut m = FxHashMap::default();
                 m.insert("id".to_string(), "label".to_string());
@@ -354,7 +354,7 @@
 
     fn window_node() -> MizuNode {
         MizuNode {
-            primitive: Primitive::Window,
+            primitive: Primitive::Doc,
             attributes: FxHashMap::default(),
             events: FxHashMap::default(),
             iterator_context: None,
