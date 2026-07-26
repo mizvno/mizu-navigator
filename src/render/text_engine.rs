@@ -218,6 +218,19 @@ pub fn calculate_node_text(
         generic_family,
     ));
     builder.push_default(parley::style::StyleProperty::FontFamily(font_family));
+    // ux-8: the resolved `lang` (ancestor-inherited, see render::bidi::resolve_lang)
+    // feeds fontique's per-run fallback query as a locale hint — it disambiguates
+    // Han-unification fallback (e.g. picking a Japanese vs. Simplified-Chinese
+    // face for CJK code points) but does not affect icu_segmenter's line/word
+    // breaking, which parley invokes with locale-invariant options regardless
+    // (verified against parley 0.10's `analysis` module: no `Language`/`Locale`
+    // is threaded into its icu_segmenter calls, unlike `shape::FontSelector`,
+    // which passes it straight into `fontique::FallbackKey::new`).
+    if let Some(lang) = crate::render::bidi::resolve_lang(node_ref)
+        && let Ok(locale) = lang.parse::<parley::style::Language>()
+    {
+        builder.push_default(parley::style::StyleProperty::Locale(Some(locale)));
+    }
     builder.push_default(parley::style::StyleProperty::FontSize(font_size));
     builder.push_default(parley::style::StyleProperty::Brush(text_color));
     builder.push_default(parley::style::StyleProperty::LineHeight(
@@ -551,6 +564,114 @@ mod tests {
             dark_dims.1,
             light_dims.1
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Lang (ux-8)
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn text_node_with_lang(content: &str, lang: Option<&str>) -> MizuNode {
+        let mut attrs = FxHashMap::default();
+        attrs.insert("content".to_string(), content.to_string());
+        if let Some(l) = lang {
+            attrs.insert("lang".to_string(), l.to_string());
+        }
+        MizuNode {
+            primitive: Primitive::Text,
+            attributes: attrs,
+            events: FxHashMap::default(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lang_reaches_calculate_node_text_via_dom_attribute_inheritance() {
+        // End-to-end: a `lang="ja"` on a `doc` ancestor reaches
+        // calculate_node_text through render::bidi::resolve_lang's ancestor
+        // walk (mirroring the `dir` test above) and doesn't prevent a layout
+        // from being produced — the Locale StyleProperty this feeds is
+        // consumed inside fontique's fallback query, which has no public
+        // introspection hook, so "still produces a layout, unaffected" is
+        // the observable-from-here guarantee.
+        let mut tree = Tree::new(MizuNode {
+            primitive: Primitive::Doc,
+            attributes: {
+                let mut a = FxHashMap::default();
+                a.insert("lang".to_string(), "ja".to_string());
+                a
+            },
+            events: FxHashMap::default(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        });
+        let node_id = tree.root_mut().append(text_node_with_lang("こんにちは", None)).id();
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+        let style_rules: HashMap<String, StyleRules> = HashMap::new();
+
+        let result = calculate_node_text(
+            node_id,
+            None,
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &[],
+                render_env: &no_op_render_env(),
+            },
+        );
+        assert!(
+            result.is_some(),
+            "an inherited lang=\"ja\" must not prevent a layout from being produced"
+        );
+    }
+
+    #[test]
+    fn absent_lang_does_not_prevent_a_layout() {
+        // No `lang` anywhere in the ancestor chain: resolve_lang returns
+        // `None`, no Locale StyleProperty is pushed, and shaping proceeds
+        // exactly as it did before ux-8.
+        let tree = Tree::new(text_node_with_lang("Hello", None));
+        let node_id = tree.root().id();
+
+        let mut font_cx = parley::FontContext::new();
+        font_cx.collection.load_system_fonts();
+        let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
+            parley::LayoutContext::new();
+        let store = VariableStore::new();
+        let local_inputs = rustc_hash::FxHashMap::default();
+        let node_id_to_u32 = HashMap::new();
+        let style_rules: HashMap<String, StyleRules> = HashMap::new();
+
+        let result = calculate_node_text(
+            node_id,
+            None,
+            &mut TextLayoutContext {
+                dom: &tree,
+                style_rules: &style_rules,
+                font_cx: &mut font_cx,
+                layout_cx: &mut layout_cx,
+                store: &store,
+                local_inputs: &local_inputs,
+                node_id_to_u32: &node_id_to_u32,
+                focused_input: None,
+                style_variants: &[],
+                render_env: &no_op_render_env(),
+            },
+        );
+        assert!(result.is_some(), "no lang anywhere must still produce a layout");
     }
 
     // ────────────────────────────────────────────────────────────────────────
