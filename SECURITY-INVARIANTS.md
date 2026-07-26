@@ -18,14 +18,14 @@ under any server response.
 *Source constructs:* network worker redirect handling.
 *Enforcement:* **Runtime** — callers of data/media paths never invoke
 `check_navigation`; redirect loops are followed internally with a budget
-(`src/network/worker.rs`).
+(`src/network/worker/` — `mod.rs`/`fetch.rs`).
 
 **N2 — Single choke point:** Every top-level navigation passes through one
 policy function (`check_navigation`) before any state change or
 `NetworkCmd::Navigate` is emitted.
 *Source constructs:* address bar, link click, `navigate` action, server redirect.
 *Enforcement:* **Runtime** — `src/render/navigation.rs`, called from
-`src/render/window.rs`.
+`src/render/window/navigate.rs`.
 
 **N3 — Agency:** Same-origin top-level navigation is always allowed.
 Cross-origin top-level navigation is allowed only when the initiating cause
@@ -43,7 +43,8 @@ choke point.
 **N5 — Uniform lifecycle:** Origin-scoped state (`capability_policy`,
 redirect-chain budget, `url_registry`) is handled identically on every
 navigation path.
-*Source constructs:* `CapabilityPolicy` reset in `window.rs`.
+*Source constructs:* `CapabilityPolicy` reset in `src/render/window/navigate.rs`
+(construction in `src/render/window/manager.rs`).
 *Enforcement:* **Runtime** — navigation choke point.
 
 ---
@@ -55,7 +56,7 @@ performs O(data) allocation or CPU work must draw from an explicit, named
 budget.  Specifically, layout expansion (`each` nodes) is bounded by
 `MAX_SYNTHETIC_LAYOUT_NODES` (20,000).
 *Source constructs:* `each` iteration in `src/render/layout_bridge.rs`; nested
-`each` rejection in `src/parser/layout.rs`.
+`each` rejection in `crates/core/src/parser/layout.rs`.
 *Enforcement:* **Runtime** (`layout_bridge.rs` budget counter) and
 **Parse-time** (nested `each` rejection).
 
@@ -82,13 +83,14 @@ stack overflow, which aborts the process and cannot be caught — the opposite
 of the fail-secure, bounded-error behavior every other budget in this
 document provides.
 
-*Source constructs:* `eval_depth` field and guard in `src/core/types.rs`
-(`MAX_EVAL_DEPTH` constant; the check in `evaluate_impl`).
+*Source constructs:* `eval_depth` field and guard in
+`crates/core/src/core/types/eval.rs` (`MAX_EVAL_DEPTH` constant; the check
+in `evaluate_impl`).
 
 *Enforcement:* **Runtime**, with a stack-size margin as defense in depth:
 the guard itself is a plain integer check, but it only fires *after* one more
 nested call is already on the stack, so `LogicWorker::spawn`
-(`src/parser/logic_worker.rs`) runs the evaluator on a thread with an
+(`crates/core/src/parser/logic_worker.rs`) runs the evaluator on a thread with an
 explicit 16 MiB stack (`LogicWorker::STACK_SIZE_BYTES`) rather than the
 platform default (~1 MiB on Windows, ~2–8 MiB on Linux/macOS). This size was
 chosen empirically, not guessed: `core::types::tests::
@@ -137,14 +139,14 @@ config at startup, unlike `MAX_INSTRUCTIONS` (`env_override`).
 what it remembers never leaves the device.  Storage is write-only from the
 document's side; no logic-reachable path returns stored values into the
 expression evaluator.
-*Source constructs:* `store_local` builtin in `src/core/types.rs`.
+*Source constructs:* `store_local` builtin in `crates/core/src/core/types/eval.rs`.
 *Enforcement:* **Code boundary contract** — no `read_local` primitive is
 exposed.  *Note: if `read_local` is ever added, it must be declared as a taint
 source in invariant F1 and route through the load-time flow checker.*
 
 **S2 — Debounced writes are eventually durable, not immediately durable
 (RM-12):** `NetworkCmd::StorageStore` commands for the same origin are
-batched via `StorageWriteDebouncer` (`src/network/worker.rs`) into a single
+batched via `StorageWriteDebouncer` (`src/network/worker/storage_debounce.rs`) into a single
 `redb` transaction per debounce window (`STORAGE_DEBOUNCE_WINDOW`, 150ms) or
 per `STORAGE_BATCH_MAX_KEYS` (64) buffered keys, whichever comes first,
 instead of one transaction per `store_local` call. A write is durable only
@@ -157,9 +159,10 @@ apply to authentication tokens/credentials: `VaultEntry` (`src/network/vault.rs`
 writes straight to the OS keyring on every `save()` call and never goes
 through `StoragePool`/`redb` at all, so bearer tokens keep an unconditional
 immediate-write guarantee.
-*Source constructs:* `StorageWriteDebouncer::submit` in `src/network/worker.rs`;
-`StorageEngine::write_batch` in `src/core/storage.rs` (the still-available,
-non-debounced `StoragePool::write_record` bypasses this entirely).
+*Source constructs:* `StorageWriteDebouncer::submit` in
+`src/network/worker/storage_debounce.rs`; `StorageEngine::write_batch` in
+`crates/core/src/core/storage.rs` (the still-available, non-debounced
+`StoragePool::write_record` bypasses this entirely).
 *Enforcement:* **Design boundary** — the debounce window is short and bounded
 by both time and key count; no document-observable correctness property
 depends on write timing (see S1).
@@ -247,8 +250,10 @@ without explicit sanitisation or user agency.
 `NetworkCall.target_var`, `$form` fields.
 
 *Enforcement:* **Load-time** — `check_information_flow` in
-`src/parser/flow.rs`.  Runs after `check_dag` and `comp` extraction, before
-the document is considered ready.
+`crates/core/src/parser/flow.rs`.  Runs after `check_dag` and `comp`
+extraction, before the document is considered ready — both on initial load
+(`src/main.rs`) and on every subsequent navigation
+(`src/render/window/navigate.rs`).
 
 ### Taint Lattice
 
@@ -258,7 +263,7 @@ Two-point lattice: **Clean** / **Tainted**.
 |---|---|---|
 | **Sources** (Untrusted) | `NetworkCall.target_var` (values bound from network responses), `$form` fields, `read_local` (specified-but-empty — see S1) | A variable assigned from a `NetworkCall` or `$form` is tainted from load. |
 | **Sinks** (Capability-determining) | `Action::Navigate.url`, and any future destination-bearing expression. | — |
-| **Non-sinks** (important) | `NetworkCall.alias_sym`, `NetworkCall.path_param` | The alias is a `Symbol` resolved against the static `urls` registry at parse time (`parse_action_with_urls`), so the host is enumerable by construction; the taint concern is path/params, not the alias.  `path_param` is gated by construction: every runtime evaluation validates A1 (type: string/number) and A2 (single segment, no delimiters, percent-encoded) — see `logic.rs:2122-2150`. |
+| **Non-sinks** (important) | `NetworkCall.alias_sym`, `NetworkCall.path_param` | The alias is a `Symbol` resolved against the static `urls` registry at parse time (`parse_action_with_urls`), so the host is enumerable by construction; the taint concern is path/params, not the alias.  `path_param` is gated by construction: every runtime evaluation validates A1 (type: string/number) and A2 (single segment, no delimiters, percent-encoded) — see `path_param_ok` in `crates/core/src/parser/logic/parse.rs:1182`. |
 
 ### Taint Propagation
 
@@ -313,19 +318,19 @@ gate is a compile error.
 
 | ID | Invariant | Enforcement | Location |
 |---|---|---|---|
-| N1 | No fetch→navigation escalation | Runtime | `src/network/worker.rs` |
+| N1 | No fetch→navigation escalation | Runtime | `src/network/worker/` |
 | N2 | Single choke point | Runtime | `src/render/navigation.rs` |
 | N3 | User gesture for cross-origin | Runtime | `check_navigation` |
 | N4 | Scheme allowlist | Runtime | `check_navigation` |
-| N5 | Uniform lifecycle | Runtime | `src/render/window.rs` |
-| L1 | Layout budget | Runtime + Parse-time | `layout_bridge.rs`, `layout.rs` |
-| E1 | Bounded evaluator recursion | Runtime + stack-size margin | `types.rs` (`eval_depth`), `logic_worker.rs` (`STACK_SIZE_BYTES`) |
+| N5 | Uniform lifecycle | Runtime | `src/render/window/navigate.rs` |
+| L1 | Layout budget | Runtime + Parse-time | `src/render/layout_bridge.rs`, `crates/core/src/parser/layout.rs` |
+| E1 | Bounded evaluator recursion | Runtime + stack-size margin | `core/types/eval.rs` (`eval_depth`), `parser/logic_worker.rs` (`STACK_SIZE_BYTES`) — both under `crates/core/src/` |
 | E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
-| S1 | Write-only storage | Code boundary | `types.rs` (no `read_local`) |
-| S2 | Debounced writes are eventually (not immediately) durable | Design boundary | `StorageWriteDebouncer` in `worker.rs` |
-| S3 | `MIZU_MASTER_KEY` break-glass path is logged, not silent | Runtime (logged) | `derive_key_from_env_override` in `core/storage.rs` |
-| P1 | Purity in observation contexts | Parse-time | `find_effectful_call` in `logic.rs` |
-| F1 | Gated information flow | Load-time | `check_information_flow` in `flow.rs` |
+| S1 | Write-only storage | Code boundary | `core/types/eval.rs` (no `read_local`) |
+| S2 | Debounced writes are eventually (not immediately) durable | Design boundary | `StorageWriteDebouncer` in `src/network/worker/storage_debounce.rs` |
+| S3 | `MIZU_MASTER_KEY` break-glass path is logged, not silent | Runtime (logged) | `derive_key_from_env_override` in `crates/core/src/core/storage.rs` |
+| P1 | Purity in observation contexts | Parse-time | `find_side_effect_call` in `crates/core/src/parser/logic/purity.rs` |
+| F1 | Gated information flow | Load-time | `check_information_flow` in `crates/core/src/parser/flow.rs` |
 
 ---
 
