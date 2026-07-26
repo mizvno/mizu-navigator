@@ -149,7 +149,7 @@ layout
 Declare an endpoint in `urls`, then call it from an action.
 
 ```
-urls
+reach
     api items /api/v1/items
 
 logic
@@ -165,7 +165,7 @@ layout
 Wait — the alias name must match what is declared.  Let us do it correctly:
 
 ```
-urls
+reach
     api items_api /api/v1/items
 
 logic
@@ -212,7 +212,7 @@ the UI.
 ## 8. Rendering a List with `each`
 
 ```
-urls
+reach
     api todos_api /api/v1/todos
 
 logic
@@ -234,7 +234,7 @@ layout
 ## 9. Forms
 
 ```
-urls
+reach
     api submit_api /api/v1/message
 
 logic

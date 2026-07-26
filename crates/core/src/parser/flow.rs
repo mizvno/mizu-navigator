@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn network_var_into_navigate_rejected() {
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -518,7 +518,7 @@ layout
     #[test]
     fn gated_gesture_navigation_allowed() {
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -539,7 +539,7 @@ layout
         // validation.  This test verifies the design change from the previous
         // validate_path-based gate to the by-construction gate.
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/user/{id}
 logic
     timer 1s -> GET(api) -> data
@@ -558,7 +558,7 @@ layout
         // `data` is tainted (from GET), navigating `data.url` should be
         // rejected since FieldAccess propagates taint.
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -588,7 +588,7 @@ layout
         // source â†’ comp â†’ sink: `data` (from GET) â†’ `comp derived = data` â†’
         // navigate `derived` without gesture should be rejected.
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -605,7 +605,7 @@ layout
     fn taint_propagates_through_function_return() {
         // A user function that returns a tainted global should taint the result
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     passthrough(x) : x
@@ -622,7 +622,7 @@ layout
     fn taint_propagates_through_transitive_global() {
         // A function reads a tainted global transitively
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     read_data() : data
@@ -644,7 +644,7 @@ layout
         // `data`, even though at runtime the else is never taken.
         // This is acceptable: sound over complete.
         let doc = r#"
-urls
+reach
     api: mizu://api.example.com/
 logic
     timer 1s -> GET(api) -> data
@@ -724,7 +724,7 @@ layout
     #[test]
     fn diagnostic_includes_source_and_sink() {
         let doc = r#"
-urls
+reach
     feed: mizu://api.example.com/feed
 logic
     timer 1s -> GET(feed) -> next
