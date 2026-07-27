@@ -41,10 +41,13 @@ pub(super) fn content_type_for(format: PayloadFormat) -> &'static str {
 ///   crate's `form_urlencoded` module.
 pub(super) fn serialize_payload(value: &Value, format: PayloadFormat) -> Result<Vec<u8>, MizuError> {
     match format {
-        PayloadFormat::Json => serde_json::to_vec(&crate::core::types::to_json(value))
-            .map_err(|e| MizuError::Network(format!("request payload serialisation failed: {e}"))),
+        PayloadFormat::Json => {
+            let json_val = crate::core::types::to_json(value)?;
+            serde_json::to_vec(&json_val)
+                .map_err(|e| MizuError::Network(format!("request payload serialisation failed: {e}")))
+        }
         PayloadFormat::Yaml => {
-            let json_val = crate::core::types::to_json(value);
+            let json_val = crate::core::types::to_json(value)?;
             serde_yaml_bw::to_string(&json_val)
                 .map(String::into_bytes)
                 .map_err(|e| {
@@ -80,6 +83,12 @@ fn serialize_form(value: &Value) -> Result<Vec<u8>, MizuError> {
                      (bool/int/string/null), not a nested list/record"
                 )));
             }
+            Value::FileHandle(_) => {
+                return Err(MizuError::ExecutionError(format!(
+                    "`as form` payload field `{key}` cannot be a file selection; \
+                     use `as multipart` to upload a file"
+                )));
+            }
         };
         pairs.push((key.to_string(), encoded_value));
     }
@@ -104,7 +113,7 @@ mod tests {
     #[test]
     fn json_default_matches_manual_serialisation() {
         let value = Value::from("hello".to_string());
-        let expected = serde_json::to_vec(&crate::core::types::to_json(&value)).unwrap();
+        let expected = serde_json::to_vec(&crate::core::types::to_json(&value).unwrap()).unwrap();
         let got = serialize_payload(&value, PayloadFormat::Json).unwrap();
         assert_eq!(got, expected);
         assert_eq!(content_type_for(PayloadFormat::Json), "application/json");
@@ -150,7 +159,7 @@ mod tests {
         let bytes = serialize_payload(&value, PayloadFormat::Yaml).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         let parsed: serde_json::Value = serde_yaml_bw::from_str(&text).unwrap();
-        let expected = crate::core::types::to_json(&value);
+        let expected = crate::core::types::to_json(&value).unwrap();
         assert_eq!(parsed, expected);
         assert_eq!(content_type_for(PayloadFormat::Yaml), "application/yaml");
     }

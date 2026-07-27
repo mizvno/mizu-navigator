@@ -13,6 +13,29 @@ use super::eval::MAX_EVAL_DEPTH;
 /// `±92,233,720,368.54775807`.
 pub const DECIMAL_SCALE: i64 = 100_000_000;
 
+/// Opaque handle to a user-selected local file, produced only by a
+/// `type "file"` input's native picker dialog.
+///
+/// Deliberately holds only a path and a display name — never the file's
+/// bytes. A `Value` is meant to be cheap to clone/compare/store (the same
+/// spirit as the fixed-point `Value::Int` scale and the evaluator's bounded
+/// recursion); loading a whole file into a `Value` the evaluator freely
+/// passes through `filter`/`store_local`/comparisons would blow past that,
+/// and would make raw file content reachable from ordinary logic in ways
+/// nothing here is designed to gate. The file's bytes are read only by the
+/// network worker, in bounded chunks, at the moment a `Multipart` request is
+/// actually sent (see `network::worker::multipart`).
+#[derive(Debug)]
+pub struct FileHandleData {
+    /// Absolute filesystem path to the selected file.
+    pub path: std::path::PathBuf,
+    /// User-visible original filename (the last path component at selection
+    /// time), used for the `Content-Disposition: filename=` part of a
+    /// multipart upload. Never a path — see `network::worker::multipart`'s
+    /// filename sanitisation for why even this is not trusted verbatim.
+    pub filename: String,
+}
+
 /// The set of all primitive values in the Mizu type system.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -28,6 +51,9 @@ pub enum Value {
     List(Arc<Vec<Value>>),
     /// A reference-counted record of key-value pairs sorted by key.
     Record(Arc<[(Arc<str>, Value)]>),
+    /// An opaque handle to a locally-selected file (from a `type "file"`
+    /// input). See [`FileHandleData`] for why this never carries file bytes.
+    FileHandle(Arc<FileHandleData>),
 }
 
 impl PartialEq for Value {
@@ -39,6 +65,10 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Record(a), Value::Record(b)) => a == b,
+            // `FileHandle` is deliberately never equal to anything, even to
+            // itself — comparing file selections isn't a meaningful
+            // operation this type system supports, and path-based equality
+            // would leak filesystem layout through comparison behavior.
             _ => false,
         }
     }
@@ -104,6 +134,8 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            // Redact to the display filename only — never the full path.
+            Value::FileHandle(handle) => write!(f, "<file: {}>", handle.filename),
         }
     }
 }
@@ -259,32 +291,48 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
 /// * [`Value::String`] → `string`
 /// * [`Value::List`]   → `array` (elements converted recursively)
 /// * [`Value::Record`] → `object` (values converted recursively)
-pub fn to_json(val: &Value) -> serde_json::Value {
+/// * [`Value::FileHandle`] → always `Err` (see the field's own doc comment
+///   below) — never silently stringified. A local filesystem path reaching a
+///   JSON body sent to a server (or written to disk via `store_local`) is
+///   its own information leak; a `FileHandle` reaches the wire only via the
+///   dedicated `Multipart` payload format, never through `to_json`.
+///
+/// # Errors
+///
+/// Returns [`MizuError::ExecutionError`] if `val` contains a
+/// [`Value::FileHandle`] anywhere (including nested inside a `List`/`Record`).
+pub fn to_json(val: &Value) -> Result<serde_json::Value, MizuError> {
     match val {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         Value::Int(i) => {
             // Whole values take the exact integer path (mirrors from_json's
             // exact path for whole-number JSON literals) instead of always
             // dividing through f64, which cannot exactly represent every
             // value in this type's range.
             if i % DECIMAL_SCALE == 0 {
-                serde_json::Value::Number(serde_json::Number::from(i / DECIMAL_SCALE))
+                Ok(serde_json::Value::Number(serde_json::Number::from(i / DECIMAL_SCALE)))
             } else {
                 let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
-                serde_json::Number::from_f64(unscaled)
+                Ok(serde_json::Number::from_f64(unscaled)
                     .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
+                    .unwrap_or(serde_json::Value::Null))
             }
         },
-        Value::String(s) => serde_json::Value::String(s.to_string()),
-        Value::List(items) => serde_json::Value::Array(items.iter().map(to_json).collect()),
+        Value::String(s) => Ok(serde_json::Value::String(s.to_string())),
+        Value::List(items) => {
+            let arr = items.iter().map(to_json).collect::<Result<Vec<_>, _>>()?;
+            Ok(serde_json::Value::Array(arr))
+        }
         Value::Record(slice) => {
             let obj: serde_json::Map<String, serde_json::Value> = slice
                 .iter()
-                .map(|(k, v)| (k.to_string(), to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
+                .map(|(k, v)| Ok((k.to_string(), to_json(v)?)))
+                .collect::<Result<_, MizuError>>()?;
+            Ok(serde_json::Value::Object(obj))
         }
+        Value::FileHandle(_) => Err(MizuError::ExecutionError(
+            "a file selection cannot be JSON-encoded; use `as multipart` to upload it".to_string(),
+        )),
     }
 }

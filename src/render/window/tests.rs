@@ -698,3 +698,182 @@
             manager.chrome_state.url
         );
     }
+
+    // --- `type "file"` inputs: native picker + $form (mocked — no real OS dialog) ---
+
+    fn file_input_node(name: &str, accept: Option<&str>) -> MizuNode {
+        let mut attrs = FxHashMap::default();
+        attrs.insert("name".to_string(), name.to_string());
+        attrs.insert("type".to_string(), "file".to_string());
+        if let Some(accept) = accept {
+            attrs.insert("accept".to_string(), accept.to_string());
+        }
+        MizuNode {
+            primitive: Primitive::Input,
+            attributes: attrs,
+            events: FxHashMap::default(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn submit_event_block() -> crate::parser::EventBlock {
+        let mut arena = crate::parser::logic::ExprArena::new();
+        let root = arena.alloc(crate::parser::Expr::Literal(crate::core::types::Value::Bool(true)));
+        crate::parser::EventBlock::Submit {
+            action: crate::parser::Action::Assign {
+                target: "submitted".to_string(),
+                expr: crate::parser::logic::ExprTree { arena, root },
+            },
+        }
+    }
+
+    fn form_node() -> MizuNode {
+        MizuNode {
+            primitive: Primitive::Form,
+            attributes: FxHashMap::default(),
+            events: FxHashMap::default(),
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    fn submit_button_node() -> MizuNode {
+        let mut events = FxHashMap::default();
+        events.insert("submit".to_string(), submit_event_block());
+        MizuNode {
+            primitive: Primitive::Button,
+            attributes: FxHashMap::default(),
+            events,
+            iterator_context: None,
+            conditional_classes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_accept_extensions_splits_and_strips_dots_and_mime_patterns() {
+        let extensions = parse_accept_extensions(".png, .jpg,image/*, gif ");
+        assert_eq!(extensions, vec!["png".to_string(), "jpg".to_string(), "gif".to_string()]);
+    }
+
+    #[test]
+    fn selecting_a_file_yields_filehandle_in_submit_form_fields() {
+        // Mocks the `rfd` call: `apply_file_selection` takes the already-
+        // picked path directly rather than invoking a real OS dialog, which
+        // is exactly the seam `pick_file_path`/`apply_file_selection`'s
+        // split exists to provide.
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            Vec::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+
+        let form_id = manager.dom.root_mut().append(form_node()).id();
+        let file_input_id;
+        let submit_id;
+        {
+            let mut form_ref = manager.dom.get_mut(form_id).unwrap();
+            file_input_id = form_ref.append(file_input_node("avatar", Some(".png,.jpg"))).id();
+            submit_id = form_ref.append(submit_button_node()).id();
+        }
+        manager.rebuild_node_mappings();
+
+        let (test_tx, test_rx) = std::sync::mpsc::channel();
+        manager.logic_tx = test_tx;
+
+        let file_u32 = manager.node_id_to_u32[&file_input_id];
+        apply_file_selection(
+            &mut manager,
+            file_u32,
+            Some(std::path::PathBuf::from("/home/user/pictures/cat.png")),
+        );
+
+        assert!(dispatch_form_submit(&mut manager, submit_id));
+
+        match test_rx.try_recv() {
+            Ok(crate::network::UiEvent::SubmitForm { fields, .. }) => {
+                match fields.get("avatar") {
+                    Some(crate::core::types::Value::FileHandle(handle)) => {
+                        assert_eq!(handle.filename, "cat.png");
+                    }
+                    other => panic!("expected Value::FileHandle for `avatar`, got {other:?}"),
+                }
+            }
+            other => panic!("expected UiEvent::SubmitForm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_the_file_dialog_leaves_the_field_null() {
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            Vec::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+
+        let form_id = manager.dom.root_mut().append(form_node()).id();
+        let file_input_id;
+        let submit_id;
+        {
+            let mut form_ref = manager.dom.get_mut(form_id).unwrap();
+            file_input_id = form_ref.append(file_input_node("avatar", None)).id();
+            submit_id = form_ref.append(submit_button_node()).id();
+        }
+        manager.rebuild_node_mappings();
+
+        let (test_tx, test_rx) = std::sync::mpsc::channel();
+        manager.logic_tx = test_tx;
+
+        // Cancelling the dialog: `apply_file_selection` receives `None`.
+        let file_u32 = manager.node_id_to_u32[&file_input_id];
+        apply_file_selection(&mut manager, file_u32, None);
+
+        assert!(dispatch_form_submit(&mut manager, submit_id));
+
+        match test_rx.try_recv() {
+            Ok(crate::network::UiEvent::SubmitForm { fields, .. }) => {
+                assert_eq!(
+                    fields.get("avatar"),
+                    Some(&crate::core::types::Value::Null),
+                    "an unselected/cancelled file field must submit Null, not an error"
+                );
+            }
+            other => panic!("expected UiEvent::SubmitForm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_input_click_focuses_no_text_caret() {
+        // A `type "file"` input must never take the plain text-caret focus —
+        // clicking it routes to the native picker instead (see
+        // `dispatch_dom_click`'s `is_file_input` branch).
+        let tree = Tree::new(window_node());
+        let mut manager = MizuWindowManager::new(
+            tree,
+            HashMap::new(),
+            Vec::new(),
+            FxHashMap::default(),
+            #[cfg(feature = "insecure-dev")]
+            false,
+        )
+        .expect("manager created");
+        let file_input_id = manager
+            .dom
+            .root_mut()
+            .append(file_input_node("avatar", None))
+            .id();
+        manager.rebuild_node_mappings();
+
+        assert!(is_file_input(&manager.dom, file_input_id));
+        assert!(!is_file_input(&manager.dom, manager.dom.root().id()));
+    }

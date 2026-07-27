@@ -29,4 +29,4 @@ pub use eval::{MAX_COMP_BINDINGS, MAX_EVAL_DEPTH, MAX_INSTRUCTIONS, StateMachine
 use eval::{compare_values, field_value, variant_weight};
 pub use interner::{StringInterner, Symbol};
 pub use store::VariableStore;
-pub use value::{DECIMAL_SCALE, Value, from_json, to_json};
+pub use value::{DECIMAL_SCALE, FileHandleData, Value, from_json, to_json};

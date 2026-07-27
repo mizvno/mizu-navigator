@@ -158,6 +158,11 @@ fn infer(
             crate::core::types::Value::List(_) => Ok(None),
             crate::core::types::Value::Record(_) => Ok(None),
             crate::core::types::Value::Null => Ok(Some(ValueType::Nullable(Box::new(ValueType::Num)))),
+            // Unreachable in practice: there is no source-level literal
+            // syntax that produces a `FileHandle` (only the `type "file"`
+            // input's native picker does), but the match must stay
+            // exhaustive — treated as dynamic/unknown, like List/Record.
+            crate::core::types::Value::FileHandle(_) => Ok(None),
         },
         Expr::Variable(sym) => {
             if let Some(ty) = env.get(sym) {

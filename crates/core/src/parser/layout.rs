@@ -1307,6 +1307,35 @@ mod tests {
     }
 
     #[test]
+    fn input_type_file_parses_with_and_without_accept() {
+        // `type "file"` needs no dedicated grammar support: `type` is
+        // already a generic recognised attribute (as this test's sibling,
+        // `test_attribute_extraction`, demonstrates for `type "text"`), and
+        // `accept` is just another ordinary `key "value"` attribute pair.
+        let layout = r#"
+    doc
+        input type "file" name "avatar" accept ".png,.jpg"
+        input type "file" name "resume"
+"#;
+        let tree = parse_layout(layout, &mut StringInterner::new()).unwrap();
+        let mut inputs = tree
+            .root()
+            .children()
+            .filter(|n| n.value().primitive == Primitive::Input);
+
+        let with_accept = inputs.next().unwrap();
+        let attrs = &with_accept.value().attributes;
+        assert_eq!(attrs.get("type").map(|s| s.as_str()), Some("file"));
+        assert_eq!(attrs.get("name").map(|s| s.as_str()), Some("avatar"));
+        assert_eq!(attrs.get("accept").map(|s| s.as_str()), Some(".png,.jpg"));
+
+        let without_accept = inputs.next().unwrap();
+        let attrs = &without_accept.value().attributes;
+        assert_eq!(attrs.get("type").map(|s| s.as_str()), Some("file"));
+        assert_eq!(attrs.get("accept"), None);
+    }
+
+    #[test]
     fn class_with_leading_dot_is_a_parse_error() {
         let layout = "\n    doc\n        box class .foo\n";
         let result = parse_layout(layout, &mut StringInterner::new());

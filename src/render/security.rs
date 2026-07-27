@@ -30,6 +30,11 @@ pub fn estimate_value_bytes(value: &Value) -> usize {
             .iter()
             .map(|(k, v)| k.len() + estimate_value_bytes(v))
             .sum(),
+        // Never actually persisted — `storage`'s `to_json` conversion
+        // rejects `FileHandle` outright (see `Value::FileHandle`'s doc
+        // comment) — this estimate only needs to exist for the match to be
+        // exhaustive.
+        Value::FileHandle(handle) => handle.filename.len(),
     }
 }
 

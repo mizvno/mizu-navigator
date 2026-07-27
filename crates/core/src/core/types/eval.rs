@@ -964,7 +964,7 @@ fn resolve_dot_path<'a>(root: &'a Value, segments: &[&str]) -> Option<&'a Value>
 /// values belong to different variants.  The ordering is arbitrary but fixed,
 /// which is sufficient to satisfy Strict Weak Ordering.
 ///
-/// Weights: Null=1, Bool=2, Int=3, String=4, List=5, Record=6.
+/// Weights: Null=1, Bool=2, Int=3, String=4, List=5, Record=6, FileHandle=7.
 #[inline]
 pub(super) fn variant_weight(v: &Value) -> u8 {
     match v {
@@ -974,6 +974,10 @@ pub(super) fn variant_weight(v: &Value) -> u8 {
         Value::String(_) => 4,
         Value::List(_) => 5,
         Value::Record(_) => 6,
+        // Not meaningfully orderable — see `Value::PartialEq`'s doc comment;
+        // this only needs a stable position for `sort`'s heterogeneous-pair
+        // tiebreaker, never a real ordering between two file selections.
+        Value::FileHandle(_) => 7,
     }
 }
 

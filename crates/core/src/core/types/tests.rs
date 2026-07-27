@@ -1,6 +1,6 @@
     use super::{
-        StateMachine, StringInterner, Value, VariableStore, compare_values, field_value, from_json,
-        to_json, variant_weight, Symbol,
+        FileHandleData, StateMachine, StringInterner, Value, VariableStore, compare_values,
+        field_value, from_json, to_json, variant_weight, Symbol,
     };
     use crate::core::errors::MizuError;
     use std::collections::HashMap;
@@ -346,7 +346,7 @@
         // exact-integer path and to_json's exact-integer emission against
         // silent precision loss at the top of the new 8-decimal-digit range.
         let original = Value::Int(i64::MAX);
-        let json = to_json(&original);
+        let json = to_json(&original).unwrap();
         let roundtripped = from_json(&json).unwrap();
         assert_eq!(roundtripped, original);
     }
@@ -2306,5 +2306,68 @@
             worker_store.interner.vec.len(),
             ui_interner.vec.len(),
             "worker must not add symbols after freeze"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Value::FileHandle — deliberately inert (never compared/serialised/
+    // displayed in full)
+    // ────────────────────────────────────────────────────────────────────────
+
+    fn file_handle(filename: &str) -> Value {
+        Value::FileHandle(Arc::new(FileHandleData {
+            path: std::path::PathBuf::from(format!("/home/user/secret-dir/{filename}")),
+            filename: filename.to_string(),
+        }))
+    }
+
+    #[test]
+    fn file_handle_never_equals_anything_including_itself() {
+        let a = file_handle("avatar.png");
+        // Compare against a fresh clone of the *same* Arc allocation, not
+        // just an equivalent one, to make sure this isn't accidentally
+        // pointer-equality-based.
+        let a2 = a.clone();
+        assert_ne!(a, a2, "a FileHandle must never compare equal, even to itself");
+
+        let b = file_handle("avatar.png"); // same filename, distinct handle
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn file_handle_to_json_errors_without_leaking_the_path() {
+        let handle = file_handle("resume.pdf");
+        let err = to_json(&handle).unwrap_err();
+        assert!(matches!(err, MizuError::ExecutionError(_)));
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("secret-dir") && !msg.contains("/home/user"),
+            "to_json error message must not leak the file's path: {msg}"
+        );
+    }
+
+    #[test]
+    fn file_handle_nested_in_record_still_fails_to_json() {
+        let record = Value::Record(Arc::from(vec![(
+            Arc::from("avatar"),
+            file_handle("avatar.png"),
+        )]));
+        assert!(to_json(&record).is_err());
+    }
+
+    #[test]
+    fn file_handle_nested_in_list_still_fails_to_json() {
+        let list = Value::List(Arc::new(vec![file_handle("a.txt"), file_handle("b.txt")]));
+        assert!(to_json(&list).is_err());
+    }
+
+    #[test]
+    fn file_handle_display_redacts_the_full_path() {
+        let handle = file_handle("tax-return-2025.pdf");
+        let rendered = handle.to_string();
+        assert!(rendered.contains("tax-return-2025.pdf"));
+        assert!(
+            !rendered.contains("secret-dir") && !rendered.contains("/home/user"),
+            "Display must never show the full path: {rendered}"
         );
     }

@@ -476,7 +476,7 @@ impl StorageEngine {
             let mut table = write_txn.open_table(STORAGE_TABLE)
                 .map_err(|e| MizuError::ExecutionError(format!("redb open_table: {e}")))?;
             for (key, value) in records {
-                let json = to_json(value);
+                let json = to_json(value)?;
                 let plaintext = serde_json::to_vec(&json)
                     .map_err(|e| MizuError::ExecutionError(format!("json encode: {e}")))?;
                 let blob = encrypt_record_with_rng(&self.master_key, key, &plaintext, &mut rng)?;

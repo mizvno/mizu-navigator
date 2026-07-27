@@ -54,10 +54,11 @@ fn find_form_ancestor(
 /// Values come from `local_inputs` (the live text buffers); inputs the user
 /// never touched submit an empty string.  Returns `None` when `member` is not
 /// inside any `form` node.
-fn collect_form_fields(
+pub(super) fn collect_form_fields(
     dom: &ego_tree::Tree<crate::parser::MizuNode>,
     node_id_to_u32: &HashMap<EgoNodeId, u32>,
     local_inputs: &FxHashMap<u32, String>,
+    local_file_selections: &FxHashMap<u32, std::sync::Arc<crate::core::types::FileHandleData>>,
     member: EgoNodeId,
 ) -> Option<FxHashMap<String, crate::core::types::Value>> {
     let form_id = find_form_ancestor(dom, member)?;
@@ -68,12 +69,26 @@ fn collect_form_fields(
         if v.primitive == crate::parser::Primitive::Input
             && let Some(name) = v.attributes.get("name")
         {
-            let text = node_id_to_u32
-                .get(&desc.id())
-                .and_then(|u| local_inputs.get(u))
-                .cloned()
-                .unwrap_or_default();
-            fields.insert(name.clone(), crate::core::types::Value::from(text));
+            let is_file_input = v.attributes.get("type").map(String::as_str) == Some("file");
+            let value = if is_file_input {
+                // A `type "file"` field carries a `FileHandle` exactly like
+                // an ordinary field carries a `String` — same `$form` shape,
+                // no code change needed downstream. An untouched/cancelled
+                // file input submits `Null`, not an error.
+                node_id_to_u32
+                    .get(&desc.id())
+                    .and_then(|u| local_file_selections.get(u))
+                    .map(|handle| crate::core::types::Value::FileHandle(handle.clone()))
+                    .unwrap_or(crate::core::types::Value::Null)
+            } else {
+                let text = node_id_to_u32
+                    .get(&desc.id())
+                    .and_then(|u| local_inputs.get(u))
+                    .cloned()
+                    .unwrap_or_default();
+                crate::core::types::Value::from(text)
+            };
+            fields.insert(name.clone(), value);
         }
     }
     Some(fields)
@@ -90,6 +105,101 @@ pub(super) fn find_form_submitter(
     form.descendants()
         .find(|d| d.value().events.contains_key("submit"))
         .map(|d| d.id())
+}
+
+/// Returns `true` if `node_id` is a `type "file"` input.
+pub(super) fn is_file_input(
+    dom: &ego_tree::Tree<crate::parser::MizuNode>,
+    node_id: EgoNodeId,
+) -> bool {
+    dom.get(node_id)
+        .map(|n| n.value().attributes.get("type").map(String::as_str) == Some("file"))
+        .unwrap_or(false)
+}
+
+/// Parses an `accept "…"` attribute value into bare extensions (no leading
+/// `.`) suitable for `rfd::FileDialog::add_filter`.
+///
+/// This is a convenience filter only, **not a security boundary** — most
+/// native file dialogs still let the user type an arbitrary filename past
+/// it. MIME-pattern tokens (containing `/`, e.g. `image/*`) aren't
+/// expressible as an `rfd` extension filter and are silently skipped rather
+/// than rejected; the real gates are the outbound MIME-by-extension-table
+/// (never sniffed) and the request size budget applied when the file is
+/// actually uploaded.
+pub(super) fn parse_accept_extensions(accept: &str) -> Vec<String> {
+    accept
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('/'))
+        .map(|s| s.trim_start_matches('.').to_string())
+        .collect()
+}
+
+/// Opens the native file-picker dialog (blocking — invoked directly from the
+/// click handler, so it runs within the same user-gesture context as the
+/// click itself). Returns `None` if the user cancels.
+///
+/// Not unit-tested directly (would require a real OS dialog); the testable
+/// surface is [`apply_file_selection`], which takes the picked path (or
+/// `None`) as a plain argument.
+fn pick_file_path(accept: Option<&str>) -> Option<std::path::PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(accept) = accept {
+        let extensions = parse_accept_extensions(accept);
+        if !extensions.is_empty() {
+            let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter("Accepted files", &ext_refs);
+        }
+    }
+    dialog.pick_file()
+}
+
+/// Records a picked file path (or clears the field on cancellation) for
+/// `u32_id`. Pure w.r.t. its inputs — takes the already-picked path rather
+/// than calling `rfd` itself, so this is the unit-testable half of file
+/// selection (see [`pick_file_path`]'s doc comment).
+///
+/// Only path/filename metadata is stored — never the file's bytes (see
+/// [`crate::core::types::FileHandleData`]).
+pub(super) fn apply_file_selection(
+    manager: &mut MizuWindowManager,
+    u32_id: u32,
+    picked: Option<std::path::PathBuf>,
+) {
+    let Some(path) = picked else {
+        // Cancelled: leave the field unset (Null on submit), not an error.
+        manager.local_file_selections.remove(&u32_id);
+        return;
+    };
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    manager.local_file_selections.insert(
+        u32_id,
+        std::sync::Arc::new(crate::core::types::FileHandleData { path, filename }),
+    );
+}
+
+/// Dispatches a click on a `type "file"` input: opens the native picker
+/// (the OS dialog itself is the user-gesture gate here, exactly like G1 for
+/// navigation — it can only be triggered from a real click) and records the
+/// selection. Returns `true` if `node_id` resolved to a live node (matching
+/// the other `dispatch_*` helpers' convention), regardless of whether the
+/// user picked a file or cancelled.
+pub(super) fn dispatch_file_input_click(manager: &mut MizuWindowManager, node_id: EgoNodeId) -> bool {
+    let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) else {
+        return false;
+    };
+    let accept = manager
+        .dom
+        .get(node_id)
+        .and_then(|n| n.value().attributes.get("accept").cloned());
+    manager.has_user_gesture = true;
+    let picked = pick_file_path(accept.as_deref());
+    apply_file_selection(manager, u32_id, picked);
+    true
 }
 
 /// Dispatches a click gesture for `node_id` — the exact user-gesture
@@ -127,6 +237,7 @@ pub(super) fn dispatch_form_submit(manager: &mut MizuWindowManager, submitter: E
         &manager.dom,
         &manager.node_id_to_u32,
         &manager.local_inputs,
+        &manager.local_file_selections,
         submitter,
     ) else {
         tracing::warn!("submit event outside any form node; ignored");

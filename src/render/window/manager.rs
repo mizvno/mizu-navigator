@@ -127,6 +127,13 @@ pub struct MizuWindowManager {
     /// Current values of locally typed text fields.
     /// NOT sent to the worker during typing — only collected on Submit.
     pub local_inputs: FxHashMap<u32, String>,
+    /// Current file selections for `type "file"` inputs, keyed by the
+    /// input node's u32 id — mirrors `local_inputs`'s "not sent until
+    /// Submit" lifecycle. Never cleared into a `Value` logic can inspect
+    /// byte-for-byte: only the path/filename metadata is held here, and the
+    /// file's bytes are read only by the network worker at upload time (see
+    /// [`crate::core::types::FileHandleData`]).
+    pub local_file_selections: FxHashMap<u32, std::sync::Arc<crate::core::types::FileHandleData>>,
     /// URL registry — compile-time endpoint aliases resolved from the `urls` block.
     pub url_registry: crate::parser::UrlRegistry,
     /// Expanded Taffy subtrees for every `Each` node in the document.
@@ -303,6 +310,7 @@ impl MizuWindowManager {
             dirty_nodes: std::collections::HashSet::new(),
             typing_layout_dirty: false,
             local_inputs: FxHashMap::default(),
+            local_file_selections: FxHashMap::default(),
             url_registry: rustc_hash::FxHashMap::default(),
             each_expansion: EachExpansion::default(),
             redirect_count: 0,
@@ -535,6 +543,7 @@ impl MizuWindowManager {
         self.text_dimensions.clear();
         self.dirty_nodes.clear();
         self.local_inputs.clear();
+        self.local_file_selections.clear();
         // The new Taffy tree has fresh node IDs; the old synthetic IDs are invalid.
         self.each_expansion = EachExpansion::default();
 

@@ -269,6 +269,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::List(_) => "list",
         Value::Record(_) => "record",
         Value::Null => "null",
+        Value::FileHandle(_) => "file",
     }
 }
 

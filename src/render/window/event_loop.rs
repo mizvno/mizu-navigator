@@ -34,8 +34,8 @@ use crate::render::accessibility::{MizuUserEvent, build_a11y_tree, resolve_ego_i
 
 use super::focus::find_click_and_submit;
 use super::input::{
-    apply_clipboard_action, dispatch_click_gesture, dispatch_form_submit, find_form_submitter,
-    push_input_text,
+    apply_clipboard_action, dispatch_click_gesture, dispatch_file_input_click, dispatch_form_submit,
+    find_form_submitter, is_file_input, push_input_text,
 };
 use super::manager::MizuWindowManager;
 use super::navigate::{navigate_back, navigate_forward, navigate_to_url, process_network_result};
@@ -545,12 +545,19 @@ fn dispatch_dom_click(manager: &mut MizuWindowManager, window: &Window, mouse: &
     let mut action_node_id = None;
     let mut submit_node_id = None;
     let mut new_focus = None;
+    let mut file_input_id = None;
     let mut current_hit = hit_node_id;
 
     while let Some(id) = current_hit {
         if let Some(node_ref) = manager.dom.get(id) {
             if node_ref.value().primitive == crate::parser::Primitive::Input {
-                new_focus = Some(id);
+                // A `type "file"` input opens the native picker instead of
+                // taking the text-caret focus — it has no typed-text state.
+                if is_file_input(&manager.dom, id) {
+                    file_input_id = Some(id);
+                } else {
+                    new_focus = Some(id);
+                }
             }
             if node_ref.value().events.contains_key("click") {
                 action_node_id = Some(id);
@@ -577,6 +584,12 @@ fn dispatch_dom_click(manager: &mut MizuWindowManager, window: &Window, mouse: &
             manager.mark_text_dirty(next);
         }
         manager.focused_node = new_focus;
+        window.request_redraw();
+    }
+
+    if let Some(node_id) = file_input_id
+        && dispatch_file_input_click(manager, node_id)
+    {
         window.request_redraw();
     }
 
