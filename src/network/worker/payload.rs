@@ -5,20 +5,38 @@ use crate::core::errors::MizuError;
 use crate::core::types::Value;
 use crate::parser::logic::PayloadFormat;
 
-/// Returns the `Content-Type` header value for `format`.
+/// Returns the static `Content-Type` header value for the non-`Multipart`
+/// formats.
 ///
 /// `form` intentionally carries no `charset` parameter — that matches what a
 /// typical HTTP server expects for `application/x-www-form-urlencoded`,
 /// unlike `text/plain` where an explicit `charset=utf-8` is conventional.
 /// `application/yaml` is the IANA-registered media type from RFC 9512, not
 /// the older unofficial `text/yaml` / `application/x-yaml`.
-pub(super) fn content_type_for(format: PayloadFormat) -> &'static str {
+///
+/// `Multipart`'s real `Content-Type` includes a per-request random boundary
+/// (RFC 2046) and can't be a fixed `&'static str` — [`serialize_payload`]
+/// builds it directly instead of calling this function for that format; the
+/// value returned here for `Multipart` is a placeholder, never sent on the
+/// wire, that exists only so this match stays exhaustive.
+fn content_type_for(format: PayloadFormat) -> &'static str {
     match format {
         PayloadFormat::Json => "application/json",
         PayloadFormat::Form => "application/x-www-form-urlencoded",
         PayloadFormat::Text => "text/plain; charset=utf-8",
         PayloadFormat::Yaml => "application/yaml",
+        PayloadFormat::Multipart => "multipart/form-data",
     }
+}
+
+/// A serialised request body paired with the `Content-Type` it must be sent
+/// with. Bundled together because `Multipart`'s `Content-Type` carries a
+/// boundary generated during serialisation — the two can't be computed
+/// independently for that format the way they can for the other four.
+#[derive(Debug)]
+pub(super) struct SerializedRequestBody {
+    pub(super) bytes: Vec<u8>,
+    pub(super) content_type: String,
 }
 
 /// Serialises `value` into a request body per `format`.
@@ -39,8 +57,24 @@ pub(super) fn content_type_for(format: PayloadFormat) -> &'static str {
 /// * `Form` — the payload must be a flat [`Value::Record`] of scalar
 ///   (`Bool`/`Int`/`String`/`Null`) fields, percent-encoded via the `url`
 ///   crate's `form_urlencoded` module.
-pub(super) fn serialize_payload(value: &Value, format: PayloadFormat) -> Result<Vec<u8>, MizuError> {
-    match format {
+/// * `Multipart` — the payload must be a [`Value::Record`]; see
+///   `super::multipart` for the per-field encoding rules. The only format
+///   that reads a [`Value::FileHandle`]'s bytes (bounded, streamed, and
+///   budget-checked while reading — see `multipart::MAX_REQUEST_BODY_BYTES`).
+pub(super) async fn serialize_payload(
+    value: &Value,
+    format: PayloadFormat,
+) -> Result<SerializedRequestBody, MizuError> {
+    if format == PayloadFormat::Multipart {
+        let boundary = super::multipart::generate_boundary()?;
+        let bytes = super::multipart::encode_multipart(value, &boundary).await?;
+        return Ok(SerializedRequestBody {
+            bytes,
+            content_type: format!("multipart/form-data; boundary={boundary}"),
+        });
+    }
+
+    let bytes = match format {
         PayloadFormat::Json => {
             let json_val = crate::core::types::to_json(value)?;
             serde_json::to_vec(&json_val)
@@ -61,7 +95,13 @@ pub(super) fn serialize_payload(value: &Value, format: PayloadFormat) -> Result<
             ))),
         },
         PayloadFormat::Form => serialize_form(value),
-    }
+        PayloadFormat::Multipart => unreachable!("handled above"),
+    }?;
+
+    Ok(SerializedRequestBody {
+        bytes,
+        content_type: content_type_for(format).to_string(),
+    })
 }
 
 /// Encodes a flat record of scalar fields as
@@ -110,57 +150,69 @@ mod tests {
         Value::Record(Arc::from(v))
     }
 
-    #[test]
-    fn json_default_matches_manual_serialisation() {
+    #[tokio::test]
+    async fn json_default_matches_manual_serialisation() {
         let value = Value::from("hello".to_string());
         let expected = serde_json::to_vec(&crate::core::types::to_json(&value).unwrap()).unwrap();
-        let got = serialize_payload(&value, PayloadFormat::Json).unwrap();
-        assert_eq!(got, expected);
-        assert_eq!(content_type_for(PayloadFormat::Json), "application/json");
+        let got = serialize_payload(&value, PayloadFormat::Json).await.unwrap();
+        assert_eq!(got.bytes, expected);
+        assert_eq!(got.content_type, "application/json");
     }
 
-    #[test]
-    fn text_requires_string() {
-        assert!(serialize_payload(&Value::from("ok".to_string()), PayloadFormat::Text).is_ok());
-        let err = serialize_payload(&Value::Int(100_000_000), PayloadFormat::Text).unwrap_err();
+    #[tokio::test]
+    async fn text_requires_string() {
+        assert!(serialize_payload(&Value::from("ok".to_string()), PayloadFormat::Text).await.is_ok());
+        let err = serialize_payload(&Value::Int(100_000_000), PayloadFormat::Text)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
-    #[test]
-    fn form_encodes_scalars_and_rejects_nested() {
+    #[tokio::test]
+    async fn form_encodes_scalars_and_rejects_nested() {
         let value = record(vec![
             ("q", Value::from("a b&c=d".to_string())),
             ("n", Value::Int(150_000_000)), // 1.5 scaled
             ("ok", Value::Bool(true)),
         ]);
-        let bytes = serialize_payload(&value, PayloadFormat::Form).unwrap();
-        let s = String::from_utf8(bytes).unwrap();
+        let got = serialize_payload(&value, PayloadFormat::Form).await.unwrap();
+        let s = String::from_utf8(got.bytes).unwrap();
         assert!(s.contains("q=a+b%26c%3Dd") || s.contains("q=a%20b%26c%3Dd"));
         assert!(s.contains("n=1.5"));
         assert!(s.contains("ok=true"));
+        assert_eq!(got.content_type, "application/x-www-form-urlencoded");
 
         let nested = record(vec![("bad", Value::List(Arc::new(vec![Value::Int(1)])))]);
-        let err = serialize_payload(&nested, PayloadFormat::Form).unwrap_err();
+        let err = serialize_payload(&nested, PayloadFormat::Form).await.unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
-    #[test]
-    fn form_rejects_non_record() {
-        let err = serialize_payload(&Value::from("x".to_string()), PayloadFormat::Form).unwrap_err();
+    #[tokio::test]
+    async fn form_rejects_non_record() {
+        let err = serialize_payload(&Value::from("x".to_string()), PayloadFormat::Form)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
-    #[test]
-    fn yaml_round_trips_through_json_intermediate() {
+    #[tokio::test]
+    async fn yaml_round_trips_through_json_intermediate() {
         let value = record(vec![
             ("name", Value::from("mizu".to_string())),
             ("count", Value::Int(300_000_000)),
         ]);
-        let bytes = serialize_payload(&value, PayloadFormat::Yaml).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
+        let got = serialize_payload(&value, PayloadFormat::Yaml).await.unwrap();
+        let text = String::from_utf8(got.bytes).unwrap();
         let parsed: serde_json::Value = serde_yaml_bw::from_str(&text).unwrap();
         let expected = crate::core::types::to_json(&value).unwrap();
         assert_eq!(parsed, expected);
-        assert_eq!(content_type_for(PayloadFormat::Yaml), "application/yaml");
+        assert_eq!(got.content_type, "application/yaml");
+    }
+
+    #[tokio::test]
+    async fn multipart_content_type_carries_a_boundary() {
+        let value = record(vec![("field", Value::from("x".to_string()))]);
+        let got = serialize_payload(&value, PayloadFormat::Multipart).await.unwrap();
+        assert!(got.content_type.starts_with("multipart/form-data; boundary="));
     }
 }

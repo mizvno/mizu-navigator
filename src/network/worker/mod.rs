@@ -31,6 +31,7 @@ use crate::network::{NetworkCmd, NetworkResult};
 mod auth;
 mod fetch;
 mod h3_pool;
+mod multipart;
 mod payload;
 mod storage_debounce;
 #[cfg(test)]
@@ -288,25 +289,26 @@ pub fn spawn_network_thread(
 
                             // Serialise the optional payload per its declared format once,
                             // before any I/O, so a serialisation or shape-validation
-                            // failure aborts cleanly without touching the network.
-                            let request_body = match payload
-                                .as_ref()
-                                .map(|v| payload::serialize_payload(v, format))
-                            {
-                                Some(Ok(vec)) => Some(bytes::Bytes::from(vec)),
-                                Some(Err(e)) => {
-                                    if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
-                                        tracing::trace!(
-                                            "UI channel closed; payload serialisation error dropped"
-                                        );
+                            // failure (or, for `Multipart`, a file read exceeding
+                            // `multipart::MAX_REQUEST_BODY_BYTES`) aborts cleanly
+                            // without touching the network.
+                            let (request_body, content_type) = match &payload {
+                                Some(v) => match payload::serialize_payload(v, format).await {
+                                    Ok(serialized) => (
+                                        Some(bytes::Bytes::from(serialized.bytes)),
+                                        Some(serialized.content_type),
+                                    ),
+                                    Err(e) => {
+                                        if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
+                                            tracing::trace!(
+                                                "UI channel closed; payload serialisation error dropped"
+                                            );
+                                        }
+                                        return;
                                     }
-                                    return;
-                                }
-                                None => None,
+                                },
+                                None => (None, None),
                             };
-                            let content_type = request_body
-                                .as_ref()
-                                .map(|_| payload::content_type_for(format));
 
                             // Header *names* were already validated (syntax +
                             // reserved denylist) at parse time; header

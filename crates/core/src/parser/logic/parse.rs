@@ -1191,7 +1191,7 @@ pub fn parse_action_with_urls(
                 Some(Token::Ident(kw)) => PayloadFormat::from_keyword(kw).ok_or_else(|| {
                     MizuError::ParseError(format!(
                         "network call `{}`: unknown payload format `{}`; \
-                         expected one of: json, form, text, yaml",
+                         expected one of: json, form, text, yaml, multipart",
                         method.as_str(),
                         kw
                     ))

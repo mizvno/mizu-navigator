@@ -1745,6 +1745,21 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
     }
 
     #[test]
+    fn network_call_as_multipart_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as multipart"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall { format: PayloadFormat::Multipart, .. }
+        ));
+    }
+
+    #[test]
     fn network_call_as_json_explicit_is_parsed() {
         let mut interner = StringInterner::new();
         let action = parse_action_with_urls(

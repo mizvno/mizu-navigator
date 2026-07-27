@@ -136,6 +136,13 @@ fn check_payload_format_shape(
                 )));
             }
         },
+        PayloadFormat::Multipart => {
+            if !matches!(ty, ValueType::Record(_)) {
+                return Err(MizuError::StaticTypeError(format!(
+                    "network call `as multipart` payload must be a record, found `{ty}`"
+                )));
+            }
+        }
         PayloadFormat::Json | PayloadFormat::Yaml => {}
     }
     Ok(())
@@ -410,6 +417,20 @@ mod tests {
         let action =
             crate::parser::logic::parse_action("POST(orders, 42) -> resp", &mut interner).unwrap();
         assert!(check_action(&action, &env, &functions, &interner).is_ok());
+    }
+
+    #[test]
+    fn network_call_as_multipart_rejects_int_literal_payload() {
+        let mut interner = StringInterner::new();
+        let functions = FxHashMap::default();
+        let env = Env::default();
+        let action = crate::parser::logic::parse_action(
+            "POST(orders, 42) -> resp as multipart",
+            &mut interner,
+        )
+        .unwrap();
+        let err = check_action(&action, &env, &functions, &interner).unwrap_err();
+        assert!(matches!(err, MizuError::StaticTypeError(_)));
     }
 
 }

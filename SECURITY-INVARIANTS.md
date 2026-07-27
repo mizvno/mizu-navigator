@@ -144,6 +144,18 @@ expression evaluator.
 exposed.  *Note: if `read_local` is ever added, it must be declared as a taint
 source in invariant F1 and route through the load-time flow checker.*
 
+**S1 extended to local file selections:** A `type "file"` input's
+[`Value::FileHandle`](crates/core/src/core/types/value.rs) holds only a path
+and a display filename — never the file's bytes — and is deliberately inert
+everywhere in the type system (never equal to anything, `to_json` always
+errors, `Display` redacts to the filename). The file's bytes are read in
+exactly one place, `network::worker::multipart::encode_multipart`, only for
+an `as multipart` request, only in the network worker thread (never the
+UI/evaluator thread), in bounded chunks, at the moment the request is
+actually sent — the same write-only spirit S1 already establishes for local
+storage, confirmed by inspection: no code path anywhere turns a
+`FileHandle` back into byte-inspectable document logic.
+
 **S2 — Debounced writes are eventually durable, not immediately durable
 (RM-12):** `NetworkCmd::StorageStore` commands for the same origin are
 batched via `StorageWriteDebouncer` (`src/network/worker/storage_debounce.rs`) into a single

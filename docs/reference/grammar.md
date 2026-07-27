@@ -502,7 +502,7 @@ http_verb     = "GET" | "POST" | "PUT" | "DELETE" | "QUERY" ;
 alias         = ident ;
 payload       = expr ;
 path_param    = expr ;
-payload_format = "json" | "form" | "text" | "yaml" ;
+payload_format = "json" | "form" | "text" | "yaml" | "multipart" ;
 
 download_action = "download(" alias ")" ;
 
@@ -528,7 +528,8 @@ eval_action   = expr ;
 - `path_param` at runtime must be a single path segment — no `/`, `\`, `..`, or ASCII control characters (`path_param_ok`, `src/parser/logic.rs`).
 - Assigning to a `comp` variable in an assignment action → runtime `ExecutionError`.
 - `get_system_time(target)` — requests the current time be written to `target`. `target` must be a single **bare variable identifier**, checked at parse time; any other expression (a literal, a field access, a computed expression) → `ParseError`. `target` may not name a `comp` variable (checked at load time by `parser::flow`). This restriction exists so the write destination is always a statically-known `Symbol`, never derived from untrusted data.
-- `as <format>` — optional trailing clause selecting the request payload's wire format and `Content-Type`: `json` (default, `application/json`), `form` (`application/x-www-form-urlencoded`; payload must be a flat record of scalar fields), `text` (`text/plain; charset=utf-8`; payload must be exactly a string), or `yaml` (`application/yaml`; accepts any payload shape). The format keyword is fixed at parse time — never a runtime expression — and any keyword other than these four → `ParseError`.
+- `as <format>` — optional trailing clause selecting the request payload's wire format and `Content-Type`: `json` (default, `application/json`), `form` (`application/x-www-form-urlencoded`; payload must be a flat record of scalar fields), `text` (`text/plain; charset=utf-8`; payload must be exactly a string), `yaml` (`application/yaml`; accepts any payload shape), or `multipart` (`multipart/form-data; boundary=<random>`; payload must be a record — see below). The format keyword is fixed at parse time — never a runtime expression — and any keyword other than these five → `ParseError`.
+- `as multipart` field encoding — each payload record field becomes one part: `bool`/`num`/`string`/`null` → a `text/plain` part; a nested `list`/`record` → a JSON part; a `type "file"` input's selected file (a `FileHandle` value) → a file part, with `Content-Type` chosen from a static file-extension table (never content-sniffed) and falling back to `application/octet-stream` for an unrecognised extension. The multipart boundary is generated fresh per request from a CSPRNG.
 - `header "<name>" <expr>` — zero or more optional trailing clauses adding a custom request header. `<name>` is a parse-time string literal, checked against the HTTP header-name grammar and a reserved-name denylist (`Host`, `Content-Length`, `Content-Type`, `Authorization`, `Connection`, `Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, and anything starting with `Proxy-`, `Sec-`, or `Mizu-`) → `ParseError` if invalid or reserved. `<expr>` is an arbitrary runtime expression, evaluated and stringified at request time; a value that fails `HeaderValue`'s own validation (e.g. contains `\r\n`) aborts the whole request rather than sending a sanitised header.
 
 ---

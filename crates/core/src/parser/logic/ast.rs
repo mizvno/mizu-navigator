@@ -103,11 +103,17 @@ pub enum PayloadFormat {
     /// `Content-Type: application/yaml` — the payload may be any [`Value`]
     /// shape, serialised the same way JSON is.
     Yaml,
+    /// `Content-Type: multipart/form-data; boundary=<random>` — the payload
+    /// must be a [`Value::Record`]; each field becomes a text, JSON, or file
+    /// part depending on its value's shape (see
+    /// `network::worker::multipart`). The only format that can carry a
+    /// [`Value::FileHandle`] onto the wire.
+    Multipart,
 }
 
 impl PayloadFormat {
     /// Parses the keyword following `as` in a `NetworkCall`'s trailing
-    /// clause. Returns `None` for any string that isn't one of the four
+    /// clause. Returns `None` for any string that isn't one of the five
     /// recognised keywords — the caller turns that into a hard parse error.
     #[must_use]
     pub fn from_keyword(s: &str) -> Option<Self> {
@@ -116,11 +122,12 @@ impl PayloadFormat {
             "form" => Some(PayloadFormat::Form),
             "text" => Some(PayloadFormat::Text),
             "yaml" => Some(PayloadFormat::Yaml),
+            "multipart" => Some(PayloadFormat::Multipart),
             _ => None,
         }
     }
 
-    /// Returns the lowercase source keyword (`json`, `form`, `text`, `yaml`).
+    /// Returns the lowercase source keyword (`json`, `form`, `text`, `yaml`, `multipart`).
     #[must_use]
     pub fn as_keyword(&self) -> &'static str {
         match self {
@@ -128,6 +135,7 @@ impl PayloadFormat {
             PayloadFormat::Form => "form",
             PayloadFormat::Text => "text",
             PayloadFormat::Yaml => "yaml",
+            PayloadFormat::Multipart => "multipart",
         }
     }
 }

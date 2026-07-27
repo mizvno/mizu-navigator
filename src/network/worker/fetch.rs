@@ -75,7 +75,7 @@ pub(super) async fn handle_fetch(
     url_str: &str,
     _is_remote_origin: bool,
     request_body: Option<bytes::Bytes>,
-    content_type: Option<&'static str>,
+    content_type: Option<String>,
     custom_headers: &[(String, String)],
 ) -> Result<(Option<String>, crate::core::types::Value), MizuError> {
     let (status, headers, body) = handle_fetch_raw(
@@ -114,7 +114,7 @@ pub(super) async fn handle_fetch_raw(
     url_str: &str,
     _is_remote_origin: bool,
     request_body: Option<bytes::Bytes>,
-    content_type: Option<&'static str>,
+    content_type: Option<String>,
     custom_headers: &[(String, String)],
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     if url_str.starts_with("file://") {
@@ -147,7 +147,7 @@ pub(super) async fn handle_fetch_raw(
         method,
         opt_entry.as_ref(),
         request_body.clone(),
-        content_type,
+        content_type.clone(),
         custom_headers,
     )
     .await
@@ -224,7 +224,7 @@ fn build_h3_request(
     uri: &MizuUri,
     method: &str,
     opt_entry: Option<&VaultEntry>,
-    content_type: Option<&'static str>,
+    content_type: Option<String>,
     custom_headers: &[(String, String)],
 ) -> Result<http::Request<()>, MizuError> {
     let mut req_builder = http::Request::builder()
@@ -241,9 +241,10 @@ fn build_h3_request(
     }
 
     // The `Content-Type` is selected by the request's declared `PayloadFormat`
-    // (see `payload::content_type_for`); `None` for body-less requests.
+    // (`Multipart`'s includes a per-request random boundary — see
+    // `payload::serialize_payload`); `None` for body-less requests.
     if let Some(ct) = content_type {
-        req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
+        req_builder = req_builder.header(http::header::CONTENT_TYPE, ct.as_str());
     }
 
     for (name, value) in custom_headers {
@@ -268,7 +269,7 @@ pub(super) async fn do_h3_request(
     method: &str,
     opt_entry: Option<&VaultEntry>,
     body: Option<bytes::Bytes>,
-    content_type: Option<&'static str>,
+    content_type: Option<String>,
     custom_headers: &[(String, String)],
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     let h3_client = pool.get_or_connect(endpoint, addr, &uri.domain).await?;
@@ -374,7 +375,7 @@ mod tests {
 
     #[test]
     fn content_type_is_set_from_format() {
-        let req = build_h3_request(&uri(), "POST", None, Some("application/yaml"), &[]).unwrap();
+        let req = build_h3_request(&uri(), "POST", None, Some("application/yaml".to_string()), &[]).unwrap();
         assert_eq!(req.headers().get(http::header::CONTENT_TYPE).unwrap(), "application/yaml");
     }
 

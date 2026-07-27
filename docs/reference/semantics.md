@@ -373,7 +373,7 @@ Network calls are validated at **parse time** against the `urls` registry:
 
 At execution time network calls are **queued** as `RuntimeAction::NetworkCall` in `accumulated_actions` and dispatched asynchronously by the network layer.
 
-### Payload format (`as json|form|text|yaml`)
+### Payload format (`as json|form|text|yaml|multipart`)
 
 An optional trailing `as <format>` clause selects the request body's wire
 format and `Content-Type`, fixed at parse time (never a runtime
@@ -385,11 +385,47 @@ expression):
 - `text` — the payload must be exactly a string, sent as `text/plain; charset=utf-8`.
 - `yaml` — any `Value` shape, serialised via the same `Value` → JSON
   intermediate representation as `json`, sent as `application/yaml`.
+- `multipart` — the payload must be a record; each field becomes one part,
+  sent as `Content-Type: multipart/form-data; boundary=<random>` with a
+  fresh CSPRNG-generated boundary per request. See "File uploads" below for
+  the field → part mapping.
 
 A shape violation (e.g. `as text` with a non-string payload) is a runtime
 error and the request is never sent; an obviously-wrong static shape (e.g.
 `as text` with a literal integer) is caught earlier, at load time, by the
 type checker.
+
+### File uploads (`input type "file"`, `as multipart`)
+
+An `input type "file"` field (optionally with an `accept "…"` convenience
+filter for the native dialog — not a security boundary) opens a native
+file-picker when clicked, instead of taking text-caret focus. Selecting a
+file binds a `FileHandle` value to that field in `$form`, exactly like an
+ordinary field carries a string; cancelling the dialog leaves the field
+`Null`. Only one file per input; there is no drag-and-drop, multi-file
+selection, or upload-progress reporting.
+
+A `FileHandle` holds only a path and a display filename — never the file's
+bytes. It is deliberately inert everywhere in the type system: it is never
+equal to anything (including itself), it cannot be JSON/YAML-encoded
+(`as json`/`as yaml`/`as form` all reject it as a runtime error), and it is
+redacted to just the filename anywhere it would otherwise be displayed. The
+only way to actually send a `FileHandle`'s contents is `as multipart`.
+
+Under `as multipart`, each payload record field becomes one part depending
+on its value's shape:
+
+- `bool`/`num`/`string`/`null` → a text part (`Content-Type: text/plain; charset=utf-8`).
+- a nested `list`/`record` → a JSON part (`Content-Type: application/json`).
+- a `FileHandle` → a file part, with `filename=` set from the handle's
+  (sanitised) display filename and `Content-Type` chosen from a static
+  file-extension table — never by inspecting file contents — falling back
+  to `application/octet-stream` for an unrecognised extension.
+
+The file's bytes are read only at this point — inside the network worker,
+never the UI/evaluator thread — in bounded chunks, against a fixed request
+size budget; a file that would push the request over that budget aborts the
+whole upload rather than sending a truncated one.
 
 ### Custom request headers (`header "<name>" <expr>`)
 
