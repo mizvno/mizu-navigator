@@ -373,6 +373,37 @@ Network calls are validated at **parse time** against the `urls` registry:
 
 At execution time network calls are **queued** as `RuntimeAction::NetworkCall` in `accumulated_actions` and dispatched asynchronously by the network layer.
 
+### Payload format (`as json|form|text|yaml`)
+
+An optional trailing `as <format>` clause selects the request body's wire
+format and `Content-Type`, fixed at parse time (never a runtime
+expression):
+
+- `json` (default) — any `Value` shape, `Content-Type: application/json`.
+- `form` — the payload must be a flat record of scalar (`bool`/`num`/`string`/`null`)
+  fields, percent-encoded as `application/x-www-form-urlencoded`.
+- `text` — the payload must be exactly a string, sent as `text/plain; charset=utf-8`.
+- `yaml` — any `Value` shape, serialised via the same `Value` → JSON
+  intermediate representation as `json`, sent as `application/yaml`.
+
+A shape violation (e.g. `as text` with a non-string payload) is a runtime
+error and the request is never sent; an obviously-wrong static shape (e.g.
+`as text` with a literal integer) is caught earlier, at load time, by the
+type checker.
+
+### Custom request headers (`header "<name>" <expr>`)
+
+Zero or more optional trailing `header "<name>" <expr>` clauses attach a
+custom request header. The name is a parse-time string literal — validated
+against the HTTP header-name grammar and rejected if it names a
+runtime-reserved header (`Host`, `Content-Length`, `Content-Type`,
+`Authorization`, `Connection`, `Transfer-Encoding`, `Upgrade`, `TE`,
+`Trailer`, or anything starting with `Proxy-`, `Sec-`, or `Mizu-`). The
+value is an ordinary runtime expression, evaluated and stringified when the
+request is sent; a value that fails header-value validation (e.g. contains
+a `\r` or `\n`) aborts the whole request rather than stripping or
+sanitising just that header.
+
 ### `path_param` rules
 
 Evaluated to a string or number.  The resulting string is validated as a **single path segment** — it must not contain `/`, `\`, `..`, or ASCII control characters.  Failure → `ExecutionError`.
