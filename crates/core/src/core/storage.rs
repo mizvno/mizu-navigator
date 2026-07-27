@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -291,13 +291,21 @@ pub fn encrypt_record_with_rng(
     let mut nonce_bytes = [0u8; 12];
     rng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| MizuError::ExecutionError(format!("AES-GCM encrypt: {e}")))?;
 
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    // Single allocation for nonce || plaintext, encrypted in place below —
+    // encrypt_in_place_detached operates on a plain &mut [u8] (unlike
+    // encrypt_in_place, which needs a growable aead::Buffer), so the
+    // plaintext region can be encrypted in place inside `out` instead of
+    // allocating a separate ciphertext Vec first and copying it in.
+    let mut out = Vec::with_capacity(12 + plaintext.len() + 16);
     out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(plaintext);
+
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut out[12..])
+        .map_err(|e| MizuError::ExecutionError(format!("AES-GCM encrypt: {e}")))?;
+    out.extend_from_slice(&tag);
+
     Ok(out)
 }
 
@@ -418,6 +426,21 @@ impl StorageEngine {
         self.write_batch_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Decrypts and parses every record in this domain's table into an
+    /// in-memory map.
+    ///
+    /// This is a full-table scan, `O(records)` in time and peak memory —
+    /// not the `O(1)` point lookup `redb`'s B-tree is otherwise good for.
+    /// That's intentionally not fixed by lazy per-key reads triggered by
+    /// first `Symbol` access during evaluation: **S1** (write-only storage,
+    /// see `SECURITY-INVARIANTS.md`) deliberately exposes no `read_local`
+    /// path back into the evaluator, so there is no "first access" event to
+    /// hook — reintroducing one here would quietly rebuild exactly the
+    /// read-back path S1 rules out, without the load-time flow checker ever
+    /// being taught about the new taint source. Currently a non-issue in
+    /// practice too: no production load path calls this (`initial_variables`
+    /// is seeded from the live in-memory store, not from disk) — only tests
+    /// exercise it today.
     pub fn read_all(&self) -> Result<HashMap<String, Value>, MizuError> {
         let read_txn = self.db.begin_read()
             .map_err(|e| MizuError::ExecutionError(format!("redb begin_read: {e}")))?;

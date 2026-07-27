@@ -240,6 +240,14 @@ impl StateMachine {
     /// Variable resolution order:
     ///   1. `overlay[name]` — if present and `overlay` is `Some`
     ///   2. `self.get_value_by_name(name, interner)` — global store fallback
+    ///
+    /// Walks `raw_text` one `char` at a time (via `chars().peekable()`)
+    /// rather than scanning for `{`/`\` in bulk: `\{`, `\}`, and `\\` escapes
+    /// have to be recognised inline, so a chunked/`memchr`-based scan would
+    /// still need the same per-character escape check inside each chunk —
+    /// it isn't a free win. Revisit only if profiling on real documents shows
+    /// this is a measurable cost, not on the assumption that char-by-char is
+    /// inherently slow.
     pub(super) fn interpolate_into_with_overlay(
         &self,
         raw_text: &str,
@@ -739,17 +747,26 @@ impl StateMachine {
                             // separate, e.g. INPUT_MAX_BYTES), so counting
                             // Unicode scalar values is the correct choice; byte
                             // length would misreport for any multi-byte text.
-                            // Charged against the instruction budget before
-                            // doing the work, same discipline as string `+`
-                            // and `contains`, so a huge string can't bypass
-                            // MAX_INSTRUCTIONS via repeated length() calls.
+                            //
+                            // The byte length is an O(1) upper bound on the char
+                            // count (a UTF-8 string can never have more chars
+                            // than bytes), so it's charged and budget-checked
+                            // *before* the O(n) `chars().count()` scan runs —
+                            // otherwise a huge string (e.g. a large network
+                            // response bound to a variable) would pay its full
+                            // scan cost before Timeout could ever fire, letting
+                            // a single length() call do MAX_INSTRUCTIONS-times
+                            // more work than the budget allows.
                             Value::String(s) => {
+                                let max_possible_chars = s.len() as u64;
+                                if self.instruction_count.saturating_add(max_possible_chars)
+                                    > *MAX_INSTRUCTIONS
+                                {
+                                    return Err(MizuError::Timeout);
+                                }
                                 let char_count = s.chars().count() as u64;
                                 self.instruction_count =
                                     self.instruction_count.saturating_add(char_count);
-                                if self.instruction_count > *MAX_INSTRUCTIONS {
-                                    return Err(MizuError::Timeout);
-                                }
                                 char_count as i64
                             }
                             other => {
