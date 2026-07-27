@@ -90,7 +90,7 @@ mod tests;
 
 pub use ast::{
     Action, BinOp, ComputedBinding, Expr, ExprArena, ExprId, ExprTree, MizuFunction, NetworkMethod,
-    RootTimer, TimerInterval, ValueType,
+    PayloadFormat, RootTimer, TimerInterval, ValueType,
 };
 pub use comp::{
     CompReverseIndex, build_comp_reverse_index, parse_computed, parse_computed_with_functions,

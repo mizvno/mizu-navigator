@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::core::types::{StringInterner, Symbol, Value};
-use crate::parser::logic::NetworkMethod;
+use crate::parser::logic::{NetworkMethod, PayloadFormat};
 use crate::parser::{Action, MizuFunction};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -52,6 +52,10 @@ pub struct NetworkRequest {
     pub path_param: Option<String>,
     /// Variable name the response is bound to.
     pub target_variable: Symbol,
+    /// Request payload wire format, fixed at parse time.
+    pub format: PayloadFormat,
+    /// Custom request headers: `(name, evaluated_value)` pairs.
+    pub headers: Vec<(String, Value)>,
 }
 
 /// Declarative runtime actions executed by the Main Thread.
@@ -73,6 +77,10 @@ pub enum RuntimeAction {
         path_param: Option<String>,
         /// Variable name the response is bound to.
         target_variable: Symbol,
+        /// Request payload wire format, fixed at parse time.
+        format: PayloadFormat,
+        /// Custom request headers: `(name, evaluated_value)` pairs.
+        headers: Vec<(String, Value)>,
     },
     /// A fully-resolved HTTP call with a concrete URL, produced by the
     /// `LogicWorker` after looking up the alias in the `UrlRegistry`.
@@ -88,6 +96,12 @@ pub enum RuntimeAction {
         payload: Option<Value>,
         /// Variable name the response is bound to.
         target_variable: Symbol,
+        /// Request payload wire format, carried over unchanged from
+        /// [`RuntimeAction::NetworkCall`].
+        format: PayloadFormat,
+        /// Custom request headers, carried over unchanged from
+        /// [`RuntimeAction::NetworkCall`].
+        headers: Vec<(String, Value)>,
     },
     /// Persists `key` â†’ `value` to the current origin's encrypted local storage.
     StoreLocal {

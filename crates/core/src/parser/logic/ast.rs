@@ -80,6 +80,58 @@ impl NetworkMethod {
     }
 }
 
+/// Request payload wire format for [`Action::NetworkCall`], selected by an
+/// optional trailing `as <keyword>` clause.
+///
+/// This is always fixed at parse time, never computed from a runtime
+/// expression — see `SECURITY-INVARIANTS.md` §6 (the `alias_sym` /
+/// `path_param` non-sinks entry): a format that could depend on a tainted
+/// runtime value would be a header-injection channel with no existing gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadFormat {
+    /// `Content-Type: application/json` — the default when no `as` clause is
+    /// present. Any [`Value`] shape is accepted.
+    #[default]
+    Json,
+    /// `Content-Type: application/x-www-form-urlencoded` — the payload must
+    /// be a flat [`Value::Record`] of scalar (`Bool`/`Int`/`String`/`Null`)
+    /// fields.
+    Form,
+    /// `Content-Type: text/plain; charset=utf-8` — the payload must be
+    /// exactly a [`Value::String`].
+    Text,
+    /// `Content-Type: application/yaml` — the payload may be any [`Value`]
+    /// shape, serialised the same way JSON is.
+    Yaml,
+}
+
+impl PayloadFormat {
+    /// Parses the keyword following `as` in a `NetworkCall`'s trailing
+    /// clause. Returns `None` for any string that isn't one of the four
+    /// recognised keywords — the caller turns that into a hard parse error.
+    #[must_use]
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s {
+            "json" => Some(PayloadFormat::Json),
+            "form" => Some(PayloadFormat::Form),
+            "text" => Some(PayloadFormat::Text),
+            "yaml" => Some(PayloadFormat::Yaml),
+            _ => None,
+        }
+    }
+
+    /// Returns the lowercase source keyword (`json`, `form`, `text`, `yaml`).
+    #[must_use]
+    pub fn as_keyword(&self) -> &'static str {
+        match self {
+            PayloadFormat::Json => "json",
+            PayloadFormat::Form => "form",
+            PayloadFormat::Text => "text",
+            PayloadFormat::Yaml => "yaml",
+        }
+    }
+}
+
 
 /// A recurring timer declared at the root of the `logic` block.
 ///
@@ -383,6 +435,17 @@ pub enum Action {
         path_param: Option<ExprTree>,
         /// The variable name that receives the response.
         target_var: String,
+        /// Request payload wire format, fixed at parse time by an optional
+        /// trailing `as <keyword>` clause (defaults to `json`).
+        format: PayloadFormat,
+        /// Custom request headers: `(name, value_expr)` pairs from zero or
+        /// more trailing `header "<name>" <expr>` clauses.
+        ///
+        /// The name is always a parse-time string literal (validated and
+        /// denylist-checked at parse time — see `SECURITY-INVARIANTS.md`'s
+        /// Non-sinks entry); the value is a runtime expression, evaluated and
+        /// stringified at request time.
+        headers: Vec<(String, ExprTree)>,
     },
 }
 

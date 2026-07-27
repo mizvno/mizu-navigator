@@ -30,10 +30,19 @@ pub enum NetworkCmd {
         /// `mizu://` host.  Retained for API symmetry; `file://` is unconditionally
         /// blocked regardless of this value.
         is_remote_origin: bool,
-        /// Optional request payload (POST / PUT / QUERY).  Serialised to JSON by
-        /// the network worker and sent as the HTTP/3 request body with
-        /// `Content-Type: application/json`.  `None` for body-less methods.
+        /// Optional request payload (POST / PUT / QUERY).  Serialised by the
+        /// network worker according to `format` and sent as the HTTP/3
+        /// request body.  `None` for body-less methods.
         payload: Option<crate::core::types::Value>,
+        /// Request payload wire format, fixed at parse time; selects both the
+        /// serialisation and the `Content-Type` header.
+        format: crate::parser::logic::PayloadFormat,
+        /// Custom request headers: `(name, evaluated_value)` pairs. Names are
+        /// fixed at parse time and denylist-checked (see
+        /// `parser::logic::parse::validate_header_name`); values are
+        /// stringified and validated (fail-closed, no request sent on
+        /// failure) by the network worker before the request is built.
+        headers: Vec<(String, crate::core::types::Value)>,
     },
     /// Perform a full navigation request
     Navigate {

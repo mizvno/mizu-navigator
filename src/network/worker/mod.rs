@@ -31,6 +31,7 @@ use crate::network::{NetworkCmd, NetworkResult};
 mod auth;
 mod fetch;
 mod h3_pool;
+mod payload;
 mod storage_debounce;
 #[cfg(test)]
 mod tests;
@@ -269,6 +270,8 @@ pub fn spawn_network_thread(
                         target_var,
                         is_remote_origin,
                         payload,
+                        format,
+                        headers,
                     } => {
                         let tx_clone = tx.clone();
                         let endpoint_clone = endpoint.clone();
@@ -283,22 +286,16 @@ pub fn spawn_network_thread(
                             };
                             let _permit = permit; // RAII: released when this task exits
 
-                            // Serialise the optional payload to JSON once, before any I/O,
-                            // so a serialisation failure aborts cleanly without touching
-                            // the network.
+                            // Serialise the optional payload per its declared format once,
+                            // before any I/O, so a serialisation or shape-validation
+                            // failure aborts cleanly without touching the network.
                             let request_body = match payload
                                 .as_ref()
-                                .map(|v| serde_json::to_vec(&crate::core::types::to_json(v)))
+                                .map(|v| payload::serialize_payload(v, format))
                             {
                                 Some(Ok(vec)) => Some(bytes::Bytes::from(vec)),
                                 Some(Err(e)) => {
-                                    if tx_clone
-                                        .send(NetworkResult::Error(MizuError::Network(format!(
-                                            "request payload serialisation failed: {e}"
-                                        ))))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
                                         tracing::trace!(
                                             "UI channel closed; payload serialisation error dropped"
                                         );
@@ -307,6 +304,21 @@ pub fn spawn_network_thread(
                                 }
                                 None => None,
                             };
+                            let content_type = request_body
+                                .as_ref()
+                                .map(|_| payload::content_type_for(format));
+
+                            // Header *names* were already validated (syntax +
+                            // reserved denylist) at parse time; header
+                            // *values* are runtime expressions, stringified
+                            // here via `Value`'s `Display` impl. Actual
+                            // wire-safety (rejecting CR/LF etc.) is enforced
+                            // by `http::HeaderValue`'s own constructor inside
+                            // `do_h3_request`, fail-closed before any I/O.
+                            let request_headers: Vec<(String, String)> = headers
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.to_string()))
+                                .collect();
 
                             match handle_fetch(
                                 &endpoint_clone,
@@ -316,6 +328,8 @@ pub fn spawn_network_thread(
                                 &url,
                                 is_remote_origin,
                                 request_body,
+                                content_type,
+                                &request_headers,
                             )
                             .await
                             {
@@ -378,6 +392,8 @@ pub fn spawn_network_thread(
                                 &url,
                                 false,
                                 None,
+                                None,
+                                &[],
                             )
                             .await
                             {
@@ -530,6 +546,8 @@ pub fn spawn_network_thread(
                                 &url,
                                 is_remote_origin,
                                 None,
+                                None,
+                                &[],
                             )
                             .await
                             {

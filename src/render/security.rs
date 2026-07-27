@@ -128,6 +128,8 @@ pub fn execute_capability_action(
             url,
             payload,
             target_variable,
+            format,
+            headers,
         } => {
             // Block outbound calls from file:// origins to non-local mizu:// hosts.
             // Prevents SSRF and exfiltration of local data to attacker-controlled servers.
@@ -172,6 +174,8 @@ pub fn execute_capability_action(
                 target_var,
                 is_remote_origin: chrome_url.starts_with("mizu://"),
                 payload,
+                format,
+                headers,
             }) {
                 tracing::warn!(error = %e, "network channel closed; Fetch command dropped");
             }
@@ -241,6 +245,8 @@ pub fn execute_capability_action(
             payload,
             path_param,
             target_variable,
+            format,
+            headers,
         } => {
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::NetworkRequest {
                 request: crate::network::NetworkRequest {
@@ -249,6 +255,8 @@ pub fn execute_capability_action(
                     payload,
                     path_param,
                     target_variable,
+                    format,
+                    headers,
                 },
             }) {
                 tracing::warn!(error = %e, "network channel closed; NetworkRequest command dropped");
@@ -616,6 +624,8 @@ mod tests {
                 url: "mizu://example.com/api/v1/submit".to_string(),
                 payload: Some(payload.clone()),
                 target_variable,
+                format: crate::parser::logic::PayloadFormat::Json,
+                headers: vec![],
             },
         );
 
@@ -638,6 +648,51 @@ mod tests {
                 );
             }
             other => panic!("expected NetworkCmd::Fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_call_format_reaches_network_cmd() {
+        // Mirrors `resolved_call_payload_reaches_network_cmd`: `format` must
+        // survive the same ResolvedCall → NetworkCmd::Fetch dispatch intact,
+        // for every non-default format value, not just the JSON default.
+        for format in [
+            crate::parser::logic::PayloadFormat::Form,
+            crate::parser::logic::PayloadFormat::Text,
+            crate::parser::logic::PayloadFormat::Yaml,
+        ] {
+            let (network_tx, mut network_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+            let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
+            let mut store = crate::core::types::VariableStore::new();
+            let target_variable = store.interner.get_or_intern("result");
+            let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+
+            super::execute_capability_action(
+                &mut store,
+                &network_tx,
+                &logic_tx,
+                "mizu://example.com/index.mizu",
+                &mut policy,
+                crate::network::RuntimeAction::ResolvedCall {
+                    method: "POST".to_string(),
+                    url: "mizu://example.com/api/v1/submit".to_string(),
+                    payload: Some(Value::from("x".to_string())),
+                    target_variable,
+                    format,
+                    headers: vec![],
+                },
+            );
+
+            match network_rx.try_recv() {
+                Ok(crate::network::NetworkCmd::Fetch { format: sent_format, .. }) => {
+                    assert_eq!(
+                        sent_format, format,
+                        "format must survive the ResolvedCall → Fetch dispatch"
+                    );
+                }
+                other => panic!("expected NetworkCmd::Fetch, got {other:?}"),
+            }
         }
     }
 
@@ -668,6 +723,8 @@ mod tests {
                 url: "mizu://example.com/api/weather".to_string(),
                 payload: None,
                 target_variable,
+                format: crate::parser::logic::PayloadFormat::Json,
+                headers: vec![],
             },
         );
 
@@ -706,6 +763,8 @@ mod tests {
                 url: "mizu://example.com/api/x".to_string(),
                 payload: None,
                 target_variable: crate::core::types::Symbol(0), // never interned
+                format: crate::parser::logic::PayloadFormat::Json,
+                headers: vec![],
             },
         );
 

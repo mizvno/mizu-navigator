@@ -9,7 +9,7 @@ use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value};
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
-use super::ast::{Action, BinOp, Expr, ExprArena, ExprTree, MizuFunction, NetworkMethod, RootTimer, TimerInterval, ValueType};
+use super::ast::{Action, BinOp, Expr, ExprArena, ExprTree, MizuFunction, NetworkMethod, PayloadFormat, RootTimer, TimerInterval, ValueType};
 use super::comp::collect_calls;
 use super::lexer::{Cursor, Token, assert_cursor_empty, leading_spaces, lex};
 
@@ -1012,6 +1012,98 @@ fn check_dag(functions: &FxHashMap<Symbol, MizuFunction>) -> Result<(), MizuErro
 }
 
 
+/// Finds the index of the `)` that closes the `(` at `open_idx`, scanning
+/// forward and tracking nesting depth. String literals (`"..."`, with `\`
+/// escapes) are skipped over as opaque spans so a literal paren character
+/// inside a quoted string never perturbs the depth count.
+///
+/// Returns `None` if no matching close is found (unterminated nesting).
+fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = open_idx;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// HTTP header names a `NetworkCall`'s `header "<name>" <expr>` clause may
+/// never set, checked case-insensitively at parse time.
+///
+/// This mirrors the web platform's "forbidden header name" concept from the
+/// Fetch spec (<https://fetch.spec.whatwg.org/#forbidden-request-header>):
+/// names that are either owned by another mechanism in this runtime
+/// (`Content-Type` by [`PayloadFormat`]/Item 1, `Authorization` by the
+/// zero-touch vault — see `network::worker::auth`) or that could otherwise
+/// let a document interfere with connection-level framing the runtime
+/// depends on. `Mizu-` is additionally reserved wholesale for the runtime's
+/// own signaling headers (matching the existing `Mizu-Auth-Set` naming).
+const RESERVED_HEADER_NAMES_EXACT: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "authorization",
+    "connection",
+    "transfer-encoding",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
+/// Validates a `NetworkCall` header clause's name at parse time: it must be a
+/// syntactically valid HTTP header name (checked via a real constructor,
+/// [`http::HeaderName::from_str`], never hand-rolled validation) and must not
+/// be on the [`RESERVED_HEADER_NAMES_EXACT`] denylist or under the
+/// `Proxy-`/`Sec-`/`Mizu-` reserved prefixes.
+fn validate_header_name(name: &str, method_name: &str) -> Result<(), MizuError> {
+    use std::str::FromStr;
+    http::HeaderName::from_str(name).map_err(|e| {
+        MizuError::ParseError(format!(
+            "network call `{method_name}`: invalid header name `{name}`: {e}"
+        ))
+    })?;
+
+    let lower = name.to_ascii_lowercase();
+    let reserved = RESERVED_HEADER_NAMES_EXACT.contains(&lower.as_str())
+        || lower.starts_with("proxy-")
+        || lower.starts_with("sec-")
+        || lower.starts_with("mizu-");
+    if reserved {
+        return Err(MizuError::ParseError(format!(
+            "network call `{method_name}`: header `{name}` is reserved and cannot be set by a \
+             document (see the Fetch spec's forbidden-header-name list; `Content-Type` is \
+             owned by the `as <format>` clause, `Authorization` by the vault mechanism, \
+             and the `Mizu-` prefix is reserved for the runtime's own signaling headers)"
+        )));
+    }
+    Ok(())
+}
+
 /// Parses an action string (e.g. from a `click -> ...` event) into an [`Action`] AST node.
 ///
 /// When `url_registry` is provided, built-in HTTP verb calls (`GET(alias)`,
@@ -1047,7 +1139,13 @@ pub fn parse_action_with_urls(
                 m = method.as_str()
             ))
         })?;
-        let close = rest.rfind(')').ok_or_else(|| {
+        // The matching `)` for `open`, not simply the *last* `)` in `rest`:
+        // a trailing `header "<name>" <expr>` clause may itself contain
+        // parenthesised sub-expressions (e.g. `header "X-Sum" (a + b)`),
+        // which a naive `rfind(')')` would mistake for the call's own
+        // closing paren. String literals are tracked so a literal `)`
+        // inside a quoted payload string doesn't perturb the depth count.
+        let close = find_matching_paren(rest, open).ok_or_else(|| {
             MizuError::ParseError(format!(
                 "network call `{m}` missing `)`: expected `{m}(alias) -> var`",
                 m = method.as_str()
@@ -1055,14 +1153,87 @@ pub fn parse_action_with_urls(
         })?;
         let args_str = rest[open + 1..close].trim();
         let after_close = rest[close + 1..].trim();
-        let target_var = if let Some(stripped) = after_close.strip_prefix("->") {
-            stripped.trim().to_string()
+        let arrow_rhs = if let Some(stripped) = after_close.strip_prefix("->") {
+            stripped.trim()
         } else {
             return Err(MizuError::ParseError(format!(
                 "network call `{m}` missing `-> target_var` after `)`",
                 m = method.as_str()
             )));
         };
+
+        // `-> target_var [as <format-keyword>] [header "<name>" <expr>]*`
+        //
+        // Tokenised (rather than hand-split) so that `header` clause values
+        // can be arbitrary expressions: the Pratt expression parser naturally
+        // stops at the next `header`/end-of-input token (no infix operator
+        // follows a bare identifier), so clauses compose without ambiguity.
+        let rhs_tokens = lex(arrow_rhs)?;
+        let mut rhs_cursor = Cursor::new(&rhs_tokens);
+
+        let target_var = match rhs_cursor.next() {
+            Some(Token::Ident(name)) => (*name).to_string(),
+            other => {
+                return Err(MizuError::ParseError(format!(
+                    "network call `{}`: expected a target variable name after `->`, got {:?}",
+                    method.as_str(),
+                    other
+                )));
+            }
+        };
+
+        // Optional trailing `as <keyword>` clause selecting the request
+        // payload wire format. Fixed at parse time only — never a runtime
+        // expression (see `PayloadFormat`'s doc comment).
+        let format = if matches!(rhs_cursor.peek(), Some(Token::Ident("as"))) {
+            rhs_cursor.next();
+            match rhs_cursor.next() {
+                Some(Token::Ident(kw)) => PayloadFormat::from_keyword(kw).ok_or_else(|| {
+                    MizuError::ParseError(format!(
+                        "network call `{}`: unknown payload format `{}`; \
+                         expected one of: json, form, text, yaml",
+                        method.as_str(),
+                        kw
+                    ))
+                })?,
+                other => {
+                    return Err(MizuError::ParseError(format!(
+                        "network call `{}`: expected a payload format keyword after `as`, got {:?}",
+                        method.as_str(),
+                        other
+                    )));
+                }
+            }
+        } else {
+            PayloadFormat::Json
+        };
+
+        // Zero or more `header "<name>" <expr>` clauses. The name is a
+        // parse-time string literal — validated (syntax + reserved-name
+        // denylist) here, never a runtime expression; the value is an
+        // arbitrary expression, evaluated and stringified at request time.
+        let mut headers: Vec<(String, ExprTree)> = Vec::new();
+        while matches!(rhs_cursor.peek(), Some(Token::Ident("header"))) {
+            rhs_cursor.next();
+            let name = match rhs_cursor.next() {
+                Some(Token::Str(s)) => s.to_string(),
+                other => {
+                    return Err(MizuError::ParseError(format!(
+                        "network call `{}`: expected a string header name after `header`, got {:?}",
+                        method.as_str(),
+                        other
+                    )));
+                }
+            };
+            validate_header_name(&name, method.as_str())?;
+            let value_expr = parse_expr_tree(&mut rhs_cursor, interner)?;
+            headers.push((name, value_expr));
+        }
+
+        assert_cursor_empty(
+            &rhs_cursor,
+            &format!("network call `{}`", method.as_str()),
+        )?;
 
         // Whether this verb carries a request body (POST, PUT, QUERY do; GET, DELETE do not).
         let has_body = matches!(
@@ -1153,6 +1324,8 @@ pub fn parse_action_with_urls(
             payload,
             path_param,
             target_var,
+            format,
+            headers,
         })
     }
 

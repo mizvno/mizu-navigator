@@ -25,6 +25,7 @@ hkdf = "0.12"
 zeroize = "1"
 rand_core = "0.6"
 rand_chacha = "0.3"
+http = "1"
 
 [target.'cfg(not(kani))'.dependencies]
 hickory-resolver = { version = "0.24", default-features = false }

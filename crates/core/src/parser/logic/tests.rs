@@ -1,6 +1,6 @@
     use super::{
-        Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, NetworkMethod, TimerInterval,
-        ValueType, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,
+        Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, NetworkMethod, PayloadFormat,
+        TimerInterval, ValueType, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,
     };
     use crate::core::errors::MizuError;
     use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
@@ -728,6 +728,8 @@
             payload: None,
             path_param: Some(crate::parser::logic::ExprTree { arena, root }),
             target_var: "data".to_string(),
+            format: crate::parser::logic::PayloadFormat::Json,
+            headers: vec![],
         }
     }
 
@@ -1676,6 +1678,233 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         } else {
             panic!("expected NetworkCall");
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // NetworkCall — `as <keyword>` payload format clause
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn network_call_with_no_as_clause_defaults_to_json() {
+        let mut interner = StringInterner::new();
+        let action =
+            parse_action_with_urls(r#"POST(orders, $form) -> resp"#, &mut interner, None).unwrap();
+        if let Action::NetworkCall { format, target_var, .. } = action {
+            assert_eq!(format, PayloadFormat::Json);
+            assert_eq!(target_var, "resp");
+        } else {
+            panic!("expected NetworkCall");
+        }
+    }
+
+    #[test]
+    fn network_call_as_form_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as form"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        if let Action::NetworkCall { format, target_var, .. } = action {
+            assert_eq!(format, PayloadFormat::Form);
+            assert_eq!(target_var, "resp");
+        } else {
+            panic!("expected NetworkCall");
+        }
+    }
+
+    #[test]
+    fn network_call_as_text_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as text"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall { format: PayloadFormat::Text, .. }
+        ));
+    }
+
+    #[test]
+    fn network_call_as_yaml_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as yaml"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall { format: PayloadFormat::Yaml, .. }
+        ));
+    }
+
+    #[test]
+    fn network_call_as_json_explicit_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as json"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall { format: PayloadFormat::Json, .. }
+        ));
+    }
+
+    #[test]
+    fn network_call_as_unknown_keyword_is_hard_parse_error() {
+        let mut interner = StringInterner::new();
+        let err = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as xml"#,
+            &mut interner,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MizuError::ParseError(ref msg) if msg.contains("xml") && msg.contains("payload format")),
+            "expected a payload-format parse error mentioning `xml`, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn network_call_as_clause_works_on_get_without_payload() {
+        // `as` is grammatically accepted even on body-less verbs; it is
+        // simply unused since there is no payload to serialise.
+        let mut interner = StringInterner::new();
+        let action =
+            parse_action_with_urls(r#"GET(users) -> result as text"#, &mut interner, None).unwrap();
+        assert!(matches!(
+            action,
+            Action::NetworkCall { format: PayloadFormat::Text, payload: None, .. }
+        ));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // NetworkCall — `header "<name>" <expr>` custom header clause
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn network_call_with_single_header_clause_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp header "X-Idempotency-Key" idempotency_id"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        if let Action::NetworkCall { headers, target_var, .. } = action {
+            assert_eq!(target_var, "resp");
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].0, "X-Idempotency-Key");
+        } else {
+            panic!("expected NetworkCall");
+        }
+    }
+
+    #[test]
+    fn network_call_with_multiple_header_clauses_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp header "X-Foo" foo_var header "X-Bar" bar_var"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        if let Action::NetworkCall { headers, .. } = action {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[0].0, "X-Foo");
+            assert_eq!(headers[1].0, "X-Bar");
+        } else {
+            panic!("expected NetworkCall");
+        }
+    }
+
+    #[test]
+    fn network_call_with_as_and_header_clauses_together_is_parsed() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp as form header "X-Foo" foo_var"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        if let Action::NetworkCall { headers, format, .. } = action {
+            assert_eq!(format, PayloadFormat::Form);
+            assert_eq!(headers.len(), 1);
+        } else {
+            panic!("expected NetworkCall");
+        }
+    }
+
+    #[test]
+    fn network_call_header_value_accepts_arbitrary_expression() {
+        let mut interner = StringInterner::new();
+        let action = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp header "X-Sum" (a + b)"#,
+            &mut interner,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(action, Action::NetworkCall { .. }));
+    }
+
+    #[test]
+    fn network_call_header_denylisted_name_is_hard_parse_error() {
+        let mut interner = StringInterner::new();
+        for reserved in [
+            "Authorization",
+            "Content-Type",
+            "Host",
+            "Content-Length",
+            "Connection",
+            "Transfer-Encoding",
+            "Upgrade",
+            "TE",
+            "Trailer",
+            "Proxy-Foo",
+            "Sec-Foo",
+            "Mizu-Foo",
+        ] {
+            let src = format!(r#"POST(orders, $form) -> resp header "{reserved}" some_var"#);
+            let err = parse_action_with_urls(&src, &mut interner, None).unwrap_err();
+            assert!(
+                matches!(err, MizuError::ParseError(ref msg) if msg.contains("reserved")),
+                "expected `{reserved}` to be rejected as reserved, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_call_header_invalid_name_syntax_is_hard_parse_error() {
+        let mut interner = StringInterner::new();
+        // A space is not a legal HTTP header-name token character.
+        let err = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp header "X Invalid Name" some_var"#,
+            &mut interner,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
+    }
+
+    #[test]
+    fn network_call_header_missing_string_name_is_hard_parse_error() {
+        let mut interner = StringInterner::new();
+        let err = parse_action_with_urls(
+            r#"POST(orders, $form) -> resp header some_var"#,
+            &mut interner,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MizuError::ParseError(_)));
     }
 
     #[test]

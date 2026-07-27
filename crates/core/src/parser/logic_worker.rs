@@ -267,6 +267,8 @@ impl LogicWorker {
                     payload,
                     path_param,
                     target_variable,
+                    format,
+                    headers,
                 } => {
                     let sym = crate::core::types::Symbol(endpoint_symbol);
                     if let Some(ep) = url_registry.get(&sym) {
@@ -276,7 +278,10 @@ impl LogicWorker {
                                     method: method.as_str().to_owned(),
                                     url,
                                     payload,
-                                    target_variable, });
+                                    target_variable,
+                                    format,
+                                    headers,
+                                });
                             }
                             Err(e) => {
                                 let name = self

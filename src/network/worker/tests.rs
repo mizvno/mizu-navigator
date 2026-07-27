@@ -274,6 +274,8 @@
                 "file:///etc/passwd",
                 is_remote_origin,
                 None,
+                None,
+                &[],
             )
             .await;
             assert!(

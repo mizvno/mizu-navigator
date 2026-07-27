@@ -64,6 +64,8 @@ pub fn execute_action(
             payload,
             path_param,
             target_var,
+            format,
+            headers,
         } => {
             // Evaluate optional payload and path_param expressions.
             let payload_val = if let Some(p) = payload {
@@ -98,6 +100,16 @@ pub fn execute_action(
                 None
             };
             let target_variable = store.interner.get_or_intern(target_var);
+            // Custom header values are runtime expressions (unlike their
+            // names, fixed at parse time) — evaluate each here, same as the
+            // payload.
+            let mut header_values = Vec::with_capacity(headers.len());
+            for (name, expr) in headers {
+                let v = store
+                    .state_machine
+                    .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
+                header_values.push((name.clone(), v));
+            }
             store.state_machine.accumulated_actions.push(
                 crate::messages::RuntimeAction::NetworkCall {
                     method: method.clone(),
@@ -105,6 +117,8 @@ pub fn execute_action(
                     payload: payload_val,
                     path_param: path_param_str,
                     target_variable,
+                    format: *format,
+                    headers: header_values,
                 },
             );
             Ok(true)

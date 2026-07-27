@@ -15,7 +15,8 @@ use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
 use crate::parser::layout::{EventBlock, MizuNode};
 use crate::parser::logic::{
-    Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, RootTimer, ValueType,
+    Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, PayloadFormat, RootTimer,
+    ValueType,
 };
 use rustc_hash::FxHashMap;
 
@@ -74,15 +75,68 @@ fn check_action(
         Action::NetworkCall {
             payload,
             path_param,
+            format,
+            headers,
             ..
         } => {
             if let Some(p) = payload {
-                infer(p.root(), &p.arena, env, functions, interner)?;
+                let ty = infer(p.root(), &p.arena, env, functions, interner)?;
+                check_payload_format_shape(*format, &ty)?;
             }
             if let Some(p) = path_param {
                 infer(p.root(), &p.arena, env, functions, interner)?;
             }
+            for (_, value_expr) in headers {
+                infer(value_expr.root(), &value_expr.arena, env, functions, interner)?;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Statically validates that a `NetworkCall` payload's inferred type is
+/// compatible with its declared [`PayloadFormat`], catching an obvious
+/// author mistake (e.g. `as text` with a literal integer payload) at load
+/// time.
+///
+/// When `ty` is `None` (dynamic/unknown, per `infer`'s documented
+/// convention), this pass stays silent — the runtime check performed during
+/// serialisation (`network::worker::payload::serialize_payload`) remains the
+/// authoritative, always-enforced gate; this is defense in depth, not a
+/// replacement.
+fn check_payload_format_shape(
+    format: PayloadFormat,
+    ty: &Option<ValueType>,
+) -> Result<(), MizuError> {
+    let Some(ty) = ty else {
+        return Ok(());
+    };
+    match format {
+        PayloadFormat::Text => {
+            if !matches!(ty, ValueType::Str) {
+                return Err(MizuError::StaticTypeError(format!(
+                    "network call `as text` payload must be type `string`, found `{ty}`"
+                )));
+            }
+        }
+        PayloadFormat::Form => match ty {
+            ValueType::Record(fields) => {
+                for (name, field_ty) in fields {
+                    if matches!(field_ty, ValueType::List(_) | ValueType::Record(_)) {
+                        return Err(MizuError::StaticTypeError(format!(
+                            "network call `as form` payload field `{name}` must be a \
+                             scalar (bool/num/string), found `{field_ty}`"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(MizuError::StaticTypeError(format!(
+                    "network call `as form` payload must be a record, found `{ty}`"
+                )));
+            }
+        },
+        PayloadFormat::Json | PayloadFormat::Yaml => {}
     }
     Ok(())
 }
@@ -312,6 +366,45 @@ mod tests {
         let src = "f(x: num) : x.field";
         let err = check_logic_string(src).unwrap_err();
         assert!(matches!(err, MizuError::StaticTypeError(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // NetworkCall — `as` format-dependent static payload shape checks
+    // ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn network_call_as_text_rejects_int_literal_payload() {
+        let mut interner = StringInterner::new();
+        let functions = FxHashMap::default();
+        let env = Env::default();
+        let action = crate::parser::logic::parse_action("POST(orders, 42) -> resp as text", &mut interner)
+            .unwrap();
+        let err = check_action(&action, &env, &functions, &interner).unwrap_err();
+        assert!(matches!(err, MizuError::StaticTypeError(_)));
+    }
+
+    #[test]
+    fn network_call_as_text_accepts_string_literal_payload() {
+        let mut interner = StringInterner::new();
+        let functions = FxHashMap::default();
+        let env = Env::default();
+        let action = crate::parser::logic::parse_action(
+            r#"POST(orders, "hi") -> resp as text"#,
+            &mut interner,
+        )
+        .unwrap();
+        assert!(check_action(&action, &env, &functions, &interner).is_ok());
+    }
+
+    #[test]
+    fn network_call_as_json_accepts_any_literal_payload() {
+        // The default/explicit `json` format imposes no static shape constraint.
+        let mut interner = StringInterner::new();
+        let functions = FxHashMap::default();
+        let env = Env::default();
+        let action =
+            crate::parser::logic::parse_action("POST(orders, 42) -> resp", &mut interner).unwrap();
+        assert!(check_action(&action, &env, &functions, &interner).is_ok());
     }
 
 }

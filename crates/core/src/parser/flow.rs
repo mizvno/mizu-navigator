@@ -261,13 +261,16 @@ fn action_exprs(action: &Action) -> Vec<&ExprTree> {
         Action::Eval(e) => vec![e],
         Action::Assign { expr, .. } => vec![expr],
         Action::Navigate { url } => vec![url],
-        Action::NetworkCall { payload, path_param, .. } => {
+        Action::NetworkCall { payload, path_param, headers, .. } => {
             let mut exprs = Vec::new();
             if let Some(p) = payload {
                 exprs.push(p);
             }
             if let Some(p) = path_param {
                 exprs.push(p);
+            }
+            for (_, value_expr) in headers {
+                exprs.push(value_expr);
             }
             exprs
         }

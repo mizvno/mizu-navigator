@@ -75,6 +75,8 @@ pub(super) async fn handle_fetch(
     url_str: &str,
     _is_remote_origin: bool,
     request_body: Option<bytes::Bytes>,
+    content_type: Option<&'static str>,
+    custom_headers: &[(String, String)],
 ) -> Result<(Option<String>, crate::core::types::Value), MizuError> {
     let (status, headers, body) = handle_fetch_raw(
         endpoint,
@@ -84,6 +86,8 @@ pub(super) async fn handle_fetch(
         url_str,
         _is_remote_origin,
         request_body,
+        content_type,
+        custom_headers,
     )
     .await?;
     let domain = MizuUri::parse(url_str)
@@ -110,6 +114,8 @@ pub(super) async fn handle_fetch_raw(
     url_str: &str,
     _is_remote_origin: bool,
     request_body: Option<bytes::Bytes>,
+    content_type: Option<&'static str>,
+    custom_headers: &[(String, String)],
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     if url_str.starts_with("file://") {
         return Err(MizuError::SecurityViolation(
@@ -141,6 +147,8 @@ pub(super) async fn handle_fetch_raw(
         method,
         opt_entry.as_ref(),
         request_body.clone(),
+        content_type,
+        custom_headers,
     )
     .await
     {
@@ -157,6 +165,8 @@ pub(super) async fn handle_fetch_raw(
                 method,
                 opt_entry2.as_ref(),
                 request_body,
+                content_type,
+                custom_headers,
             )
             .await
         }
@@ -193,25 +203,30 @@ pub(crate) fn check_response_body_budget(
     Ok(())
 }
 
-/// Sends a single HTTP/3 request on a pooled connection and reads the full
-/// response.
+/// Builds the HTTP/3 request headers/method/URI (everything but the body),
+/// with no network I/O — split out from [`do_h3_request`] so header
+/// attachment (`Content-Type`, the vault `Authorization` bearer token, and
+/// document-declared custom headers) is unit-testable without a live QUIC
+/// connection.
 ///
-/// `body` carries the optional JSON-serialised request payload (POST / PUT /
-/// QUERY).  `None` sends a body-less request (GET / DELETE / navigation).
-pub(super) async fn do_h3_request(
-    pool: &H3ConnectionPool,
-    endpoint: &Endpoint,
-    addr: std::net::SocketAddr,
+/// The `:scheme` pseudo-header is set to `"https"` because `h3` validates
+/// scheme conformance; Mizu's custom `mizu://` routing is enforced by the
+/// ALPN layer, not the HTTP scheme header.
+///
+/// Custom header *names* were already validated (syntax + reserved denylist)
+/// at parse time; a header *value* is only checked here, via
+/// `http::request::Builder`'s own `TryInto<HeaderValue>` conversion — which
+/// is what actually rejects an unsafe value (e.g. one containing CR/LF).
+/// That rejection surfaces as `Err` from this function, before any I/O is
+/// attempted, so a bad value aborts the whole request rather than silently
+/// stripping just that header.
+fn build_h3_request(
     uri: &MizuUri,
     method: &str,
     opt_entry: Option<&VaultEntry>,
-    body: Option<bytes::Bytes>,
-) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
-    let h3_client = pool.get_or_connect(endpoint, addr, &uri.domain).await?;
-
-    // Build the HTTP/3 request.  The `:scheme` pseudo-header is set to "https"
-    // because h3 validates scheme conformance; Mizu's custom `mizu://` routing
-    // is enforced by the ALPN layer, not the HTTP scheme header.
+    content_type: Option<&'static str>,
+    custom_headers: &[(String, String)],
+) -> Result<http::Request<()>, MizuError> {
     let mut req_builder = http::Request::builder()
         .method(method)
         .uri(format!("https://{}{}", uri.domain, uri.path))
@@ -225,14 +240,40 @@ pub(super) async fn do_h3_request(
         );
     }
 
-    // Request payloads are always JSON (serialised from a Mizu `Value`).
-    if body.is_some() {
-        req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
+    // The `Content-Type` is selected by the request's declared `PayloadFormat`
+    // (see `payload::content_type_for`); `None` for body-less requests.
+    if let Some(ct) = content_type {
+        req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
     }
 
-    let req = req_builder
+    for (name, value) in custom_headers {
+        req_builder = req_builder.header(name.as_str(), value.as_str());
+    }
+
+    req_builder
         .body(())
-        .map_err(|e| MizuError::Network(format!("Request build error: {e}")))?;
+        .map_err(|e| MizuError::Network(format!("Request build error: {e}")))
+}
+
+/// Sends a single HTTP/3 request on a pooled connection and reads the full
+/// response.
+///
+/// `body` carries the optional JSON-serialised request payload (POST / PUT /
+/// QUERY).  `None` sends a body-less request (GET / DELETE / navigation).
+pub(super) async fn do_h3_request(
+    pool: &H3ConnectionPool,
+    endpoint: &Endpoint,
+    addr: std::net::SocketAddr,
+    uri: &MizuUri,
+    method: &str,
+    opt_entry: Option<&VaultEntry>,
+    body: Option<bytes::Bytes>,
+    content_type: Option<&'static str>,
+    custom_headers: &[(String, String)],
+) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
+    let h3_client = pool.get_or_connect(endpoint, addr, &uri.domain).await?;
+
+    let req = build_h3_request(uri, method, opt_entry, content_type, custom_headers)?;
 
     // The whole send/receive exchange — HEADERS, optional body, and the full
     // response (HEADERS + all DATA frames) — is bounded by REQUEST_TIMEOUT.
@@ -305,4 +346,87 @@ pub(super) async fn do_h3_request(
                 uri.domain, *REQUEST_TIMEOUT
             ))
         })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri() -> MizuUri {
+        MizuUri::parse("mizu://example.com/api/submit").unwrap()
+    }
+
+    #[test]
+    fn custom_header_reaches_the_built_request() {
+        let req = build_h3_request(
+            &uri(),
+            "POST",
+            None,
+            None,
+            &[("X-Idempotency-Key".to_string(), "abc-123".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            req.headers().get("x-idempotency-key").unwrap(),
+            "abc-123"
+        );
+    }
+
+    #[test]
+    fn content_type_is_set_from_format() {
+        let req = build_h3_request(&uri(), "POST", None, Some("application/yaml"), &[]).unwrap();
+        assert_eq!(req.headers().get(http::header::CONTENT_TYPE).unwrap(), "application/yaml");
+    }
+
+    #[test]
+    fn no_content_type_when_body_less() {
+        let req = build_h3_request(&uri(), "GET", None, None, &[]).unwrap();
+        assert!(req.headers().get(http::header::CONTENT_TYPE).is_none());
+    }
+
+    #[test]
+    fn vault_entry_sets_authorization_bearer() {
+        let entry = VaultEntry {
+            token: "tok123".to_string(),
+            allowed_methods: vec!["GET".to_string()],
+            exp: u64::MAX,
+        };
+        let req = build_h3_request(&uri(), "GET", Some(&entry), None, &[]).unwrap();
+        assert_eq!(
+            req.headers().get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer tok123"
+        );
+    }
+
+    #[test]
+    fn header_value_with_crlf_is_rejected_before_any_request_is_built() {
+        // A value containing CR/LF must fail via `HeaderValue`'s own
+        // constructor — the request is never sent, not sanitised.
+        let err = build_h3_request(
+            &uri(),
+            "POST",
+            None,
+            None,
+            &[("X-Evil".to_string(), "line1\r\nX-Injected: yes".to_string())],
+        )
+        .unwrap_err();
+        assert!(matches!(err, MizuError::Network(_)));
+    }
+
+    #[test]
+    fn multiple_custom_headers_all_reach_the_request() {
+        let req = build_h3_request(
+            &uri(),
+            "POST",
+            None,
+            None,
+            &[
+                ("X-Foo".to_string(), "foo-value".to_string()),
+                ("X-Bar".to_string(), "bar-value".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(req.headers().get("x-foo").unwrap(), "foo-value");
+        assert_eq!(req.headers().get("x-bar").unwrap(), "bar-value");
+    }
 }
