@@ -10,7 +10,7 @@ pub mod vault;
 pub mod worker;
 pub use crate::parser::logic::NetworkMethod;
 pub use messages::{
-    NetworkRequest, ReloadPayload, RuntimeAction, StateUpdate, UiEvent, WorkerResponse,
+    NetworkRequest, ReloadPayload, RuntimeAction, StateUpdate, TabId, UiEvent, WorkerResponse,
 };
 
 use crate::core::errors::MizuError;
@@ -20,6 +20,10 @@ use crate::core::errors::MizuError;
 pub enum NetworkCmd {
     /// Perform a network request
     Fetch {
+        /// Tab that issued this command. Echoed back on every result so the
+        /// UI can route the response to the document that asked for it, and
+        /// only to that one.
+        tab: TabId,
         /// Uppercase HTTP method (`"GET"`, `"POST"`, …).
         method: String,
         /// Fully-resolved `mizu://` target URL.
@@ -46,11 +50,19 @@ pub enum NetworkCmd {
     },
     /// Perform a full navigation request
     Navigate {
+        /// Tab that issued this command. Echoed back on every result so the
+        /// UI can route the response to the document that asked for it, and
+        /// only to that one.
+        tab: TabId,
         /// The target document's URL.
         url: String,
     },
     /// Fetch an image and cache it
     FetchImage {
+        /// Tab that issued this command. Echoed back on every result so the
+        /// UI can route the response to the document that asked for it, and
+        /// only to that one.
+        tab: TabId,
         /// The resolved image URL (`mizu://`, `file://`, …).
         url: String,
         /// `true` when the triggering document was loaded from a remote `mizu://` host.
@@ -64,6 +76,10 @@ pub enum NetworkCmd {
     },
     /// Execute a compile-time–validated HTTP/3 request via a URL alias.
     NetworkRequest {
+        /// Tab that issued this command. Echoed back on every result so the
+        /// UI can route the response to the document that asked for it, and
+        /// only to that one.
+        tab: TabId,
         /// The alias-resolved request description.
         request: NetworkRequest,
     },
@@ -88,6 +104,11 @@ pub enum NetworkCmd {
 pub enum NetworkResult {
     /// Request succeeded, with the value to update in VariableStore
     Success {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// Variable name the response value is bound to.
         target_var: String,
         /// The decoded response value.
@@ -98,6 +119,11 @@ pub enum NetworkResult {
     /// gone (e.g. `Status: error: connection refused`), instead of failing
     /// silently.
     FetchFailed {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// The variable the fetch result was bound to (`GET(alias) -> var`).
         target_var: String,
         /// The failure that aborted the request.
@@ -105,6 +131,11 @@ pub enum NetworkResult {
     },
     /// Navigation succeeded, returning the new source code to parse
     NavigateSuccess {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// The navigated-to document's URL.
         url: String,
         /// The raw `.mizu` source fetched from that URL.
@@ -117,11 +148,21 @@ pub enum NetworkResult {
     /// this variant — they follow same-origin redirects internally or surface
     /// failure through `FetchFailed` / `FetchImageFailed` (invariant N1).
     NavigationRedirect {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// The redirect target URL to navigate to next.
         new_url: String,
     },
     /// Image fetch succeeded, returning decoded image
     FetchImageSuccess {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// The URL the image was fetched from (cache key).
         url: String,
         /// The decoded, ready-to-paint image.
@@ -129,11 +170,25 @@ pub enum NetworkResult {
     },
     /// Image fetch failed
     FetchImageFailed {
+        /// Tab this result belongs to — the value echoed from the command.
+        /// Never resolve it against the *active* tab: the user may have
+        /// switched, or the tab may have closed (in which case the result is
+        /// dropped).
+        tab: TabId,
         /// The URL the image fetch was attempted for.
         url: String,
         /// The failure that aborted the fetch.
         error: MizuError,
     },
-    /// Request failed
-    Error(MizuError),
+    /// Request failed.
+    ///
+    /// Carries the originating tab for the same routing reason as every other
+    /// variant: the error clears that tab's loading flag and lands in its
+    /// inspector log.
+    ///
+    /// `None` for failures that belong to no tab — the worker's own startup
+    /// (runtime, QUIC endpoint, TLS config), which happens before any command
+    /// is read. Those are surfaced on the active tab because there is nothing
+    /// better to attach them to.
+    Error(Option<TabId>, MizuError),
 }

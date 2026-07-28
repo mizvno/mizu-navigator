@@ -13,12 +13,12 @@
 
         // Fill the channel to capacity — every try_send up to the limit must succeed.
         for i in 0..*MAX_UI_CHANNEL_CAPACITY {
-            tx.try_send(NetworkResult::Error(MizuError::Network(format!("msg {i}"))))
+            tx.try_send(NetworkResult::Error(None, MizuError::Network(format!("msg {i}"))))
                 .unwrap_or_else(|_| panic!("try_send must succeed for slot {i}"));
         }
 
         // The (MAX_UI_CHANNEL_CAPACITY + 1)-th message must be rejected immediately.
-        let overflow = tx.try_send(NetworkResult::Error(MizuError::Network(
+        let overflow = tx.try_send(NetworkResult::Error(None, MizuError::Network(
             "overflow".to_string(),
         )));
         assert!(
@@ -93,7 +93,7 @@
 
         // Fill the channel to capacity so the next send will block.
         for i in 0..*MAX_UI_CHANNEL_CAPACITY {
-            tx.try_send(NetworkResult::Error(MizuError::Network(format!(
+            tx.try_send(NetworkResult::Error(None, MizuError::Network(format!(
                 "fill {i}"
             ))))
             .unwrap_or_else(|_| panic!("fill slot {i} must succeed"));
@@ -102,7 +102,7 @@
         // Spawn a task that blocks on the full channel — simulates a suspended fetch.
         let tx2 = tx.clone();
         let sender = tokio::spawn(async move {
-            tx2.send(NetworkResult::Error(MizuError::Network(
+            tx2.send(NetworkResult::Error(None, MizuError::Network(
                 "recovered".to_string(),
             )))
             .await
@@ -133,7 +133,7 @@
             panic!("recovered message must be in channel after sender completes")
         });
         assert!(
-            matches!(recovered, NetworkResult::Error(_)),
+            matches!(recovered, NetworkResult::Error(None, _)),
             "recovered message must be the one sent by the suspended task"
         );
     }
