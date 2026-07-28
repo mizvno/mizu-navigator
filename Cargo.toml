@@ -47,7 +47,7 @@ hmac = "0.12"
 keyring = "3.6.2"
 arboard = "3.6.1"
 webpki-roots = "1.0.7"
-image = { version = "0.25", features = ["gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["gif", "webp"] }
 icu_segmenter = { version = "2", features = ["auto"] }
 hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-rustls", "webpki-roots"] }
 rustc-hash = "2"
@@ -68,6 +68,12 @@ rand_chacha = "0.3"
 [features]
 default = []
 insecure-dev = []
+
+[lints.rust]
+# `kani` is set by the Kani model checker when it runs proofs; rustc doesn't
+# know about it during normal builds, so we declare it as an expected cfg to
+# suppress unexpected_cfgs warnings on #[cfg(kani)] / #[cfg(not(kani))] guards.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [profile.dev]
 debug = true
