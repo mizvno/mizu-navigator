@@ -122,6 +122,20 @@ pub struct ChromePalette {
     pub select: Color,
     /// The "loaded OK" status dot.
     pub ok_dot: Color,
+    /// Tab strip background, behind the tabs themselves.
+    pub strip_bg: Color,
+    /// Background of the active tab.
+    pub tab_active_bg: Color,
+    /// Background of an inactive tab.
+    pub tab_inactive_bg: Color,
+    /// Title text of the active tab.
+    pub tab_text: Color,
+    /// Title text of an inactive tab. Kept opaque rather than a low-alpha
+    /// grey: the AA contrast assertion is computed against the tab background,
+    /// and translucent greys are exactly what fails it.
+    pub tab_text_inactive: Color,
+    /// The per-tab close glyph.
+    pub tab_close_glyph: Color,
 }
 
 /// Mizu's original palette — unchanged from before ux-5.
@@ -138,6 +152,12 @@ const DARK: ChromePalette = ChromePalette {
     cursor: Color::rgba8(255, 255, 255, 255),
     select: Color::rgba8(74, 144, 217, 120),
     ok_dot: Color::rgba8(76, 175, 80, 255),
+    strip_bg: Color::rgba8(32, 32, 32, 255),
+    tab_active_bg: Color::rgba8(60, 60, 60, 255),
+    tab_inactive_bg: Color::rgba8(40, 40, 40, 255),
+    tab_text: Color::rgba8(230, 230, 230, 255),
+    tab_text_inactive: Color::rgba8(175, 175, 175, 255),
+    tab_close_glyph: Color::rgba8(210, 210, 210, 255),
 };
 
 /// Light counterpart. Contrast ratios are computed and asserted (≥ 4.5:1,
@@ -157,6 +177,12 @@ const LIGHT: ChromePalette = ChromePalette {
     cursor: Color::rgba8(20, 20, 20, 255),
     select: Color::rgba8(74, 144, 217, 90),
     ok_dot: Color::rgba8(46, 125, 50, 255),
+    strip_bg: Color::rgba8(222, 222, 222, 255),
+    tab_active_bg: Color::rgba8(255, 255, 255, 255),
+    tab_inactive_bg: Color::rgba8(235, 235, 235, 255),
+    tab_text: Color::rgba8(25, 25, 25, 255),
+    tab_text_inactive: Color::rgba8(85, 85, 85, 255),
+    tab_close_glyph: Color::rgba8(60, 60, 60, 255),
 };
 
 /// A maximum-contrast palette forced when [`UserPreferences::high_contrast`]
@@ -175,6 +201,12 @@ const HIGH_CONTRAST: ChromePalette = ChromePalette {
     cursor: Color::rgba8(255, 255, 0, 255),
     select: Color::rgba8(255, 255, 0, 140),
     ok_dot: Color::rgba8(0, 255, 0, 255),
+    strip_bg: Color::rgba8(0, 0, 0, 255),
+    tab_active_bg: Color::rgba8(0, 0, 0, 255),
+    tab_inactive_bg: Color::rgba8(0, 0, 0, 255),
+    tab_text: Color::rgba8(255, 255, 255, 255),
+    tab_text_inactive: Color::rgba8(255, 255, 255, 255),
+    tab_close_glyph: Color::rgba8(255, 255, 0, 255),
 };
 
 impl ChromePalette {
@@ -311,6 +343,18 @@ mod tests {
                 url_ratio >= MIN_AA,
                 "{name}: URL bar text/background contrast {url_ratio:.2} is below AA ({MIN_AA})"
             );
+            for (label, fg, bg) in [
+                ("active tab title", p.tab_text, p.tab_active_bg),
+                ("inactive tab title", p.tab_text_inactive, p.tab_inactive_bg),
+                ("close glyph on active tab", p.tab_close_glyph, p.tab_active_bg),
+                ("close glyph on inactive tab", p.tab_close_glyph, p.tab_inactive_bg),
+            ] {
+                let ratio = contrast_ratio(fg, bg);
+                assert!(
+                    ratio >= MIN_AA,
+                    "{name}: {label} contrast {ratio:.2} is below AA ({MIN_AA})"
+                );
+            }
         }
     }
 

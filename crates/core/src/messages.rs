@@ -8,6 +8,23 @@ use crate::parser::{Action, MizuFunction};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
+/// Identifies one open tab for the lifetime of the process.
+///
+/// **Never reused after a tab closes.** That is a correctness requirement, not
+/// a convenience: each document owns its own frozen [`StringInterner`], so a
+/// [`Symbol`] minted against one tab's table is meaningless against another's
+/// (see the type-level docs on `core::types::StringInterner`). Messages
+/// crossing the UI↔worker boundary carry bare `Symbol`s, and the only thing
+/// making that sound once several documents are alive at once is that the
+/// `TabId` they are tagged with selects the *one* interner they may be
+/// resolved against. Recycling an id would let a late message from a closed
+/// tab be resolved against a different document's table.
+///
+/// Allocated from a monotonically increasing counter on the window manager;
+/// `u64` exhaustion is not a realistic concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TabId(pub u64);
+
 /// Complete payload for document reloading.
 #[derive(Debug, Clone)]
 pub struct ReloadPayload {
@@ -194,6 +211,14 @@ pub enum UiEvent {
     },
     /// Complete document reload.
     Reload(Box<ReloadPayload>),
+    /// The tab this event is addressed to was closed; drop its worker-side
+    /// state.
+    ///
+    /// Without this the worker keeps a full `VariableStore` plus a frozen
+    /// interner alive for every tab ever opened, for the life of the process.
+    /// Dropping the entry is also what makes late events for the closed tab
+    /// fall into the "unknown tab" branch instead of mutating stale state.
+    CloseTab,
 }
 
 /// Aggregated response of the LogicWorker towards the UI.

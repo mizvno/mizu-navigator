@@ -1,4 +1,4 @@
-﻿//! DNS-over-TLS (DoT) split-horizon resolver for `mizu://`.
+//! DNS-over-TLS (DoT) split-horizon resolver for `mizu://`.
 //!
 //! # Architecture
 //!
@@ -236,6 +236,7 @@ pub(crate) async fn resolve_with_pool_fallback(
 /// formatting.  Only `Timeout` and `Io` errors (connection-refused, network-
 /// unreachable, etc.) are transient; all other variants (including
 /// `NoRecordsFound`, `Message`, `Proto`) are authoritative.
+#[cfg(not(kani))]
 fn is_transient_dns_error(e: &MizuError) -> bool {
     use hickory_resolver::error::ResolveErrorKind;
     use std::io::ErrorKind as IOKind;
@@ -327,7 +328,10 @@ async fn resolve_ip(
         .await
         .map_err(|e| {
             tracing::debug!(domain = %bare, error = %e, "DoT lookup failed");
-            MizuError::DnsError(e)
+            #[cfg(not(kani))]
+            return MizuError::DnsError(e);
+            #[cfg(kani)]
+            return MizuError::Network(e.to_string());
         })?;
 
     let mut ipv6_fallback: Option<SocketAddr> = None;
@@ -353,7 +357,7 @@ async fn resolve_ip(
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, not(kani)))]
 mod tests {
     use super::*;
 

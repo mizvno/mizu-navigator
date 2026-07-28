@@ -5,7 +5,7 @@ use ego_tree::NodeId as EgoNodeId;
 
 use crate::parser::{MizuNode, Primitive};
 
-use super::manager::MizuWindowManager;
+use super::manager::TabState;
 
 /// A node is keyboard-focusable iff it is an `input`, a `button`, or any node
 /// carrying a `click`/`submit` event handler. Document order is the tab
@@ -53,7 +53,7 @@ pub(super) fn find_click_and_submit(
     (action_node_id, submit_node_id)
 }
 
-impl MizuWindowManager {
+impl TabState {
     /// Collects every keyboard-focusable node in document order (pre-order
     /// DOM traversal). This *is* the tab order.
     pub fn focusable_nodes_in_order(&self) -> Vec<EgoNodeId> {

@@ -22,17 +22,38 @@ use crate::render::preferences::ChromePalette;
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 
-/// Height of the chrome bar in logical pixels.
-pub const CHROME_HEIGHT: f32 = 28.0;
+/// Height of the tab strip band, above the navigation bar.
+pub const TAB_STRIP_HEIGHT: f32 = 26.0;
 
-const BTN_Y: f32 = 4.0;
+/// Height of the navigation bar band (back/reload/forward + URL bar).
+const BAR_HEIGHT: f32 = 28.0;
+
+/// Total height of the chrome in logical pixels — both bands.
+///
+/// Every content-space calculation in the renderer treats this as "the
+/// document's vertical offset", so keeping the tab strip *inside* it (rather
+/// than adding a second offset) is what lets the strip be introduced without
+/// touching hit tests, clip rects, or viewport maths.
+pub const CHROME_HEIGHT: f32 = TAB_STRIP_HEIGHT + BAR_HEIGHT;
+
+/// Minimum/maximum width of one tab in the strip.
+const TAB_MIN_W: f32 = 80.0;
+const TAB_MAX_W: f32 = 200.0;
+/// Width of a tab's close affordance, at the tab's right edge.
+const TAB_CLOSE_W: f32 = 16.0;
+/// Width of the trailing "new tab" button.
+const NEW_TAB_W: f32 = 24.0;
+/// Horizontal padding inside a tab, before its title.
+const TAB_TEXT_PAD: f32 = 6.0;
+
+const BTN_Y: f32 = TAB_STRIP_HEIGHT + 4.0;
 const BTN_H: f32 = 20.0;
 const BTN_W: f32 = 24.0;
 const BACK_X: f32 = 4.0;
 const RELOAD_X: f32 = 32.0;
 const FORWARD_X: f32 = 60.0;
 const URL_BAR_X: f32 = 88.0;
-const URL_BAR_Y: f32 = 3.0;
+const URL_BAR_Y: f32 = TAB_STRIP_HEIGHT + 3.0;
 const URL_BAR_H: f32 = 22.0;
 /// Width reserved for the status indicator on the right.
 const STATUS_W: f32 = 40.0;
@@ -80,6 +101,63 @@ pub enum ChromeHitZone {
     UrlBar,
     /// Any other part of the chrome bar (background).
     Background,
+    /// The body of the tab at this index in the visible strip.
+    TabItem(usize),
+    /// The close affordance of the tab at this index.
+    TabCloseButton(usize),
+    /// The trailing "new tab" button.
+    NewTabButton,
+}
+
+/// Everything the strip's geometry depends on.
+///
+/// Passed to both [`chrome_hit_zone`] and [`paint_chrome`] so hit testing and
+/// painting derive their rectangles from one function ([`tab_rects`]) and
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromeLayout {
+    /// Logical window width.
+    pub window_width: f32,
+    /// Number of open tabs.
+    pub tab_count: usize,
+}
+
+/// Yields `(index, rect)` for every tab that fits in the strip.
+///
+/// Tabs past the right edge are simply not produced: the strip clips rather
+/// than scrolls, and a tab with no rectangle is neither painted nor hittable,
+/// which keeps the two consistent by construction.
+pub fn tab_rects(layout: &ChromeLayout) -> impl Iterator<Item = (usize, Rect)> + '_ {
+    let avail = (layout.window_width - NEW_TAB_W).max(0.0);
+    let width = if layout.tab_count == 0 {
+        TAB_MIN_W
+    } else {
+        (avail / layout.tab_count as f32).clamp(TAB_MIN_W, TAB_MAX_W)
+    };
+    (0..layout.tab_count).filter_map(move |i| {
+        let x = i as f32 * width;
+        if x + width > avail {
+            return None;
+        }
+        Some((
+            i,
+            Rect::new(x as f64, 0.0, (x + width) as f64, TAB_STRIP_HEIGHT as f64),
+        ))
+    })
+}
+
+/// Rect of the trailing "new tab" button.
+fn new_tab_rect(layout: &ChromeLayout) -> Rect {
+    let x = tab_rects(layout)
+        .last()
+        .map(|(_, r)| r.x1 as f32)
+        .unwrap_or(0.0);
+    Rect::new(
+        x as f64,
+        0.0,
+        (x + NEW_TAB_W) as f64,
+        TAB_STRIP_HEIGHT as f64,
+    )
 }
 
 /// An action requested by a chrome keyboard event.
@@ -424,8 +502,27 @@ impl ChromeState {
 /// Returns the [`ChromeHitZone`] for a logical (x, y) coordinate.
 /// Returns [`ChromeHitZone::Background`] if the point is outside the chrome area
 /// (y ≥ CHROME_HEIGHT) or in an unoccupied region.
-pub fn chrome_hit_zone(x: f32, y: f32, window_width: f32) -> ChromeHitZone {
+pub fn chrome_hit_zone(x: f32, y: f32, layout: &ChromeLayout) -> ChromeHitZone {
     if !(0.0..CHROME_HEIGHT).contains(&y) {
+        return ChromeHitZone::Background;
+    }
+    let window_width = layout.window_width;
+    if y < TAB_STRIP_HEIGHT {
+        for (i, rect) in tab_rects(layout) {
+            if (rect.x0..rect.x1).contains(&(x as f64)) {
+                // Close first: its glyph lives inside the tab's own rect, so
+                // testing the tab body first would swallow every close click.
+                return if (x as f64) >= rect.x1 - TAB_CLOSE_W as f64 {
+                    ChromeHitZone::TabCloseButton(i)
+                } else {
+                    ChromeHitZone::TabItem(i)
+                };
+            }
+        }
+        let plus = new_tab_rect(layout);
+        if (plus.x0..plus.x1).contains(&(x as f64)) {
+            return ChromeHitZone::NewTabButton;
+        }
         return ChromeHitZone::Background;
     }
     if (BACK_X..BACK_X + BTN_W).contains(&x) && (BTN_Y..BTN_Y + BTN_H).contains(&y) {
@@ -612,6 +709,37 @@ fn paint_nav_button(
 
 // ── Main paint function ───────────────────────────────────────────────────────
 
+/// Truncates `text` with an ellipsis so it fits `max_width` logical pixels.
+///
+/// Measures with the same layout builder the strip paints with, so the elision
+/// point matches what is actually drawn.
+fn elide_to_width(
+    text: &str,
+    max_width: f32,
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
+) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if build_chrome_text_layout(text, font_cx, layout_cx).width() <= max_width {
+        return text.to_owned();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        // Walk back to a char boundary so multi-byte titles never panic.
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}…", &text[..end]);
+        if build_chrome_text_layout(&candidate, font_cx, layout_cx).width() <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 /// Context for [`paint_chrome`], bundling everything but the `Scene` it
 /// draws into.
 pub struct ChromePaintContext<'a> {
@@ -634,6 +762,19 @@ pub struct ChromePaintContext<'a> {
     pub can_go_forward: bool,
     /// Resolved light/dark color palette.
     pub palette: &'a ChromePalette,
+    /// One entry per open tab, in strip order.
+    ///
+    /// A flat, borrow-free view rather than the tabs themselves, so painting
+    /// stays independent of `TabState` and unit-testable.
+    pub tabs: &'a [TabStripEntry],
+}
+
+/// What the strip needs to know about one tab.
+pub struct TabStripEntry {
+    /// Display title, already bidi-sanitised by the caller.
+    pub title: String,
+    /// Whether this tab is the visible one.
+    pub active: bool,
 }
 
 /// Renders the browser chrome bar into `scene`.
@@ -646,6 +787,62 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     // ── Bar background ────────────────────────────────────────────────────────
     let bar_rect = Rect::new(0.0, 0.0, ctx.window_width as f64, CHROME_HEIGHT as f64);
     scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &bar_rect);
+
+    // ── Tab strip ─────────────────────────────────────────────────────────────
+    let strip_rect = Rect::new(0.0, 0.0, ctx.window_width as f64, TAB_STRIP_HEIGHT as f64);
+    scene.fill(Fill::NonZero, transform, ctx.palette.strip_bg, None, &strip_rect);
+    let layout = ChromeLayout {
+        window_width: ctx.window_width,
+        tab_count: ctx.tabs.len(),
+    };
+    for (i, rect) in tab_rects(&layout) {
+        let Some(entry) = ctx.tabs.get(i) else {
+            continue;
+        };
+        let bg = if entry.active {
+            ctx.palette.tab_active_bg
+        } else {
+            ctx.palette.tab_inactive_bg
+        };
+        scene.fill(Fill::NonZero, transform, bg, None, &rect);
+
+        let text_color = if entry.active {
+            ctx.palette.tab_text
+        } else {
+            ctx.palette.tab_text_inactive
+        };
+        let avail = (rect.width() as f32) - TAB_TEXT_PAD * 2.0 - TAB_CLOSE_W;
+        let title = elide_to_width(&entry.title, avail, ctx.font_cx, ctx.layout_cx);
+        let title_layout = build_chrome_text_layout(&title, ctx.font_cx, ctx.layout_cx);
+        draw_text_layout(
+            scene,
+            &title_layout,
+            rect.x0 as f32 + TAB_TEXT_PAD,
+            (TAB_STRIP_HEIGHT - title_layout.height()) / 2.0,
+            text_color,
+            transform,
+        );
+
+        let close_layout = build_chrome_text_layout("×", ctx.font_cx, ctx.layout_cx);
+        draw_text_layout(
+            scene,
+            &close_layout,
+            rect.x1 as f32 - TAB_CLOSE_W + (TAB_CLOSE_W - close_layout.width()) / 2.0,
+            (TAB_STRIP_HEIGHT - close_layout.height()) / 2.0,
+            ctx.palette.tab_close_glyph,
+            transform,
+        );
+    }
+    let plus_rect = new_tab_rect(&layout);
+    let plus_layout = build_chrome_text_layout("+", ctx.font_cx, ctx.layout_cx);
+    draw_text_layout(
+        scene,
+        &plus_layout,
+        plus_rect.x0 as f32 + (NEW_TAB_W - plus_layout.width()) / 2.0,
+        (TAB_STRIP_HEIGHT - plus_layout.height()) / 2.0,
+        ctx.palette.tab_text,
+        transform,
+    );
 
     // ── Back button (dimmed + inert when the back stack is empty) ────────────
     paint_nav_button(
@@ -937,15 +1134,67 @@ mod tests {
         assert_eq!(s.cursor, 3);
     }
 
+    /// A single-tab strip over an 800px window.
+    fn test_layout(tab_count: usize) -> ChromeLayout {
+        ChromeLayout {
+            window_width: 800.0,
+            tab_count,
+        }
+    }
+
+    /// Hit-tests a point given in *navigation-bar* coordinates: `y` is
+    /// measured from the top of the bar, below the tab strip.
+    fn bar_zone(x: f32, y: f32) -> ChromeHitZone {
+        chrome_hit_zone(x, y + TAB_STRIP_HEIGHT, &test_layout(1))
+    }
+
+    #[test]
+    fn tab_strip_hit_zones_prefer_close_over_body() {
+        let layout = test_layout(3);
+        let (_, first) = tab_rects(&layout).next().expect("at least one tab fits");
+        assert_eq!(
+            chrome_hit_zone(first.x0 as f32 + 4.0, 8.0, &layout),
+            ChromeHitZone::TabItem(0)
+        );
+        assert_eq!(
+            chrome_hit_zone(first.x1 as f32 - 4.0, 8.0, &layout),
+            ChromeHitZone::TabCloseButton(0),
+            "the close glyph sits inside the tab rect, so it must be tested first"
+        );
+    }
+
+    #[test]
+    fn new_tab_button_follows_the_last_tab() {
+        let layout = test_layout(2);
+        let last = tab_rects(&layout).last().expect("tabs fit").1;
+        assert_eq!(
+            chrome_hit_zone(last.x1 as f32 + 4.0, 8.0, &layout),
+            ChromeHitZone::NewTabButton
+        );
+    }
+
+    #[test]
+    fn tab_strip_clips_rather_than_overflowing() {
+        // 32 tabs at the 80px minimum need 2560px; only what fits in 800px
+        // (minus the new-tab button) is produced.
+        let layout = test_layout(32);
+        let visible = tab_rects(&layout).count();
+        assert!(visible < 32 && visible > 0, "got {visible} visible tabs");
+        assert!(
+            tab_rects(&layout).all(|(_, r)| r.x1 <= (layout.window_width - 24.0) as f64),
+            "no tab may extend past the new-tab button"
+        );
+    }
+
     #[test]
     fn chrome_hit_zone_back_button() {
-        assert_eq!(chrome_hit_zone(5.0, 10.0, 800.0), ChromeHitZone::BackButton);
+        assert_eq!(bar_zone(5.0, 10.0), ChromeHitZone::BackButton);
     }
 
     #[test]
     fn chrome_hit_zone_reload_button() {
         assert_eq!(
-            chrome_hit_zone(40.0, 10.0, 800.0),
+            bar_zone(40.0, 10.0),
             ChromeHitZone::ReloadButton
         );
     }
@@ -953,20 +1202,20 @@ mod tests {
     #[test]
     fn chrome_hit_zone_forward_button() {
         assert_eq!(
-            chrome_hit_zone(65.0, 10.0, 800.0),
+            bar_zone(65.0, 10.0),
             ChromeHitZone::ForwardButton
         );
     }
 
     #[test]
     fn chrome_hit_zone_url_bar() {
-        assert_eq!(chrome_hit_zone(200.0, 10.0, 800.0), ChromeHitZone::UrlBar);
+        assert_eq!(bar_zone(200.0, 10.0), ChromeHitZone::UrlBar);
     }
 
     #[test]
     fn chrome_hit_zone_background_below_chrome() {
         assert_eq!(
-            chrome_hit_zone(200.0, 50.0, 800.0),
+            chrome_hit_zone(200.0, CHROME_HEIGHT + 1.0, &test_layout(1)),
             ChromeHitZone::Background
         );
     }
@@ -976,7 +1225,7 @@ mod tests {
         // x = 57 is between the Reload button end (56) and Forward button
         // start (60).
         assert_eq!(
-            chrome_hit_zone(57.0, 10.0, 800.0),
+            bar_zone(57.0, 10.0),
             ChromeHitZone::Background
         );
     }
@@ -985,7 +1234,7 @@ mod tests {
     fn chrome_hit_zone_background_between_forward_and_url_bar() {
         // x = 85 is between the Forward button end (84) and URL bar start (88).
         assert_eq!(
-            chrome_hit_zone(85.0, 10.0, 800.0),
+            bar_zone(85.0, 10.0),
             ChromeHitZone::Background
         );
     }

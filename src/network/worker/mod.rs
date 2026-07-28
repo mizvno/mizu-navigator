@@ -85,6 +85,13 @@ pub(crate) static MAX_UI_CHANNEL_CAPACITY: std::sync::LazyLock<usize> =
 /// park until a permit is released.
 pub(crate) static MAX_CONCURRENT_FETCHES: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| crate::core::config::CONFIG.max_concurrent_fetches);
+/// Number of network worker threads spawned in this process.
+///
+/// Test-only counterpart to `parser::logic_worker::SPAWN_COUNT`; see that
+/// constant for why the count is tracked here rather than read from the OS,
+/// and why it is not `#[cfg(test)]`-gated.
+pub static SPAWN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Spawns the background network thread and initialises the QUIC endpoint.
 ///
 /// `allow_insecure`: when `true`, TLS certificate verification is skipped
@@ -95,6 +102,7 @@ pub fn spawn_network_thread(
     tx: tokio::sync::mpsc::Sender<NetworkResult>,
     #[cfg(feature = "insecure-dev")] allow_insecure: bool,
 ) {
+    SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -103,7 +111,7 @@ pub fn spawn_network_thread(
             Ok(rt) => rt,
             Err(e) => {
                 if tx
-                    .blocking_send(NetworkResult::Error(MizuError::Network(format!(
+                    .blocking_send(NetworkResult::Error(None, MizuError::Network(format!(
                         "Tokio error: {}",
                         e
                     ))))
@@ -127,7 +135,7 @@ pub fn spawn_network_thread(
                 Ok(ep) => ep,
                 Err(e) => {
                     if tx
-                        .send(NetworkResult::Error(MizuError::Network(format!(
+                        .send(NetworkResult::Error(None, MizuError::Network(format!(
                             "Endpoint error: {}",
                             e
                         ))))
@@ -156,7 +164,7 @@ pub fn spawn_network_thread(
                     Ok(v) => v,
                     Err(e) => {
                         if tx
-                            .send(NetworkResult::Error(MizuError::Network(format!(
+                            .send(NetworkResult::Error(None, MizuError::Network(format!(
                                 "insecure-dev TLS verifier build failed: {e:?}"
                             ))))
                             .await
@@ -196,7 +204,7 @@ pub fn spawn_network_thread(
                 Ok(c) => c,
                 Err(e) => {
                     if tx
-                        .send(NetworkResult::Error(MizuError::Network(format!(
+                        .send(NetworkResult::Error(None, MizuError::Network(format!(
                             "TLS error: {:?}",
                             e
                         ))))
@@ -222,7 +230,7 @@ pub fn spawn_network_thread(
                 Ok(t) => t,
                 Err(e) => {
                     if tx
-                        .send(NetworkResult::Error(MizuError::Network(format!(
+                        .send(NetworkResult::Error(None, MizuError::Network(format!(
                             "QUIC idle timeout config error: {e}"
                         ))))
                         .await
@@ -266,6 +274,7 @@ pub fn spawn_network_thread(
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     NetworkCmd::Fetch {
+                        tab,
                         method,
                         url,
                         target_var,
@@ -299,7 +308,7 @@ pub fn spawn_network_thread(
                                         Some(serialized.content_type),
                                     ),
                                     Err(e) => {
-                                        if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
+                                        if tx_clone.send(NetworkResult::Error(Some(tab), e)).await.is_err() {
                                             tracing::trace!(
                                                 "UI channel closed; payload serialisation error dropped"
                                             );
@@ -337,7 +346,7 @@ pub fn spawn_network_thread(
                             {
                                 Ok((Some(new_url), _)) => {
                                     if tx_clone
-                                        .send(NetworkResult::NavigationRedirect { new_url })
+                                        .send(NetworkResult::NavigationRedirect { tab, new_url })
                                         .await
                                         .is_err()
                                     {
@@ -346,7 +355,7 @@ pub fn spawn_network_thread(
                                 }
                                 Ok((None, data)) => {
                                     if tx_clone
-                                        .send(NetworkResult::Success { target_var, data })
+                                        .send(NetworkResult::Success { tab, target_var, data })
                                         .await
                                         .is_err()
                                     {
@@ -357,7 +366,7 @@ pub fn spawn_network_thread(
                                     // Surface the failure into the call's bound
                                     // variable so the document can display it.
                                     if tx_clone
-                                        .send(NetworkResult::FetchFailed {
+                                        .send(NetworkResult::FetchFailed { tab,
                                             target_var,
                                             error: e,
                                         })
@@ -370,7 +379,7 @@ pub fn spawn_network_thread(
                             }
                         });
                     }
-                    NetworkCmd::Navigate { url } => {
+                    NetworkCmd::Navigate { tab, url } => {
                         let tx_clone = tx.clone();
                         let endpoint_clone = endpoint.clone();
                         let pool_clone = pool.clone();
@@ -402,7 +411,7 @@ pub fn spawn_network_thread(
                                 Ok((Some(new_url), _)) => {
                                     tracing::debug!(url = %new_url, "navigation redirect");
                                     if tx_clone
-                                        .send(NetworkResult::NavigationRedirect { new_url })
+                                        .send(NetworkResult::NavigationRedirect { tab, new_url })
                                         .await
                                         .is_err()
                                     {
@@ -412,7 +421,7 @@ pub fn spawn_network_thread(
                                 Ok((None, crate::core::types::Value::String(source))) => {
                                     tracing::debug!("navigation payload fetched");
                                     if tx_clone
-                                        .send(NetworkResult::NavigateSuccess {
+                                        .send(NetworkResult::NavigateSuccess { tab,
                                             url,
                                             source: source.to_string(),
                                         })
@@ -427,7 +436,7 @@ pub fn spawn_network_thread(
                                         "navigation expected string payload, got other type"
                                     );
                                     if tx_clone
-                                        .send(NetworkResult::Error(MizuError::Network(
+                                        .send(NetworkResult::Error(Some(tab), MizuError::Network(
                                             "Expected string payload for navigation".to_string(),
                                         )))
                                         .await
@@ -438,7 +447,7 @@ pub fn spawn_network_thread(
                                 }
                                 Err(e) => {
                                     tracing::error!(error = ?e, "navigation fetch failed");
-                                    if tx_clone.send(NetworkResult::Error(e)).await.is_err() {
+                                    if tx_clone.send(NetworkResult::Error(Some(tab), e)).await.is_err() {
                                         tracing::trace!("UI channel closed; Navigate error dropped");
                                     }
                                 }
@@ -446,6 +455,7 @@ pub fn spawn_network_thread(
                         });
                     }
                     NetworkCmd::FetchImage {
+                        tab,
                         url,
                         is_remote_origin,
                         sandbox_base,
@@ -476,7 +486,7 @@ pub fn spawn_network_thread(
                                             crate::render::window::decode_image_bytes(&body)
                                         {
                                             if tx_clone
-                                                .send(NetworkResult::FetchImageSuccess {
+                                                .send(NetworkResult::FetchImageSuccess { tab,
                                                     url: u,
                                                     image: img,
                                                 })
@@ -486,7 +496,7 @@ pub fn spawn_network_thread(
                                                 tracing::trace!("UI channel closed; local FetchImageSuccess dropped");
                                             }
                                         } else if tx_clone
-                                            .send(NetworkResult::FetchImageFailed {
+                                            .send(NetworkResult::FetchImageFailed { tab,
                                                 url: u,
                                                 error: MizuError::Network(
                                                     "Failed to decode local image bytes"
@@ -501,7 +511,7 @@ pub fn spawn_network_thread(
                                     }
                                     Ok(Err(e)) => {
                                         if tx_clone
-                                            .send(NetworkResult::FetchImageFailed {
+                                            .send(NetworkResult::FetchImageFailed { tab,
                                                 url: url_for_err,
                                                 error: e,
                                             })
@@ -513,7 +523,7 @@ pub fn spawn_network_thread(
                                     }
                                     Err(je) => {
                                         if tx_clone
-                                            .send(NetworkResult::FetchImageFailed {
+                                            .send(NetworkResult::FetchImageFailed { tab,
                                                 url: url_for_err,
                                                 error: MizuError::Network(format!(
                                                     "spawn_blocking panicked: {je}"
@@ -559,7 +569,7 @@ pub fn spawn_network_thread(
                                     match parse_http_response(status, &headers, &body, &domain) {
                                         Ok(Some(new_url)) => {
                                             if tx_clone
-                                                .send(NetworkResult::NavigationRedirect { new_url })
+                                                .send(NetworkResult::NavigationRedirect { tab, new_url })
                                                 .await
                                                 .is_err()
                                             {
@@ -571,7 +581,7 @@ pub fn spawn_network_thread(
                                                 crate::render::window::decode_image_bytes(&body)
                                             {
                                                 if tx_clone
-                                                    .send(NetworkResult::FetchImageSuccess {
+                                                    .send(NetworkResult::FetchImageSuccess { tab,
                                                         url,
                                                         image: animated_img,
                                                     })
@@ -581,7 +591,7 @@ pub fn spawn_network_thread(
                                                     tracing::trace!("UI channel closed; FetchImageSuccess dropped");
                                                 }
                                             } else if tx_clone
-                                                .send(NetworkResult::FetchImageFailed {
+                                                .send(NetworkResult::FetchImageFailed { tab,
                                                     url,
                                                     error: MizuError::Network(
                                                         "Failed to decode image bytes".to_string(),
@@ -595,7 +605,7 @@ pub fn spawn_network_thread(
                                         }
                                         Err(e) => {
                                             if tx_clone
-                                                .send(NetworkResult::FetchImageFailed {
+                                                .send(NetworkResult::FetchImageFailed { tab,
                                                     url,
                                                     error: e,
                                                 })
@@ -609,7 +619,7 @@ pub fn spawn_network_thread(
                                 }
                                 Err(e) => {
                                     if tx_clone
-                                        .send(NetworkResult::FetchImageFailed { url, error: e })
+                                        .send(NetworkResult::FetchImageFailed { tab, url, error: e })
                                         .await
                                         .is_err()
                                     {

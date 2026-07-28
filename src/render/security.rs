@@ -121,7 +121,8 @@ pub enum CapabilityOutcome {
 pub fn execute_capability_action(
     store: &mut VariableStore,
     network_tx: &tokio::sync::mpsc::UnboundedSender<crate::network::NetworkCmd>,
-    logic_tx: &std::sync::mpsc::Sender<UiEvent>,
+    logic_tx: &std::sync::mpsc::Sender<(crate::network::TabId, UiEvent)>,
+    tab_id: crate::network::TabId,
     chrome_url: &str,
     policy: &mut CapabilityPolicy,
     action: RuntimeAction,
@@ -174,6 +175,7 @@ pub fn execute_capability_action(
                 }
             };
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::Fetch {
+                tab: tab_id,
                 method,
                 url,
                 target_var,
@@ -222,10 +224,13 @@ pub fn execute_capability_action(
             // worker never has to trust a Symbol minted by this thread.
             match store.interner.resolve(target_variable) {
                 Some(name) => {
-                    if let Err(e) = logic_tx.send(UiEvent::UpdateVariable {
-                        name: name.to_string(),
-                        value: Value::Int(time_ms),
-                    }) {
+                    if let Err(e) = logic_tx.send((
+                        tab_id,
+                        UiEvent::UpdateVariable {
+                            name: name.to_string(),
+                            value: Value::Int(time_ms),
+                        },
+                    )) {
                         tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
                     }
                 }
@@ -239,7 +244,7 @@ pub fn execute_capability_action(
             CapabilityOutcome::Dispatched
         }
         RuntimeAction::Navigate { url } => {
-            if let Err(e) = network_tx.send(crate::network::NetworkCmd::Navigate { url }) {
+            if let Err(e) = network_tx.send(crate::network::NetworkCmd::Navigate { tab: tab_id, url }) {
                 tracing::warn!(error = %e, "network channel closed; Navigate command dropped");
             }
             CapabilityOutcome::Dispatched
@@ -254,6 +259,7 @@ pub fn execute_capability_action(
             headers,
         } => {
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::NetworkRequest {
+                tab: tab_id,
                 request: crate::network::NetworkRequest {
                     endpoint_symbol,
                     method,
@@ -271,6 +277,7 @@ pub fn execute_capability_action(
         RuntimeAction::DownloadMedia { url } => {
             tracing::info!(url = %url, "download media requested");
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::FetchImage {
+                tab: tab_id,
                 url,
                 is_remote_origin: chrome_url.starts_with("mizu://"),
                 sandbox_base: if chrome_url.starts_with("file://") {
@@ -622,6 +629,7 @@ mod tests {
             &mut store,
             &network_tx,
             &logic_tx,
+            crate::network::TabId(0),
             "mizu://example.com/index.mizu",
             &mut policy,
             crate::network::RuntimeAction::ResolvedCall {
@@ -677,6 +685,7 @@ mod tests {
                 &mut store,
                 &network_tx,
                 &logic_tx,
+                crate::network::TabId(0),
                 "mizu://example.com/index.mizu",
                 &mut policy,
                 crate::network::RuntimeAction::ResolvedCall {
@@ -721,6 +730,7 @@ mod tests {
             &mut store,
             &network_tx,
             &logic_tx,
+            crate::network::TabId(0),
             "mizu://example.com/index.mizu",
             &mut policy,
             crate::network::RuntimeAction::ResolvedCall {
@@ -761,6 +771,7 @@ mod tests {
             &mut store,
             &network_tx,
             &logic_tx,
+            crate::network::TabId(0),
             "mizu://example.com/index.mizu",
             &mut policy,
             crate::network::RuntimeAction::ResolvedCall {
