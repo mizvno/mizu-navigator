@@ -5,7 +5,7 @@
 use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value, VariableStore};
 use crate::messages::RuntimeAction;
-use crate::messages::{StateUpdate, UiEvent, WorkerResponse};
+use crate::messages::{StateUpdate, TabId, UiEvent, WorkerResponse};
 use crate::parser::logic::{
     ComputedBinding, CompReverseIndex, build_comp_reverse_index, path_param_ok,
     recompute_computed_bindings,
@@ -15,8 +15,33 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
-/// LogicWorker thread that wraps the StateMachine and handles evaluations.
-pub struct LogicWorker {
+/// Number of logic-worker threads spawned in this process.
+///
+/// Test-only instrumentation backing the "opening tabs spawns no threads"
+/// guarantee: tabs share one worker, so this must stay flat as tabs are
+/// opened. Counted here rather than read from the OS (`/proc/self/task` is
+/// Linux-only; this project's primary target is Windows).
+///
+/// Always compiled rather than `#[cfg(test)]`: the guarantee is asserted from
+/// the *navigator* crate's tests, which link this crate in its non-test
+/// configuration. One relaxed atomic increment per process is not worth a
+/// feature flag.
+pub static SPAWN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Hard cap on the number of documents one worker keeps resident.
+///
+/// Mirrors the UI's own tab cap. The worker enforces it independently because
+/// it must not trust its input channel: a `Reload` beyond this bound is logged
+/// and dropped rather than growing the map without limit, since each entry
+/// pins a whole `VariableStore` plus a frozen interner.
+pub const MAX_WORKER_TABS: usize = 32;
+
+/// One document's worker-side state.
+///
+/// Exactly the fields a `UiEvent::Reload` replaces wholesale, which is why the
+/// extraction is mechanical: reloading a tab is `insert`, closing it is
+/// `remove`.
+pub struct LogicWorkerTabState {
     /// Crate-internal variable store.
     pub store: VariableStore,
     /// Logic functions mapped by symbol.
@@ -37,10 +62,43 @@ pub struct LogicWorker {
     /// rebuilt once whenever `computed_vars` is (re)loaded so
     /// `recompute_computed_bindings` never has to scan every binding per event.
     pub computed_reverse_index: CompReverseIndex,
-    /// Receiving channel for UI events.
-    rx: Receiver<UiEvent>,
-    /// Sending channel for state updates, capability actions, or timeout errors.
-    tx: Sender<Result<WorkerResponse, MizuError>>,
+}
+
+impl LogicWorkerTabState {
+    /// An empty document: what a tab looks like before its first `Reload`.
+    fn new() -> Self {
+        Self {
+            store: VariableStore::new(),
+            logic_fns: FxHashMap::default(),
+            click_actions: HashMap::new(),
+            submit_actions: HashMap::new(),
+            root_timer_actions: Vec::new(),
+            url_registry: FxHashMap::default(),
+            document_domain: String::new(),
+            computed_vars: Vec::new(),
+            computed_reverse_index: FxHashMap::default(),
+        }
+    }
+}
+
+/// LogicWorker thread that wraps the StateMachine and handles evaluations.
+///
+/// One thread serves every tab: opening a tab allocates a map entry, never a
+/// thread. The consequence is head-of-line blocking — a slow evaluation in a
+/// background tab delays the foreground tab's next event — which is bounded by
+/// the per-event instruction budget in [`crate::core::types::StateMachine`].
+pub struct LogicWorker {
+    /// Per-document state, keyed by the tab that owns it.
+    ///
+    /// Every `Symbol` in a message for a given key is meaningful only against
+    /// *that* entry's frozen interner; routing by `TabId` (never reused) is
+    /// what keeps that sound with several documents resident.
+    tabs: FxHashMap<TabId, LogicWorkerTabState>,
+    /// Receiving channel for UI events, tagged with their destination tab.
+    rx: Receiver<(TabId, UiEvent)>,
+    /// Sending channel for state updates, capability actions, or timeout
+    /// errors, tagged with the tab that produced them.
+    tx: Sender<(TabId, Result<WorkerResponse, MizuError>)>,
 }
 
 impl LogicWorker {
@@ -68,6 +126,10 @@ impl LogicWorker {
     /// sibling test (`eval_depth_guard`) already relies on as proven-safe â€”
     /// a large margin against interpreter changes, platform stack-frame
     /// layout differences, and future growth of `evaluate_impl`'s frame size.
+    ///
+    /// Shared by every tab, and correctly so: recursion depth is a property of
+    /// the single event being evaluated, not of how many documents are
+    /// resident, and events are processed one at a time on this thread.
     pub const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     /// Spawns a permanent native thread executing the LogicWorker.
@@ -77,23 +139,16 @@ impl LogicWorker {
     /// panicking, so the caller can surface a real error instead of aborting
     /// the process on an opaque message.
     pub fn spawn(
-        rx: Receiver<UiEvent>,
-        tx: Sender<Result<WorkerResponse, MizuError>>,
+        rx: Receiver<(TabId, UiEvent)>,
+        tx: Sender<(TabId, Result<WorkerResponse, MizuError>)>,
     ) -> Result<std::thread::JoinHandle<()>, MizuError> {
+        SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let handle = std::thread::Builder::new()
             .name("logic-worker".to_owned())
             .stack_size(Self::STACK_SIZE_BYTES)
             .spawn(move || {
                 let mut worker = Self {
-                    store: VariableStore::new(),
-                    logic_fns: FxHashMap::default(),
-                    click_actions: HashMap::new(),
-                    submit_actions: HashMap::new(),
-                    root_timer_actions: Vec::new(),
-                    url_registry: FxHashMap::default(),
-                    document_domain: String::new(),
-                    computed_vars: Vec::new(),
-                    computed_reverse_index: FxHashMap::default(),
+                    tabs: FxHashMap::default(),
                     rx,
                     tx,
                 };
@@ -103,84 +158,119 @@ impl LogicWorker {
     }
 
     fn run_loop(&mut self) {
-        while let Ok(event) = self.rx.recv() {
+        while let Ok((tab_id, event)) = self.rx.recv() {
+            // `Reload` creates a tab's state; `CloseTab` destroys it. Every
+            // other event addresses state that must already exist — if it does
+            // not, the tab was closed while the event was in flight and the
+            // event is dropped. Never fall back to "some other tab": that is
+            // exactly the cross-document write this routing exists to prevent.
+            if matches!(event, UiEvent::CloseTab) {
+                self.tabs.remove(&tab_id);
+                continue;
+            }
+            if matches!(event, UiEvent::Reload(_))
+                && !self.tabs.contains_key(&tab_id)
+                && self.tabs.len() >= MAX_WORKER_TABS
+            {
+                tracing::warn!(
+                    tab = tab_id.0,
+                    open = self.tabs.len(),
+                    "refusing Reload: worker tab limit reached"
+                );
+                continue;
+            }
+            let tx = &self.tx;
+            let tab = if matches!(event, UiEvent::Reload(_)) {
+                self.tabs
+                    .entry(tab_id)
+                    .or_insert_with(LogicWorkerTabState::new)
+            } else {
+                match self.tabs.get_mut(&tab_id) {
+                    Some(t) => t,
+                    None => {
+                        tracing::debug!(tab = tab_id.0, "event for unknown tab; dropped");
+                        continue;
+                    }
+                }
+            };
             match event {
+                UiEvent::CloseTab => unreachable!("handled above"),
                 UiEvent::Reload(payload) => {
-                    self.logic_fns = payload.logic_fns;
-                    self.click_actions = payload.click_actions;
-                    self.submit_actions = payload.submit_actions;
-                    self.root_timer_actions = payload.root_timer_actions;
-                    self.url_registry = payload.url_registry;
-                    self.document_domain = payload.document_domain;
+                    tab.logic_fns = payload.logic_fns;
+                    tab.click_actions = payload.click_actions;
+                    tab.submit_actions = payload.submit_actions;
+                    tab.root_timer_actions = payload.root_timer_actions;
+                    tab.url_registry = payload.url_registry;
+                    tab.document_domain = payload.document_domain;
 
-                    self.store = VariableStore::new();
+                    tab.store = VariableStore::new();
                     // `payload.interner` is a frozen clone of the UI-thread interner.
                     // Clone now preserves `frozen = true`, so both threads share the
                     // same immutable Symbol(u32) â†’ String mapping after this point.
-                    self.store.interner = payload.interner;
+                    tab.store.interner = payload.interner;
                     // `initial_variables` are from the UI thread's global store; every
                     // name is guaranteed to be in the frozen interner already, so
                     // set_runtime (which uses get not get_or_intern) is safe.
                     for (k, v) in payload.initial_variables {
-                        self.store.set_runtime(&k, v);
+                        tab.store.set_runtime(&k, v);
                     }
-                    self.store.state_machine.undo_log.clear();
+                    tab.store.state_machine.undo_log.clear();
 
                     // Load computed bindings and register their symbols as read-only.
-                    self.computed_vars = payload.computed_bindings;
+                    tab.computed_vars = payload.computed_bindings;
                     // Built once per reload; `recompute_after_mutation` reuses it on
                     // every subsequent event instead of rescanning `computed_vars`.
-                    self.computed_reverse_index = build_comp_reverse_index(&self.computed_vars);
+                    tab.computed_reverse_index = build_comp_reverse_index(&tab.computed_vars);
                     let comp_syms: FxHashSet<Symbol> =
-                        self.computed_vars.iter().map(|cb| cb.name).collect();
-                    self.store.state_machine.computed_var_syms = comp_syms;
+                        tab.computed_vars.iter().map(|cb| cb.name).collect();
+                    tab.store.state_machine.computed_var_syms = comp_syms;
 
                     // Initial evaluation of zero-parameter logic functions.
                     // instruction_count is reset per function so each gets its own budget.
-                    for (&sym, func) in &self.logic_fns {
+                    for (&sym, func) in &tab.logic_fns {
                         if func.params.is_empty() {
-                            self.store.state_machine.instruction_count = 0;
-                            if let Ok(val) = self.store.state_machine.evaluate(
+                            tab.store.state_machine.instruction_count = 0;
+                            if let Ok(val) = tab.store.state_machine.evaluate(
                                 func.body.root(),
                                 0,
-                                &self.logic_fns,
-                                &self.store.interner,
+                                &tab.logic_fns,
+                                &tab.store.interner,
                                 &func.body.arena,
                             ) {
-                                self.store.set_symbol(sym, val);
+                                tab.store.set_symbol(sym, val);
                             }
                         }
                     }
 
                     // Initial evaluation of comp vars: treat every global as mutated.
-                    let all_syms: FxHashSet<Symbol> = self
+                    let all_syms: FxHashSet<Symbol> = tab
                         .store
                         .state_machine
                         .global_store
                         .keys()
                         .copied()
                         .collect();
-                    let computed = self.computed_vars.clone();
+                    let computed = tab.computed_vars.clone();
                     recompute_computed_bindings(
-                        &mut self.store,
+                        &mut tab.store,
                         &computed,
-                        &self.logic_fns,
+                        &tab.logic_fns,
                         &all_syms,
-                        &self.computed_reverse_index,
+                        &tab.computed_reverse_index,
                     );
 
-                    self.send_response();
+                    send_response(tab, tx, tab_id);
                 }
 
                 UiEvent::Click { node_id } => {
-                    if let Some(action) = self.click_actions.get(&node_id).cloned() {
-                        self.execute_and_respond(&action);
+                    if let Some(action) = tab.click_actions.get(&node_id).cloned() {
+                        execute_and_respond(tab, tx, tab_id, &action);
                     }
                 }
 
                 UiEvent::RootTimer { index } => {
-                    if let Some(action) = self.root_timer_actions.get(index as usize).cloned() {
-                        self.execute_and_respond(&action);
+                    if let Some(action) = tab.root_timer_actions.get(index as usize).cloned() {
+                        execute_and_respond(tab, tx, tab_id, &action);
                     }
                 }
 
@@ -188,7 +278,7 @@ impl LogicWorker {
                     submitter_node_id,
                     fields,
                 } => {
-                    self.store.state_machine.undo_log.clear();
+                    tab.store.state_machine.undo_log.clear();
                     // Populate the `$form` magic record first, so the submit
                     // action can read `$form.<field>` regardless of whether
                     // the individual field names are declared variables.
@@ -196,30 +286,30 @@ impl LogicWorker {
                         .iter()
                         .map(|(k, v)| (std::sync::Arc::from(k.as_str()), v.clone()))
                         .collect();
-                    self.store
+                    tab.store
                         .set_runtime("$form", { let mut vec_rec: Vec<_> = record.into_iter().collect(); vec_rec.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(std::sync::Arc::from(vec_rec)) });
                     for (field_name, field_value) in fields {
                         // Use set_runtime (not set) so that form field names
                         // not declared in the logic block never create new
                         // symbols in the frozen interner.  Declared fields are
                         // updated normally; undeclared ones are logged + dropped.
-                        self.store.set_runtime(&field_name, field_value);
+                        tab.store.set_runtime(&field_name, field_value);
                     }
                     // Execute the submit button's declared action (e.g.
                     // `submit -> name = $form.who`).  Field mutations above
                     // must reach the UI even if the action itself fails, so
                     // the undo log is NOT cleared here.
-                    if let Some(action) = self.submit_actions.get(&submitter_node_id).cloned()
-                        && let Err(e) = execute_action(&action, &mut self.store, &self.logic_fns)
+                    if let Some(action) = tab.submit_actions.get(&submitter_node_id).cloned()
+                        && let Err(e) = execute_action(&action, &mut tab.store, &tab.logic_fns)
                     {
                         tracing::warn!(error = %e, "form submit action failed");
                     }
-                    self.recompute_after_mutation();
-                    self.send_response();
+                    recompute_after_mutation(tab);
+                    send_response(tab, tx, tab_id);
                 }
 
                 UiEvent::UpdateVariable { name, value } => {
-                    self.store.state_machine.undo_log.clear();
+                    tab.store.state_machine.undo_log.clear();
                     // `name` is a resolved string, not a pre-validated Symbol
                     // (see the UiEvent::UpdateVariable doc comment): the
                     // sender's interner clone and this worker's are
@@ -229,31 +319,43 @@ impl LogicWorker {
                     // table and silently drops it if the document never
                     // declared it â€” the frozen interner is never grown by
                     // network-response-driven names.
-                    self.store.set_runtime(&name, value);
-                    self.recompute_after_mutation();
-                    self.send_response();
+                    tab.store.set_runtime(&name, value);
+                    recompute_after_mutation(tab);
+                    send_response(tab, tx, tab_id);
                 }
             }
         }
     }
 
-    fn send_response(&mut self) {
+}
+
+/// Collects this tab's mutations and resolved actions into one response and
+/// sends it back tagged with `tab_id`.
+///
+/// A free function rather than a method: the caller holds `&mut` on one map
+/// entry and `&` on the shared sender, which are disjoint borrows of the
+/// worker only when they are passed separately.
+fn send_response(
+    tab: &mut LogicWorkerTabState,
+    tx: &Sender<(TabId, Result<WorkerResponse, MizuError>)>,
+    tab_id: TabId,
+) {
         let mut mutated_variables = Vec::new();
         let mut original_values = HashMap::new();
-        for &(sym, ref val) in &self.store.state_machine.undo_log {
+        for &(sym, ref val) in &tab.store.state_machine.undo_log {
             original_values.entry(sym).or_insert_with(|| val.clone());
         }
         for (sym, old_val) in original_values {
-            let cur_val = self.store.state_machine.get_global(sym);
+            let cur_val = tab.store.state_machine.get_global(sym);
             if &old_val != cur_val {
                 mutated_variables.push((sym, cur_val.clone()));
             }
         }
-        self.store.state_machine.undo_log.clear();
+        tab.store.state_machine.undo_log.clear();
         // Resolve NetworkCall â†’ ResolvedCall and DownloadAlias â†’ DownloadMedia.
-        let document_domain = &self.document_domain;
-        let url_registry = &self.url_registry;
-        let raw_actions = std::mem::take(&mut self.store.state_machine.accumulated_actions);
+        let document_domain = &tab.document_domain;
+        let url_registry = &tab.url_registry;
+        let raw_actions = std::mem::take(&mut tab.store.state_machine.accumulated_actions);
         let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
         // Unresolved aliases surface a readable error in the call's bound
         // variable instead of silently dropping the action â€” the user must
@@ -284,7 +386,7 @@ impl LogicWorker {
                                 });
                             }
                             Err(e) => {
-                                let name = self
+                                let name = tab
                                     .store
                                     .interner
                                     .resolve(target_variable)
@@ -303,7 +405,7 @@ impl LogicWorker {
                             }
                         }
                     } else {
-                        let alias = self
+                        let alias = tab
                             .store
                             .interner
                             .resolve(sym)
@@ -343,17 +445,19 @@ impl LogicWorker {
         for (name, val) in alias_errors {
             // Only surface into declared variables: the frozen interner must
             // not grow, and an undeclared target could never be displayed.
-            if self.store.interner.get(&name).is_some() {
-                self.store.set_runtime(&name, val.clone());
-                mutated_variables.push((self.store.interner.get_or_intern(&name), val));
+            if tab.store.interner.get(&name).is_some() {
+                tab.store.set_runtime(&name, val.clone());
+                mutated_variables.push((tab.store.interner.get_or_intern(&name), val));
             }
         }
-        if let Err(e) = self.tx.send(Ok(WorkerResponse {
+    if let Err(e) = tx.send((
+        tab_id,
+        Ok(WorkerResponse {
             state_update: StateUpdate { mutated_variables },
             runtime_actions,
-        })) {
-            tracing::warn!(error = %e, "UI response channel closed; state update dropped");
-        }
+        }),
+    )) {
+        tracing::warn!(error = %e, "UI response channel closed; state update dropped");
     }
 }
 
@@ -424,49 +528,56 @@ pub(crate) fn resolve_endpoint_url(
     }
 }
 
-impl LogicWorker {
-    fn recompute_after_mutation(&mut self) {
-        if self.computed_vars.is_empty() {
-            return;
-        }
-        let mutated: FxHashSet<Symbol> = self
-            .store
-            .state_machine
-            .undo_log
-            .iter()
-            .map(|(sym, _)| *sym)
-            .collect();
-        let computed = self.computed_vars.clone();
-        recompute_computed_bindings(
-            &mut self.store,
-            &computed,
-            &self.logic_fns,
-            &mutated,
-            &self.computed_reverse_index,
-        );
+/// Re-evaluates this tab's computed bindings against the symbols the last
+/// action mutated.
+fn recompute_after_mutation(tab: &mut LogicWorkerTabState) {
+    if tab.computed_vars.is_empty() {
+        return;
     }
+    let mutated: FxHashSet<Symbol> = tab
+        .store
+        .state_machine
+        .undo_log
+        .iter()
+        .map(|(sym, _)| *sym)
+        .collect();
+    let computed = tab.computed_vars.clone();
+    recompute_computed_bindings(
+        &mut tab.store,
+        &computed,
+        &tab.logic_fns,
+        &mutated,
+        &tab.computed_reverse_index,
+    );
+}
 
-    fn execute_and_respond(&mut self, action: &Action) {
-        self.store.state_machine.undo_log.clear();
-        let initial_actions_len = self.store.state_machine.accumulated_actions.len();
+/// Runs one action against `tab` and responds, rolling the tab's store back to
+/// its pre-action state if the action fails.
+fn execute_and_respond(
+    tab: &mut LogicWorkerTabState,
+    tx: &Sender<(TabId, Result<WorkerResponse, MizuError>)>,
+    tab_id: TabId,
+    action: &Action,
+) {
+    tab.store.state_machine.undo_log.clear();
+    let initial_actions_len = tab.store.state_machine.accumulated_actions.len();
 
-        match execute_action(action, &mut self.store, &self.logic_fns) {
-            Ok(_) => {
-                self.recompute_after_mutation();
-                self.send_response();
+    match execute_action(action, &mut tab.store, &tab.logic_fns) {
+        Ok(_) => {
+            recompute_after_mutation(tab);
+            send_response(tab, tx, tab_id);
+        }
+        Err(e) => {
+            for (sym, old_val) in tab.store.state_machine.undo_log.drain(..).rev() {
+                tab.store.state_machine.global_store.insert(sym, old_val);
             }
-            Err(e) => {
-                for (sym, old_val) in self.store.state_machine.undo_log.drain(..).rev() {
-                    self.store.state_machine.global_store.insert(sym, old_val);
-                }
-                self.store
-                    .state_machine
-                    .accumulated_actions
-                    .truncate(initial_actions_len);
-                self.store.state_machine.undo_log.clear();
-                if let Err(send_err) = self.tx.send(Err(e)) {
-                    tracing::warn!(error = %send_err, "UI response channel closed; action error dropped");
-                }
+            tab.store
+                .state_machine
+                .accumulated_actions
+                .truncate(initial_actions_len);
+            tab.store.state_machine.undo_log.clear();
+            if let Err(send_err) = tx.send((tab_id, Err(e))) {
+                tracing::warn!(error = %send_err, "UI response channel closed; action error dropped");
             }
         }
     }
@@ -692,12 +803,14 @@ mod tests {
     /// worker responds with the expected controlled error instead of the
     /// process crashing.
     fn run_logic_worker_depth_guard_child(ok_marker: &str) {
-        use crate::messages::{ReloadPayload, UiEvent};
+        use crate::messages::{ReloadPayload, TabId, UiEvent};
         use crate::parser::logic::{BinOp, Expr, ExprArena, ExprTree};
         use std::sync::mpsc;
 
-        let (tx_in, rx_in) = mpsc::channel::<UiEvent>();
-        let (tx_out, rx_out) = mpsc::channel::<Result<WorkerResponse, MizuError>>();
+        let (tx_in, rx_in) = mpsc::channel::<(TabId, UiEvent)>();
+        let (tx_out, rx_out) =
+            mpsc::channel::<(TabId, Result<WorkerResponse, MizuError>)>();
+        let tab = TabId(0);
         let _handle = LogicWorker::spawn(rx_in, tx_out).expect("logic worker thread must spawn");
 
         // 300-level deep chain: exceeds MAX_EVAL_DEPTH (256), same shape as
@@ -719,7 +832,7 @@ mod tests {
         interner.freeze();
 
         tx_in
-            .send(UiEvent::Reload(Box::new(ReloadPayload {
+            .send((tab, UiEvent::Reload(Box::new(ReloadPayload {
                 logic_fns: FxHashMap::default(),
                 click_actions,
                 submit_actions: HashMap::new(),
@@ -729,18 +842,19 @@ mod tests {
                 url_registry: FxHashMap::default(),
                 document_domain: String::new(),
                 computed_bindings: Vec::new(),
-            })))
+            }))))
             .expect("worker thread must be alive to receive Reload");
         rx_out
             .recv()
             .expect("worker must respond to Reload")
+            .1
             .expect("reload must not error");
 
         tx_in
-            .send(UiEvent::Click { node_id: 0 })
+            .send((tab, UiEvent::Click { node_id: 0 }))
             .expect("worker thread must still be alive after Reload");
 
-        match rx_out.recv() {
+        match rx_out.recv().map(|(_, r)| r) {
             Ok(Err(MizuError::ExecutionError(msg))) if msg.contains("nesting too deep") => {
                 println!("{ok_marker}");
             }
