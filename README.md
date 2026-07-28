@@ -2,8 +2,8 @@
 
 **A hypermedia format and native renderer where a document you've never seen is safe to open.**
 
-Mizu reads a `.mizu` file — its own small, declarative language for describing
-a page and how it reacts — and draws it in a native window. It is not a
+Mizu reads a `.mizu` file, its own small, declarative language for describing
+a page and how it reacts, and draws it in a native window. It is not a
 general-purpose programming language and doesn't aim to reimplement what
 HTML5 and JavaScript already do. It aims at one thing instead: every reaction
 a document can make is finite, runs only code that shipped with it, and
