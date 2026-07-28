@@ -232,7 +232,7 @@ pub fn split_source_with_origin(
                 _ => {
                     return Err(MizuError::ParseError(format!(
                         "line {}: unexpected root-level token `{trimmed}`; \
-                         expected `logic`, `style`, `layout`, `reach`, or `import \"…\"`",
+                         expected `logic`, `style`, `layout`, `urls`, or `import \"…\"`",
                         line_idx + 1
                     )));
                 }

@@ -88,7 +88,7 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
 /// `/`), unlike that helper's fixture, whose stale `api: mizu://...` syntax
 /// only "works" there because the parse error itself gets discarded.
 const F1_VIOLATION_FIXTURE: &str = r#"
-reach
+urls
     api endpoint /data
 logic
     timer 1s -> GET(endpoint) -> data
