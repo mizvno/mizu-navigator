@@ -10,7 +10,9 @@ use crate::render::security::CapabilityPolicy;
 
 use super::AssetSlot;
 use super::history::HistoryEntry;
-use super::manager::{MAX_REDIRECTS, MizuWindowManager, ReloadedDocument};
+use super::manager::{
+    MAX_REDIRECTS, ReloadedDocument, TabState, WindowCtx, reload_tab_document, resize_tab_viewport,
+};
 
 /// Resolves and validates a navigation URL given the current document's URL.
 ///
@@ -108,12 +110,12 @@ pub(crate) fn chrome_url_to_file_sandbox_base(chrome_url: &str) -> Option<String
 ///
 /// Called both from the file:// fast path in `navigate_to_url` (synchronous
 /// disk read) and from `process_network_result` (async QUIC fetch result).
-pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: String, source: String) {
+pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_>, url: String, source: String) {
     tracing::debug!(url = %url, "navigate success");
-    manager.chrome_state.url = url.clone();
-    manager.chrome_state.loading = false;
-    manager.reset_redirect_count();
-    manager
+    tab.chrome_state.url = url.clone();
+    tab.chrome_state.loading = false;
+    tab.reset_redirect_count();
+    tab
         .store
         .set("window_url", crate::core::types::Value::from(url.clone()));
 
@@ -217,7 +219,7 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                         &new_interner,
                     ) {
                         Ok(metrics) => {
-                            manager.inspector.flow_metrics = Some(metrics);
+                            tab.inspector.flow_metrics = Some(metrics);
                         }
                         Err(e) => {
                             tracing::error!(error = ?e, "flow check error");
@@ -225,16 +227,23 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                         }
                     }
 
-                    manager.url_registry = new_url_registry;
-                    if let Err(e) = manager.reload_document(ReloadedDocument {
-                        dom,
-                        style_rules,
-                        style_variants,
-                        logic_fns,
-                        interner: new_interner,
-                        computed_bindings: new_computed,
-                        root_timers: new_root_timers,
-                    }) {
+                    tab.url_registry = new_url_registry;
+                    if let Err(e) = reload_tab_document(
+                        tab,
+                        ctx,
+                        ReloadedDocument {
+                            dom,
+                            style_rules,
+                            style_variants,
+                            logic_fns,
+                            interner: new_interner,
+                            computed_bindings: new_computed,
+                            root_timers: new_root_timers,
+                        },
+                        // A background tab finishing a load must not rename the
+                        // window the user is looking at.
+                        tab.id == ctx.active_tab_id,
+                    ) {
                         tracing::error!(error = ?e, "document reload error");
                     } else {
                         tracing::debug!("document reloaded");
@@ -244,8 +253,8 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
                         // must run after it. A `None` here (the overwhelming
                         // majority of navigations, which aren't history
                         // steps) is a no-op.
-                        if let Some(scroll_y) = manager.pending_scroll_restore.take() {
-                            manager.root_scroll_offset_y = scroll_y;
+                        if let Some(scroll_y) = tab.pending_scroll_restore.take() {
+                            tab.root_scroll_offset_y = scroll_y;
                         }
                     }
                 }
@@ -264,16 +273,16 @@ pub(super) fn handle_navigate_success(manager: &mut MizuWindowManager, url: Stri
 /// network worker onto the manager's state.
 ///
 /// Called from the `AboutToWait` drain loop — never from a blocking context.
-pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate::network::NetworkResult) {
+pub(super) fn process_network_result(tab: &mut TabState, ctx: &mut WindowCtx<'_>, res: crate::network::NetworkResult) {
     use crate::network::NetworkResult;
     use crate::render::inspector::log::NetOutcome;
     match res {
-        NetworkResult::Success { target_var, data } => {
+        NetworkResult::Success { tab: _, target_var, data } => {
             let bytes = match &data {
                 Value::String(s) => Some(s.len()),
                 _ => None,
             };
-            manager
+            tab
                 .inspector_log
                 .complete_net(&target_var, NetOutcome::Ok, bytes);
             // `UiEvent::UpdateVariable` carries the resolved name, not a
@@ -281,62 +290,58 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
             // `/* FIX SYMBOL */` fix in `execute_capability_action`), and
             // the worker resolves it against its own frozen interner via
             // `set_runtime` — no interner lookup needed on this side at all.
-            let _ = manager
-                .logic_tx
-                .send(crate::network::UiEvent::UpdateVariable {
+            let _ = ctx.logic_tx
+                .send((tab.id, crate::network::UiEvent::UpdateVariable {
                     name: target_var,
                     value: data,
-                });
-            let _ = manager
-                .logic_tx
-                .send(crate::network::UiEvent::UpdateVariable {
+                }));
+            let _ = ctx.logic_tx
+                .send((tab.id, crate::network::UiEvent::UpdateVariable {
                     name: "stato_navigazione".to_string(),
                     value: crate::core::types::Value::from("Completato.".to_string()),
-                });
+                }));
         }
-        NetworkResult::FetchFailed { target_var, error } => {
+        NetworkResult::FetchFailed { tab: _, target_var, error } => {
             tracing::error!(error = ?error, target = %target_var, "fetch failed");
-            manager.inspector_log.complete_net(
+            tab.inspector_log.complete_net(
                 &target_var,
                 NetOutcome::Failed(error.to_string()),
                 None,
             );
             // Write a readable error where the response would have gone, so
             // the document shows it (e.g. `Status: error: connection refused`).
-            let _ = manager
-                .logic_tx
-                .send(crate::network::UiEvent::UpdateVariable {
+            let _ = ctx.logic_tx
+                .send((tab.id, crate::network::UiEvent::UpdateVariable {
                     name: target_var,
                     value: crate::core::types::Value::from(format!("error: {error}")),
-                });
+                }));
         }
-        NetworkResult::Error(e) => {
+        NetworkResult::Error(_, e) => {
             tracing::error!(error = ?e, "network error");
-            manager
+            tab
                 .inspector_log
                 .complete_latest_pending(NetOutcome::Failed(e.to_string()));
-            manager.chrome_state.loading = false;
-            let _ = manager
-                .logic_tx
-                .send(crate::network::UiEvent::UpdateVariable {
+            tab.chrome_state.loading = false;
+            let _ = ctx.logic_tx
+                .send((tab.id, crate::network::UiEvent::UpdateVariable {
                     name: "stato_navigazione".to_string(),
                     value: crate::core::types::Value::from(format!("Errore: {e}")),
-                });
+                }));
         }
-        NetworkResult::NavigateSuccess { url, source } => {
-            manager
+        NetworkResult::NavigateSuccess { tab: _, url, source } => {
+            tab
                 .inspector_log
                 .complete_net(&url, NetOutcome::Ok, Some(source.len()));
-            handle_navigate_success(manager, url, source);
+            handle_navigate_success(tab, ctx, url, source);
         }
-        NetworkResult::NavigationRedirect { new_url } => {
-            manager
+        NetworkResult::NavigationRedirect { tab: _, new_url } => {
+            tab
                 .inspector_log
                 .complete_latest_pending(NetOutcome::Redirect);
-            if manager.register_redirect() {
+            if tab.register_redirect() {
                 tracing::debug!(
                     url = %new_url,
-                    count = manager.redirect_count,
+                    count = tab.redirect_count,
                     "redirecting (through choke point)"
                 );
                 // N2+N5: route through the single choke point so scheme,
@@ -352,7 +357,8 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                 // through navigate_to_url (which is always either
                 // user-initiated or a same-origin logic action).
                 navigate_to_url(
-                    manager,
+                    tab,
+                    ctx,
                     new_url,
                     NavigationInitiator::RedirectOf(Box::new(
                         NavigationInitiator::UserGesture,
@@ -363,71 +369,78 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
                     limit = *MAX_REDIRECTS,
                     "redirect limit exceeded; aborting navigation"
                 );
-                manager.chrome_state.loading = false;
-                let _ = manager
-                    .logic_tx
-                    .send(crate::network::UiEvent::UpdateVariable {
+                tab.chrome_state.loading = false;
+                let _ = ctx.logic_tx
+                    .send((tab.id, crate::network::UiEvent::UpdateVariable {
                         name: "stato_navigazione".to_string(),
                         value: crate::core::types::Value::from(
                             "Errore: troppi redirect".to_string(),
                         ),
-                    });
+                    }));
             }
         }
-        NetworkResult::FetchImageSuccess { url, image } => {
-            manager
+        NetworkResult::FetchImageSuccess { tab: _, url, image } => {
+            tab
                 .inspector_log
                 .push_net_done("IMG", &url, NetOutcome::Ok);
-            manager.fetching_images.remove(&url);
-            manager
-                .image_cache
-                .put(url.clone(), AssetSlot::Ready(image));
-            let mut new_taffy = taffy::TaffyTree::new();
-            let mut new_node_map = HashMap::new();
-            let env = crate::render::responsive::RenderEnvironment {
-                viewport: manager.viewport_size,
-                color_scheme: manager.preferences.color_scheme,
-            };
-            match crate::render::layout_bridge::build_taffy_tree(
-                manager.dom.root(),
-                &mut crate::render::layout_bridge::TaffyBuildContext {
-                    style_rules_map: &manager.style_rules,
-                    taffy: &mut new_taffy,
-                    node_to_taffy_id: &mut new_node_map,
-                    image_cache: &mut manager.image_cache,
-                    chrome_url: &manager.chrome_state.url,
-                    variants: &manager.style_variants,
-                    env: &env,
-                },
-            ) {
-                Ok(new_root) => {
-                    manager.taffy = new_taffy;
-                    manager.node_to_taffy_id = new_node_map;
-                    manager.root_taffy_id = new_root;
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, "taffy rebuild failed after image fetch");
-                }
-            }
+            ctx.image_cache.put(url.clone(), AssetSlot::Ready(image));
+            rebuild_tab_taffy_after_image(tab, ctx);
         }
-        NetworkResult::FetchImageFailed { url, error } => {
-            manager
+        NetworkResult::FetchImageFailed { tab: _, url, error } => {
+            tab
                 .inspector_log
                 .push_net_done("IMG", &url, NetOutcome::Failed(error.to_string()));
-            manager.fetching_images.remove(&url);
-            manager.image_cache.put(url.clone(), AssetSlot::Failed);
+            ctx.image_cache.put(url.clone(), AssetSlot::Failed);
             tracing::error!(url = %url, error = ?error, "image load failed");
         }
     }
 
     // Request a layout recalc + redraw for every network result.
     // Clone the Arc so resize_viewport can take &mut manager without a borrow conflict.
-    if let Some(w) = manager.window.clone() {
+    if let Some(w) = ctx.window.cloned() {
         let physical_size = w.inner_size();
         let logical_width = physical_size.width as f32 / w.scale_factor() as f32;
         let logical_height = physical_size.height as f32 / w.scale_factor() as f32;
-        let _ = manager.resize_viewport(logical_width, logical_height);
+        let _ = resize_tab_viewport(tab, ctx, logical_width, logical_height, None);
         w.request_redraw();
+    }
+}
+
+/// Rebuilds `tab`'s taffy tree after an image finished loading: an image's
+/// intrinsic size participates in layout, so the tree built while the slot was
+/// `Loading` is stale.
+///
+/// Applied to every tab that was waiting on that URL, not just the one that
+/// requested it first — the decoded-image cache is shared and URL-keyed, so a
+/// second tab showing the same image is deduped at request time and would
+/// otherwise never be told the bytes arrived.
+pub(super) fn rebuild_tab_taffy_after_image(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
+    let mut new_taffy = taffy::TaffyTree::new();
+    let mut new_node_map = HashMap::new();
+    let env = crate::render::responsive::RenderEnvironment {
+        viewport: tab.viewport_size,
+        color_scheme: ctx.preferences.color_scheme,
+    };
+    match crate::render::layout_bridge::build_taffy_tree(
+        tab.dom.root(),
+        &mut crate::render::layout_bridge::TaffyBuildContext {
+            style_rules_map: &tab.style_rules,
+            taffy: &mut new_taffy,
+            node_to_taffy_id: &mut new_node_map,
+            image_cache: ctx.image_cache,
+            chrome_url: &tab.chrome_state.url,
+            variants: &tab.style_variants,
+            env: &env,
+        },
+    ) {
+        Ok(new_root) => {
+            tab.taffy = new_taffy;
+            tab.node_to_taffy_id = new_node_map;
+            tab.root_taffy_id = new_root;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "taffy rebuild failed after image fetch");
+        }
     }
 }
 
@@ -452,7 +465,7 @@ pub(super) fn process_network_result(manager: &mut MizuWindowManager, res: crate
 /// - `file://` documents are loaded directly; `mizu://` dispatches
 ///   `NetworkCmd::Navigate` to the network worker.
 pub(super) fn navigate_to_url(
-    manager: &mut MizuWindowManager,
+    tab: &mut TabState, ctx: &mut WindowCtx<'_>,
     url: String,
     initiator: NavigationInitiator,
 ) {
@@ -460,54 +473,54 @@ pub(super) fn navigate_to_url(
     // that set it. Any other navigation (fresh, logic, redirect) starting
     // here must not inherit a stale value from an earlier, unrelated step.
     if !matches!(initiator, NavigationInitiator::HistoryStep) {
-        manager.pending_scroll_restore = None;
+        tab.pending_scroll_restore = None;
     }
 
     // Reloading or navigating to the blank start page is a no-op: there is
     // nothing to fetch, and `about:` is not a routable scheme.
     if url == "about:blank" {
-        manager.chrome_state.loading = false;
+        tab.chrome_state.loading = false;
         return;
     }
 
     // For file:// origins with relative paths, we still need resolve_navigate_url
     // for sandbox enforcement (it does I/O via canonicalize).  check_navigation
     // handles the pure policy, then we do the I/O-dependent resolution.
-    let resolved_url = if !url.contains("://") && manager.chrome_state.url.starts_with("file://") {
+    let resolved_url = if !url.contains("://") && tab.chrome_state.url.starts_with("file://") {
         // check_navigation allows this at the policy level; now enforce sandbox.
-        match resolve_navigate_url(&manager.chrome_state.url, &url) {
+        match resolve_navigate_url(&tab.chrome_state.url, &url) {
             Some(u) => u,
             None => {
                 tracing::warn!(
-                    current = %manager.chrome_state.url,
+                    current = %tab.chrome_state.url,
                     target = %url,
                     "blocked: relative path escapes file:// sandbox"
                 );
-                manager.inspector_log.push_net_blocked(
+                tab.inspector_log.push_net_blocked(
                     "NAV",
                     &url,
                     "relative path escapes file:// sandbox".to_string(),
                 );
-                manager.chrome_state.loading = false;
+                tab.chrome_state.loading = false;
                 return;
             }
         }
-    } else if url.starts_with("file://") && manager.chrome_state.url.starts_with("file://") {
+    } else if url.starts_with("file://") && tab.chrome_state.url.starts_with("file://") {
         // Absolute file→file: sandbox check via resolve_navigate_url.
-        match resolve_navigate_url(&manager.chrome_state.url, &url) {
+        match resolve_navigate_url(&tab.chrome_state.url, &url) {
             Some(u) => u,
             None => {
                 tracing::warn!(
-                    current = %manager.chrome_state.url,
+                    current = %tab.chrome_state.url,
                     target = %url,
                     "blocked: file:// target escapes sandbox"
                 );
-                manager.inspector_log.push_net_blocked(
+                tab.inspector_log.push_net_blocked(
                     "NAV",
                     &url,
                     "file:// target escapes sandbox".to_string(),
                 );
-                manager.chrome_state.loading = false;
+                tab.chrome_state.loading = false;
                 return;
             }
         }
@@ -516,11 +529,11 @@ pub(super) fn navigate_to_url(
     };
 
     // N2: all navigation decisions go through the policy choke point.
-    match check_navigation(&manager.chrome_state.url, &resolved_url, &initiator) {
+    match check_navigation(&tab.chrome_state.url, &resolved_url, &initiator) {
         NavigationVerdict::Allow(target) => {
             // N5: reset redirect chain for non-redirect initiators.
             if !matches!(initiator, NavigationInitiator::RedirectOf(_)) {
-                manager.reset_redirect_count();
+                tab.reset_redirect_count();
             }
 
             // ux-4: record the page being left, unless this navigation IS a
@@ -533,9 +546,9 @@ pub(super) fn navigate_to_url(
                 initiator,
                 NavigationInitiator::HistoryStep | NavigationInitiator::RedirectOf(_)
             ) {
-                manager.history.record_navigation(HistoryEntry {
-                    url: manager.chrome_state.url.clone(),
-                    scroll_y: manager.root_scroll_offset_y,
+                tab.history.record_navigation(HistoryEntry {
+                    url: tab.chrome_state.url.clone(),
+                    scroll_y: tab.root_scroll_offset_y,
                 });
             }
 
@@ -548,42 +561,45 @@ pub(super) fn navigate_to_url(
             // `target` itself (used below for the actual fetch/read) is
             // left untouched — only what becomes `chrome_state.url` is
             // sanitized.
-            manager.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
-            manager.capability_policy = CapabilityPolicy::new(&target);
+            tab.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
+            tab.capability_policy = CapabilityPolicy::new(&target);
 
             if target.starts_with("file://") {
                 if let Some(path) = target.strip_prefix("file:///")
                     && let Ok(content) = std::fs::read_to_string(path)
                 {
-                    handle_navigate_success(manager, target, content);
+                    handle_navigate_success(tab, ctx, target, content);
                 }
             } else if target.starts_with("mizu://") {
-                manager.chrome_state.loading = true;
-                manager
+                tab.chrome_state.loading = true;
+                tab
                     .inspector_log
                     .push_net_start("NAV", &target, Some(target.clone()));
                 // N2: this is the ONLY site that emits NetworkCmd::Navigate.
-                let _ = manager
+                let _ = ctx
                     .network_tx
-                    .send(crate::network::NetworkCmd::Navigate { url: target });
+                    .send(crate::network::NetworkCmd::Navigate {
+                        tab: tab.id,
+                        url: target,
+                    });
             }
         }
         NavigationVerdict::Block(reason) => {
             tracing::warn!(
-                current = %manager.chrome_state.url,
+                current = %tab.chrome_state.url,
                 target = %resolved_url,
                 reason = reason,
                 "navigation blocked by policy"
             );
-            manager.inspector_log.push_net_blocked(
+            tab.inspector_log.push_net_blocked(
                 "NAV",
                 &resolved_url,
                 reason.to_string(),
             );
-            manager.chrome_state.loading = false;
+            tab.chrome_state.loading = false;
             // A blocked history step must not leave a stale scroll restore
             // hanging around for some later, unrelated navigation.
-            manager.pending_scroll_restore = None;
+            tab.pending_scroll_restore = None;
         }
     }
 }
@@ -597,29 +613,29 @@ pub(super) fn navigate_to_url(
 /// real user gesture (N3), but the step must still pass through the single
 /// choke point for scheme/origin/lifecycle handling (N4/N5) rather than
 /// swapping `chrome_state.url` directly.
-pub(super) fn navigate_back(manager: &mut MizuWindowManager) {
+pub(super) fn navigate_back(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
     let leaving = HistoryEntry {
-        url: manager.chrome_state.url.clone(),
-        scroll_y: manager.root_scroll_offset_y,
+        url: tab.chrome_state.url.clone(),
+        scroll_y: tab.root_scroll_offset_y,
     };
-    let Some(target) = manager.history.go_back(leaving) else {
+    let Some(target) = tab.history.go_back(leaving) else {
         return;
     };
-    manager.pending_scroll_restore = Some(target.scroll_y);
-    navigate_to_url(manager, target.url, NavigationInitiator::HistoryStep);
+    tab.pending_scroll_restore = Some(target.scroll_y);
+    navigate_to_url(tab, ctx, target.url, NavigationInitiator::HistoryStep);
 }
 
 /// Steps forward one entry in session history (the chrome Forward button /
 /// `Alt+Right`). Symmetric to [`navigate_back`]; a no-op when the forward
 /// stack is empty.
-pub(super) fn navigate_forward(manager: &mut MizuWindowManager) {
+pub(super) fn navigate_forward(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
     let leaving = HistoryEntry {
-        url: manager.chrome_state.url.clone(),
-        scroll_y: manager.root_scroll_offset_y,
+        url: tab.chrome_state.url.clone(),
+        scroll_y: tab.root_scroll_offset_y,
     };
-    let Some(target) = manager.history.go_forward(leaving) else {
+    let Some(target) = tab.history.go_forward(leaving) else {
         return;
     };
-    manager.pending_scroll_restore = Some(target.scroll_y);
-    navigate_to_url(manager, target.url, NavigationInitiator::HistoryStep);
+    tab.pending_scroll_restore = Some(target.scroll_y);
+    navigate_to_url(tab, ctx, target.url, NavigationInitiator::HistoryStep);
 }

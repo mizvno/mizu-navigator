@@ -7,9 +7,9 @@ use ego_tree::NodeId as EgoNodeId;
 
 use crate::core::errors::MizuError;
 use crate::core::types::VariableStore;
-use crate::network::UiEvent;
+use crate::network::{TabId, UiEvent};
 
-use super::manager::MizuWindowManager;
+use super::manager::TabState;
 
 /// Maximum number of bytes a single input field accepts from typing or
 /// pasting.  Prevents unbounded memory growth from key-repeat or a huge paste.
@@ -163,20 +163,20 @@ fn pick_file_path(accept: Option<&str>) -> Option<std::path::PathBuf> {
 /// Only path/filename metadata is stored — never the file's bytes (see
 /// [`crate::core::types::FileHandleData`]).
 pub(super) fn apply_file_selection(
-    manager: &mut MizuWindowManager,
+    tab: &mut TabState,
     u32_id: u32,
     picked: Option<std::path::PathBuf>,
 ) {
     let Some(path) = picked else {
         // Cancelled: leave the field unset (Null on submit), not an error.
-        manager.local_file_selections.remove(&u32_id);
+        tab.local_file_selections.remove(&u32_id);
         return;
     };
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    manager.local_file_selections.insert(
+    tab.local_file_selections.insert(
         u32_id,
         std::sync::Arc::new(crate::core::types::FileHandleData { path, filename }),
     );
@@ -188,17 +188,17 @@ pub(super) fn apply_file_selection(
 /// selection. Returns `true` if `node_id` resolved to a live node (matching
 /// the other `dispatch_*` helpers' convention), regardless of whether the
 /// user picked a file or cancelled.
-pub(super) fn dispatch_file_input_click(manager: &mut MizuWindowManager, node_id: EgoNodeId) -> bool {
-    let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) else {
+pub(super) fn dispatch_file_input_click(tab: &mut TabState, node_id: EgoNodeId) -> bool {
+    let Some(&u32_id) = tab.node_id_to_u32.get(&node_id) else {
         return false;
     };
-    let accept = manager
+    let accept = tab
         .dom
         .get(node_id)
         .and_then(|n| n.value().attributes.get("accept").cloned());
-    manager.has_user_gesture = true;
+    tab.has_user_gesture = true;
     let picked = pick_file_path(accept.as_deref());
-    apply_file_selection(manager, u32_id, picked);
+    apply_file_selection(tab, u32_id, picked);
     true
 }
 
@@ -208,20 +208,25 @@ pub(super) fn dispatch_file_input_click(manager: &mut MizuWindowManager, node_id
 /// activation (Enter/Space) so the two are observationally identical: same
 /// gesture flag, same single event. Returns `true` if dispatched (`node_id`
 /// must have a u32 mapping, which every live DOM node has).
-pub(super) fn dispatch_click_gesture(manager: &mut MizuWindowManager, node_id: EgoNodeId) -> bool {
-    let Some(&u32_id) = manager.node_id_to_u32.get(&node_id) else {
+pub(super) fn dispatch_click_gesture(
+    tab: &mut TabState,
+    logic_tx: &std::sync::mpsc::Sender<(TabId, UiEvent)>,
+    node_id: EgoNodeId,
+) -> bool {
+    let Some(&u32_id) = tab.node_id_to_u32.get(&node_id) else {
         return false;
     };
-    if let Some(node_ref) = manager.dom.get(node_id) {
-        manager.inspector_log.push_event(
+    if let Some(node_ref) = tab.dom.get(node_id) {
+        tab.inspector_log.push_event(
             crate::render::inspector::log::EventKind::Click,
             crate::render::inspector::model::node_label(node_ref.value(), None),
         );
     }
     // Mark user gesture before dispatching — clipboard actions in this
-    // response batch are therefore authorised.
-    manager.has_user_gesture = true;
-    let _ = manager.logic_tx.send(UiEvent::Click { node_id: u32_id });
+    // response batch are therefore authorised. Per-tab (invariant T1): a
+    // click here can never authorise another tab's clipboard read.
+    tab.has_user_gesture = true;
+    let _ = logic_tx.send((tab.id, UiEvent::Click { node_id: u32_id }));
     true
 }
 
@@ -229,29 +234,33 @@ pub(super) fn dispatch_click_gesture(manager: &mut MizuWindowManager, node_id: E
 /// `submit` event): gathers the enclosing form's fields from the live input
 /// buffers and forwards them to the logic worker together with the
 /// submitter's id.  Returns `true` when the submission was dispatched.
-pub(super) fn dispatch_form_submit(manager: &mut MizuWindowManager, submitter: EgoNodeId) -> bool {
-    let Some(&submitter_u32) = manager.node_id_to_u32.get(&submitter) else {
+pub(super) fn dispatch_form_submit(
+    tab: &mut TabState,
+    logic_tx: &std::sync::mpsc::Sender<(TabId, UiEvent)>,
+    submitter: EgoNodeId,
+) -> bool {
+    let Some(&submitter_u32) = tab.node_id_to_u32.get(&submitter) else {
         return false;
     };
     let Some(fields) = collect_form_fields(
-        &manager.dom,
-        &manager.node_id_to_u32,
-        &manager.local_inputs,
-        &manager.local_file_selections,
+        &tab.dom,
+        &tab.node_id_to_u32,
+        &tab.local_inputs,
+        &tab.local_file_selections,
         submitter,
     ) else {
         tracing::warn!("submit event outside any form node; ignored");
         return false;
     };
-    manager.has_user_gesture = true;
-    manager.inspector_log.push_event(
+    tab.has_user_gesture = true;
+    tab.inspector_log.push_event(
         crate::render::inspector::log::EventKind::Submit,
         format!("form submit ({} fields)", fields.len()),
     );
-    let _ = manager.logic_tx.send(UiEvent::SubmitForm {
+    let _ = logic_tx.send((tab.id, UiEvent::SubmitForm {
         submitter_node_id: submitter_u32,
         fields,
-    });
+    }));
     true
 }
 /// Extracts the text content of the DOM node identified by `node_id_str`.

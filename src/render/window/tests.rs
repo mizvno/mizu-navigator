@@ -1,5 +1,6 @@
     use super::input::*;
     use super::manager::*;
+    use crate::network::TabId;
     use super::navigate::*;
     use crate::core::errors::MizuError;
     use crate::core::types::VariableStore;
@@ -32,23 +33,16 @@
         };
         styles.insert("window".to_string(), root_style);
 
-        let mut manager = MizuWindowManager::new(
-            tree,
-            styles,
-            Vec::new(),
-            FxHashMap::default(),
-            #[cfg(feature = "insecure-dev")]
-            false,
-        )
-        .expect("Manager created");
+        let (mut manager, _keepalive) = make_manager_with(tree, styles);
 
         manager
             .resize_viewport(800.0, 600.0)
             .expect("Initial resize ok");
 
         let layout = manager
+            .active()
             .taffy
-            .layout(manager.root_taffy_id)
+            .layout(manager.active().root_taffy_id)
             .expect("Layout exists");
         assert_eq!(layout.size.width, 800.0);
         assert_eq!(layout.size.height, 600.0 - CHROME_HEIGHT);
@@ -57,15 +51,62 @@
             .resize_viewport(1024.0, 768.0)
             .expect("Second resize ok");
         let layout = manager
+            .active()
             .taffy
-            .layout(manager.root_taffy_id)
+            .layout(manager.active().root_taffy_id)
             .expect("Layout exists");
         assert_eq!(layout.size.width, 1024.0);
         assert_eq!(layout.size.height, 768.0 - CHROME_HEIGHT);
     }
 
-    fn make_minimal_manager() -> MizuWindowManager {
-        let tree = Tree::new(MizuNode {
+    /// Default test URL. `mizu://localhost/...` gets the localhost capability
+    /// tier, matching what `MizuWindowManager::new` used before the tab split.
+    const TEST_URL: &str = "mizu://localhost/index.mizu";
+
+    /// Builds a single `TabState` for tests — no threads, no system fonts.
+    fn make_tab(
+        id: u64,
+        dom: Tree<MizuNode>,
+        styles: HashMap<String, StyleRules>,
+        url: &str,
+    ) -> TabState {
+        let mut throwaway_cache =
+            lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap());
+        TabState::new(
+            TabId(id),
+            TabDocument {
+                dom,
+                style_rules: styles,
+                style_variants: Vec::new(),
+                logic_fns: FxHashMap::default(),
+            },
+            crate::render::responsive::RenderEnvironment {
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0 - CHROME_HEIGHT,
+                },
+                color_scheme: crate::render::preferences::ColorScheme::Dark,
+            },
+            url,
+            &mut throwaway_cache,
+        )
+        .expect("tab created")
+    }
+
+    /// Builds a headless single-tab manager around `dom`/`styles`.
+    ///
+    /// Returns the channel keep-alive alongside it; bind it (`let (mut m, _k)
+    /// = ...`) so the manager's senders keep a live peer for the test's
+    /// duration.
+    fn make_manager_with(
+        dom: Tree<MizuNode>,
+        styles: HashMap<String, StyleRules>,
+    ) -> (MizuWindowManager, TestChannelKeepAlive) {
+        MizuWindowManager::new_headless(vec![make_tab(0, dom, styles, TEST_URL)])
+    }
+
+    fn window_dom() -> Tree<MizuNode> {
+        Tree::new(MizuNode {
             primitive: Primitive::Doc,
             attributes: {
                 let mut attrs = FxHashMap::default();
@@ -75,31 +116,26 @@
             events: FxHashMap::default(),
             iterator_context: None,
             conditional_classes: Vec::new(),
-        });
+        })
+    }
+
+    fn make_minimal_manager() -> (MizuWindowManager, TestChannelKeepAlive) {
         let mut styles = HashMap::new();
         styles.insert("window".to_string(), StyleRules::default());
-        MizuWindowManager::new(
-            tree,
-            styles,
-            Vec::new(),
-            FxHashMap::default(),
-            #[cfg(feature = "insecure-dev")]
-            false,
-        )
-        .expect("Manager created")
+        make_manager_with(window_dom(), styles)
     }
 
     #[test]
     fn redirect_counter_allows_up_to_max_then_stops() {
-        let mut manager = make_minimal_manager();
+        let (mut manager, _keepalive) = make_minimal_manager();
         for hop in 1..=*MAX_REDIRECTS {
             assert!(
-                manager.register_redirect(),
+                manager.active_mut().register_redirect(),
                 "redirect hop {hop} should be permitted (<= MAX_REDIRECTS)"
             );
         }
         assert!(
-            !manager.register_redirect(),
+            !manager.active_mut().register_redirect(),
             "redirect hop {} must be refused (exceeds MAX_REDIRECTS)",
             *MAX_REDIRECTS + 1
         );
@@ -107,17 +143,17 @@
 
     #[test]
     fn redirect_counter_reset_clears_budget() {
-        let mut manager = make_minimal_manager();
+        let (mut manager, _keepalive) = make_minimal_manager();
         for _ in 0..*MAX_REDIRECTS {
-            assert!(manager.register_redirect());
+            assert!(manager.active_mut().register_redirect());
         }
         assert!(
-            !manager.register_redirect(),
+            !manager.active_mut().register_redirect(),
             "budget exhausted before reset"
         );
-        manager.reset_redirect_count();
+        manager.active_mut().reset_redirect_count();
         assert!(
-            manager.register_redirect(),
+            manager.active_mut().register_redirect(),
             "after reset, a fresh navigation chain may redirect again"
         );
     }
@@ -422,13 +458,13 @@
         )
         .expect("manager created");
 
-        let plain_id = manager.dom.root_mut().append(plain_box_node()).id();
-        let click_box_id = manager.dom.root_mut().append(clickable_box_node()).id();
-        let input_id = manager.dom.root_mut().append(input_node("a")).id();
-        let button_id = manager.dom.root_mut().append(button_node()).id();
-        manager.rebuild_node_mappings();
+        let plain_id = manager.active_mut().dom.root_mut().append(plain_box_node()).id();
+        let click_box_id = manager.active_mut().dom.root_mut().append(clickable_box_node()).id();
+        let input_id = manager.active_mut().dom.root_mut().append(input_node("a")).id();
+        let button_id = manager.active_mut().dom.root_mut().append(button_node()).id();
+        manager.active_mut().rebuild_node_mappings();
 
-        let order = manager.focusable_nodes_in_order();
+        let order = manager.active_mut().focusable_nodes_in_order();
         assert!(
             !order.contains(&plain_id),
             "a plain box with no click/submit event must not be focusable"
@@ -455,36 +491,36 @@
         )
         .expect("manager created");
 
-        let a = manager.dom.root_mut().append(input_node("a")).id();
-        let b = manager.dom.root_mut().append(input_node("b")).id();
-        let c = manager.dom.root_mut().append(input_node("c")).id();
-        manager.rebuild_node_mappings();
+        let a = manager.active_mut().dom.root_mut().append(input_node("a")).id();
+        let b = manager.active_mut().dom.root_mut().append(input_node("b")).id();
+        let c = manager.active_mut().dom.root_mut().append(input_node("c")).id();
+        manager.active_mut().rebuild_node_mappings();
 
         // Nothing focused: Tab focuses the first, Shift-Tab focuses the last.
-        assert_eq!(manager.next_focus_target(false), Some(a));
-        assert_eq!(manager.next_focus_target(true), Some(c));
+        assert_eq!(manager.active_mut().next_focus_target(false), Some(a));
+        assert_eq!(manager.active_mut().next_focus_target(true), Some(c));
 
         // Forward advance a -> b -> c -> wraps to a.
-        manager.focused_node = Some(a);
-        assert_eq!(manager.next_focus_target(false), Some(b));
-        manager.focused_node = Some(b);
-        assert_eq!(manager.next_focus_target(false), Some(c));
-        manager.focused_node = Some(c);
+        manager.active_mut().focused_node = Some(a);
+        assert_eq!(manager.active_mut().next_focus_target(false), Some(b));
+        manager.active_mut().focused_node = Some(b);
+        assert_eq!(manager.active_mut().next_focus_target(false), Some(c));
+        manager.active_mut().focused_node = Some(c);
         assert_eq!(
-            manager.next_focus_target(false),
+            manager.active_mut().next_focus_target(false),
             Some(a),
             "Tab from the last focusable node must wrap to the first"
         );
 
         // Shift-Tab reverses: a -> wraps to c.
-        manager.focused_node = Some(a);
+        manager.active_mut().focused_node = Some(a);
         assert_eq!(
-            manager.next_focus_target(true),
+            manager.active_mut().next_focus_target(true),
             Some(c),
             "Shift-Tab from the first focusable node must wrap to the last"
         );
-        manager.focused_node = Some(c);
-        assert_eq!(manager.next_focus_target(true), Some(b));
+        manager.active_mut().focused_node = Some(c);
+        assert_eq!(manager.active_mut().next_focus_target(true), Some(b));
     }
 
     #[test]
@@ -506,19 +542,19 @@
         )
         .expect("manager created");
 
-        let button_id = manager.dom.root_mut().append(button_node()).id();
-        manager.rebuild_node_mappings();
+        let button_id = manager.active_mut().dom.root_mut().append(button_node()).id();
+        manager.active_mut().rebuild_node_mappings();
 
         // Replace the real logic channel with a test channel so the emitted
         // UiEvent can be observed directly.
         let (test_tx, test_rx) = std::sync::mpsc::channel();
         manager.logic_tx = test_tx;
-        manager.has_user_gesture = false;
+        manager.active_mut().has_user_gesture = false;
 
-        let dispatched = dispatch_click_gesture(&mut manager, button_id);
+        let dispatched = { let (t, c) = manager.split_active(); dispatch_click_gesture(t, c.logic_tx, button_id) };
         assert!(dispatched, "dispatch must succeed for a live DOM node");
         assert!(
-            manager.has_user_gesture,
+            manager.active_mut().has_user_gesture,
             "keyboard activation must set has_user_gesture, exactly like a mouse click"
         );
 
@@ -529,8 +565,8 @@
             "exactly one UiEvent must be emitted, got: {events:?}"
         );
         match &events[0] {
-            crate::network::UiEvent::Click { node_id } => {
-                let expected_u32 = *manager.node_id_to_u32.get(&button_id).unwrap();
+            (_, crate::network::UiEvent::Click { node_id }) => {
+                let expected_u32 = *manager.active_mut().node_id_to_u32.get(&button_id).unwrap();
                 assert_eq!(*node_id, expected_u32);
             }
             other => panic!("expected UiEvent::Click, got: {other:?}"),
@@ -547,59 +583,59 @@
         // `CapabilityPolicy`. We plant a sentinel in the current policy and
         // confirm it is gone after the Back step: that's only possible if
         // the real choke point ran, not a bypass.
-        let mut manager = make_minimal_manager();
-        manager.chrome_state.url = "mizu://current.example/page".to_string();
-        manager
+        let (mut manager, _keepalive) = make_minimal_manager();
+        manager.active_mut().chrome_state.url = "mizu://current.example/page".to_string();
+        manager.active_mut()
             .history
             .record_navigation(super::history::HistoryEntry {
                 url: "mizu://previous.example/page".to_string(),
                 scroll_y: 77.0,
             });
-        assert!(manager.history.can_go_back());
+        assert!(manager.active_mut().history.can_go_back());
 
-        manager.capability_policy.bytes_stored = 123_456;
+        manager.active_mut().capability_policy.bytes_stored = 123_456;
 
-        navigate_back(&mut manager);
+        { let (t, mut c) = manager.split_active(); navigate_back(t, &mut c) };
 
         assert_eq!(
-            manager.chrome_state.url, "mizu://previous.example/page",
+            manager.active_mut().chrome_state.url, "mizu://previous.example/page",
             "Back must navigate to the popped history entry"
         );
         assert_eq!(
-            manager.capability_policy.bytes_stored, 0,
+            manager.active_mut().capability_policy.bytes_stored, 0,
             "capability_policy must have been freshly reset by navigate_to_url's \
              Allow branch (N5) — a direct URL swap bypassing the choke point \
              would have left the sentinel value untouched"
         );
         assert!(
-            !manager.history.can_go_back(),
+            !manager.active_mut().history.can_go_back(),
             "the popped entry must be gone from the back stack"
         );
         assert!(
-            manager.history.can_go_forward(),
+            manager.active_mut().history.can_go_forward(),
             "the page left behind must now be on the forward stack"
         );
     }
 
     #[test]
     fn history_forward_step_routes_through_navigation_choke_point() {
-        let mut manager = make_minimal_manager();
-        manager.chrome_state.url = "mizu://current.example/page".to_string();
-        manager
+        let (mut manager, _keepalive) = make_minimal_manager();
+        manager.active_mut().chrome_state.url = "mizu://current.example/page".to_string();
+        manager.active_mut()
             .history
             .record_navigation(super::history::HistoryEntry {
                 url: "mizu://previous.example/page".to_string(),
                 scroll_y: 0.0,
             });
-        navigate_back(&mut manager);
-        assert!(manager.history.can_go_forward());
+        { let (t, mut c) = manager.split_active(); navigate_back(t, &mut c) };
+        assert!(manager.active_mut().history.can_go_forward());
 
-        manager.capability_policy.bytes_stored = 999;
-        navigate_forward(&mut manager);
+        manager.active_mut().capability_policy.bytes_stored = 999;
+        { let (t, mut c) = manager.split_active(); navigate_forward(t, &mut c) };
 
-        assert_eq!(manager.chrome_state.url, "mizu://current.example/page");
+        assert_eq!(manager.active_mut().chrome_state.url, "mizu://current.example/page");
         assert_eq!(
-            manager.capability_policy.bytes_stored, 0,
+            manager.active_mut().capability_policy.bytes_stored, 0,
             "Forward must also route through the choke point's N5 reset"
         );
     }
@@ -608,70 +644,82 @@
     fn history_back_with_empty_stack_fires_no_navigation() {
         // Disabled-button behavior: clicking Back with an empty back stack
         // must be a guaranteed no-op, not merely "unlikely to do anything".
-        let mut manager = make_minimal_manager();
-        assert!(!manager.history.can_go_back());
-        manager.chrome_state.url = "mizu://only-page.example/".to_string();
-        manager.capability_policy.bytes_stored = 42;
+        let (mut manager, _keepalive) = make_minimal_manager();
+        assert!(!manager.active_mut().history.can_go_back());
+        manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
+        manager.active_mut().capability_policy.bytes_stored = 42;
 
-        navigate_back(&mut manager);
+        { let (t, mut c) = manager.split_active(); navigate_back(t, &mut c) };
 
         assert_eq!(
-            manager.chrome_state.url, "mizu://only-page.example/",
+            manager.active_mut().chrome_state.url, "mizu://only-page.example/",
             "URL must be unchanged when back stack is empty"
         );
         assert_eq!(
-            manager.capability_policy.bytes_stored, 42,
+            manager.active_mut().capability_policy.bytes_stored, 42,
             "capability_policy must be untouched — no navigation occurred at all"
         );
-        assert!(!manager.history.can_go_forward());
+        assert!(!manager.active_mut().history.can_go_forward());
     }
 
     #[test]
     fn history_forward_with_empty_stack_fires_no_navigation() {
-        let mut manager = make_minimal_manager();
-        assert!(!manager.history.can_go_forward());
-        manager.chrome_state.url = "mizu://only-page.example/".to_string();
-        manager.capability_policy.bytes_stored = 42;
+        let (mut manager, _keepalive) = make_minimal_manager();
+        assert!(!manager.active_mut().history.can_go_forward());
+        manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
+        manager.active_mut().capability_policy.bytes_stored = 42;
 
-        navigate_forward(&mut manager);
+        { let (t, mut c) = manager.split_active(); navigate_forward(t, &mut c) };
 
-        assert_eq!(manager.chrome_state.url, "mizu://only-page.example/");
-        assert_eq!(manager.capability_policy.bytes_stored, 42);
+        assert_eq!(manager.active_mut().chrome_state.url, "mizu://only-page.example/");
+        assert_eq!(manager.active_mut().capability_policy.bytes_stored, 42);
     }
 
     #[test]
     fn fresh_navigation_after_back_clears_forward_stack() {
         // A -> B -> C, back to B, then a fresh navigation to D from B must
         // clear the forward stack (standard browser semantics).
-        let mut manager = make_minimal_manager();
-        manager.chrome_state.url = "mizu://a.example/".to_string();
-        navigate_to_url(
-            &mut manager,
+        let (mut manager, _keepalive) = make_minimal_manager();
+        manager.active_mut().chrome_state.url = "mizu://a.example/".to_string();
+        {
+            let (t, mut c) = manager.split_active();
+            navigate_to_url(
+                t,
+                &mut c,
             "mizu://b.example/".to_string(),
             crate::render::navigation::NavigationInitiator::UserGesture,
         );
-        navigate_to_url(
-            &mut manager,
+        }
+        {
+            let (t, mut c) = manager.split_active();
+            navigate_to_url(
+                t,
+                &mut c,
             "mizu://c.example/".to_string(),
             crate::render::navigation::NavigationInitiator::UserGesture,
         );
-        assert_eq!(manager.chrome_state.url, "mizu://c.example/");
+        }
+        assert_eq!(manager.active_mut().chrome_state.url, "mizu://c.example/");
 
-        navigate_back(&mut manager);
-        assert_eq!(manager.chrome_state.url, "mizu://b.example/");
-        assert!(manager.history.can_go_forward());
+        { let (t, mut c) = manager.split_active(); navigate_back(t, &mut c) };
+        assert_eq!(manager.active_mut().chrome_state.url, "mizu://b.example/");
+        assert!(manager.active_mut().history.can_go_forward());
 
-        navigate_to_url(
-            &mut manager,
+        {
+            let (t, mut c) = manager.split_active();
+            navigate_to_url(
+                t,
+                &mut c,
             "mizu://d.example/".to_string(),
             crate::render::navigation::NavigationInitiator::UserGesture,
         );
-        assert_eq!(manager.chrome_state.url, "mizu://d.example/");
+        }
+        assert_eq!(manager.active_mut().chrome_state.url, "mizu://d.example/");
         assert!(
-            !manager.history.can_go_forward(),
+            !manager.active_mut().history.can_go_forward(),
             "a fresh navigation must clear the forward stack"
         );
-        assert!(manager.history.can_go_back());
+        assert!(manager.active_mut().history.can_go_back());
     }
 
     // --- Bidi anti-spoofing (ux-7): programmatic chrome_state.url assignment ---
@@ -683,19 +731,23 @@
         // override character) must not be able to plant one into the
         // address bar's display any more than typing one can
         // (chrome_vello.rs's insert_text is the other choke point).
-        let mut manager = make_minimal_manager();
-        manager.chrome_state.url = "mizu://start.example/".to_string();
+        let (mut manager, _keepalive) = make_minimal_manager();
+        manager.active_mut().chrome_state.url = "mizu://start.example/".to_string();
 
-        navigate_to_url(
-            &mut manager,
+        {
+            let (t, mut c) = manager.split_active();
+            navigate_to_url(
+                t,
+                &mut c,
             "mizu://evil\u{202E}gnp.example/".to_string(),
             crate::render::navigation::NavigationInitiator::UserGesture,
         );
+        }
 
         assert!(
-            !manager.chrome_state.url.contains('\u{202E}'),
+            !manager.active_mut().chrome_state.url.contains('\u{202E}'),
             "the displayed URL must never contain an RLO override character, got: {:?}",
-            manager.chrome_state.url
+            manager.active_mut().chrome_state.url
         );
     }
 
@@ -773,30 +825,30 @@
         )
         .expect("manager created");
 
-        let form_id = manager.dom.root_mut().append(form_node()).id();
+        let form_id = manager.active_mut().dom.root_mut().append(form_node()).id();
         let file_input_id;
         let submit_id;
         {
-            let mut form_ref = manager.dom.get_mut(form_id).unwrap();
+            let mut form_ref = manager.active_mut().dom.get_mut(form_id).unwrap();
             file_input_id = form_ref.append(file_input_node("avatar", Some(".png,.jpg"))).id();
             submit_id = form_ref.append(submit_button_node()).id();
         }
-        manager.rebuild_node_mappings();
+        manager.active_mut().rebuild_node_mappings();
 
         let (test_tx, test_rx) = std::sync::mpsc::channel();
         manager.logic_tx = test_tx;
 
-        let file_u32 = manager.node_id_to_u32[&file_input_id];
+        let file_u32 = manager.active_mut().node_id_to_u32[&file_input_id];
         apply_file_selection(
-            &mut manager,
+            manager.active_mut(),
             file_u32,
             Some(std::path::PathBuf::from("/home/user/pictures/cat.png")),
         );
 
-        assert!(dispatch_form_submit(&mut manager, submit_id));
+        assert!({ let (t, c) = manager.split_active(); dispatch_form_submit(t, c.logic_tx, submit_id) });
 
         match test_rx.try_recv() {
-            Ok(crate::network::UiEvent::SubmitForm { fields, .. }) => {
+            Ok((_, crate::network::UiEvent::SubmitForm { fields, .. })) => {
                 match fields.get("avatar") {
                     Some(crate::core::types::Value::FileHandle(handle)) => {
                         assert_eq!(handle.filename, "cat.png");
@@ -821,27 +873,27 @@
         )
         .expect("manager created");
 
-        let form_id = manager.dom.root_mut().append(form_node()).id();
+        let form_id = manager.active_mut().dom.root_mut().append(form_node()).id();
         let file_input_id;
         let submit_id;
         {
-            let mut form_ref = manager.dom.get_mut(form_id).unwrap();
+            let mut form_ref = manager.active_mut().dom.get_mut(form_id).unwrap();
             file_input_id = form_ref.append(file_input_node("avatar", None)).id();
             submit_id = form_ref.append(submit_button_node()).id();
         }
-        manager.rebuild_node_mappings();
+        manager.active_mut().rebuild_node_mappings();
 
         let (test_tx, test_rx) = std::sync::mpsc::channel();
         manager.logic_tx = test_tx;
 
         // Cancelling the dialog: `apply_file_selection` receives `None`.
-        let file_u32 = manager.node_id_to_u32[&file_input_id];
-        apply_file_selection(&mut manager, file_u32, None);
+        let file_u32 = manager.active_mut().node_id_to_u32[&file_input_id];
+        apply_file_selection(manager.active_mut(), file_u32, None);
 
-        assert!(dispatch_form_submit(&mut manager, submit_id));
+        assert!({ let (t, c) = manager.split_active(); dispatch_form_submit(t, c.logic_tx, submit_id) });
 
         match test_rx.try_recv() {
-            Ok(crate::network::UiEvent::SubmitForm { fields, .. }) => {
+            Ok((_, crate::network::UiEvent::SubmitForm { fields, .. })) => {
                 assert_eq!(
                     fields.get("avatar"),
                     Some(&crate::core::types::Value::Null),
@@ -858,22 +910,208 @@
         // clicking it routes to the native picker instead (see
         // `dispatch_dom_click`'s `is_file_input` branch).
         let tree = Tree::new(window_node());
-        let mut manager = MizuWindowManager::new(
-            tree,
-            HashMap::new(),
-            Vec::new(),
-            FxHashMap::default(),
-            #[cfg(feature = "insecure-dev")]
-            false,
-        )
-        .expect("manager created");
+        let (mut manager, _keepalive) = make_manager_with(tree, HashMap::new());
         let file_input_id = manager
+            .active_mut()
             .dom
             .root_mut()
             .append(file_input_node("avatar", None))
             .id();
-        manager.rebuild_node_mappings();
+        manager.active_mut().rebuild_node_mappings();
 
-        assert!(is_file_input(&manager.dom, file_input_id));
-        assert!(!is_file_input(&manager.dom, manager.dom.root().id()));
+        assert!(is_file_input(&manager.active().dom, file_input_id));
+        let root_id = manager.active().dom.root().id();
+        assert!(!is_file_input(&manager.active().dom, root_id));
     }
+
+    // ---- Tab lifecycle & per-tab isolation (invariant T1) ----
+
+    /// Builds a headless manager with `n` tabs over the same trivial document.
+    fn make_multi_tab_manager(n: u64) -> (MizuWindowManager, TestChannelKeepAlive) {
+        let mut styles = HashMap::new();
+        styles.insert("window".to_string(), StyleRules::default());
+        let tabs = (0..n)
+            .map(|i| make_tab(i, window_dom(), styles.clone(), TEST_URL))
+            .collect();
+        MizuWindowManager::new_headless(tabs)
+    }
+
+    #[test]
+    fn opening_tabs_spawns_no_threads() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let base = crate::parser::logic_worker::SPAWN_COUNT.load(SeqCst)
+            + crate::network::worker::SPAWN_COUNT.load(SeqCst);
+        let (mut manager, _keepalive) = make_minimal_manager();
+        for _ in 0..8 {
+            manager.open_tab("mizu://localhost/blank.mizu").expect("tab opens");
+        }
+        assert_eq!(manager.tabs.len(), 9);
+        assert_eq!(
+            crate::parser::logic_worker::SPAWN_COUNT.load(SeqCst)
+                + crate::network::worker::SPAWN_COUNT.load(SeqCst),
+            base,
+            "tabs share the two window-level workers; opening one must spawn no thread"
+        );
+    }
+
+    #[test]
+    fn open_tab_refuses_past_max() {
+        let (mut manager, _keepalive) = make_minimal_manager();
+        while manager.tabs.len() < MAX_OPEN_TABS {
+            assert!(manager.open_tab(TEST_URL).is_some());
+        }
+        assert!(
+            manager.open_tab(TEST_URL).is_none(),
+            "the cap is what keeps tab creation from being a memory-exhaustion vector"
+        );
+    }
+
+    #[test]
+    fn tab_ids_are_never_reused() {
+        let (mut manager, _keepalive) = make_minimal_manager();
+        let first = manager.open_tab(TEST_URL).expect("opens");
+        assert!(manager.close_tab(first));
+        let second = manager.open_tab(TEST_URL).expect("opens");
+        assert_ne!(
+            first, second,
+            "a recycled id would let a late message resolve against a different interner"
+        );
+    }
+
+    #[test]
+    fn close_tab_refuses_the_last_tab() {
+        let (mut manager, _keepalive) = make_minimal_manager();
+        let only = manager.active().id;
+        assert!(!manager.close_tab(only), "closing the last tab is the caller's exit signal");
+        assert_eq!(manager.tabs.len(), 1);
+    }
+
+    #[test]
+    fn active_tab_index_stays_in_bounds_after_close() {
+        for close_at in 0..4usize {
+            let (mut manager, _keepalive) = make_multi_tab_manager(4);
+            let victim = manager.tabs[close_at].id;
+            manager.switch_to_tab(manager.tabs[3].id);
+            assert!(manager.close_tab(victim));
+            assert_eq!(manager.tabs.len(), 3);
+            assert!(
+                manager.active_tab_index() < manager.tabs.len(),
+                "closing at position {close_at} left active_tab out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_budget_is_per_tab() {
+        let (mut manager, _keepalive) = make_multi_tab_manager(2);
+        let b = manager.tabs[1].id;
+        // Exhaust tab A's budget.
+        while manager.tabs[0].register_redirect() {}
+        assert!(
+            manager.split_tab(b).expect("tab b exists").0.register_redirect(),
+            "one tab's redirect chain must not consume another's loop protection"
+        );
+    }
+
+    #[test]
+    fn capability_policy_is_per_tab() {
+        let (mut manager, _keepalive) = make_multi_tab_manager(2);
+        manager.tabs[0].capability_policy.bytes_stored = 4096;
+        assert_eq!(
+            manager.tabs[1].capability_policy.bytes_stored, 0,
+            "storage quota is per-origin and per-tab; one document must not spend another's"
+        );
+    }
+
+    #[test]
+    fn gesture_flag_is_per_tab() {
+        let (mut manager, _keepalive) = make_multi_tab_manager(2);
+        manager.tabs[0].has_user_gesture = true;
+        assert!(
+            !manager.tabs[1].has_user_gesture,
+            "a click in one tab must never authorise another tab's clipboard read"
+        );
+    }
+
+    #[test]
+    fn switching_relayouts_a_stale_background_tab() {
+        let (mut manager, _keepalive) = make_multi_tab_manager(2);
+        let b = manager.tabs[1].id;
+        manager.resize_viewport(1024.0, 768.0).expect("resize ok");
+        assert!(
+            manager.tabs[1].layout_stale,
+            "a resize while backgrounded must flag the tab rather than relayout it"
+        );
+        manager.switch_to_tab(b);
+        assert!(!manager.tabs[1].layout_stale);
+        assert_eq!(manager.active().viewport_size.width, 1024.0);
+    }
+
+    #[test]
+    fn close_tab_purges_image_waiters() {
+        let (mut manager, _keepalive) = make_multi_tab_manager(2);
+        let a = manager.tabs[0].id;
+        let b = manager.tabs[1].id;
+        manager
+            .fetching_images
+            .insert("mizu://localhost/x.png".to_string(), vec![a, b]);
+        manager.switch_to_tab(b);
+        assert!(manager.close_tab(a));
+        let waiters = &manager.fetching_images["mizu://localhost/x.png"];
+        assert_eq!(waiters, &vec![b], "a closed tab must not stay on a waiter list");
+    }
+
+    #[test]
+    fn tab_titles_are_stripped_of_bidi_overrides() {
+        // A document-controlled `title` carrying an RLO could otherwise
+        // render reversed over a neighbouring tab's label — a spoofing
+        // vector, which is why the strip sanitises exactly like the URL bar.
+        let raw = "safe\u{202E}gnp.eruces";
+        let cleaned = crate::render::bidi::strip_bidi_overrides(raw);
+        assert!(
+            !cleaned.contains('\u{202E}'),
+            "an RLO override must not survive into a painted tab title"
+        );
+    }
+
+    #[test]
+    fn background_timers_are_throttled_but_still_fire() {
+        use super::event_loop::background_timer_period;
+        assert_eq!(
+            background_timer_period(100),
+            1000,
+            "a hidden document must not wake the loop 10x a second"
+        );
+        assert_eq!(
+            background_timer_period(5000),
+            5000,
+            "a slower timer keeps its own period; the clamp is a floor, not a rewrite"
+        );
+    }
+
+    #[test]
+    fn reload_clears_each_block_measurements_keyed_by_the_old_tree() {
+        // `each_row_height_estimate` / `each_container_offset_y` are keyed by
+        // `EgoNodeId`. Carried across a document reload they would seed the
+        // new tree's virtualization with another document's row heights.
+        let (mut manager, _keepalive) = make_minimal_manager();
+        let stale = manager.active().dom.root().id();
+        manager.active_mut().each_row_height_estimate.insert(stale, 42.0);
+        manager.active_mut().each_container_offset_y.insert(stale, 7.0);
+
+        manager
+            .reload_document(ReloadedDocument {
+                dom: window_dom(),
+                style_rules: HashMap::new(),
+                style_variants: Vec::new(),
+                logic_fns: FxHashMap::default(),
+                interner: crate::core::types::StringInterner::new(),
+                computed_bindings: Vec::new(),
+                root_timers: Vec::new(),
+            })
+            .expect("reload ok");
+
+        assert!(manager.active().each_row_height_estimate.is_empty());
+        assert!(manager.active().each_container_offset_y.is_empty());
+    }
+
