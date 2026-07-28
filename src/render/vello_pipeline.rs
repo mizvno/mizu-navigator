@@ -42,8 +42,27 @@ pub fn to_vello_color(color: &crate::parser::MizuColor) -> Color {
     Color::rgba8(color.r, color.g, color.b, color.a)
 }
 
+/// Records `tab` as waiting on `url`'s in-flight fetch, if it isn't already.
+///
+/// Linear scan: the list is one or two entries in every realistic case (it is
+/// the number of open tabs showing the same image at the same moment).
+fn register_image_waiter(
+    waiters: &mut rustc_hash::FxHashMap<String, Vec<crate::network::TabId>>,
+    url: &str,
+    tab: crate::network::TabId,
+) {
+    let list = waiters.entry(url.to_owned()).or_default();
+    if !list.contains(&tab) {
+        list.push(tab);
+    }
+}
+
 /// Context holding references required for painting.
 pub struct PaintContext<'a> {
+    /// Tab being painted. Stamped on the `FetchImage` commands this pass
+    /// issues so the completion is routed back to the tab that needs the
+    /// relayout, not to whichever tab happens to be active when it lands.
+    pub tab: crate::network::TabId,
     /// Reference to the DOM tree.
     pub tree: &'a Tree<MizuNode>,
     /// Reference to the computed Taffy layout tree.
@@ -75,8 +94,13 @@ pub struct PaintContext<'a> {
     pub focused_node: Option<EgoNodeId>,
     /// Cache for decoded images.
     pub image_cache: &'a mut lru::LruCache<String, crate::render::window::AssetSlot>,
-    /// Track currently fetching images.
-    pub fetching_images: &'a mut std::collections::HashSet<String>,
+    /// Tabs waiting on each in-flight image URL.
+    ///
+    /// Presence of a key means "in flight" (the dedupe the decoded-image cache's
+    /// `Loading` slot also expresses); the value is every tab that must relayout
+    /// when the bytes land. A bare set would let a second tab requesting the
+    /// same URL be deduped and then never notified.
+    pub fetching_images: &'a mut rustc_hash::FxHashMap<String, Vec<crate::network::TabId>>,
     /// Elapsed time in milliseconds.
     pub elapsed_ms: u64,
     /// MPSC sender for network requests.
@@ -370,12 +394,19 @@ pub fn paint_node(
 
             let animated_img = match ctx.image_cache.get(&abs_url) {
                 Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
-                Some(crate::render::window::AssetSlot::Loading) => None,
+                Some(crate::render::window::AssetSlot::Loading) => {
+                    // Already in flight for another tab: join the waiter list
+                    // so this tab is relaid out too when the bytes arrive.
+                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                    None
+                }
                 Some(crate::render::window::AssetSlot::Failed) => None,
                 None => {
                     ctx.image_cache
                         .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
                     let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
+                        tab: ctx.tab,
                         url: abs_url.clone(),
                         is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
                         sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
@@ -780,12 +811,17 @@ pub fn paint_node(
 
         let peniko_img = match ctx.image_cache.get(&abs_url) {
             Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
-            Some(crate::render::window::AssetSlot::Loading) => None,
+            Some(crate::render::window::AssetSlot::Loading) => {
+                register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                None
+            }
             Some(crate::render::window::AssetSlot::Failed) => None,
             None => {
                 ctx.image_cache
                     .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
                 let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
+                    tab: ctx.tab,
                     url: abs_url.clone(),
                     is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
                     sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
@@ -1231,7 +1267,7 @@ mod tests {
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
 
-        let mut fetching_images = std::collections::HashSet::new();
+        let mut fetching_images = rustc_hash::FxHashMap::default();
         let (network_tx, _network_rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let chrome_url = "mizu://localhost/index.mizu";
 
@@ -1243,6 +1279,7 @@ mod tests {
 
         // Setup PaintContext
         let mut ctx = PaintContext {
+            tab: crate::network::TabId(0),
             tree: &tree,
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
@@ -1396,13 +1433,14 @@ mod tests {
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
-        let mut fetching_images = std::collections::HashSet::new();
+        let mut fetching_images = rustc_hash::FxHashMap::default();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
         let mut each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
 
         let mut ctx = PaintContext {
+            tab: crate::network::TabId(0),
             tree: &tree,
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
@@ -1789,7 +1827,7 @@ mod tests {
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
-        let mut fetching_images = std::collections::HashSet::new();
+        let mut fetching_images = rustc_hash::FxHashMap::default();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
 
@@ -1800,6 +1838,7 @@ mod tests {
         let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
         let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut ctx = PaintContext {
+            tab: crate::network::TabId(0),
             tree: &tree,
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
@@ -1893,7 +1932,7 @@ mod tests {
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
-        let mut fetching_images = std::collections::HashSet::new();
+        let mut fetching_images = rustc_hash::FxHashMap::default();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let empty_each_groups = HashMap::new();
@@ -1901,6 +1940,7 @@ mod tests {
         let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
 
         let mut ctx = PaintContext {
+            tab: crate::network::TabId(0),
             tree: &tree,
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
@@ -2001,7 +2041,7 @@ mod tests {
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
-        let mut fetching_images = std::collections::HashSet::new();
+        let mut fetching_images = rustc_hash::FxHashMap::default();
         let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
 
@@ -2013,6 +2053,7 @@ mod tests {
         let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
         let mut empty_each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut ctx = PaintContext {
+            tab: crate::network::TabId(0),
             tree: &tree,
             taffy: &taffy,
             node_to_taffy_id: &node_to_taffy_id,
