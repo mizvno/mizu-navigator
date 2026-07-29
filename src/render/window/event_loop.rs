@@ -1483,7 +1483,12 @@ fn dispatch_redraw_requested(
                 sel,
             )
         {
-            crate::render::inspector::paint::paint_node_highlight(&mut scene, rect, scale as f32);
+            crate::render::inspector::paint::paint_node_highlight(
+                &mut scene,
+                rect,
+                scale as f32,
+                &ChromePalette::for_preferences(ctx.preferences),
+            );
         }
         let rows = {
             let src = tab.inspector_sources();
@@ -1499,6 +1504,7 @@ fn dispatch_redraw_requested(
                 scale: scale as f32,
                 font_cx: ctx.font_cx,
                 layout_cx: ctx.layout_cx,
+                palette: &ChromePalette::for_preferences(ctx.preferences),
             },
         );
     }

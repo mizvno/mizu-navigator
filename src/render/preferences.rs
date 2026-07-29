@@ -120,8 +120,11 @@ pub struct ChromePalette {
     pub cursor: Color,
     /// URL bar text selection highlight.
     pub select: Color,
-    /// The "loaded OK" status dot.
+    /// The "loaded OK" status dot, and any other "this is fine" text.
     pub ok_dot: Color,
+    /// Text reporting a failure — a blocked request, a rejected document.
+    /// Contrast-checked against [`Self::bar_bg`] like every other pairing.
+    pub err_text: Color,
     /// Tab strip background, behind the tabs themselves.
     pub strip_bg: Color,
     /// Background of the active tab.
@@ -152,6 +155,7 @@ const DARK: ChromePalette = ChromePalette {
     cursor: Color::rgba8(255, 255, 255, 255),
     select: Color::rgba8(74, 144, 217, 120),
     ok_dot: Color::rgba8(76, 175, 80, 255),
+    err_text: Color::rgba8(255, 121, 121, 255),
     strip_bg: Color::rgba8(32, 32, 32, 255),
     tab_active_bg: Color::rgba8(60, 60, 60, 255),
     tab_inactive_bg: Color::rgba8(40, 40, 40, 255),
@@ -176,7 +180,8 @@ const LIGHT: ChromePalette = ChromePalette {
     url_text: Color::rgba8(25, 25, 25, 255),
     cursor: Color::rgba8(20, 20, 20, 255),
     select: Color::rgba8(74, 144, 217, 90),
-    ok_dot: Color::rgba8(46, 125, 50, 255),
+    ok_dot: Color::rgba8(27, 94, 32, 255),
+    err_text: Color::rgba8(178, 34, 34, 255),
     strip_bg: Color::rgba8(222, 222, 222, 255),
     tab_active_bg: Color::rgba8(255, 255, 255, 255),
     tab_inactive_bg: Color::rgba8(235, 235, 235, 255),
@@ -201,6 +206,7 @@ const HIGH_CONTRAST: ChromePalette = ChromePalette {
     cursor: Color::rgba8(255, 255, 0, 255),
     select: Color::rgba8(255, 255, 0, 140),
     ok_dot: Color::rgba8(0, 255, 0, 255),
+    err_text: Color::rgba8(255, 85, 85, 255),
     strip_bg: Color::rgba8(0, 0, 0, 255),
     tab_active_bg: Color::rgba8(0, 0, 0, 255),
     tab_inactive_bg: Color::rgba8(0, 0, 0, 255),
@@ -348,6 +354,12 @@ mod tests {
                 ("inactive tab title", p.tab_text_inactive, p.tab_inactive_bg),
                 ("close glyph on active tab", p.tab_close_glyph, p.tab_active_bg),
                 ("close glyph on inactive tab", p.tab_close_glyph, p.tab_inactive_bg),
+                // The inspector paints its rows straight onto the bar
+                // background, so its semantic colors are held to the same bar.
+                ("ok text on panel", p.ok_dot, p.bar_bg),
+                ("error text on panel", p.err_text, p.bar_bg),
+                ("dim text on panel", p.tab_text_inactive, p.bar_bg),
+                ("normal text on panel", p.tab_text, p.bar_bg),
             ] {
                 let ratio = contrast_ratio(fg, bg);
                 assert!(

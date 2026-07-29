@@ -12,6 +12,7 @@ use vello::peniko::{Color, Fill};
 use parley::style::{FontFamily, FontFamilyName, GenericFamily, LineHeight, StyleProperty};
 
 use crate::render::chrome_vello::CHROME_HEIGHT;
+use crate::render::preferences::ChromePalette;
 use crate::render::inspector::model::{Row, RowKind};
 use crate::render::inspector::{
     InspectorState, InspectorTab, PANEL_WIDTH, PICKER_BTN_WIDTH, ROW_HEIGHT, TAB_BAR_HEIGHT,
@@ -21,31 +22,23 @@ use crate::render::inspector::{
 /// Font size of panel text.
 const FONT_SIZE: f32 = 11.5;
 
-const PANEL_BG: Color = Color::rgba8(0x14, 0x16, 0x1c, 0xff);
-const DIVIDER: Color = Color::rgba8(0x2a, 0x2f, 0x3a, 0xff);
-const TAB_ACTIVE_BG: Color = Color::rgba8(0x1f, 0x24, 0x2e, 0xff);
-const PICKER_ACTIVE_BG: Color = Color::rgba8(0x3a, 0x86, 0xff, 0xff);
-const SELECTION_BG: Color = Color::rgba8(0x7c, 0xc4, 0xff, 0x26);
-const SCROLLBAR: Color = Color::rgba8(0x3a, 0x40, 0x4d, 0xff);
+/// Alpha applied to the accent color for the page highlight's fill; the
+/// border reuses the accent at full strength.
+const HIGHLIGHT_FILL_ALPHA: u8 = 0x2d;
 
-const COL_NORMAL: Color = Color::rgba8(0xd7, 0xda, 0xe0, 0xff);
-const COL_HEADER: Color = Color::rgba8(0x7c, 0xc4, 0xff, 0xff);
-const COL_DIM: Color = Color::rgba8(0x6b, 0x72, 0x80, 0xff);
-const COL_ACCENT: Color = Color::rgba8(0x7c, 0xc4, 0xff, 0xff);
-const COL_GOOD: Color = Color::rgba8(0x6f, 0xd0, 0x8c, 0xff);
-const COL_BAD: Color = Color::rgba8(0xff, 0x5c, 0x5c, 0xff);
+/// Height of the accent underline marking the picker button as engaged.
+const ACTIVE_UNDERLINE_H: f32 = 2.0;
 
-const HIGHLIGHT_FILL: Color = Color::rgba8(0x7c, 0xc4, 0xff, 0x2d);
-const HIGHLIGHT_BORDER: Color = Color::rgba8(0x7c, 0xc4, 0xff, 0xd0);
-
-fn row_color(kind: RowKind) -> Color {
+/// Resolves a row's semantic kind to a color from the chrome palette, so the
+/// panel follows light/dark/high-contrast exactly as the tab strip and URL
+/// bar do rather than carrying a dark-only palette of its own.
+fn row_color(kind: RowKind, palette: &ChromePalette) -> Color {
     match kind {
-        RowKind::Header => COL_HEADER,
-        RowKind::Normal => COL_NORMAL,
-        RowKind::Dim => COL_DIM,
-        RowKind::Accent => COL_ACCENT,
-        RowKind::Good => COL_GOOD,
-        RowKind::Bad => COL_BAD,
+        RowKind::Header | RowKind::Accent => palette.url_border_focused,
+        RowKind::Normal => palette.tab_text,
+        RowKind::Dim => palette.tab_text_inactive,
+        RowKind::Good => palette.ok_dot,
+        RowKind::Bad => palette.err_text,
     }
 }
 
@@ -131,6 +124,8 @@ pub struct PanelPaintContext<'a> {
     pub font_cx: &'a mut parley::FontContext,
     /// Parley layout context, for row/tab-label text layout.
     pub layout_cx: &'a mut parley::LayoutContext<Color>,
+    /// The chrome palette — the panel's only source of color.
+    pub palette: &'a ChromePalette,
 }
 
 /// Paints the docked panel: background, tab bar, picker button, visible rows,
@@ -148,14 +143,14 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
         ctx.window_width as f64,
         ctx.window_height as f64,
     );
-    scene.fill(Fill::NonZero, transform, PANEL_BG, None, &panel_rect);
+    scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &panel_rect);
     let divider = Rect::new(
         left as f64,
         top as f64,
         (left + 1.0) as f64,
         ctx.window_height as f64,
     );
-    scene.fill(Fill::NonZero, transform, DIVIDER, None, &divider);
+    scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &divider);
 
     // ── Tab bar ──────────────────────────────────────────────────────────
     let tab_strip_width = PANEL_WIDTH - PICKER_BTN_WIDTH;
@@ -169,15 +164,29 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
                 (x0 + tab_width) as f64,
                 (top + TAB_BAR_HEIGHT) as f64,
             );
-            scene.fill(Fill::NonZero, transform, TAB_ACTIVE_BG, None, &r);
+            scene.fill(Fill::NonZero, transform, ctx.palette.tab_active_bg, None, &r);
+            let underline = Rect::new(
+                x0 as f64,
+                (top + TAB_BAR_HEIGHT - ACTIVE_UNDERLINE_H) as f64,
+                (x0 + tab_width) as f64,
+                (top + TAB_BAR_HEIGHT) as f64,
+            );
+            scene.fill(Fill::NonZero, transform, ctx.palette.url_border_focused, None, &underline);
         }
-        let color = if *tab == ctx.state.tab { COL_ACCENT } else { COL_DIM };
+        let color = if *tab == ctx.state.tab {
+            ctx.palette.tab_text
+        } else {
+            ctx.palette.tab_text_inactive
+        };
         let layout = build_row_layout(tab.label(), color, ctx.font_cx, ctx.layout_cx);
         let tx = x0 + (tab_width - layout.width()).max(0.0) / 2.0;
         let ty = top + (TAB_BAR_HEIGHT - layout.height()).max(0.0) / 2.0;
         draw_layout(scene, &layout, tx, ty, color, transform);
     }
     // Picker button.
+    // Engaged state is an accent underline over the active-tab background,
+    // the same treatment the chrome bar's own toggles use: inverting the fill
+    // instead would need the glyph re-checked for contrast in every palette.
     let picker_x0 = left + tab_strip_width;
     if ctx.state.picker {
         let r = Rect::new(
@@ -186,9 +195,20 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
             (picker_x0 + PICKER_BTN_WIDTH) as f64,
             (top + TAB_BAR_HEIGHT) as f64,
         );
-        scene.fill(Fill::NonZero, transform, PICKER_ACTIVE_BG, None, &r);
+        scene.fill(Fill::NonZero, transform, ctx.palette.tab_active_bg, None, &r);
+        let underline = Rect::new(
+            picker_x0 as f64,
+            (top + TAB_BAR_HEIGHT - ACTIVE_UNDERLINE_H) as f64,
+            (picker_x0 + PICKER_BTN_WIDTH) as f64,
+            (top + TAB_BAR_HEIGHT) as f64,
+        );
+        scene.fill(Fill::NonZero, transform, ctx.palette.url_border_focused, None, &underline);
     }
-    let picker_color = if ctx.state.picker { COL_NORMAL } else { COL_DIM };
+    let picker_color = if ctx.state.picker {
+        ctx.palette.tab_text
+    } else {
+        ctx.palette.tab_text_inactive
+    };
     let picker_layout = build_row_layout("[+]", picker_color, ctx.font_cx, ctx.layout_cx);
     let px = picker_x0 + (PICKER_BTN_WIDTH - picker_layout.width()).max(0.0) / 2.0;
     let py = top + (TAB_BAR_HEIGHT - picker_layout.height()).max(0.0) / 2.0;
@@ -200,7 +220,7 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
         ctx.window_width as f64,
         (top + TAB_BAR_HEIGHT + 1.0) as f64,
     );
-    scene.fill(Fill::NonZero, transform, DIVIDER, None, &bar_divider);
+    scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &bar_divider);
 
     // ── Content: scroll clamp + visible slice ────────────────────────────
     let content_top = top + TAB_BAR_HEIGHT + 1.0;
@@ -243,9 +263,9 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
                 ctx.window_width as f64,
                 (y + ROW_HEIGHT) as f64,
             );
-            scene.fill(Fill::NonZero, transform, SELECTION_BG, None, &r);
+            scene.fill(Fill::NonZero, transform, ctx.palette.select, None, &r);
         }
-        let color = row_color(row.kind);
+        let color = row_color(row.kind, ctx.palette);
         let x = left + 8.0 + row.indent as f32 * 12.0;
         let layout = build_row_layout(&row.text, color, ctx.font_cx, ctx.layout_cx);
         let ty = y + (ROW_HEIGHT - layout.height()).max(0.0) / 2.0;
@@ -264,20 +284,22 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
             (ctx.window_width - 2.0) as f64,
             (thumb_y + thumb_h) as f64,
         );
-        scene.fill(Fill::NonZero, transform, SCROLLBAR, None, &r);
+        scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &r);
     }
 }
 
 /// Paints the translucent highlight over the selected node in the page.
 ///
 /// `rect` is in logical coordinates (already offset by the chrome bar).
-pub fn paint_node_highlight(scene: &mut Scene, rect: Rect, scale: f32) {
+pub fn paint_node_highlight(scene: &mut Scene, rect: Rect, scale: f32, palette: &ChromePalette) {
     let transform = Affine::scale(scale as f64);
-    scene.fill(Fill::NonZero, transform, HIGHLIGHT_FILL, None, &rect);
+    let accent = palette.url_border_focused;
+    let fill = Color { a: HIGHLIGHT_FILL_ALPHA, ..accent };
+    scene.fill(Fill::NonZero, transform, fill, None, &rect);
     scene.stroke(
         &Stroke::new(1.5),
         transform,
-        HIGHLIGHT_BORDER,
+        accent,
         None,
         &rect,
     );
