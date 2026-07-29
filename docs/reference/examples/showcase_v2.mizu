@@ -1,0 +1,333 @@
+// ─────────────────────────────────────────────────────────────────────────
+// Mizu Feature Showcase v2 — a single-file tour of the language, extended
+// with the payload-format, custom-header, and file-upload work (Phases 1-2).
+//
+// This is a didactic/manual-testing reference file (like showcase.mizu), not
+// part of the automated example suite — point the navigator at it and click
+// around against your own backend.
+//
+// ── Server contract ─────────────────────────────────────────────────────
+// Every endpoint below just needs to accept the request and answer with a
+// small JSON body (any shape) — the response is bound to a variable and
+// rendered as text via "{var}", so whatever comes back is visible.
+//
+//   GET    /api/v1/items                          -> list of items
+//   GET    /api/v1/items      (custom headers)     -> same, headers visible server-side
+//   DELETE /api/v1/items/3                         -> delete-by-path-param demo
+//   POST   /api/v1/search     (as query, verb=QUERY) -> search results
+//   POST   /api/v1/profile    Content-Type: application/json
+//   POST   /api/v1/login      Content-Type: application/x-www-form-urlencoded
+//   POST   /api/v1/notes      Content-Type: text/plain; charset=utf-8
+//   POST   /api/v1/settings   Content-Type: application/yaml
+//   POST   /api/v1/upload     Content-Type: multipart/form-data; boundary=...
+//                             (fields: "caption" text part, "avatar" file part)
+//
+// Log the incoming Content-Type and a couple of headers server-side to see
+// the format/header machinery in action.
+// ─────────────────────────────────────────────────────────────────────────
+
+urls
+    api items_api      /api/v1/items
+    api delete_item    /api/v1/items
+    api search_api     /api/v1/search
+    api update_profile /api/v1/profile
+    api login_api      /api/v1/login
+    api note_api       /api/v1/notes
+    api settings_api   /api/v1/settings
+    api upload_api     /api/v1/upload
+    // Placeholder target — point this at a real mizu:// media asset your
+    // server serves, or the image/download demos will simply fail at
+    // runtime (not a parse-time concern).
+    media hero_img mizu://assets.example/hero.png
+
+logic
+    // ── Reactive state ──────────────────────────────────────────────────
+    counter = 0
+    elapsed_seconds = 0
+    wall_clock_ms = 0
+    api_key = "demo-key-123"
+
+    // ── Network response bindings ───────────────────────────────────────
+    items = null
+    search_results = null
+    delete_result = null
+    profile_result = null
+    login_result = null
+    note_result = null
+    settings_result = null
+    upload_result = null
+
+    // Pure, DAG-validated functions.
+    double(x: num) : x * 2
+    greet(name: string) : "Hello, " + name + "!"
+
+    clamp(x: num, lo: num, hi: num)
+        limited = if x > hi then hi else x
+        if limited < lo then lo else limited
+
+    // `comp` — derived, read-only, recomputed whenever a dependency changes.
+    comp doubled_counter = double(counter)
+    comp progress = clamp(counter, 0, 10)
+
+    // Root timer — the only recurring behavior a document can declare.
+    timer 1000ms -> elapsed_seconds = elapsed_seconds + 1
+
+style
+    doc
+        background #0b0e14
+        flex-direction column
+        align center
+        padding 32
+        gap 24
+
+    .page
+        width 720
+        flex-direction column
+        gap 24
+
+    .page @max-width 799
+        width 100%
+
+    // ── Hero banner ──────────────────────────────────────────────────────
+    .hero
+        background linear-gradient(135deg, #1d2b53, #4c1d95)
+        border-radius 16
+        padding 32
+        flex-direction column
+        gap 12
+
+    .hero-title
+        font-size 32
+        font-weight bold
+        color #f8fafc
+
+    .hero-subtitle
+        font-size 16
+        color #cbd5e1
+        line-height 1.4
+
+    .badge-row
+        flex-direction row
+        gap 8
+
+    .badge
+        background rgba(255, 255, 255, 0.1)
+        color #93c5fd
+        padding 8
+        border-radius 999
+        font-size 13
+
+    // ── Cards ────────────────────────────────────────────────────────────
+    .card
+        background #131822
+        border-color #1f2733
+        border-width 1
+        border-radius 14
+        padding 24
+        flex-direction column
+        gap 12
+
+    // Conditional highlight once the counter demo has real progress.
+    .glowing
+        border-color #7dd3fc
+        border-width 2
+
+    .card-title
+        font-size 18
+        font-weight bold
+        color #e5e7eb
+
+    .card-desc
+        font-size 14
+        color #8b93a7
+        line-height 1.4
+
+    .row
+        flex-direction row
+        gap 10
+        align center
+
+    .format-grid
+        flex-direction row
+        gap 16
+
+    .format-grid @max-width 799
+        flex-direction column
+
+    .format-card
+        background #0f1420
+        border-color #232b3a
+        border-width 1
+        border-radius 10
+        padding 16
+        flex-direction column
+        gap 8
+        width 47%
+
+    .format-card @max-width 799
+        width 100%
+
+    .format-label
+        font-size 12
+        color #7dd3fc
+        font-weight bold
+
+    .result-text
+        font-size 13
+        color #94a3b8
+
+    .footer-note
+        font-size 13
+        color #5b6577
+        text-align center
+
+    button
+        background #7dd3fc
+        color #0b0e14
+        padding 10
+        border-radius 8
+        font-weight bold
+
+    .btn-ghost
+        background rgba(255, 255, 255, 0.06)
+        color #e5e7eb
+        padding 10
+        border-radius 8
+        border-color #2a3341
+        border-width 1
+
+    input
+        background #0f1420
+        color #e5e7eb
+        border-color #232b3a
+        border-width 1
+        padding 8
+        border-radius 6
+
+    text
+        color #e5e7eb
+        font-size 14
+
+layout
+    doc title "Mizu Feature Showcase"
+        box class page
+            // ── Hero ─────────────────────────────────────────────────────
+            box class hero
+                t "Mizu Feature Showcase" class hero-title
+                t "A GPU-rendered, sandboxed hypermedia runtime — no JavaScript, every network call declared and type-checked at parse time." class hero-subtitle
+                box class badge-row
+                    t "Zero JS" class badge
+                    t "GPU rendered" class badge
+                    t "Sandboxed network" class badge
+                    t "Typed file uploads" class badge
+
+            // ── Reactive state + comp + conditional class ───────────────
+            box class card
+                class glowing if counter >= 5
+                t "Reactive State & Derived Values" class card-title
+                t "Plain variables, pure DAG-checked functions, and comp bindings that recompute automatically." class card-desc
+                box class row
+                    button "- Decrement" click -> counter = counter - 1
+                    button "+ Increment" click -> counter = counter + 1
+                    button "Reset" class btn-ghost click -> counter = 0
+                t "counter: {counter}  ·  doubled: {doubled_counter}  ·  progress: {progress}/10" class result-text
+                t "{greet(\"Mizu\")}" class result-text
+
+            // ── GET + each + DELETE + path_param ─────────────────────────
+            box class card
+                t "Fetching & Rendering Lists" class card-title
+                t "GET(alias) -> var, each over the response, and DELETE with a path parameter." class card-desc
+                box class row
+                    button "Load Items (GET)" click -> GET(items_api) -> items
+                    button "Delete Item #3 (DELETE + path_param)" click -> DELETE(delete_item, "3") -> delete_result
+                each item in items
+                    t "- {item.name}" class result-text
+                t "delete response: {delete_result}" class result-text
+
+            // ── QUERY via a submit form ──────────────────────────────────
+            box class card
+                t "Server-Side Search (QUERY)" class card-title
+                t "QUERY is Mizu's non-standard search verb — same shape as POST, dedicated intent." class card-desc
+                form
+                    box class row
+                        input type "text" name "q" placeholder "Search term"
+                        button "Search" submit -> QUERY(search_api, $form) -> search_results
+                each result in search_results
+                    t "- {result.name}" class result-text
+
+            // ── Custom request headers ───────────────────────────────────
+            box class card
+                t "Custom Request Headers" class card-title
+                t "header \"<name>\" <expr> attaches a runtime-evaluated header; the name is fixed and denylist-checked at parse time." class card-desc
+                box class row
+                    button "Ping with X-Api-Key + X-Request-Id" click -> GET(items_api) -> items header "X-Api-Key" api_key header "X-Request-Id" counter
+
+            // ── Payload formats: json / form / text / yaml ───────────────
+            box class card
+                t "Payload Formats" class card-title
+                t "An optional \"as <format>\" clause on any body-carrying network call selects the wire format and Content-Type." class card-desc
+                box class format-grid
+                    box class format-card
+                        t "as json  (default)" class format-label
+                        form
+                            input type "text" name "display_name" placeholder "Display name"
+                            input type "text" name "email" placeholder "Email"
+                            button "Save Profile" submit -> POST(update_profile, $form) -> profile_result as json
+                        t "{profile_result}" class result-text
+
+                    box class format-card
+                        t "as form  (urlencoded)" class format-label
+                        form
+                            input type "text" name "username" placeholder "Username"
+                            input type "text" name "password" placeholder "Password"
+                            button "Log In" submit -> POST(login_api, $form) -> login_result as form
+                        t "{login_result}" class result-text
+
+                    box class format-card
+                        t "as text  (plain string)" class format-label
+                        form
+                            input type "text" name "note" placeholder "A quick note, sent as text/plain"
+                            button "Send Note" submit -> POST(note_api, $form.note) -> note_result as text
+                        t "{note_result}" class result-text
+
+                    box class format-card
+                        t "as yaml" class format-label
+                        form
+                            input type "text" name "theme" placeholder "dark / light"
+                            input type "text" name "notifications" placeholder "on / off"
+                            button "Save Settings" submit -> POST(settings_api, $form) -> settings_result as yaml
+                        t "{settings_result}" class result-text
+
+            // ── File upload: multipart/form-data ─────────────────────────
+            box class card
+                class glowing if upload_result != null
+                t "File Upload — as multipart" class card-title
+                t "A type \"file\" input opens the native picker; the selected file rides in $form as a FileHandle. \"as multipart\" is the only format that can carry one, encoding text fields, nested records, and files each as their own part." class card-desc
+                form
+                    box class row
+                        input type "file" name "avatar" accept ".png,.jpg,.jpeg,.webp"
+                        input type "text" name "caption" placeholder "Say something about this file"
+                    button "Upload" submit -> POST(upload_api, $form) -> upload_result as multipart
+                t "{upload_result}" class result-text
+
+            // ── Media + markdown ──────────────────────────────────────────
+            box class card
+                t "Media & Rich Text" class card-title
+                image src "hero_img" alt "Mizu hero illustration"
+                markdown """
+                    ### Markdown works too
+                    Inline and multi-line rich text, right alongside the layout tree.
+                    - No client-side rendering library
+                    - No virtual DOM diffing
+                """
+
+            // ── Downloads, navigation, and the system clock ──────────────
+            box class card
+                t "Downloads, Navigation & the Clock" class card-title
+                box class row
+                    button "Download hero image" class btn-ghost click -> download(hero_img)
+                    button "About Mizu" class btn-ghost click -> navigate "mizu://localhost/about.mizu"
+                    button "What time is it?" click -> get_system_time(wall_clock_ms)
+                t "uptime: {elapsed_seconds}s  ·  last checked: {wall_clock_ms}" class result-text
+
+            t "Rendered natively. Every network call above is declared, typed, and sandboxed at parse time — nothing here reaches the wire except what you explicitly wrote." class footer-note
