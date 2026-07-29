@@ -582,7 +582,6 @@ fn draw_text(
     };
     let metrics = first.metrics();
     let y_offset = metrics.ascent - metrics.baseline;
-    let font_size = metrics.ascent + metrics.descent;
 
     for line in layout.lines() {
         for item in line.items() {
@@ -598,7 +597,7 @@ fn draw_text(
                 });
                 scene
                     .draw_glyphs(&font)
-                    .font_size(font_size)
+                    .font_size(run.run().font_size())
                     .brush(color)
                     .transform(transform * Affine::translate((x as f64, (y + y_offset) as f64)))
                     .draw(Fill::NonZero, glyphs);

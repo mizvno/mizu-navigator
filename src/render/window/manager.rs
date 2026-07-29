@@ -1181,7 +1181,7 @@ pub(super) fn reload_tab_document(
             .attributes
             .get("title")
             .cloned()
-            .unwrap_or_else(|| "Mizu Application".to_string());
+            .unwrap_or_else(|| "Mizu Navigator".to_string());
         window.set_title(&title);
     }
     tab.style_rules = style_rules;

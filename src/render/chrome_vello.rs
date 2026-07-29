@@ -13,7 +13,7 @@
 use parley::style::{FontFamily, FontFamilyName, GenericFamily, LineHeight, StyleProperty};
 use vello::{
     Scene,
-    kurbo::{Affine, Circle, Rect, RoundedRect, Stroke},
+    kurbo::{Affine, BezPath, Circle, Rect, RoundedRect, Stroke},
     peniko::{BlendMode, Color, Compose, Fill, Mix},
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -53,13 +53,14 @@ const BTN_W: f32 = 24.0;
 /// opens — a left-docked panel with a right-edge switch reads as unrelated.
 const HISTORY_X: f32 = 4.0;
 const BACK_X: f32 = 32.0;
-const RELOAD_X: f32 = 60.0;
-const FORWARD_X: f32 = 88.0;
-const URL_BAR_X: f32 = 116.0;
+const FORWARD_X: f32 = 60.0;
+const RELOAD_X: f32 = 88.0;
+/// The X coordinate where the URL bar starts.
+pub const URL_BAR_X: f32 = 116.0;
 const URL_BAR_Y: f32 = TAB_STRIP_HEIGHT + 3.0;
 const URL_BAR_H: f32 = 22.0;
 /// Width reserved for the status indicator on the right.
-const STATUS_W: f32 = 40.0;
+pub const STATUS_W: f32 = 40.0;
 /// Text padding inside the URL bar.
 const URL_TEXT_PAD: f32 = 4.0;
 /// Font size used throughout the chrome bar.
@@ -77,6 +78,8 @@ const CHROME_FONT_SIZE: f32 = 12.0;
 /// The state for the browser chrome UI element.
 #[derive(Debug, Default)]
 pub struct ChromeState {
+    /// The actual URL of the currently loaded page (the origin of record).
+    pub committed_url: String,
     /// Current text in the URL bar.
     pub url: String,
     /// Cursor position as a **byte offset** into `url`.
@@ -89,6 +92,14 @@ pub struct ChromeState {
     pub focused: bool,
     /// Whether the browser is loading a page.
     pub loading: bool,
+    /// Autocomplete suggestions retrieved from history.
+    pub suggestions: Vec<crate::render::window::history::VisitRecord>,
+    /// The currently selected autocomplete suggestion index.
+    pub selected_suggestion: Option<usize>,
+    /// The currently hovered autocomplete suggestion index.
+    pub hovered_suggestion: Option<usize>,
+    /// Inline autocompletion string (suffix).
+    pub inline_completion: Option<String>,
 }
 
 /// A zone within the chrome bar hit by a mouse click.
@@ -112,6 +123,8 @@ pub enum ChromeHitZone {
     TabCloseButton(usize),
     /// The trailing "new tab" button.
     NewTabButton,
+    /// An autocomplete suggestion at this index.
+    AutocompleteSuggestion(usize),
 }
 
 /// Everything the strip's geometry depends on.
@@ -125,6 +138,8 @@ pub struct ChromeLayout {
     pub window_width: f32,
     /// Number of open tabs.
     pub tab_count: usize,
+    /// Number of visible autocomplete suggestions in the dropdown.
+    pub dropdown_count: usize,
 }
 
 /// Yields `(index, rect)` for every tab that fits in the strip.
@@ -371,6 +386,46 @@ impl ChromeState {
         self.cursor = len;
     }
 
+    /// Selects the word or URL segment at the current cursor.
+    pub fn select_word_at_cursor(&mut self) {
+        if self.url.is_empty() {
+            return;
+        }
+        
+        let chars: Vec<(usize, char)> = self.url.char_indices().collect();
+        let cursor_char_idx = chars.iter().position(|&(idx, _)| idx >= self.cursor).unwrap_or(chars.len());
+        
+        let is_separator = |c: char| " /.:?&=-".contains(c);
+        
+        let mut i = cursor_char_idx;
+        while i > 0 {
+            let (_, c) = chars[i - 1];
+            if is_separator(c) {
+                break;
+            }
+            i -= 1;
+        }
+        let mut start = if i < chars.len() { chars[i].0 } else { self.url.len() };
+        
+        let mut j = cursor_char_idx;
+        while j < chars.len() {
+            let (_, c) = chars[j];
+            if is_separator(c) {
+                break;
+            }
+            j += 1;
+        }
+        let mut end = if j < chars.len() { chars[j].0 } else { self.url.len() };
+        
+        if start == end && cursor_char_idx < chars.len() {
+            start = chars[cursor_char_idx].0;
+            end = start + chars[cursor_char_idx].1.len_utf8();
+        }
+        
+        self.selection = Some((start, end));
+        self.cursor = end;
+    }
+
     // ── Clipboard helpers ─────────────────────────────────────────────────────
 
     /// Returns the selected text as a `String` (for copy to clipboard).
@@ -437,21 +492,70 @@ impl ChromeState {
 
         match key {
             Key::Named(NamedKey::Enter) => {
-                // Normalise URL: add schema if missing
-                let mut url = self.url.trim().to_string();
-                if !url.is_empty() && !url.contains("://") {
+                let target_url = if let Some(idx) = self.selected_suggestion {
+                    if let Some(record) = self.suggestions.get(idx) {
+                        record.url.clone()
+                    } else {
+                        self.url.trim().to_string()
+                    }
+                } else if let Some(inline) = &self.inline_completion {
+                    format!("{}{}", self.url, inline)
+                } else {
+                    self.url.trim().to_string()
+                };
+
+                let mut url = target_url;
+                if !url.is_empty() && !url.contains("://") && !url.starts_with("about:") {
                     url = format!("mizu://{url}");
-                    self.url = url.clone();
-                    self.cursor = self.url.len();
                 }
+                self.url = url.clone();
+                self.cursor = self.url.len();
                 self.selection = None;
                 self.focused = false;
+                self.suggestions.clear();
+                self.selected_suggestion = None;
+                self.inline_completion = None;
                 ChromeKeyAction::Navigate(url)
             }
             Key::Named(NamedKey::Escape) => {
                 self.selection = None;
                 self.focused = false;
+                self.suggestions.clear();
+                self.selected_suggestion = None;
+                self.inline_completion = None;
                 ChromeKeyAction::Handled
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if !self.suggestions.is_empty() {
+                    if let Some(idx) = self.selected_suggestion {
+                        if idx > 0 {
+                            self.selected_suggestion = Some(idx - 1);
+                        } else {
+                            self.selected_suggestion = None;
+                        }
+                    } else {
+                        self.selected_suggestion = Some(self.suggestions.len() - 1);
+                    }
+                    ChromeKeyAction::Handled
+                } else {
+                    ChromeKeyAction::Ignored
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if !self.suggestions.is_empty() {
+                    if let Some(idx) = self.selected_suggestion {
+                        if idx + 1 < self.suggestions.len() {
+                            self.selected_suggestion = Some(idx + 1);
+                        } else {
+                            self.selected_suggestion = None;
+                        }
+                    } else {
+                        self.selected_suggestion = Some(0);
+                    }
+                    ChromeKeyAction::Handled
+                } else {
+                    ChromeKeyAction::Ignored
+                }
             }
             Key::Named(NamedKey::Backspace) => {
                 self.delete_backward();
@@ -508,6 +612,25 @@ impl ChromeState {
 /// Returns [`ChromeHitZone::Background`] if the point is outside the chrome area
 /// (y ≥ CHROME_HEIGHT) or in an unoccupied region.
 pub fn chrome_hit_zone(x: f32, y: f32, layout: &ChromeLayout) -> ChromeHitZone {
+    if layout.dropdown_count > 0 {
+        let item_h = 24.0;
+        let padding = 4.0;
+        let dropdown_h = (layout.dropdown_count as f32) * item_h + padding * 2.0;
+        
+        let url_bar_right = (layout.window_width - STATUS_W).max(URL_BAR_X + 10.0);
+        
+        if x >= URL_BAR_X && x < url_bar_right && y >= URL_BAR_Y + URL_BAR_H && y < URL_BAR_Y + URL_BAR_H + dropdown_h {
+            let relative_y = y - (URL_BAR_Y + URL_BAR_H + padding);
+            if relative_y >= 0.0 {
+                let index = (relative_y / item_h) as usize;
+                if index < layout.dropdown_count {
+                    return ChromeHitZone::AutocompleteSuggestion(index);
+                }
+            }
+            return ChromeHitZone::Background;
+        }
+    }
+
     if !(0.0..CHROME_HEIGHT).contains(&y) {
         return ChromeHitZone::Background;
     }
@@ -673,6 +796,41 @@ fn draw_text_layout(
     }
 }
 
+use std::sync::OnceLock;
+
+fn parse_svg_path(svg: &str) -> BezPath {
+    let start_idx = svg.find("d=\"").expect("Valid SVG path") + 3;
+    let end_idx = svg[start_idx..].find("\"").expect("Valid SVG path") + start_idx;
+    let path_data = &svg[start_idx..end_idx];
+    BezPath::from_svg(path_data).expect("Valid SVG path data")
+}
+
+fn get_icon_back() -> &'static BezPath {
+    static ICON: OnceLock<BezPath> = OnceLock::new();
+    ICON.get_or_init(|| parse_svg_path(include_str!("../../assets/icons/arrow-left-bold.svg")))
+}
+
+fn get_icon_forward() -> &'static BezPath {
+    static ICON: OnceLock<BezPath> = OnceLock::new();
+    ICON.get_or_init(|| parse_svg_path(include_str!("../../assets/icons/arrow-right-bold.svg")))
+}
+
+fn get_icon_reload() -> &'static BezPath {
+    static ICON: OnceLock<BezPath> = OnceLock::new();
+    ICON.get_or_init(|| parse_svg_path(include_str!("../../assets/icons/arrow-clockwise-bold.svg")))
+}
+
+fn get_icon_history() -> &'static BezPath {
+    static ICON: OnceLock<BezPath> = OnceLock::new();
+    ICON.get_or_init(|| parse_svg_path(include_str!("../../assets/icons/clock-counter-clockwise-bold.svg")))
+}
+
+enum ButtonContent<'a> {
+    #[allow(dead_code)]
+    Text(&'a str),
+    Icon(&'a BezPath),
+}
+
 /// Context for [`paint_nav_button`]: everything shared across both the
 /// Back and Forward button paint calls in a single `paint_chrome` pass.
 struct NavButtonContext<'a> {
@@ -692,7 +850,7 @@ struct NavButtonContext<'a> {
 fn paint_nav_button(
     scene: &mut Scene,
     x: f32,
-    label: &str,
+    content: ButtonContent<'_>,
     enabled: bool,
     ctx: &mut NavButtonContext<'_>,
 ) {
@@ -701,20 +859,15 @@ fn paint_nav_button(
     } else {
         (ctx.palette.btn_bg_disabled, ctx.palette.btn_text_disabled)
     };
-    paint_toolbar_button(scene, x, label, bg, text_color, false, ctx);
+    paint_toolbar_button(scene, x, content, bg, text_color, false, ctx);
 }
 
 /// Paints one `BTN_W × BTN_H` toolbar button at `x` with an explicit
 /// background and glyph color.
-///
-/// `active` adds the accent underline that marks a toggle as engaged.
-/// Signalling the state that way rather than by inverting the fill keeps the
-/// glyph's contrast identical in both states, in every palette — an inverted
-/// button would have to be contrast-checked against three of them.
 fn paint_toolbar_button(
     scene: &mut Scene,
     x: f32,
-    label: &str,
+    content: ButtonContent<'_>,
     bg: Color,
     text_color: Color,
     active: bool,
@@ -743,10 +896,23 @@ fn paint_toolbar_button(
             &underline,
         );
     }
-    let layout = build_chrome_text_layout(label, ctx.font_cx, ctx.layout_cx);
-    let text_x = x + (BTN_W - layout.width()) / 2.0;
-    let text_y = BTN_Y + (BTN_H - layout.height()) / 2.0;
-    draw_text_layout(scene, &layout, text_x, text_y, text_color, ctx.transform);
+    
+    match content {
+        ButtonContent::Text(label) => {
+            let layout = build_chrome_text_layout(label, ctx.font_cx, ctx.layout_cx);
+            let text_x = x + (BTN_W - layout.width()) / 2.0;
+            let text_y = BTN_Y + (BTN_H - layout.height()) / 2.0;
+            draw_text_layout(scene, &layout, text_x, text_y, text_color, ctx.transform);
+        }
+        ButtonContent::Icon(path) => {
+            let icon_size = 14.0;
+            let scale = icon_size / 256.0;
+            let icon_x = x + (BTN_W - icon_size) / 2.0;
+            let icon_y = BTN_Y + (BTN_H - icon_size) / 2.0;
+            let icon_transform = ctx.transform * Affine::translate((icon_x as f64, icon_y as f64)) * Affine::scale(scale as f64);
+            scene.fill(Fill::NonZero, icon_transform, text_color, None, path);
+        }
+    }
 }
 
 // ── Main paint function ───────────────────────────────────────────────────────
@@ -839,6 +1005,7 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     let layout = ChromeLayout {
         window_width: ctx.window_width,
         tab_count: ctx.tabs.len(),
+        dropdown_count: if ctx.state.focused { ctx.state.suggestions.len() } else { 0 },
     };
     for (i, rect) in tab_rects(&layout) {
         let Some(entry) = ctx.tabs.get(i) else {
@@ -893,7 +1060,7 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     paint_toolbar_button(
         scene,
         HISTORY_X,
-        "≡",
+        ButtonContent::Icon(get_icon_history()),
         if ctx.history_sidebar_open {
             ctx.palette.tab_active_bg
         } else {
@@ -913,7 +1080,7 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     paint_nav_button(
         scene,
         BACK_X,
-        "←",
+        ButtonContent::Icon(get_icon_back()),
         ctx.can_go_back,
         &mut NavButtonContext {
             palette: ctx.palette,
@@ -924,31 +1091,26 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     );
 
     // ── Reload button ─────────────────────────────────────────────────────────
-    let reload_rect = RoundedRect::new(
-        RELOAD_X as f64,
-        BTN_Y as f64,
-        (RELOAD_X + BTN_W) as f64,
-        (BTN_Y + BTN_H) as f64,
-        3.0,
-    );
-    scene.fill(Fill::NonZero, transform, ctx.palette.btn_bg, None, &reload_rect);
-    let reload_layout = build_chrome_text_layout("↻", ctx.font_cx, ctx.layout_cx);
-    let btn2_text_x = RELOAD_X + (BTN_W - reload_layout.width()) / 2.0;
-    let btn2_text_y = BTN_Y + (BTN_H - reload_layout.height()) / 2.0;
-    draw_text_layout(
+    paint_toolbar_button(
         scene,
-        &reload_layout,
-        btn2_text_x,
-        btn2_text_y,
+        RELOAD_X,
+        ButtonContent::Icon(get_icon_reload()),
+        ctx.palette.btn_bg,
         ctx.palette.btn_text,
-        transform,
+        false,
+        &mut NavButtonContext {
+            palette: ctx.palette,
+            font_cx: ctx.font_cx,
+            layout_cx: ctx.layout_cx,
+            transform,
+        },
     );
 
     // ── Forward button (dimmed + inert when the forward stack is empty) ─────
     paint_nav_button(
         scene,
         FORWARD_X,
-        "→",
+        ButtonContent::Icon(get_icon_forward()),
         ctx.can_go_forward,
         &mut NavButtonContext {
             palette: ctx.palette,
@@ -1012,14 +1174,28 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     }
 
     // URL text
+    let mut url_layout_width = 0.0;
     if !ctx.state.url.is_empty() {
         let url_layout = build_chrome_text_layout(&ctx.state.url, ctx.font_cx, ctx.layout_cx);
+        url_layout_width = url_layout.width();
         draw_text_layout(
             scene,
             &url_layout,
             text_left,
             text_top,
             ctx.palette.url_text,
+            transform,
+        );
+    }
+
+    if let Some(inline) = &ctx.state.inline_completion {
+        let inline_layout = build_chrome_text_layout(inline, ctx.font_cx, ctx.layout_cx);
+        draw_text_layout(
+            scene,
+            &inline_layout,
+            text_left + url_layout_width,
+            text_top,
+            ctx.palette.url_text.with_alpha_factor(0.4),
             transform,
         );
     }
@@ -1038,6 +1214,56 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
     }
 
     scene.pop_layer(); // end URL bar clip
+
+    // ── Autocomplete Dropdown ─────────────────────────────────────────────────
+    if ctx.state.focused && !ctx.state.suggestions.is_empty() {
+        let item_h = 24.0;
+        let padding = 4.0;
+        let dropdown_h = (ctx.state.suggestions.len() as f64) * item_h + padding * 2.0;
+        let dropdown_rect = RoundedRect::new(
+            URL_BAR_X as f64,
+            (URL_BAR_Y + URL_BAR_H) as f64,
+            url_bar_right as f64,
+            (URL_BAR_Y + URL_BAR_H) as f64 + dropdown_h,
+            4.0,
+        );
+        
+        scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &dropdown_rect);
+        scene.stroke(&Stroke::new(1.0), transform, ctx.palette.url_border_idle, None, &dropdown_rect);
+        
+        for (i, suggestion) in ctx.state.suggestions.iter().enumerate() {
+            let item_y = (URL_BAR_Y + URL_BAR_H) as f64 + padding + (i as f64) * item_h;
+            let item_rect = Rect::new(
+                URL_BAR_X as f64,
+                item_y,
+                url_bar_right as f64,
+                item_y + item_h,
+            );
+            
+            if Some(i) == ctx.state.selected_suggestion {
+                scene.fill(Fill::NonZero, transform, ctx.palette.select, None, &item_rect);
+            } else if Some(i) == ctx.state.hovered_suggestion {
+                scene.fill(Fill::NonZero, transform, ctx.palette.btn_bg, None, &item_rect);
+            }
+            
+            let title_str = if suggestion.title.is_empty() {
+                suggestion.url.clone()
+            } else {
+                format!("{} - {}", suggestion.title, suggestion.url)
+            };
+            
+            let elided = elide_to_width(&title_str, (url_bar_right - URL_BAR_X - 16.0) as f32, ctx.font_cx, ctx.layout_cx);
+            let elided_layout = build_chrome_text_layout(&elided, ctx.font_cx, ctx.layout_cx);
+            draw_text_layout(
+                scene,
+                &elided_layout,
+                URL_BAR_X + 8.0,
+                (item_y as f32) + (item_h as f32 - elided_layout.height()) / 2.0,
+                ctx.palette.url_text,
+                transform,
+            );
+        }
+    }
 
     // ── Status indicator ──────────────────────────────────────────────────────
     let indicator_cx = ctx.window_width - STATUS_W / 2.0;
@@ -1204,6 +1430,7 @@ mod tests {
         ChromeLayout {
             window_width: 800.0,
             tab_count,
+            dropdown_count: 0,
         }
     }
 

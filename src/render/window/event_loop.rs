@@ -75,6 +75,9 @@ struct MouseState {
     last_logical_x: f32,
     last_logical_y: f32,
     dragging_url_bar: bool,
+    last_click_time: Option<std::time::Instant>,
+    last_click_pos: Option<(f32, f32)>,
+    click_count: u8,
 }
 
 /// Connects the rendering manager to the Winit event loop.
@@ -189,7 +192,7 @@ pub fn run_window_loop(
         .attributes
         .get("title")
         .cloned()
-        .unwrap_or_else(|| "Mizu Application".to_string());
+        .unwrap_or_else(|| "Mizu Navigator".to_string());
 
     let window = Arc::new(
         WindowBuilder::new()
@@ -402,6 +405,50 @@ fn dispatch_cursor_moved(
         }
     }
 
+    // ── Autocomplete Dropdown Hover ───────────────────────────
+    let tab_count = manager.tabs.len();
+    let dropdown_count = {
+        let tab = manager.active();
+        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+    };
+    
+    let mut dropdown_hovered = false;
+    if dropdown_count > 0 {
+        let layout = crate::render::chrome_vello::ChromeLayout {
+            window_width: window.inner_size().width as f32 / scale_factor as f32,
+            tab_count,
+            dropdown_count,
+        };
+        let hit_zone = crate::render::chrome_vello::chrome_hit_zone(
+            mouse.last_logical_x,
+            mouse.last_logical_y,
+            &layout,
+        );
+        
+        let tab = manager.active_mut();
+        if let crate::render::chrome_vello::ChromeHitZone::AutocompleteSuggestion(i) = hit_zone {
+            if tab.chrome_state.hovered_suggestion != Some(i) {
+                tab.chrome_state.hovered_suggestion = Some(i);
+                window.request_redraw();
+            }
+            dropdown_hovered = true;
+            window.set_cursor_icon(winit::window::CursorIcon::Pointer);
+        } else if tab.chrome_state.hovered_suggestion.is_some() {
+            tab.chrome_state.hovered_suggestion = None;
+            window.request_redraw();
+        }
+    } else {
+        let tab = manager.active_mut();
+        if tab.chrome_state.hovered_suggestion.is_some() {
+            tab.chrome_state.hovered_suggestion = None;
+            window.request_redraw();
+        }
+    }
+    
+    if dropdown_hovered {
+        return;
+    }
+
     let (tab, mut ctx) = manager.split_active();
 
     // URL bar drag-selection
@@ -471,9 +518,14 @@ fn dispatch_chrome_click(
     mouse: &mut MouseState,
     logical_width: f32,
 ) {
+    let dropdown_count = {
+        let tab = manager.active();
+        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+    };
     let layout = crate::render::chrome_vello::ChromeLayout {
         window_width: logical_width,
         tab_count: manager.tabs.len(),
+        dropdown_count,
     };
     let zone = chrome_hit_zone(mouse.last_logical_x, mouse.last_logical_y, &layout);
     // The strip arms mutate the tab *list*, so they run before the split
@@ -531,6 +583,12 @@ fn dispatch_chrome_click(
                 let fc = &mut ctx.font_cx;
                 let lc = &mut ctx.layout_cx;
                 cs.set_cursor_from_click(mouse.last_logical_x, bar_left, fc, lc);
+                
+                if mouse.click_count == 2 {
+                    cs.select_word_at_cursor();
+                } else if mouse.click_count >= 3 {
+                    cs.select_all();
+                }
             }
             if let Some(prev) = tab.focused_node.take() {
                 // Re-render the blurred input (placeholder returns).
@@ -541,6 +599,29 @@ fn dispatch_chrome_click(
             manager.history_sidebar.toggle();
             window.request_redraw();
             return;
+        }
+        ChromeHitZone::AutocompleteSuggestion(i) => {
+            let target_url = if let Some(record) = tab.chrome_state.suggestions.get(i) {
+                record.url.clone()
+            } else {
+                tab.chrome_state.url.trim().to_string()
+            };
+            
+            let mut url = target_url;
+            if !url.is_empty() && !url.contains("://") {
+                url = format!("mizu://{url}");
+            }
+            
+            tab.chrome_state.url = url.clone();
+            tab.chrome_state.cursor = tab.chrome_state.url.len();
+            tab.chrome_state.selection = None;
+            tab.chrome_state.focused = false;
+            tab.chrome_state.suggestions.clear();
+            tab.chrome_state.selected_suggestion = None;
+            tab.chrome_state.inline_completion = None;
+            
+            tab.chrome_state.loading = true;
+            navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
         ChromeHitZone::TabItem(_)
         | ChromeHitZone::TabCloseButton(_)
@@ -710,11 +791,39 @@ fn dispatch_mouse_pressed(
     elwt: &winit::event_loop::EventLoopWindowTarget<MizuUserEvent>,
     mouse: &mut MouseState,
 ) {
-    let (_tab, _ctx) = manager.split_active();
     let scale = window.scale_factor() as f32;
     let logical_width = window.inner_size().width as f32 / scale;
 
-    if mouse.last_logical_y < CHROME_HEIGHT {
+    let now = std::time::Instant::now();
+    let dx = mouse.last_logical_x - mouse.last_click_pos.map(|(x, _)| x).unwrap_or(-1000.0);
+    let dy = mouse.last_logical_y - mouse.last_click_pos.map(|(_, y)| y).unwrap_or(-1000.0);
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    if let Some(last_time) = mouse.last_click_time {
+        if now.duration_since(last_time) < std::time::Duration::from_millis(500) && dist < 5.0 {
+            mouse.click_count += 1;
+        } else {
+            mouse.click_count = 1;
+        }
+    } else {
+        mouse.click_count = 1;
+    }
+    mouse.last_click_time = Some(now);
+    mouse.last_click_pos = Some((mouse.last_logical_x, mouse.last_logical_y));
+
+    let dropdown_count = {
+        let tab = manager.active();
+        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+    };
+    let dropdown_h = if dropdown_count > 0 { dropdown_count as f32 * 24.0 + 8.0 } else { 0.0 };
+    let url_bar_right = (logical_width - crate::render::chrome_vello::STATUS_W).max(crate::render::chrome_vello::URL_BAR_X + 10.0);
+    let in_dropdown = dropdown_count > 0 &&
+                      mouse.last_logical_y >= CHROME_HEIGHT &&
+                      mouse.last_logical_y < CHROME_HEIGHT + dropdown_h &&
+                      mouse.last_logical_x >= crate::render::chrome_vello::URL_BAR_X &&
+                      mouse.last_logical_x < url_bar_right;
+
+    if mouse.last_logical_y < CHROME_HEIGHT || in_dropdown {
         dispatch_chrome_click(manager, window, elwt, mouse, logical_width);
         return;
     }
@@ -815,7 +924,7 @@ fn tab_strip_entries(manager: &MizuWindowManager) -> Vec<crate::render::chrome_v
 
 /// URL a freshly opened tab starts on. Not a network target — the blank
 /// document is built locally by `open_tab`.
-const BLANK_TAB_URL: &str = "mizu://localhost/blank.mizu";
+const BLANK_TAB_URL: &str = "about:blank";
 
 /// Sets the OS window title from the active tab's document title.
 ///
@@ -830,7 +939,7 @@ fn retitle_window(manager: &MizuWindowManager, window: &Window) {
         .attributes
         .get("title")
         .cloned()
-        .unwrap_or_else(|| "Mizu Application".to_string());
+        .unwrap_or_else(|| "Mizu Navigator".to_string());
     window.set_title(&title);
 }
 
@@ -950,28 +1059,39 @@ fn handle_chrome_key(
     window: &Window,
     key_event: &winit::event::KeyEvent,
 ) -> bool {
-    let (tab, mut ctx) = manager.split_active();
-    if !tab.chrome_state.focused {
-        return false;
+    {
+        let tab = manager.active();
+        if !tab.chrome_state.focused {
+            return false;
+        }
     }
+    
+    let url_before = manager.active().chrome_state.url.clone();
+
     let action = {
+        let (tab, ctx) = manager.split_active();
         let cs = &mut tab.chrome_state;
         cs.handle_key(&key_event.logical_key, key_event.text.as_deref(), ctx.modifiers)
     };
+
     match action {
         ChromeKeyAction::Navigate(url) => {
+            let (tab, mut ctx) = manager.split_active();
             tab.chrome_state.loading = true;
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
         ChromeKeyAction::Reload => {
+            let (tab, mut ctx) = manager.split_active();
             let url = tab.chrome_state.url.clone();
             tab.chrome_state.loading = true;
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
         ChromeKeyAction::Back => {
+            let (tab, mut ctx) = manager.split_active();
             navigate_back(tab, &mut ctx);
         }
         ChromeKeyAction::Copy => {
+            let tab = manager.active();
             if let Some(text) = tab.chrome_state.copy_text()
                 && let Ok(mut cb) = arboard::Clipboard::new()
             {
@@ -979,6 +1099,7 @@ fn handle_chrome_key(
             }
         }
         ChromeKeyAction::Cut => {
+            let tab = manager.active_mut();
             if let Some(text) = tab.chrome_state.cut_text()
                 && let Ok(mut cb) = arboard::Clipboard::new()
             {
@@ -986,6 +1107,7 @@ fn handle_chrome_key(
             }
         }
         ChromeKeyAction::Paste => {
+            let tab = manager.active_mut();
             if let Ok(mut cb) = arboard::Clipboard::new()
                 && let Ok(text) = cb.get_text()
             {
@@ -994,6 +1116,38 @@ fn handle_chrome_key(
         }
         ChromeKeyAction::Handled | ChromeKeyAction::Ignored => {}
     }
+
+    let url_after = manager.active().chrome_state.url.clone();
+    if url_before != url_after {
+        let suggestions = manager.history_log.autocomplete(&url_after, 6);
+        let tab = manager.active_mut();
+        let cs = &mut tab.chrome_state;
+        cs.suggestions = suggestions;
+        cs.selected_suggestion = None;
+        
+        if let Some(first) = cs.suggestions.first() {
+            let url_lower = first.url.to_lowercase();
+            let query_lower = url_after.to_lowercase();
+            
+            let without_scheme = url_lower.strip_prefix("mizu://")
+                .or_else(|| url_lower.strip_prefix("file://"))
+                .or_else(|| url_lower.strip_prefix("https://"))
+                .or_else(|| url_lower.strip_prefix("http://"))
+                .unwrap_or(&url_lower);
+            
+            if url_lower.starts_with(&query_lower) {
+                cs.inline_completion = Some(first.url[url_after.len()..].to_string());
+            } else if without_scheme.starts_with(&query_lower) {
+                let scheme_len = first.url.len() - without_scheme.len();
+                cs.inline_completion = Some(first.url[scheme_len + url_after.len()..].to_string());
+            } else {
+                cs.inline_completion = None;
+            }
+        } else {
+            cs.inline_completion = None;
+        }
+    }
+
     window.request_redraw();
     true
 }

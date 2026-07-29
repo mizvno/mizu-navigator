@@ -304,6 +304,50 @@ impl HistoryLog {
         groups
     }
 
+    /// Returns up to `limit` unique history records matching `query`,
+    /// prioritizing prefix matches of the URL over substring matches.
+    pub fn autocomplete(&self, query: &str, limit: usize) -> Vec<VisitRecord> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        
+        let mut results = Vec::new();
+        let mut seen_urls = std::collections::HashSet::new();
+
+        for record in &self.records {
+            if seen_urls.contains(&record.url) {
+                continue;
+            }
+            let url_lower = record.url.to_lowercase();
+            let title_lower = record.title.to_lowercase();
+            
+            let without_scheme = url_lower.strip_prefix("mizu://")
+                .or_else(|| url_lower.strip_prefix("file://"))
+                .or_else(|| url_lower.strip_prefix("https://"))
+                .or_else(|| url_lower.strip_prefix("http://"))
+                .unwrap_or(&url_lower);
+                            
+            let is_prefix = url_lower.starts_with(&query_lower) || without_scheme.starts_with(&query_lower);
+            
+            if is_prefix || url_lower.contains(&query_lower) || title_lower.contains(&query_lower) {
+                results.push((is_prefix, record.clone()));
+                seen_urls.insert(record.url.clone());
+            }
+        }
+        
+        // Stable sort to keep newest-first order, but prioritize prefix matches.
+        results.sort_by(|a, b| {
+            match (a.0, b.0) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+        
+        results.into_iter().take(limit).map(|(_, r)| r).collect()
+    }
+
     // ── Encrypted persistence ─────────────────────────────────────────────────
     //
     // On-disk format:  `nonce (12 B) || ciphertext || GCM-tag (16 B)`

@@ -493,10 +493,8 @@ pub(super) fn navigate_to_url(
         tab.pending_scroll_restore = None;
     }
 
-    // Reloading or navigating to the blank start page is a no-op: there is
-    // nothing to fetch, and `about:` is not a routable scheme.
     if url == "about:blank" {
-        tab.chrome_state.loading = false;
+        handle_navigate_success(tab, ctx, url, "layout\n  doc\n".to_string());
         return;
     }
 
@@ -564,7 +562,7 @@ pub(super) fn navigate_to_url(
                 NavigationInitiator::HistoryStep | NavigationInitiator::RedirectOf(_)
             ) {
                 tab.history.record_navigation(HistoryEntry {
-                    url: tab.chrome_state.url.clone(),
+                    url: tab.chrome_state.committed_url.clone(),
                     scroll_y: tab.root_scroll_offset_y,
                 });
             }
@@ -579,6 +577,7 @@ pub(super) fn navigate_to_url(
             // left untouched — only what becomes `chrome_state.url` is
             // sanitized.
             tab.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
+            tab.chrome_state.committed_url = target.clone();
             tab.capability_policy = CapabilityPolicy::new(&target);
 
             if target.starts_with("file://") {
