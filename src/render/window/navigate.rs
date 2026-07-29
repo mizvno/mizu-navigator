@@ -9,7 +9,7 @@ use crate::render::navigation::{NavigationInitiator, NavigationVerdict, check_na
 use crate::render::security::CapabilityPolicy;
 
 use super::AssetSlot;
-use super::history::HistoryEntry;
+use super::history::{HistoryEntry, VisitRecord};
 use super::manager::{
     MAX_REDIRECTS, ReloadedDocument, TabState, WindowCtx, reload_tab_document, resize_tab_viewport,
 };
@@ -247,6 +247,23 @@ pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_
                         tracing::error!(error = ?e, "document reload error");
                     } else {
                         tracing::debug!("document reloaded");
+                        // The sidebar log records *arrivals*, not departures:
+                        // recording the page being left would leave whatever
+                        // is currently on screen missing from the history
+                        // until the user navigated away from it. Here the new
+                        // document is already installed, so its `doc` title —
+                        // the same source `retitle_window` and the tab strip
+                        // read — is available to store alongside the URL.
+                        let title = tab
+                            .dom
+                            .root()
+                            .value()
+                            .attributes
+                            .get("title")
+                            .cloned()
+                            .unwrap_or_default();
+                        ctx.history_log
+                            .push(VisitRecord::new(tab.chrome_state.url.clone(), title));
                         // ux-4: restore scroll position after a history
                         // (Back/Forward) step. `reload_document` always
                         // resets `root_scroll_offset_y` to 0.0 first, so this

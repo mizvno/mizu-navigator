@@ -20,7 +20,7 @@ use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
 use crate::render::responsive::{RenderEnvironment, ViewportSize};
 use crate::render::security::get_raw_domain;
 use super::AssetSlot;
-use super::history::HistoryStack;
+use super::history::{HistoryLog, HistorySidebarState, HistoryStack};
 use crate::render::preferences::UserPreferences;
 use crate::render::security::CapabilityPolicy;
 
@@ -298,6 +298,12 @@ pub struct MizuWindowManager {
     /// Detected OS appearance/accessibility preferences (ux-5). A user-level
     /// setting shared by every tab.
     pub preferences: UserPreferences,
+    /// Window-level persistent history log: receives a push on every fresh
+    /// top-level navigation (not on Back/Forward steps). Loaded from disk on
+    /// startup and saved on exit. Data source for the history sidebar panel.
+    pub history_log: HistoryLog,
+    /// UI state for the history sidebar panel (visibility, scroll, hover).
+    pub history_sidebar: HistorySidebarState,
 }
 
 /// A freshly parsed document to replace the currently loaded one, passed to
@@ -378,6 +384,9 @@ pub(super) struct WindowCtx<'a> {
     pub modifiers: winit::keyboard::ModifiersState,
     /// Engine start time, for animation phase. `Copy`.
     pub start_time: std::time::Instant,
+    /// Mutable reference to the window-level persistent history log, so
+    /// navigation helpers can push entries without needing a second split.
+    pub history_log: &'a mut HistoryLog,
 }
 
 impl MizuWindowManager {
@@ -406,6 +415,7 @@ impl MizuWindowManager {
             window_logical_size,
             modifiers,
             start_time,
+            history_log,
             ..
         } = self;
         // Direct index, matching `active()`/`active_mut()`: the
@@ -429,6 +439,7 @@ impl MizuWindowManager {
                 window_logical_size: *window_logical_size,
                 modifiers: *modifiers,
                 start_time: *start_time,
+                history_log,
             },
         )
     }
@@ -456,6 +467,7 @@ impl MizuWindowManager {
             window_logical_size,
             modifiers,
             start_time,
+            history_log,
             ..
         } = self;
         let active_tab_id = tabs[*active_tab].id;
@@ -475,6 +487,7 @@ impl MizuWindowManager {
                 window_logical_size: *window_logical_size,
                 modifiers: *modifiers,
                 start_time: *start_time,
+                history_log,
             },
         ))
     }
@@ -794,6 +807,8 @@ impl MizuWindowManager {
             last_layout_time: std::time::Instant::now(),
             pending_resize: None,
             preferences,
+            history_log: HistoryLog::load_from_disk(),
+            history_sidebar: HistorySidebarState::default(),
         };
 
         manager.active().trigger_logic_reload(&manager.logic_tx);
@@ -842,6 +857,8 @@ impl MizuWindowManager {
             last_layout_time: std::time::Instant::now(),
             pending_resize: None,
             preferences: UserPreferences::default(),
+            history_log: HistoryLog::default(),
+            history_sidebar: HistorySidebarState::default(),
         };
         (
             manager,

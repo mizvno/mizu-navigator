@@ -20,7 +20,7 @@
 
 mod event_loop;
 mod focus;
-mod history;
+pub(crate) mod history;
 mod input;
 mod manager;
 mod navigate;

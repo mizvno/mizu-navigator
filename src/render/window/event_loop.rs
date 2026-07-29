@@ -317,6 +317,12 @@ pub fn run_window_loop(
             dispatch_about_to_wait(&mut manager, &window, elwt);
         } else if let Event::UserEvent(MizuUserEvent::Accesskit(ak_event)) = event {
             dispatch_accesskit_event(&mut manager, &mut a11y_adapter, ak_event);
+        } else if let Event::LoopExiting = event {
+            // The single exit path: every `elwt.exit()` in this file — the
+            // close button, Ctrl+W on the last tab, Escape, a fatal layout
+            // error — ends up here, so history is persisted no matter which
+            // one the user took.
+            manager.history_log.save_to_disk();
         }
     });
 
@@ -360,18 +366,43 @@ fn dispatch_resized(
 }
 
 /// Handles `WindowEvent::CursorMoved`: updates the tracked mouse position,
-/// continues an in-progress URL-bar drag-selection, updates the picker hover
-/// highlight, and sets the button/default cursor icon over DOM content.
+/// continues an in-progress URL-bar drag-selection, updates the history
+/// sidebar and picker hover highlights, and sets the button/default cursor
+/// icon over DOM content.
 fn dispatch_cursor_moved(
     manager: &mut MizuWindowManager,
     window: &Window,
     position: winit::dpi::PhysicalPosition<f64>,
     mouse: &mut MouseState,
 ) {
-    let (tab, mut ctx) = manager.split_active();
     let scale_factor = window.scale_factor();
     mouse.last_logical_x = position.x as f32 / scale_factor as f32;
     mouse.last_logical_y = position.y as f32 / scale_factor as f32;
+
+    // ── History sidebar hover ─────────────────────────────────
+    // Before the split borrow, because the panel is window-level. Runs even
+    // when the cursor has left the panel, so the highlight follows it out.
+    if manager.history_sidebar.open {
+        let hovered = crate::render::history_sidebar::hovered_entry(
+            mouse.last_logical_x,
+            mouse.last_logical_y,
+            &manager.history_log,
+            manager.history_sidebar.scroll_offset,
+            CHROME_HEIGHT,
+        );
+        if manager.history_sidebar.hovered != hovered {
+            manager.history_sidebar.hovered = hovered;
+            window.request_redraw();
+        }
+        if hovered.is_some() {
+            // A row is a link: say so, and skip the DOM hit test entirely —
+            // the page under the panel is not what the cursor is over.
+            window.set_cursor_icon(winit::window::CursorIcon::Pointer);
+            return;
+        }
+    }
+
+    let (tab, mut ctx) = manager.split_active();
 
     // URL bar drag-selection
     if mouse.dragging_url_bar && tab.chrome_state.focused {
@@ -505,6 +536,11 @@ fn dispatch_chrome_click(
                 // Re-render the blurred input (placeholder returns).
                 tab.mark_text_dirty(prev);
             }
+        }
+        ChromeHitZone::HistoryButton => {
+            manager.history_sidebar.toggle();
+            window.request_redraw();
+            return;
         }
         ChromeHitZone::TabItem(_)
         | ChromeHitZone::TabCloseButton(_)
@@ -666,8 +702,8 @@ fn dispatch_dom_click(manager: &mut MizuWindowManager, window: &Window, mouse: &
 }
 
 /// Handles `WindowEvent::MouseInput` (left button pressed): routes to
-/// exactly one of the chrome bar, the inspector panel, the element picker,
-/// or DOM content, in that priority order.
+/// exactly one of the chrome bar, the history sidebar, the inspector panel,
+/// the element picker, or DOM content, in that priority order.
 fn dispatch_mouse_pressed(
     manager: &mut MizuWindowManager,
     window: &Window,
@@ -675,10 +711,16 @@ fn dispatch_mouse_pressed(
     mouse: &mut MouseState,
 ) {
     let (_tab, _ctx) = manager.split_active();
-    let logical_width = window.inner_size().width as f32 / window.scale_factor() as f32;
+    let scale = window.scale_factor() as f32;
+    let logical_width = window.inner_size().width as f32 / scale;
 
     if mouse.last_logical_y < CHROME_HEIGHT {
         dispatch_chrome_click(manager, window, elwt, mouse, logical_width);
+        return;
+    }
+    // The sidebar overlays the page, so it must claim clicks over its own
+    // column before the inspector or the DOM see them.
+    if manager.history_sidebar.open && dispatch_history_sidebar_click(manager, window, mouse) {
         return;
     }
     if dispatch_inspector_panel_click(manager, window, mouse, logical_width) {
@@ -688,6 +730,51 @@ fn dispatch_mouse_pressed(
         return;
     }
     dispatch_dom_click(manager, window, mouse);
+}
+
+/// Handles a left-click inside the history sidebar panel.
+///
+/// Returns `true` when the click landed on the panel — including on inert
+/// parts of it, so a click on the panel background can never fall through to
+/// the page it is covering.
+fn dispatch_history_sidebar_click(
+    manager: &mut MizuWindowManager,
+    window: &Window,
+    mouse: &MouseState,
+) -> bool {
+    use crate::render::history_sidebar::{HistorySidebarHit, history_sidebar_hit};
+    let hit = history_sidebar_hit(
+        mouse.last_logical_x,
+        mouse.last_logical_y,
+        &manager.history_log,
+        manager.history_sidebar.scroll_offset,
+        CHROME_HEIGHT,
+    );
+    match hit {
+        HistorySidebarHit::None => return false,
+        HistorySidebarHit::Background => {}
+        HistorySidebarHit::Clear => {
+            manager.history_log.clear();
+            // Persisted immediately rather than at exit: "clear my
+            // history" must survive a crash, or it did not happen.
+            manager.history_log.save_to_disk();
+            manager.history_sidebar.hovered = None;
+        }
+        HistorySidebarHit::Entry(index) => {
+            // Copy the URL out before the split borrow: navigation needs
+            // `&mut` on the manager, which the log borrow would block.
+            let url = manager.history_log.get(index).map(|record| record.url.clone());
+            if let Some(url) = url {
+                // The panel stays open, so a mis-clicked entry costs one
+                // more click rather than a re-open — the sidebar is a list
+                // to browse, not a menu that dismisses itself.
+                let (tab, mut ctx) = manager.split_active();
+                navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
+            }
+        }
+    }
+    window.request_redraw();
+    true
 }
 
 /// Builds the strip's view of the open tabs.
@@ -764,6 +851,12 @@ fn handle_tab_shortcuts(
     }
     let shift = manager.modifiers.shift_key();
     match &key_event.logical_key {
+        Key::Character(c) if c.as_str().eq_ignore_ascii_case("h") => {
+            // Ctrl+H: toggle the history sidebar, as in Firefox and Edge.
+            manager.history_sidebar.toggle();
+            window.request_redraw();
+            return true;
+        }
         Key::Character(c) if c.as_str().eq_ignore_ascii_case("t") => {
             if let Some(id) = manager.open_tab(BLANK_TAB_URL) {
                 manager.switch_to_tab(id);
@@ -1042,10 +1135,17 @@ fn handle_escape_fallback(
     elwt: &winit::event_loop::EventLoopWindowTarget<MizuUserEvent>,
     key_event: &winit::event::KeyEvent,
 ) {
-    let (tab, mut ctx) = manager.split_active();
     if !matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
         return;
     }
+    // Dismissing an open overlay comes before anything else Escape does —
+    // and long before it reaches the branch that quits the browser.
+    if manager.history_sidebar.open {
+        manager.history_sidebar.close();
+        window.request_redraw();
+        return;
+    }
+    let (tab, mut ctx) = manager.split_active();
     if tab.inspector.picker {
         tab.inspector.set_picker(false);
         window.set_cursor_icon(winit::window::CursorIcon::Default);
@@ -1103,12 +1203,30 @@ fn dispatch_mouse_wheel(
     delta: MouseScrollDelta,
     mouse: &MouseState,
 ) {
-    let (tab, mut ctx) = manager.split_active();
     let scale = window.scale_factor() as f32;
     let delta_y = match delta {
         MouseScrollDelta::LineDelta(_dx, dy) => -dy * 20.0,
         MouseScrollDelta::PixelDelta(physical) => -(physical.y as f32) / scale,
     };
+
+    // ── Wheel over the history sidebar scrolls its content ────
+    if manager.history_sidebar.open
+        && crate::render::history_sidebar::contains_x(mouse.last_logical_x)
+        && mouse.last_logical_y >= CHROME_HEIGHT
+    {
+        let logical_height = window.inner_size().height as f32 / scale;
+        manager.history_sidebar.scroll_offset = crate::render::history_sidebar::scroll_by(
+            manager.history_sidebar.scroll_offset,
+            delta_y,
+            &manager.history_log,
+            logical_height,
+            CHROME_HEIGHT,
+        );
+        window.request_redraw();
+        return;
+    }
+
+    let (tab, mut ctx) = manager.split_active();
 
     // ── Wheel over the inspector panel scrolls its content ────
     if tab.inspector.open {
@@ -1222,6 +1340,11 @@ fn dispatch_redraw_requested(
     // Built before the split borrow: the strip is a view over *all* tabs,
     // while everything below paints exactly one.
     let strip = tab_strip_entries(manager);
+    // Snapshot window-level sidebar state before the split borrow so we can
+    // read these values during paint without conflicting with `ctx.history_log`.
+    let sidebar_open = manager.history_sidebar.open;
+    let sidebar_scroll = manager.history_sidebar.scroll_offset;
+    let sidebar_hovered = manager.history_sidebar.hovered;
     let (tab, mut ctx) = manager.split_active();
     let physical_size = window.inner_size();
     let scale = window.scale_factor();
@@ -1334,6 +1457,7 @@ fn dispatch_redraw_requested(
                 can_go_forward,
                 palette: &palette,
                 tabs: &strip,
+                history_sidebar_open: sidebar_open,
             },
         );
     }
@@ -1375,6 +1499,26 @@ fn dispatch_redraw_requested(
                 scale: scale as f32,
                 font_cx: ctx.font_cx,
                 layout_cx: ctx.layout_cx,
+            },
+        );
+    }
+
+    // ── Layer 4: History sidebar ─────────────────────────────
+    // Painted last so it overlays both the page and the inspector.
+    if sidebar_open {
+        let palette = ChromePalette::for_preferences(ctx.preferences);
+        crate::render::history_sidebar::paint_history_sidebar(
+            &mut scene,
+            &mut crate::render::history_sidebar::SidebarPaintContext {
+                log: ctx.history_log,
+                scroll_offset: sidebar_scroll,
+                hovered: sidebar_hovered,
+                palette: &palette,
+                font_cx: ctx.font_cx,
+                layout_cx: ctx.layout_cx,
+                transform: Affine::scale(scale),
+                window_height: height as f32 / scale as f32,
+                chrome_height: CHROME_HEIGHT,
             },
         );
     }
@@ -1920,6 +2064,8 @@ fn dispatch_about_to_wait(
     if state_changed || manager.active().typing_layout_dirty {
         recompute_dirty_layout(manager, window, mutated_symbols);
     }
+    // Throttled internally: a no-op on all but a handful of idle ticks.
+    manager.history_log.autosave();
     schedule_next_wakeup(manager, window, elwt);
 }
 

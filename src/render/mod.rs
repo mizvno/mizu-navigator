@@ -15,6 +15,8 @@ pub mod accessibility;
 pub mod chrome_vello;
 /// Spatial hit-testing for input events.
 pub mod hit_test;
+/// History sidebar panel (Ctrl+H): persistent browsing history grouped by day.
+pub mod history_sidebar;
 /// In-window developer inspector panel (F12).
 pub mod inspector;
 /// Image and animation decoders.

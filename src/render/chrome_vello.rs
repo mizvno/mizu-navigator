@@ -49,10 +49,13 @@ const TAB_TEXT_PAD: f32 = 6.0;
 const BTN_Y: f32 = TAB_STRIP_HEIGHT + 4.0;
 const BTN_H: f32 = 20.0;
 const BTN_W: f32 = 24.0;
-const BACK_X: f32 = 4.0;
-const RELOAD_X: f32 = 32.0;
-const FORWARD_X: f32 = 60.0;
-const URL_BAR_X: f32 = 88.0;
+/// The history-sidebar toggle leads the bar, on the same edge as the panel it
+/// opens — a left-docked panel with a right-edge switch reads as unrelated.
+const HISTORY_X: f32 = 4.0;
+const BACK_X: f32 = 32.0;
+const RELOAD_X: f32 = 60.0;
+const FORWARD_X: f32 = 88.0;
+const URL_BAR_X: f32 = 116.0;
 const URL_BAR_Y: f32 = TAB_STRIP_HEIGHT + 3.0;
 const URL_BAR_H: f32 = 22.0;
 /// Width reserved for the status indicator on the right.
@@ -99,6 +102,8 @@ pub enum ChromeHitZone {
     ForwardButton,
     /// The URL text input area.
     UrlBar,
+    /// The history-sidebar toggle button, leading the navigation bar.
+    HistoryButton,
     /// Any other part of the chrome bar (background).
     Background,
     /// The body of the tab at this index in the visible strip.
@@ -525,6 +530,9 @@ pub fn chrome_hit_zone(x: f32, y: f32, layout: &ChromeLayout) -> ChromeHitZone {
         }
         return ChromeHitZone::Background;
     }
+    if (HISTORY_X..HISTORY_X + BTN_W).contains(&x) && (BTN_Y..BTN_Y + BTN_H).contains(&y) {
+        return ChromeHitZone::HistoryButton;
+    }
     if (BACK_X..BACK_X + BTN_W).contains(&x) && (BTN_Y..BTN_Y + BTN_H).contains(&y) {
         return ChromeHitZone::BackButton;
     }
@@ -693,6 +701,25 @@ fn paint_nav_button(
     } else {
         (ctx.palette.btn_bg_disabled, ctx.palette.btn_text_disabled)
     };
+    paint_toolbar_button(scene, x, label, bg, text_color, false, ctx);
+}
+
+/// Paints one `BTN_W × BTN_H` toolbar button at `x` with an explicit
+/// background and glyph color.
+///
+/// `active` adds the accent underline that marks a toggle as engaged.
+/// Signalling the state that way rather than by inverting the fill keeps the
+/// glyph's contrast identical in both states, in every palette — an inverted
+/// button would have to be contrast-checked against three of them.
+fn paint_toolbar_button(
+    scene: &mut Scene,
+    x: f32,
+    label: &str,
+    bg: Color,
+    text_color: Color,
+    active: bool,
+    ctx: &mut NavButtonContext<'_>,
+) {
     let rect = RoundedRect::new(
         x as f64,
         BTN_Y as f64,
@@ -701,6 +728,21 @@ fn paint_nav_button(
         3.0,
     );
     scene.fill(Fill::NonZero, ctx.transform, bg, None, &rect);
+    if active {
+        let underline = Rect::new(
+            (x + 4.0) as f64,
+            (BTN_Y + BTN_H - 2.0) as f64,
+            (x + BTN_W - 4.0) as f64,
+            (BTN_Y + BTN_H) as f64,
+        );
+        scene.fill(
+            Fill::NonZero,
+            ctx.transform,
+            ctx.palette.url_border_focused,
+            None,
+            &underline,
+        );
+    }
     let layout = build_chrome_text_layout(label, ctx.font_cx, ctx.layout_cx);
     let text_x = x + (BTN_W - layout.width()) / 2.0;
     let text_y = BTN_Y + (BTN_H - layout.height()) / 2.0;
@@ -767,6 +809,9 @@ pub struct ChromePaintContext<'a> {
     /// A flat, borrow-free view rather than the tabs themselves, so painting
     /// stays independent of `TabState` and unit-testable.
     pub tabs: &'a [TabStripEntry],
+    /// Whether the history sidebar is currently open. When `true`, the
+    /// history button renders with an active/pressed background.
+    pub history_sidebar_open: bool,
 }
 
 /// What the strip needs to know about one tab.
@@ -842,6 +887,26 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
         (TAB_STRIP_HEIGHT - plus_layout.height()) / 2.0,
         ctx.palette.tab_text,
         transform,
+    );
+
+    // ── History sidebar toggle ────────────────────────────────────────────────
+    paint_toolbar_button(
+        scene,
+        HISTORY_X,
+        "≡",
+        if ctx.history_sidebar_open {
+            ctx.palette.tab_active_bg
+        } else {
+            ctx.palette.btn_bg
+        },
+        ctx.palette.btn_text,
+        ctx.history_sidebar_open,
+        &mut NavButtonContext {
+            palette: ctx.palette,
+            font_cx: ctx.font_cx,
+            layout_cx: ctx.layout_cx,
+            transform,
+        },
     );
 
     // ── Back button (dimmed + inert when the back stack is empty) ────────────
@@ -1187,29 +1252,47 @@ mod tests {
     }
 
     #[test]
+    fn chrome_hit_zone_history_button() {
+        assert_eq!(
+            bar_zone(HISTORY_X + 5.0, 10.0),
+            ChromeHitZone::HistoryButton,
+            "the sidebar toggle leads the bar, on the side the panel opens"
+        );
+    }
+
+    #[test]
     fn chrome_hit_zone_back_button() {
-        assert_eq!(bar_zone(5.0, 10.0), ChromeHitZone::BackButton);
+        assert_eq!(bar_zone(BACK_X + 5.0, 10.0), ChromeHitZone::BackButton);
     }
 
     #[test]
     fn chrome_hit_zone_reload_button() {
-        assert_eq!(
-            bar_zone(40.0, 10.0),
-            ChromeHitZone::ReloadButton
-        );
+        assert_eq!(bar_zone(RELOAD_X + 8.0, 10.0), ChromeHitZone::ReloadButton);
     }
 
     #[test]
     fn chrome_hit_zone_forward_button() {
-        assert_eq!(
-            bar_zone(65.0, 10.0),
-            ChromeHitZone::ForwardButton
-        );
+        assert_eq!(bar_zone(FORWARD_X + 5.0, 10.0), ChromeHitZone::ForwardButton);
     }
 
     #[test]
     fn chrome_hit_zone_url_bar() {
         assert_eq!(bar_zone(200.0, 10.0), ChromeHitZone::UrlBar);
+    }
+
+    #[test]
+    fn toolbar_buttons_do_not_overlap() {
+        // Each button owns BTN_W pixels, and every pair must leave a gap:
+        // that gap is what the "background between buttons" cases below hit.
+        let xs = [HISTORY_X, BACK_X, RELOAD_X, FORWARD_X, URL_BAR_X];
+        for pair in xs.windows(2) {
+            assert!(
+                pair[0] + BTN_W <= pair[1],
+                "the button at {} overruns the one at {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
@@ -1222,19 +1305,16 @@ mod tests {
 
     #[test]
     fn chrome_hit_zone_background_between_reload_and_forward() {
-        // x = 57 is between the Reload button end (56) and Forward button
-        // start (60).
         assert_eq!(
-            bar_zone(57.0, 10.0),
+            bar_zone(RELOAD_X + BTN_W + 1.0, 10.0),
             ChromeHitZone::Background
         );
     }
 
     #[test]
     fn chrome_hit_zone_background_between_forward_and_url_bar() {
-        // x = 85 is between the Forward button end (84) and URL bar start (88).
         assert_eq!(
-            bar_zone(85.0, 10.0),
+            bar_zone(FORWARD_X + BTN_W + 1.0, 10.0),
             ChromeHitZone::Background
         );
     }
