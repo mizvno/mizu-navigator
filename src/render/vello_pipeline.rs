@@ -647,18 +647,7 @@ pub fn paint_node(
             0.0
         };
 
-        let text_clip = Rect::new(
-            current_offset_x as f64,
-            current_offset_y as f64,
-            (current_offset_x + width) as f64,
-            (current_offset_y + height) as f64,
-        );
-        scene.push_layer(
-            BlendMode::new(Mix::Normal, vello::peniko::Compose::SrcOver),
-            1.0,
-            ctx.transform,
-            &text_clip,
-        );
+
 
         for line in layout.lines() {
             for item in line.items() {
@@ -692,7 +681,7 @@ pub fn paint_node(
             }
         }
 
-        scene.pop_layer();
+
     }
 
     // ── Paint input text and cursor ──────────────────────────────────────────
@@ -740,18 +729,7 @@ pub fn paint_node(
             0.0
         };
 
-        let text_clip = Rect::new(
-            current_offset_x as f64,
-            current_offset_y as f64,
-            (current_offset_x + width) as f64,
-            (current_offset_y + height) as f64,
-        );
-        scene.push_layer(
-            BlendMode::new(Mix::Normal, vello::peniko::Compose::SrcOver),
-            1.0,
-            ctx.transform,
-            &text_clip,
-        );
+
 
         for line in layout.lines() {
             for item in line.items() {
@@ -800,7 +778,7 @@ pub fn paint_node(
             );
             scene.fill(Fill::NonZero, ctx.transform, text_color, None, &cursor_rect);
         }
-        scene.pop_layer();
+
     }
 
     // ── Paint inline image ───────────────────────────────────────────────────
