@@ -77,8 +77,9 @@ pub(super) async fn serialize_payload(
     let bytes = match format {
         PayloadFormat::Json => {
             let json_val = crate::core::types::to_json(value)?;
-            serde_json::to_vec(&json_val)
-                .map_err(|e| MizuError::Network(format!("request payload serialisation failed: {e}")))
+            serde_json::to_vec(&json_val).map_err(|e| {
+                MizuError::Network(format!("request payload serialisation failed: {e}"))
+            })
         }
         PayloadFormat::Yaml => {
             let json_val = crate::core::types::to_json(value)?;
@@ -113,7 +114,9 @@ fn serialize_form(value: &Value) -> Result<Vec<u8>, MizuError> {
         ));
     };
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(fields.len());
-    for (key, field_value) in fields.iter() {
+    for field in fields.iter() {
+        let key = &field.key;
+        let field_value = &field.value;
         let encoded_value = match field_value {
             Value::Bool(_) | Value::Int(_) | Value::String(_) => field_value.to_string(),
             Value::Null => String::new(),
@@ -144,24 +147,27 @@ mod tests {
     use std::sync::Arc;
 
     fn record(fields: Vec<(&str, Value)>) -> Value {
-        let mut v: Vec<(Arc<str>, Value)> =
-            fields.into_iter().map(|(k, val)| (Arc::from(k), val)).collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        Value::Record(Arc::from(v))
+        Value::record_from_unsorted(fields)
     }
 
     #[tokio::test]
     async fn json_default_matches_manual_serialisation() {
         let value = Value::from("hello".to_string());
         let expected = serde_json::to_vec(&crate::core::types::to_json(&value).unwrap()).unwrap();
-        let got = serialize_payload(&value, PayloadFormat::Json).await.unwrap();
+        let got = serialize_payload(&value, PayloadFormat::Json)
+            .await
+            .unwrap();
         assert_eq!(got.bytes, expected);
         assert_eq!(got.content_type, "application/json");
     }
 
     #[tokio::test]
     async fn text_requires_string() {
-        assert!(serialize_payload(&Value::from("ok".to_string()), PayloadFormat::Text).await.is_ok());
+        assert!(
+            serialize_payload(&Value::from("ok".to_string()), PayloadFormat::Text)
+                .await
+                .is_ok()
+        );
         let err = serialize_payload(&Value::Int(100_000_000), PayloadFormat::Text)
             .await
             .unwrap_err();
@@ -175,7 +181,9 @@ mod tests {
             ("n", Value::Int(150_000_000)), // 1.5 scaled
             ("ok", Value::Bool(true)),
         ]);
-        let got = serialize_payload(&value, PayloadFormat::Form).await.unwrap();
+        let got = serialize_payload(&value, PayloadFormat::Form)
+            .await
+            .unwrap();
         let s = String::from_utf8(got.bytes).unwrap();
         assert!(s.contains("q=a+b%26c%3Dd") || s.contains("q=a%20b%26c%3Dd"));
         assert!(s.contains("n=1.5"));
@@ -183,7 +191,9 @@ mod tests {
         assert_eq!(got.content_type, "application/x-www-form-urlencoded");
 
         let nested = record(vec![("bad", Value::List(Arc::new(vec![Value::Int(1)])))]);
-        let err = serialize_payload(&nested, PayloadFormat::Form).await.unwrap_err();
+        let err = serialize_payload(&nested, PayloadFormat::Form)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
@@ -201,7 +211,9 @@ mod tests {
             ("name", Value::from("mizu".to_string())),
             ("count", Value::Int(300_000_000)),
         ]);
-        let got = serialize_payload(&value, PayloadFormat::Yaml).await.unwrap();
+        let got = serialize_payload(&value, PayloadFormat::Yaml)
+            .await
+            .unwrap();
         let text = String::from_utf8(got.bytes).unwrap();
         let parsed: serde_json::Value = serde_yaml_bw::from_str(&text).unwrap();
         let expected = crate::core::types::to_json(&value).unwrap();
@@ -212,7 +224,12 @@ mod tests {
     #[tokio::test]
     async fn multipart_content_type_carries_a_boundary() {
         let value = record(vec![("field", Value::from("x".to_string()))]);
-        let got = serialize_payload(&value, PayloadFormat::Multipart).await.unwrap();
-        assert!(got.content_type.starts_with("multipart/form-data; boundary="));
+        let got = serialize_payload(&value, PayloadFormat::Multipart)
+            .await
+            .unwrap();
+        assert!(
+            got.content_type
+                .starts_with("multipart/form-data; boundary=")
+        );
     }
 }

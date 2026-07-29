@@ -166,7 +166,9 @@ async fn read_file_bounded_into(
     total: &mut usize,
 ) -> Result<(), MizuError> {
     use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await.map_err(MizuError::IoError)?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(MizuError::IoError)?;
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut chunk).await.map_err(MizuError::IoError)?;
@@ -205,9 +207,15 @@ pub(super) async fn encode_multipart(value: &Value, boundary: &str) -> Result<Ve
     let mut body: Vec<u8> = Vec::new();
     let mut total = 0usize;
 
-    for (key, field_value) in fields.iter() {
+    for field in fields.iter() {
+        let key = &field.key;
+        let field_value = &field.value;
         let name = sanitize_disposition_token(key, "field name")?;
-        push_checked(&mut body, &mut total, format!("--{boundary}\r\n").as_bytes())?;
+        push_checked(
+            &mut body,
+            &mut total,
+            format!("--{boundary}\r\n").as_bytes(),
+        )?;
 
         match field_value {
             Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Null => {
@@ -262,7 +270,11 @@ pub(super) async fn encode_multipart(value: &Value, boundary: &str) -> Result<Ve
         }
     }
 
-    push_checked(&mut body, &mut total, format!("--{boundary}--\r\n").as_bytes())?;
+    push_checked(
+        &mut body,
+        &mut total,
+        format!("--{boundary}--\r\n").as_bytes(),
+    )?;
     Ok(body)
 }
 
@@ -273,10 +285,7 @@ mod tests {
     use std::sync::Arc;
 
     fn record(fields: Vec<(&str, Value)>) -> Value {
-        let mut v: Vec<(Arc<str>, Value)> =
-            fields.into_iter().map(|(k, val)| (Arc::from(k), val)).collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        Value::Record(Arc::from(v))
+        Value::record_from_unsorted(fields)
     }
 
     /// Returns the `TempDir` guard alongside the written file's path — the
@@ -310,7 +319,12 @@ mod tests {
             let file_name = field.file_name().map(str::to_string);
             let content_type = field.content_type().map(|m| m.essence_str().to_string());
             let bytes = field.bytes().await.unwrap().to_vec();
-            fields.push(ParsedField { name, file_name, content_type, bytes });
+            fields.push(ParsedField {
+                name,
+                file_name,
+                content_type,
+                bytes,
+            });
         }
         fields
     }
@@ -318,8 +332,14 @@ mod tests {
     #[test]
     fn mime_for_path_falls_back_to_octet_stream_for_unknown_extension() {
         assert_eq!(mime_for_path(std::path::Path::new("a.png")), "image/png");
-        assert_eq!(mime_for_path(std::path::Path::new("a.xyz-unknown")), MIME_FALLBACK);
-        assert_eq!(mime_for_path(std::path::Path::new("no_extension")), MIME_FALLBACK);
+        assert_eq!(
+            mime_for_path(std::path::Path::new("a.xyz-unknown")),
+            MIME_FALLBACK
+        );
+        assert_eq!(
+            mime_for_path(std::path::Path::new("no_extension")),
+            MIME_FALLBACK
+        );
         // Case-insensitivity.
         assert_eq!(mime_for_path(std::path::Path::new("A.PNG")), "image/png");
     }
@@ -328,8 +348,14 @@ mod tests {
     fn boundary_generation_is_not_predictable() {
         let a = generate_boundary().unwrap();
         let b = generate_boundary().unwrap();
-        assert_ne!(a, b, "two consecutive requests must use different boundaries");
-        assert!(a.len() > 16, "boundary must have real entropy, not a short/fixed token");
+        assert_ne!(
+            a, b,
+            "two consecutive requests must use different boundaries"
+        );
+        assert!(
+            a.len() > 16,
+            "boundary must have real entropy, not a short/fixed token"
+        );
     }
 
     #[tokio::test]
@@ -377,7 +403,10 @@ mod tests {
     async fn nested_list_and_record_fields_become_json_parts() {
         let value = record(vec![(
             "tags",
-            Value::List(Arc::new(vec![Value::from("a".to_string()), Value::from("b".to_string())])),
+            Value::List(Arc::new(vec![
+                Value::from("a".to_string()),
+                Value::from("b".to_string()),
+            ])),
         )]);
         let boundary = generate_boundary().unwrap();
         let body = encode_multipart(&value, &boundary).await.unwrap();
@@ -437,7 +466,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_record_payload_is_rejected() {
-        let err = encode_multipart(&Value::from("x".to_string()), "b").await.unwrap_err();
+        let err = encode_multipart(&Value::from("x".to_string()), "b")
+            .await
+            .unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 }

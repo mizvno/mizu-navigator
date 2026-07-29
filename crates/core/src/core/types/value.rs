@@ -37,6 +37,44 @@ pub struct FileHandleData {
 }
 
 /// The set of all primitive values in the Mizu type system.
+/// Pre-calculates a 32-bit key hash used to short-circuit field lookups.
+///
+/// FNV-1a, 32-bit. Deliberately *not* `FxHasher` (or any `DefaultHasher`):
+/// those mix at the native word size, so the same key hashes differently on a
+/// 32-bit and a 64-bit target. These hashes are baked into parsed field-access
+/// nodes, so a word-size-dependent hash would make the generated program
+/// representation architecture-dependent. Every operation here is `u32`
+/// wrapping arithmetic — no `usize` anywhere — so the result is identical on
+/// all targets.
+#[inline]
+pub fn hash_field(key: &str) -> u32 {
+    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    /// [`hash_field`] of `key`, precomputed so lookups compare a `u32` before
+    /// ever touching the string bytes.
+    pub hash: u32,
+    pub key: Arc<str>,
+    pub value: Value,
+}
+
+impl PartialEq for RecordField {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.key == other.key && self.value == other.value
+    }
+}
+
+
 #[derive(Debug, Clone)]
 pub enum Value {
     /// A null or empty value.
@@ -49,8 +87,17 @@ pub enum Value {
     String(Arc<str>),
     /// A reference-counted list of nested values.
     List(Arc<Vec<Value>>),
-    /// A reference-counted record of key-value pairs sorted by key.
-    Record(Arc<[(Arc<str>, Value)]>),
+    /// A reference-counted record of key-value pairs, kept in strict
+    /// lexicographic order of `key`.
+    ///
+    /// The ordering is load-bearing, not cosmetic: structural equality zips
+    /// the two field slices pairwise, and [`to_json`] / [`fmt::Display`] emit
+    /// fields in slice order. Sorting by anything else (a hash, say) makes
+    /// equality depend on construction order and makes serialized output
+    /// look pseudo-random. Build records through
+    /// [`Value::record_from_unsorted`] rather than assembling the slice by
+    /// hand, so the invariant is established in exactly one place.
+    Record(Arc<[RecordField]>),
     /// An opaque handle to a locally-selected file (from a `type "file"`
     /// input). See [`FileHandleData`] for why this never carries file bytes.
     FileHandle(Arc<FileHandleData>),
@@ -75,16 +122,46 @@ impl PartialEq for Value {
 }
 
 impl Value {
-    /// Safely retrieves the value associated with `field` if this value is a `Value::Record`.
-    /// Performs a binary search on the sorted key-value record slice.
-    pub fn get_field(&self, field: &str) -> Option<&Value> {
+    /// Builds a [`Value::Record`] from unordered key-value pairs, computing
+    /// each key's hash and establishing the lexicographic ordering the variant
+    /// requires.
+    ///
+    /// This is the only place records are ordered; every construction site
+    /// goes through it so the invariant cannot drift between them. Duplicate
+    /// keys are not deduplicated here — callers building from a map type
+    /// cannot produce them, and `get_field` would return the first match.
+    pub fn record_from_unsorted<I, K>(pairs: I) -> Value
+    where
+        I: IntoIterator<Item = (K, Value)>,
+        K: AsRef<str>,
+    {
+        let mut fields: Vec<RecordField> = pairs
+            .into_iter()
+            .map(|(key, value)| RecordField {
+                hash: hash_field(key.as_ref()),
+                key: Arc::from(key.as_ref()),
+                value,
+            })
+            .collect();
+        fields.sort_by(|a, b| a.key.cmp(&b.key));
+        Value::Record(Arc::from(fields))
+    }
+
+    /// Safely retrieves the value associated with `field_name` if this value
+    /// is a [`Value::Record`].
+    ///
+    /// A linear scan, not a binary search: the slice is ordered by key, not by
+    /// hash, and records in practice hold a handful of fields, so a scan over
+    /// a contiguous run of `u32`s beats the mispredicted branch chain of a
+    /// binary search. The `hash` compare is the filter and the `key` compare
+    /// is the decision, so a hash collision resolves correctly instead of
+    /// needing a fallback pass.
+    pub fn get_field(&self, field_hash: u32, field_name: &str) -> Option<&Value> {
         match self {
-            Value::Record(slice) => {
-                slice
-                    .binary_search_by_key(&field, |(k, _)| k.as_ref())
-                    .map(|idx| &slice[idx].1)
-                    .ok()
-            }
+            Value::Record(slice) => slice
+                .iter()
+                .find(|f| f.hash == field_hash && f.key.as_ref() == field_name)
+                .map(|f| &f.value),
             _ => None,
         }
     }
@@ -126,8 +203,8 @@ impl fmt::Display for Value {
             Value::Record(fields) => {
                 write!(f, "{{")?;
                 let mut iter = fields.iter().peekable();
-                while let Some((k, v)) = iter.next() {
-                    write!(f, "{k}: {v}")?;
+                while let Some(field) = iter.next() {
+                    write!(f, "{}: {}", field.key, field.value)?;
                     if iter.peek().is_some() {
                         write!(f, ", ")?;
                     }
@@ -139,7 +216,6 @@ impl fmt::Display for Value {
         }
     }
 }
-
 
 impl From<i64> for Value {
     #[inline]
@@ -247,9 +323,9 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
                     )
                 });
             }
-            let float_val = n
-                .as_f64()
-                .ok_or_else(|| MizuError::SecurityViolation("JSON number could not be parsed".to_string()))?;
+            let float_val = n.as_f64().ok_or_else(|| {
+                MizuError::SecurityViolation("JSON number could not be parsed".to_string())
+            })?;
             let scaled = (float_val * (DECIMAL_SCALE as f64)).round();
             if !scaled.is_finite() || scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
                 return Err(MizuError::SecurityViolation(
@@ -267,12 +343,11 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
             Ok(Value::List(Arc::new(items)))
         }
         serde_json::Value::Object(map) => {
-            let mut slice: Vec<(Arc<str>, Value)> = map
+            let pairs = map
                 .iter()
-                .map(|(k, v)| Ok((Arc::from(k.as_str()), from_json_bounded(v, depth + 1)?)))
-                .collect::<Result<Vec<(Arc<str>, Value)>, MizuError>>()?;
-            slice.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(Value::Record(Arc::from(slice)))
+                .map(|(k, v)| Ok((k.as_str(), from_json_bounded(v, depth + 1)?)))
+                .collect::<Result<Vec<(&str, Value)>, MizuError>>()?;
+            Ok(Value::record_from_unsorted(pairs))
         }
     }
 }
@@ -311,14 +386,16 @@ pub fn to_json(val: &Value) -> Result<serde_json::Value, MizuError> {
             // dividing through f64, which cannot exactly represent every
             // value in this type's range.
             if i % DECIMAL_SCALE == 0 {
-                Ok(serde_json::Value::Number(serde_json::Number::from(i / DECIMAL_SCALE)))
+                Ok(serde_json::Value::Number(serde_json::Number::from(
+                    i / DECIMAL_SCALE,
+                )))
             } else {
                 let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
                 Ok(serde_json::Number::from_f64(unscaled)
                     .map(serde_json::Value::Number)
                     .unwrap_or(serde_json::Value::Null))
             }
-        },
+        }
         Value::String(s) => Ok(serde_json::Value::String(s.to_string())),
         Value::List(items) => {
             let arr = items.iter().map(to_json).collect::<Result<Vec<_>, _>>()?;
@@ -327,7 +404,7 @@ pub fn to_json(val: &Value) -> Result<serde_json::Value, MizuError> {
         Value::Record(slice) => {
             let obj: serde_json::Map<String, serde_json::Value> = slice
                 .iter()
-                .map(|(k, v)| Ok((k.to_string(), to_json(v)?)))
+                .map(|f| Ok((f.key.to_string(), to_json(&f.value)?)))
                 .collect::<Result<_, MizuError>>()?;
             Ok(serde_json::Value::Object(obj))
         }

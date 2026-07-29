@@ -84,7 +84,7 @@ pub struct PaintContext<'a> {
     /// Global transformation applied to the scene (e.g. for high-DPI scaling).
     pub transform: Affine,
     /// The runtime variable store (mutable so `push_local`/`truncate_locals` can be
-    /// used in the hot conditional-class loop without cloning the whole StateMachine).
+    /// used in the hot conditional-class loop without cloning the whole Evaluator).
     pub store: &'a mut VariableStore,
     /// Vertical scroll offsets (logical pixels) for nodes with `overflow scroll`.
     ///
@@ -195,7 +195,7 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
 
     let empty_fns: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
     // Collect item_binding (name → sym, val) pairs ahead of the loop so that
-    // we can split-borrow `ctx.store.state_machine` (mut) from `ctx.store.interner`
+    // we can split-borrow `ctx.store.evaluator` (mut) from `ctx.store.interner`
     // (immutable) without the borrow checker seeing overlapping &mut / & on the
     // same struct through the ctx.item_bindings reference.
     let binding_pairs: Vec<(Symbol, Value)> = ctx
@@ -205,19 +205,22 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
         .collect();
 
     for cc in &mizu_node.conditional_classes {
-        let frame = ctx.store.state_machine.local_stack.len();
-        ctx.store.state_machine.instruction_count = 0;
+        let frame = ctx.store.evaluator.local_stack.len();
+        ctx.store.evaluator.instruction_count = 0;
 
         for (sym, val) in &binding_pairs {
-            ctx.store.state_machine.push_local(*sym, val.clone());
+            ctx.store.evaluator.push_local(*sym, val.clone());
         }
 
-        // Split-borrow: state_machine is mutably borrowed for evaluate();
+        // Split-borrow: evaluator is mutably borrowed for evaluate();
         // interner is immutably borrowed as a separate field of VariableStore.
         // Rust allows this because they are distinct struct fields.
         let resolved_class_name: Option<std::sync::Arc<str>> = match cc {
-            ConditionalClass::Toggle { class_name, condition } => {
-                let sm = &mut ctx.store.state_machine;
+            ConditionalClass::Toggle {
+                class_name,
+                condition,
+            } => {
+                let sm = &mut ctx.store.evaluator;
                 let interner = &ctx.store.interner;
                 let is_truthy = sm
                     .evaluate(condition.root(), 0, &empty_fns, interner, &condition.arena)
@@ -226,7 +229,7 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
                 is_truthy.then(|| std::sync::Arc::from(class_name.as_str()))
             }
             ConditionalClass::Ternary { expr } => {
-                let sm = &mut ctx.store.state_machine;
+                let sm = &mut ctx.store.evaluator;
                 let interner = &ctx.store.interner;
                 sm.evaluate(expr.root(), 0, &empty_fns, interner, &expr.arena)
                     .ok()
@@ -238,7 +241,7 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
         };
 
         // Rewind — O(injected_bindings) pops, zero heap allocation.
-        ctx.store.state_machine.truncate_locals(frame);
+        ctx.store.evaluator.truncate_locals(frame);
 
         if let Some(class_name) = resolved_class_name
             && let Some(rules) = ctx.style_rules.get(class_name.as_ref())
@@ -567,8 +570,8 @@ pub fn paint_node(
                 rect.x1 - FOCUS_RING_INSET,
                 rect.y1 - FOCUS_RING_INSET,
             );
-            let ring_shape =
-                ring_rect.to_rounded_rect((border_radius.unwrap_or(0.0) as f64 - FOCUS_RING_INSET).max(0.0));
+            let ring_shape = ring_rect
+                .to_rounded_rect((border_radius.unwrap_or(0.0) as f64 - FOCUS_RING_INSET).max(0.0));
             let stroke = Stroke::new(FOCUS_RING_WIDTH);
             let brush = vello::peniko::Brush::Solid(crate::render::FOCUS_RING_COLOR);
             scene.stroke(&stroke, ctx.transform, &brush, None, &ring_shape);
@@ -647,8 +650,6 @@ pub fn paint_node(
             0.0
         };
 
-
-
         for line in layout.lines() {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::GlyphRun(run) = item {
@@ -680,8 +681,6 @@ pub fn paint_node(
                 }
             }
         }
-
-
     }
 
     // ── Paint input text and cursor ──────────────────────────────────────────
@@ -728,8 +727,6 @@ pub fn paint_node(
         } else {
             0.0
         };
-
-
 
         for line in layout.lines() {
             for item in line.items() {
@@ -778,7 +775,6 @@ pub fn paint_node(
             );
             scene.fill(Fill::NonZero, ctx.transform, text_color, None, &cursor_rect);
         }
-
     }
 
     // ── Paint inline image ───────────────────────────────────────────────────
@@ -1246,7 +1242,8 @@ mod tests {
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
 
         let mut fetching_images = rustc_hash::FxHashMap::default();
-        let (network_tx, _network_rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (network_tx, _network_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let chrome_url = "mizu://localhost/index.mizu";
 
         let text_layouts = HashMap::new();
@@ -1315,10 +1312,7 @@ mod tests {
         // Build store: items = [Record{"name":"A"}, Record{"name":"B"}]
         let mut store = crate::core::types::VariableStore::new();
         let make_record = |name: &str| -> Value {
-            let mut m: Vec<(Arc<str>, Value)> =
-                Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
-            m.push((Arc::from("name"), Value::String(Arc::from(name))));
-            { m.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(m)) }
+            Value::record_from_unsorted(vec![("name", Value::String(Arc::from(name)))])
         };
         store.set(
             "lista",
@@ -1413,7 +1407,8 @@ mod tests {
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = rustc_hash::FxHashMap::default();
-        let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (network_tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
         let mut each_offset_y: HashMap<EgoNodeId, f32> = HashMap::new();
@@ -1580,7 +1575,10 @@ mod tests {
             .unwrap();
 
         // Check that there are exactly 3 groups for the Each node.
-        let groups = expansion.groups.get(&each_id).expect("Each must be expanded");
+        let groups = expansion
+            .groups
+            .get(&each_id)
+            .expect("Each must be expanded");
         assert_eq!(groups.len(), 3, "3 rows expected");
 
         // Collect (y, h) for every row container.
@@ -1736,7 +1734,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Verifies that `paint_node` evaluates conditional classes without cloning
-    /// the StateMachine's global_store — the local stack must be clean before
+    /// the Evaluator's global_store — the local stack must be clean before
     /// and after the evaluation.
     ///
     /// This is a regression guard: if the old `.clone()` code were reintroduced,
@@ -1746,16 +1744,19 @@ mod tests {
     /// which proves that `truncate_locals` properly rewound the frame.
     #[test]
     fn conditional_class_evaluation_leaves_local_stack_clean() {
+        use crate::core::types::{Value, VariableStore};
         use crate::parser::layout::ConditionalClass;
         use crate::parser::logic::{Expr, ExprArena, ExprTree};
-        use crate::core::types::{Value, VariableStore};
         use crate::parser::{MizuNode, Primitive};
 
         let mut store = VariableStore::new();
         // Intern a variable "active" and set it to true in the global store.
         let active_sym = store.interner.get_or_intern("active");
         let mut store = store.freeze();
-        store.state_machine.global_store.insert(active_sym, Value::Bool(true));
+        store
+            .evaluator
+            .global_store
+            .insert(active_sym, Value::Bool(true));
 
         let mut cond_arena = ExprArena::new();
         let cond_root = cond_arena.alloc(Expr::Variable(active_sym));
@@ -1767,7 +1768,10 @@ mod tests {
             conditional_classes: vec![ConditionalClass::Toggle {
                 class_name: "active-style".to_string(),
                 // condition: `active` (a Variable reference)
-                condition: ExprTree { arena: cond_arena, root: cond_root },
+                condition: ExprTree {
+                    arena: cond_arena,
+                    root: cond_root,
+                },
             }],
         });
 
@@ -1799,21 +1803,19 @@ mod tests {
 
         // Add the "active-style" class rule so it can be merged if condition is true.
         let mut style_rules: HashMap<String, StyleRules> = HashMap::new();
-        style_rules.insert(
-            "active-style".to_string(),
-            StyleRules::default(),
-        );
+        style_rules.insert("active-style".to_string(), StyleRules::default());
 
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx = parley::LayoutContext::new();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = rustc_hash::FxHashMap::default();
-        let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (network_tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
 
         // Record local stack depth before painting.
-        let stack_before = store.state_machine.local_stack.len();
+        let stack_before = store.evaluator.local_stack.len();
 
         let empty_each_groups = HashMap::new();
         let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
@@ -1857,7 +1859,7 @@ mod tests {
 
         // The local stack must be exactly as deep as it was before paint_node —
         // any leftover frames indicate `truncate_locals` was not called correctly.
-        let stack_after = ctx.store.state_machine.local_stack.len();
+        let stack_after = ctx.store.evaluator.local_stack.len();
         assert_eq!(
             stack_after, stack_before,
             "local stack must be clean after conditional-class evaluation: \
@@ -1871,9 +1873,9 @@ mod tests {
     /// the runtime-evaluated class name — not just parse without error.
     #[test]
     fn ternary_conditional_class_resolves_to_the_evaluated_branch_style() {
+        use crate::core::types::{StringInterner, Value, VariableStore};
         use crate::parser::layout::ConditionalClass;
         use crate::parser::logic::parse_expr_standalone;
-        use crate::core::types::{StringInterner, Value, VariableStore};
         use crate::parser::{MizuNode, Primitive};
 
         let mut interner = StringInterner::new();
@@ -1903,10 +1905,25 @@ mod tests {
             .unwrap();
 
         let mut style_rules: HashMap<String, StyleRules> = HashMap::new();
-        style_rules.insert("on".to_string(), StyleRules { z_index: 1, ..Default::default() });
-        style_rules.insert("off".to_string(), StyleRules { z_index: 2, ..Default::default() });
+        style_rules.insert(
+            "on".to_string(),
+            StyleRules {
+                z_index: 1,
+                ..Default::default()
+            },
+        );
+        style_rules.insert(
+            "off".to_string(),
+            StyleRules {
+                z_index: 2,
+                ..Default::default()
+            },
+        );
 
-        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
+        let mut store = crate::core::types::VariableStore {
+            evaluator: Default::default(),
+            interner,
+        };
         store.set("flag", Value::Bool(true));
         let mut store = store.freeze();
 
@@ -1915,7 +1932,8 @@ mod tests {
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = rustc_hash::FxHashMap::default();
-        let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (network_tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
         let empty_each_groups = HashMap::new();
         let empty_window_start: HashMap<EgoNodeId, usize> = HashMap::new();
@@ -1929,7 +1947,10 @@ mod tests {
             style_rules: &style_rules,
             style_variants: &[],
             render_env: crate::render::responsive::RenderEnvironment {
-                viewport: crate::render::responsive::ViewportSize { width: 800.0, height: 600.0 },
+                viewport: crate::render::responsive::ViewportSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
                 color_scheme: crate::render::preferences::ColorScheme::Dark,
             },
             font_cx: &mut font_cx,
@@ -1971,16 +1992,19 @@ mod tests {
     /// must be preserved by the push_local/truncate_locals approach.
     #[test]
     fn conditional_class_item_binding_shadows_global() {
+        use crate::core::types::{Value, VariableStore};
         use crate::parser::layout::ConditionalClass;
         use crate::parser::logic::{Expr, ExprArena, ExprTree};
-        use crate::core::types::{Value, VariableStore};
         use crate::parser::{MizuNode, Primitive};
 
         let mut store = VariableStore::new();
         // Global: "flag" = false
         let flag_sym = store.interner.get_or_intern("flag");
         let mut store = store.freeze();
-        store.state_machine.global_store.insert(flag_sym, Value::Bool(false));
+        store
+            .evaluator
+            .global_store
+            .insert(flag_sym, Value::Bool(false));
 
         // The conditional class condition: `flag`
         let mut cond_arena = ExprArena::new();
@@ -1992,7 +2016,10 @@ mod tests {
             iterator_context: None,
             conditional_classes: vec![ConditionalClass::Toggle {
                 class_name: "highlight".to_string(),
-                condition: ExprTree { arena: cond_arena, root: cond_root },
+                condition: ExprTree {
+                    arena: cond_arena,
+                    root: cond_root,
+                },
             }],
         };
         let tree = ego_tree::Tree::new(node);
@@ -2025,7 +2052,8 @@ mod tests {
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
         let mut fetching_images = rustc_hash::FxHashMap::default();
-        let (network_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
+        let (network_tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let text_layouts = HashMap::new();
 
         // item_bindings overrides "flag" → true (local shadow beats global false)
@@ -2076,7 +2104,7 @@ mod tests {
         paint_node(tree.root().id(), &mut ctx, &mut scene, (0.0, 0.0));
 
         // Global must not have been mutated — the old approach inserted into global_store.
-        let global_flag = ctx.store.state_machine.global_store.get(&flag_sym);
+        let global_flag = ctx.store.evaluator.global_store.get(&flag_sym);
         assert_eq!(
             global_flag,
             Some(&Value::Bool(false)),
@@ -2085,7 +2113,7 @@ mod tests {
 
         // Local stack must be empty (no leftover push_local frames).
         assert_eq!(
-            ctx.store.state_machine.local_stack.len(),
+            ctx.store.evaluator.local_stack.len(),
             0,
             "local stack must be empty after eval"
         );

@@ -7,7 +7,7 @@ use crate::core::types::{Symbol, Value, VariableStore};
 use crate::messages::RuntimeAction;
 use crate::messages::{StateUpdate, TabId, UiEvent, WorkerResponse};
 use crate::parser::logic::{
-    ComputedBinding, CompReverseIndex, build_comp_reverse_index, path_param_ok,
+    CompReverseIndex, ComputedBinding, build_comp_reverse_index, path_param_ok,
     recompute_computed_bindings,
 };
 use crate::parser::{Action, EndpointKind, MizuFunction, UrlEndpoint, UrlRegistry, execute_action};
@@ -81,12 +81,12 @@ impl LogicWorkerTabState {
     }
 }
 
-/// LogicWorker thread that wraps the StateMachine and handles evaluations.
+/// LogicWorker thread that wraps the Evaluator and handles evaluations.
 ///
 /// One thread serves every tab: opening a tab allocates a map entry, never a
 /// thread. The consequence is head-of-line blocking — a slow evaluation in a
 /// background tab delays the foreground tab's next event — which is bounded by
-/// the per-event instruction budget in [`crate::core::types::StateMachine`].
+/// the per-event instruction budget in [`crate::core::types::Evaluator`].
 pub struct LogicWorker {
     /// Per-document state, keyed by the tab that owns it.
     ///
@@ -210,7 +210,7 @@ impl LogicWorker {
                     for (k, v) in payload.initial_variables {
                         tab.store.set_runtime(&k, v);
                     }
-                    tab.store.state_machine.undo_log.clear();
+                    tab.store.evaluator.undo_log.clear();
 
                     // Load computed bindings and register their symbols as read-only.
                     tab.computed_vars = payload.computed_bindings;
@@ -219,14 +219,14 @@ impl LogicWorker {
                     tab.computed_reverse_index = build_comp_reverse_index(&tab.computed_vars);
                     let comp_syms: FxHashSet<Symbol> =
                         tab.computed_vars.iter().map(|cb| cb.name).collect();
-                    tab.store.state_machine.computed_var_syms = comp_syms;
+                    tab.store.evaluator.computed_var_syms = comp_syms;
 
                     // Initial evaluation of zero-parameter logic functions.
                     // instruction_count is reset per function so each gets its own budget.
                     for (&sym, func) in &tab.logic_fns {
                         if func.params.is_empty() {
-                            tab.store.state_machine.instruction_count = 0;
-                            if let Ok(val) = tab.store.state_machine.evaluate(
+                            tab.store.evaluator.instruction_count = 0;
+                            if let Ok(val) = tab.store.evaluator.evaluate(
                                 func.body.root(),
                                 0,
                                 &tab.logic_fns,
@@ -239,13 +239,8 @@ impl LogicWorker {
                     }
 
                     // Initial evaluation of comp vars: treat every global as mutated.
-                    let all_syms: FxHashSet<Symbol> = tab
-                        .store
-                        .state_machine
-                        .global_store
-                        .keys()
-                        .copied()
-                        .collect();
+                    let all_syms: FxHashSet<Symbol> =
+                        tab.store.evaluator.global_store.keys().copied().collect();
                     let computed = tab.computed_vars.clone();
                     recompute_computed_bindings(
                         &mut tab.store,
@@ -274,16 +269,16 @@ impl LogicWorker {
                     submitter_node_id,
                     fields,
                 } => {
-                    tab.store.state_machine.undo_log.clear();
+                    tab.store.evaluator.undo_log.clear();
                     // Populate the `$form` magic record first, so the submit
                     // action can read `$form.<field>` regardless of whether
                     // the individual field names are declared variables.
-                    let record: std::collections::BTreeMap<std::sync::Arc<str>, Value> = fields
-                        .iter()
-                        .map(|(k, v)| (std::sync::Arc::from(k.as_str()), v.clone()))
-                        .collect();
-                    tab.store
-                        .set_runtime("$form", { let mut vec_rec: Vec<_> = record.into_iter().collect(); vec_rec.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(std::sync::Arc::from(vec_rec)) });
+                    tab.store.set_runtime(
+                        "$form",
+                        Value::record_from_unsorted(
+                            fields.iter().map(|(k, v)| (k.as_str(), v.clone())),
+                        ),
+                    );
                     for (field_name, field_value) in fields {
                         // Use set_runtime (not set) so that form field names
                         // not declared in the logic block never create new
@@ -305,7 +300,7 @@ impl LogicWorker {
                 }
 
                 UiEvent::UpdateVariable { name, value } => {
-                    tab.store.state_machine.undo_log.clear();
+                    tab.store.evaluator.undo_log.clear();
                     // `name` is a resolved string, not a pre-validated Symbol
                     // (see the UiEvent::UpdateVariable doc comment): the
                     // sender's interner clone and this worker's are
@@ -322,7 +317,6 @@ impl LogicWorker {
             }
         }
     }
-
 }
 
 /// Collects this tab's mutations and resolved actions into one response and
@@ -336,116 +330,113 @@ fn send_response(
     tx: &Sender<(TabId, Result<WorkerResponse, MizuError>)>,
     tab_id: TabId,
 ) {
-        let mut mutated_variables = Vec::new();
-        let mut original_values = HashMap::new();
-        for &(sym, ref val) in &tab.store.state_machine.undo_log {
-            original_values.entry(sym).or_insert_with(|| val.clone());
+    let mut mutated_variables = Vec::new();
+    let mut original_values = HashMap::new();
+    for &(sym, ref val) in &tab.store.evaluator.undo_log {
+        original_values.entry(sym).or_insert_with(|| val.clone());
+    }
+    for (sym, old_val) in original_values {
+        let cur_val = tab.store.evaluator.get_global(sym);
+        if old_val != *cur_val {
+            mutated_variables.push((sym, cur_val.clone()));
         }
-        for (sym, old_val) in original_values {
-            let cur_val = tab.store.state_machine.get_global(sym);
-            if &old_val != cur_val {
-                mutated_variables.push((sym, cur_val.clone()));
-            }
-        }
-        tab.store.state_machine.undo_log.clear();
-        // Resolve NetworkCall â†’ ResolvedCall and DownloadAlias â†’ DownloadMedia.
-        let document_domain = &tab.document_domain;
-        let url_registry = &tab.url_registry;
-        let raw_actions = std::mem::take(&mut tab.store.state_machine.accumulated_actions);
-        let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
-        // Unresolved aliases surface a readable error in the call's bound
-        // variable instead of silently dropping the action â€” the user must
-        // see *why* nothing happened.
-        let mut alias_errors: Vec<(String, Value)> = Vec::new();
-        for action in raw_actions {
-            match action {
-                RuntimeAction::NetworkCall {
-                    method,
-                    endpoint_symbol,
-                    payload,
-                    path_param,
-                    target_variable,
-                    format,
-                    headers,
-                } => {
-                    let sym = crate::core::types::Symbol(endpoint_symbol);
-                    if let Some(ep) = url_registry.get(&sym) {
-                        match resolve_endpoint_url(document_domain, ep, path_param.as_deref()) {
-                            Ok(url) => {
-                                runtime_actions.push(RuntimeAction::ResolvedCall {
-                                    method: method.as_str().to_owned(),
-                                    url,
-                                    payload,
-                                    target_variable,
-                                    format,
-                                    headers,
-                                });
-                            }
-                            Err(e) => {
-                                let name = tab
-                                    .store
-                                    .interner
-                                    .resolve(target_variable)
-                                    .unwrap_or("<unknown>")
-                                    .to_owned();
-                                tracing::warn!(
-                                    target = %name,
-                                    error = %e,
-                                    "NetworkCall path_param failed validation; surfacing error"
-                                );
-                                alias_errors.push((
-                                    name,
-                                    Value::from(format!("error: {e}")),
-                                ));
-                                runtime_actions.push(RuntimeAction::None);
-                            }
+    }
+    tab.store.evaluator.undo_log.clear();
+    // Resolve NetworkCall â†’ ResolvedCall and DownloadAlias â†’ DownloadMedia.
+    let document_domain = &tab.document_domain;
+    let url_registry = &tab.url_registry;
+    let raw_actions = std::mem::take(&mut tab.store.evaluator.accumulated_actions);
+    let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
+    // Unresolved aliases surface a readable error in the call's bound
+    // variable instead of silently dropping the action â€” the user must
+    // see *why* nothing happened.
+    let mut alias_errors: Vec<(String, Value)> = Vec::new();
+    for action in raw_actions {
+        match action {
+            RuntimeAction::NetworkCall {
+                method,
+                endpoint_symbol,
+                payload,
+                path_param,
+                target_variable,
+                format,
+                headers,
+            } => {
+                let sym = crate::core::types::Symbol(endpoint_symbol);
+                if let Some(ep) = url_registry.get(&sym) {
+                    match resolve_endpoint_url(document_domain, ep, path_param.as_deref()) {
+                        Ok(url) => {
+                            runtime_actions.push(RuntimeAction::ResolvedCall {
+                                method: method.as_str().to_owned(),
+                                url,
+                                payload,
+                                target_variable,
+                                format,
+                                headers,
+                            });
                         }
-                    } else {
-                        let alias = tab
-                            .store
-                            .interner
-                            .resolve(sym)
-                            .unwrap_or("<unknown>")
-                            .to_owned();
-                        tracing::warn!(
-                            alias = %alias,
-                            target = %target_variable.0,
-                            "NetworkCall alias not found in the urls block; surfacing error"
-                        );
-                        alias_errors.push((
-                            target_variable.0.to_string(),
-                            Value::from(format!(
-                                "error: endpoint alias `{alias}` is not declared in the urls block"
-                            )),
-                        ));
-                        runtime_actions.push(RuntimeAction::None);
+                        Err(e) => {
+                            let name = tab
+                                .store
+                                .interner
+                                .resolve(target_variable)
+                                .unwrap_or("<unknown>")
+                                .to_owned();
+                            tracing::warn!(
+                                target = %name,
+                                error = %e,
+                                "NetworkCall path_param failed validation; surfacing error"
+                            );
+                            alias_errors.push((name, Value::from(format!("error: {e}"))));
+                            runtime_actions.push(RuntimeAction::None);
+                        }
                     }
+                } else {
+                    let alias = tab
+                        .store
+                        .interner
+                        .resolve(sym)
+                        .unwrap_or("<unknown>")
+                        .to_owned();
+                    tracing::warn!(
+                        alias = %alias,
+                        target = %target_variable.0,
+                        "NetworkCall alias not found in the urls block; surfacing error"
+                    );
+                    alias_errors.push((
+                        target_variable.0.to_string(),
+                        Value::from(format!(
+                            "error: endpoint alias `{alias}` is not declared in the urls block"
+                        )),
+                    ));
+                    runtime_actions.push(RuntimeAction::None);
                 }
-                RuntimeAction::DownloadAlias { endpoint_symbol } => {
-                    let sym = crate::core::types::Symbol(endpoint_symbol);
-                    if let Some(ep) = url_registry.get(&sym) {
-                        runtime_actions.push(RuntimeAction::DownloadMedia {
-                            url: ep.raw_target.clone(),
-                        });
-                    } else {
-                        tracing::warn!(
-                            endpoint_symbol,
-                            "DownloadAlias could not be resolved at runtime"
-                        );
-                        runtime_actions.push(RuntimeAction::None);
-                    }
+            }
+            RuntimeAction::DownloadAlias { endpoint_symbol } => {
+                let sym = crate::core::types::Symbol(endpoint_symbol);
+                if let Some(ep) = url_registry.get(&sym) {
+                    runtime_actions.push(RuntimeAction::DownloadMedia {
+                        url: ep.raw_target.clone(),
+                    });
+                } else {
+                    tracing::warn!(
+                        endpoint_symbol,
+                        "DownloadAlias could not be resolved at runtime"
+                    );
+                    runtime_actions.push(RuntimeAction::None);
                 }
-                other => runtime_actions.push(other),
             }
+            other => runtime_actions.push(other),
         }
-        for (name, val) in alias_errors {
-            // Only surface into declared variables: the frozen interner must
-            // not grow, and an undeclared target could never be displayed.
-            if let Some(sym) = tab.store.interner.get(&name) {
-                tab.store.set_runtime(&name, val.clone());
-                mutated_variables.push((sym, val));
-            }
+    }
+    for (name, val) in alias_errors {
+        // Only surface into declared variables: the frozen interner must
+        // not grow, and an undeclared target could never be displayed.
+        if let Some(sym) = tab.store.interner.get(&name) {
+            tab.store.set_runtime(&name, val.clone());
+            mutated_variables.push((sym, val.clone()));
         }
+    }
     if let Err(e) = tx.send((
         tab_id,
         Ok(WorkerResponse {
@@ -456,7 +447,6 @@ fn send_response(
         tracing::warn!(error = %e, "UI response channel closed; state update dropped");
     }
 }
-
 
 /// Composes the concrete URL for a resolved network call.
 ///
@@ -532,7 +522,7 @@ fn recompute_after_mutation(tab: &mut LogicWorkerTabState) {
     }
     let mutated: FxHashSet<Symbol> = tab
         .store
-        .state_machine
+        .evaluator
         .undo_log
         .iter()
         .map(|(sym, _)| *sym)
@@ -555,8 +545,8 @@ fn execute_and_respond(
     tab_id: TabId,
     action: &Action,
 ) {
-    tab.store.state_machine.undo_log.clear();
-    let initial_actions_len = tab.store.state_machine.accumulated_actions.len();
+    tab.store.evaluator.undo_log.clear();
+    let initial_actions_len = tab.store.evaluator.accumulated_actions.len();
 
     match execute_action(action, &mut tab.store, &tab.logic_fns) {
         Ok(_) => {
@@ -564,21 +554,20 @@ fn execute_and_respond(
             send_response(tab, tx, tab_id);
         }
         Err(e) => {
-            for (sym, old_val) in tab.store.state_machine.undo_log.drain(..).rev() {
-                tab.store.state_machine.global_store.insert(sym, old_val);
+            for (sym, old_val) in tab.store.evaluator.undo_log.drain(..).rev() {
+                tab.store.evaluator.global_store.insert(sym, old_val);
             }
             tab.store
-                .state_machine
+                .evaluator
                 .accumulated_actions
                 .truncate(initial_actions_len);
-            tab.store.state_machine.undo_log.clear();
+            tab.store.evaluator.undo_log.clear();
             if let Err(send_err) = tx.send((tab_id, Err(e))) {
                 tracing::warn!(error = %send_err, "UI response channel closed; action error dropped");
             }
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -599,7 +588,6 @@ mod tests {
             raw_target: url.to_owned(),
         }
     }
-
 
     /// Simulates `UiEvent::SubmitForm` with a mix of declared and undeclared
     /// field names.  After the fix, the interner must not grow for undeclared
@@ -687,7 +675,8 @@ mod tests {
 
     #[test]
     fn api_endpoint_nested_placeholder_substituted() {
-        let url = resolve_endpoint_url("api.local", &api("/v1/users/{uid}/posts/{pid}"), Some("7")).unwrap();
+        let url = resolve_endpoint_url("api.local", &api("/v1/users/{uid}/posts/{pid}"), Some("7"))
+            .unwrap();
         // Only the first placeholder is replaced.
         assert_eq!(url, "mizu://api.local/v1/users/7/posts/{pid}");
     }
@@ -698,7 +687,8 @@ mod tests {
             "ignored.com",
             &media("mizu://cdn.example.com/logo.png"),
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(url, "mizu://cdn.example.com/logo.png");
     }
 
@@ -708,37 +698,47 @@ mod tests {
             "ignored.com",
             &media("mizu://cdn.example.com/assets"),
             Some("icon.png"),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(url, "mizu://cdn.example.com/assets/icon.png");
     }
 
     #[test]
     fn path_param_with_reserved_chars_percent_encoded() {
-        let url = resolve_endpoint_url("api.local", &api("/v1/search/{query}"), Some("a b&c?d=1%")).unwrap();
+        let url = resolve_endpoint_url("api.local", &api("/v1/search/{query}"), Some("a b&c?d=1%"))
+            .unwrap();
         assert_eq!(url, "mizu://api.local/v1/search/a%20b%26c%3Fd%3D1%25");
     }
 
     #[test]
     fn path_param_plain_segment_unchanged() {
-        let url = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("foo-bar_123.~baz")).unwrap();
+        let url = resolve_endpoint_url(
+            "api.local",
+            &api("/v1/items/{id}"),
+            Some("foo-bar_123.~baz"),
+        )
+        .unwrap();
         assert_eq!(url, "mizu://api.local/v1/items/foo-bar_123.~baz");
     }
 
     #[test]
     fn path_param_with_slash_rejected() {
-        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a/b")).unwrap_err();
+        let err =
+            resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a/b")).unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
     #[test]
     fn path_param_with_traversal_rejected() {
-        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("..")).unwrap_err();
+        let err =
+            resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("..")).unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
     #[test]
     fn path_param_with_control_char_rejected() {
-        let err = resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a\nb")).unwrap_err();
+        let err =
+            resolve_endpoint_url("api.local", &api("/v1/items/{id}"), Some("a\nb")).unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
     }
 
@@ -804,8 +804,7 @@ mod tests {
         use std::sync::mpsc;
 
         let (tx_in, rx_in) = mpsc::channel::<(TabId, UiEvent)>();
-        let (tx_out, rx_out) =
-            mpsc::channel::<(TabId, Result<WorkerResponse, MizuError>)>();
+        let (tx_out, rx_out) = mpsc::channel::<(TabId, Result<WorkerResponse, MizuError>)>();
         let tab = TabId(0);
         let _handle = LogicWorker::spawn(rx_in, tx_out).expect("logic worker thread must spawn");
 
@@ -817,7 +816,11 @@ mod tests {
         for _ in 0..300 {
             let left = arena.alloc(expr);
             let right = arena.alloc(Expr::Literal(Value::Int(0)));
-            expr = Expr::BinaryOp { left, op: BinOp::Add, right };
+            expr = Expr::BinaryOp {
+                left,
+                op: BinOp::Add,
+                right,
+            };
         }
         let root = arena.alloc(expr);
 
@@ -828,17 +831,20 @@ mod tests {
         let interner = interner.freeze();
 
         tx_in
-            .send((tab, UiEvent::Reload(Box::new(ReloadPayload {
-                logic_fns: FxHashMap::default(),
-                click_actions,
-                submit_actions: HashMap::new(),
-                root_timer_actions: Vec::new(),
-                interner,
-                initial_variables: Vec::new(),
-                url_registry: FxHashMap::default(),
-                document_domain: String::new(),
-                computed_bindings: Vec::new(),
-            }))))
+            .send((
+                tab,
+                UiEvent::Reload(Box::new(ReloadPayload {
+                    logic_fns: FxHashMap::default(),
+                    click_actions,
+                    submit_actions: HashMap::new(),
+                    root_timer_actions: Vec::new(),
+                    interner,
+                    initial_variables: Vec::new(),
+                    url_registry: FxHashMap::default(),
+                    document_domain: String::new(),
+                    computed_bindings: Vec::new(),
+                })),
+            ))
             .expect("worker thread must be alive to receive Reload");
         rx_out
             .recv()
