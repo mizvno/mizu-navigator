@@ -58,6 +58,10 @@ http = "1"
 url = "2"
 redb = "2.1"
 lru = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-dpapi = "0.2.0"
+
 hkdf = "0.12"
 zeroize = "1"
 serde_yaml_bw = "2.5.6"

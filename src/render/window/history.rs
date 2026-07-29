@@ -486,7 +486,9 @@ fn decrypt_blob(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
 
 // ── Encryption key management ─────────────────────────────────────────────────
 
+#[cfg(not(target_os = "windows"))]
 const KEYRING_SERVICE: &str = "mizu-navigator";
+#[cfg(not(target_os = "windows"))]
 const KEYRING_HISTORY_KEY: &str = "history-encryption-key";
 
 /// Returns the AES-256-GCM history encryption key, loading it from the OS
@@ -499,6 +501,50 @@ const KEYRING_HISTORY_KEY: &str = "history-encryption-key";
 ///
 /// Returns `None` when the keyring is unavailable (e.g. headless CI or a
 /// locked session); the caller must treat this as "skip persistence".
+#[cfg(target_os = "windows")]
+fn get_or_create_history_key() -> Option<[u8; 32]> {
+    let path = data_dir().join("history_key.bin");
+    
+    // Try to load an existing key.
+    if let Ok(blob) = std::fs::read(&path) {
+        match windows_dpapi::decrypt_data(&blob, windows_dpapi::Scope::User, None) {
+            Ok(key) => {
+                if key.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&key);
+                    return Some(k);
+                }
+                tracing::warn!("history: DPAPI key was malformed; regenerating");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "history: DPAPI decryption failed; regenerating");
+            }
+        }
+    }
+
+    // Generate a fresh 256-bit key from the OS CSPRNG.
+    use rand_chacha::rand_core::{RngCore, SeedableRng};
+    let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
+    let mut key = [0u8; 32];
+    rng.fill_bytes(&mut key);
+
+    match windows_dpapi::encrypt_data(&key, windows_dpapi::Scope::User, None) {
+        Ok(blob) => {
+            if let Err(e) = std::fs::write(&path, blob) {
+                tracing::warn!(error = %e, "history: failed to write DPAPI key to disk; history will not persist this session");
+                return None;
+            }
+            tracing::debug!("history: new DPAPI encryption key generated and stored");
+            Some(key)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "history: DPAPI encryption failed; history will not persist this session");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn get_or_create_history_key() -> Option<[u8; 32]> {
     let entry = match keyring::Entry::new(KEYRING_SERVICE, KEYRING_HISTORY_KEY) {
         Ok(e) => e,
@@ -541,6 +587,7 @@ fn get_or_create_history_key() -> Option<[u8; 32]> {
 
 /// Encodes a 32-byte key as a 64-character lowercase hex string.
 /// Zero-dependency alternative to the `hex` crate.
+#[cfg(not(target_os = "windows"))]
 fn key_to_hex32(key: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
@@ -553,6 +600,7 @@ fn key_to_hex32(key: &[u8; 32]) -> String {
 
 /// Decodes a 64-character lowercase hex string into a 32-byte key.
 /// Returns `None` on length or character errors.
+#[cfg(not(target_os = "windows"))]
 fn hex_to_key32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -566,6 +614,7 @@ fn hex_to_key32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
