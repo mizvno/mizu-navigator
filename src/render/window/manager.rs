@@ -24,6 +24,30 @@ use super::history::HistoryStack;
 use crate::render::preferences::UserPreferences;
 use crate::render::security::CapabilityPolicy;
 
+/// Serialises worker spawning against anything observing the process-wide
+/// `SPAWN_COUNT` totals.
+///
+/// Those counters back the "opening a tab spawns no thread" guarantee, but
+/// they count the whole *process*, and `cargo test` runs tests as threads of
+/// one process: a test asserting "the totals did not move" races against any
+/// other test constructing a manager. Holding this gate for the length of an
+/// observation makes the totals stable for that window.
+///
+/// The lock lives inside [`MizuWindowManager::new`] rather than in each
+/// spawning test so that a future test cannot silently opt out of it by
+/// forgetting to take it. In production it is taken once per window, with no
+/// contention.
+pub(crate) static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Locks [`SPAWN_GATE`], ignoring poisoning.
+///
+/// The gate guards no data — a panicking holder leaves nothing inconsistent
+/// behind, so a poisoned lock is still perfectly usable and failing here
+/// would only turn one test failure into a cascade.
+pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Maximum number of consecutive server redirects honoured for a single
 /// user-initiated navigation before the chain is aborted.  Prevents a hostile
 /// or misconfigured server from trapping the client in an infinite redirect
@@ -676,16 +700,22 @@ impl MizuWindowManager {
         let (network_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (tx, network_rx) =
             tokio::sync::mpsc::channel(*crate::network::worker::MAX_UI_CHANNEL_CAPACITY);
-        crate::network::worker::spawn_network_thread(
-            rx,
-            tx,
-            #[cfg(feature = "insecure-dev")]
-            allow_insecure,
-        );
 
         let (logic_tx, logic_worker_rx) = std::sync::mpsc::channel();
         let (logic_worker_tx, logic_rx) = std::sync::mpsc::channel();
-        crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx)?;
+
+        // Both spawns under one gate: see `SPAWN_GATE`. Scoped tightly so the
+        // rest of construction — font loading, layout — stays parallel.
+        {
+            let _gate = lock_spawn_gate();
+            crate::network::worker::spawn_network_thread(
+                rx,
+                tx,
+                #[cfg(feature = "insecure-dev")]
+                allow_insecure,
+            );
+            crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx)?;
+        }
 
         let mut font_cx = parley::FontContext::new();
         font_cx.collection.load_system_fonts();

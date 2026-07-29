@@ -939,6 +939,10 @@
     #[test]
     fn opening_tabs_spawns_no_threads() {
         use std::sync::atomic::Ordering::SeqCst;
+        // The spawn counters are process-wide and the other tests in this
+        // file build real managers, so the totals only hold still while this
+        // gate is held — see `manager::SPAWN_GATE`.
+        let _gate = lock_spawn_gate();
         let base = crate::parser::logic_worker::SPAWN_COUNT.load(SeqCst)
             + crate::network::worker::SPAWN_COUNT.load(SeqCst);
         let (mut manager, _keepalive) = make_minimal_manager();
