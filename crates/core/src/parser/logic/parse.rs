@@ -27,7 +27,7 @@ use super::lexer::{Cursor, Token, assert_cursor_empty, leading_spaces, lex};
 /// An unmeasured starting value, overridable for a single run via
 /// `MIZU_MAX_PARSE_DEPTH` (see the module doc on [`crate::core::config`]).
 static MAX_PARSE_DEPTH: std::sync::LazyLock<u32> =
-    std::sync::LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_PARSE_DEPTH", 256));
+    std::sync::LazyLock::new(|| crate::core::config::CONFIG.max_parse_depth as u32);
 
 /// Operator keywords recognised in `filter`'s optional 4-argument form:
 /// `filter(list, field, op, value)`.
@@ -311,7 +311,7 @@ pub(super) fn parse_expr(
             }
             cursor.next(); // consume `.`
             let field = match cursor.next() {
-                Some(Token::Ident(name)) => Arc::from(*name),
+                Some(Token::Ident(name)) => interner.get_or_intern(name),
                 other => {
                     return Err(MizuError::ParseError(format!(
                         "expected field name after `.`, got: {other:?}"

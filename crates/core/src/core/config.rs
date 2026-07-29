@@ -75,6 +75,15 @@ pub struct MizuConfig {
     pub storage_batch_max_keys: usize,
     pub max_redirects: u32,
     pub mizu_port: u16,
+    
+    // Experimental budget overrides
+    #[serde(skip)] pub max_instructions: u64,
+    #[serde(skip)] pub max_comp_bindings: usize,
+    #[serde(skip)] pub max_synthetic_layout_nodes: usize,
+    #[serde(skip)] pub input_max_bytes: usize,
+    #[serde(skip)] pub max_parse_depth: usize,
+    #[serde(skip)] pub max_token_ttl_secs: u64,
+    #[serde(skip)] pub master_key: Option<String>,
 }
 
 impl Default for MizuConfig {
@@ -91,6 +100,13 @@ impl Default for MizuConfig {
             storage_batch_max_keys: 64,
             max_redirects: 10,
             mizu_port: 7399,
+            max_instructions: 10_000,
+            max_comp_bindings: 500,
+            max_synthetic_layout_nodes: 50_000,
+            input_max_bytes: 1024 * 1024,
+            max_parse_depth: 256,
+            max_token_ttl_secs: 3600,
+            master_key: None,
         }
     }
 }
@@ -130,15 +146,32 @@ fn load() -> MizuConfig {
         Ok(text) => text,
         Err(_) => return MizuConfig::default(),
     };
-    match toml::from_str(&text) {
-        Ok(cfg) => cfg,
+    match toml::from_str::<MizuConfig>(&text) {
+        Ok(mut cfg) => {
+            cfg.max_instructions = env_override("MIZU_MAX_INSTRUCTIONS", cfg.max_instructions);
+            cfg.max_comp_bindings = env_override("MIZU_MAX_COMP_BINDINGS", cfg.max_comp_bindings);
+            cfg.max_synthetic_layout_nodes = env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", cfg.max_synthetic_layout_nodes);
+            cfg.input_max_bytes = env_override("MIZU_INPUT_MAX_BYTES", cfg.input_max_bytes);
+            cfg.max_parse_depth = env_override("MIZU_MAX_PARSE_DEPTH", cfg.max_parse_depth);
+            cfg.max_token_ttl_secs = env_override("MIZU_MAX_TOKEN_TTL_SECS", cfg.max_token_ttl_secs);
+            cfg.master_key = std::env::var("MIZU_MASTER_KEY").ok();
+            cfg
+        },
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "failed to parse config.toml; using default settings"
             );
-            MizuConfig::default()
+            let mut cfg = MizuConfig::default();
+            cfg.max_instructions = env_override("MIZU_MAX_INSTRUCTIONS", cfg.max_instructions);
+            cfg.max_comp_bindings = env_override("MIZU_MAX_COMP_BINDINGS", cfg.max_comp_bindings);
+            cfg.max_synthetic_layout_nodes = env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", cfg.max_synthetic_layout_nodes);
+            cfg.input_max_bytes = env_override("MIZU_INPUT_MAX_BYTES", cfg.input_max_bytes);
+            cfg.max_parse_depth = env_override("MIZU_MAX_PARSE_DEPTH", cfg.max_parse_depth);
+            cfg.max_token_ttl_secs = env_override("MIZU_MAX_TOKEN_TTL_SECS", cfg.max_token_ttl_secs);
+            cfg.master_key = std::env::var("MIZU_MASTER_KEY").ok();
+            cfg
         }
     }
 }

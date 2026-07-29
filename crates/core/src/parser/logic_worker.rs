@@ -68,7 +68,7 @@ impl LogicWorkerTabState {
     /// An empty document: what a tab looks like before its first `Reload`.
     fn new() -> Self {
         Self {
-            store: VariableStore::new(),
+            store: VariableStore::default(),
             logic_fns: FxHashMap::default(),
             click_actions: HashMap::new(),
             submit_actions: HashMap::new(),
@@ -203,11 +203,7 @@ impl LogicWorker {
                     tab.url_registry = payload.url_registry;
                     tab.document_domain = payload.document_domain;
 
-                    tab.store = VariableStore::new();
-                    // `payload.interner` is a frozen clone of the UI-thread interner.
-                    // Clone now preserves `frozen = true`, so both threads share the
-                    // same immutable Symbol(u32) â†’ String mapping after this point.
-                    tab.store.interner = payload.interner;
+                    tab.store = VariableStore::with_interner(payload.interner);
                     // `initial_variables` are from the UI thread's global store; every
                     // name is guaranteed to be in the frozen interner already, so
                     // set_runtime (which uses get not get_or_intern) is safe.
@@ -445,9 +441,9 @@ fn send_response(
         for (name, val) in alias_errors {
             // Only surface into declared variables: the frozen interner must
             // not grow, and an undeclared target could never be displayed.
-            if tab.store.interner.get(&name).is_some() {
+            if let Some(sym) = tab.store.interner.get(&name) {
                 tab.store.set_runtime(&name, val.clone());
-                mutated_variables.push((tab.store.interner.get_or_intern(&name), val));
+                mutated_variables.push((sym, val));
             }
         }
     if let Err(e) = tx.send((
@@ -613,7 +609,7 @@ mod tests {
         let mut store = VariableStore::new();
         store.set("username", Value::from("alice"));
         store.set("email", Value::from("alice@mizu"));
-        store.interner.freeze();
+        let mut store = store.freeze();
 
         let frozen_size = store.interner.vec.len();
 
@@ -644,7 +640,7 @@ mod tests {
     fn update_variable_with_unknown_name_does_not_grow_interner() {
         let mut store = VariableStore::new();
         store.set("products", Value::Null);
-        store.interner.freeze();
+        let mut store = store.freeze();
 
         let frozen_size = store.interner.vec.len();
 
@@ -829,7 +825,7 @@ mod tests {
         click_actions.insert(0u32, Action::Eval(ExprTree { arena, root }));
 
         let mut interner = StringInterner::new();
-        interner.freeze();
+        let interner = interner.freeze();
 
         tx_in
             .send((tab, UiEvent::Reload(Box::new(ReloadPayload {

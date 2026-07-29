@@ -69,7 +69,7 @@ fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), mizu::core::errors
     let mut interner = StringInterner::new();
     let urls = parse_urls(&blocks.urls_block, &mut interner).unwrap_or_default();
     let functions = parse_logic(&blocks.logic_block, &mut interner).unwrap_or_default();
-    let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions)
+    let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions, mizu_core::core::config::CONFIG.max_comp_bindings)
         .unwrap_or_default();
     let timers = parse_root_timers(&blocks.logic_block, &mut interner).unwrap_or_default();
     let dom = parse_layout_with_urls(&blocks.layout_block, &mut interner, Some(&urls), true, &functions)
@@ -132,8 +132,9 @@ fn storage_rehydration_taint_end_to_end() {
         args_start,
         args_len,
     };
-    let mut machine = StateMachine::new();
+    let mut machine = StateMachine::new(mizu_core::core::config::CONFIG.max_instructions);
     let no_functions = Default::default();
+    let interner = interner.freeze();
     let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);
     assert!(
         result.is_err(),

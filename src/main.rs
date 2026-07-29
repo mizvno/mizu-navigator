@@ -122,7 +122,7 @@ fn run() -> Result<(), MizuError> {
     // Phase 4: Compile logic
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
     let computed_bindings =
-        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns)?;
+        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns, mizu::core::config::CONFIG.max_comp_bindings)?;
     let root_timers = parse_root_timers(&parsed.logic_block, &mut interner)?;
 
     // Phase 3: Parse styles (base rules + ux-6 breakpoint/scheme variants)

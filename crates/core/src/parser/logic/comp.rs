@@ -25,7 +25,7 @@ pub fn parse_computed(
     logic_content: &str,
     interner: &mut StringInterner,
 ) -> Result<Vec<ComputedBinding>, MizuError> {
-    parse_computed_with_functions(logic_content, interner, &FxHashMap::default())
+    parse_computed_with_functions(logic_content, interner, &FxHashMap::default(), 500)
 }
 
 /// Like [`parse_computed`], but additionally derives **transitive** data
@@ -46,6 +46,7 @@ pub fn parse_computed_with_functions(
     logic_content: &str,
     interner: &mut StringInterner,
     functions: &FxHashMap<Symbol, MizuFunction>,
+    max_comp_bindings: usize,
 ) -> Result<Vec<ComputedBinding>, MizuError> {
     let function_names: FxHashSet<Symbol> = functions.keys().copied().collect();
     let all_lines: Vec<&str> = logic_content.lines().collect();
@@ -121,13 +122,13 @@ pub fn parse_computed_with_functions(
     // arbitrarily many full-budget re-evaluations. Rejecting here, at parse
     // time, turns that into a clear load-time error instead of a runtime
     // DoS or an undiagnosable timeout.
-    if bindings.len() > *crate::core::types::MAX_COMP_BINDINGS {
+    if bindings.len() > max_comp_bindings {
         return Err(MizuError::ParseError(format!(
             "document declares {} `comp` bindings, exceeding the maximum of {} \
              (MAX_COMP_BINDINGS); split the logic across fewer computed variables \
              or reduce reliance on derived state",
             bindings.len(),
-            *crate::core::types::MAX_COMP_BINDINGS
+            max_comp_bindings
         )));
     }
 

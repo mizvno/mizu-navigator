@@ -215,20 +215,24 @@ fn infer(
             let base_ty = infer(&arena[*base], arena, env, functions, interner)?;
             match base_ty {
                 Some(ValueType::Record(fields)) => {
+                    let field_name = interner.resolve(*field).unwrap_or("");
                     for (name, ty) in fields.iter() {
-                        if name.as_ref() == field.as_ref() {
+                        if name.as_ref() == field_name {
                             return Ok(Some(ty.clone()));
                         }
                     }
                     Err(MizuError::StaticTypeError(format!(
                         "field `{}` not found in record type",
-                        field
+                        field_name
                     )))
                 }
-                Some(other) => Err(MizuError::StaticTypeError(format!(
-                    "cannot access field `{}` on type `{}`",
-                    field, other
-                ))),
+                Some(other) => {
+                    let field_name = interner.resolve(*field).unwrap_or("");
+                    Err(MizuError::StaticTypeError(format!(
+                        "cannot access field `{}` on type `{}`",
+                        field_name, other
+                    )))
+                }
                 None => Ok(None),
             }
         }

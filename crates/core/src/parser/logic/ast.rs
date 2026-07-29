@@ -407,7 +407,7 @@ pub enum Expr {
         /// The base expression, which must evaluate to a `Record`.
         base: ExprId,
         /// The field name to look up in the record.
-        field: Arc<str>,
+        field: Symbol,
     },
 }
 

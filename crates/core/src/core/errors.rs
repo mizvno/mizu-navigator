@@ -50,6 +50,10 @@ pub enum MizuError {
     #[error("parse error: {0}")]
     ParseError(String),
 
+    /// A hardware integer overflow during fixed-point arithmetic calculation.
+    #[error("integer overflow")]
+    IntegerOverflow,
+
     /// A semantic type mismatch detected during type-checking or evaluation.
     ///
     /// Both `expected` and `found` are type-name strings (e.g., `"num"`,

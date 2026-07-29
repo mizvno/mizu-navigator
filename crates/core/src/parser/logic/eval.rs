@@ -30,7 +30,7 @@ pub fn execute_action(
             let result = store
                 .state_machine
                 .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
-            store.set(target, result);
+            store.set_runtime(target, result);
             Ok(true)
         }
         Action::Eval(expr) => {
@@ -99,7 +99,12 @@ pub fn execute_action(
             } else {
                 None
             };
-            let target_variable = store.interner.get_or_intern(target_var);
+            let target_variable = store.interner.get(target_var).ok_or_else(|| {
+                MizuError::ExecutionError(format!(
+                    "Network target variable `{}` was not declared in the logic block",
+                    target_var
+                ))
+            })?;
             // Custom header values are runtime expressions (unlike their
             // names, fixed at parse time) — evaluate each here, same as the
             // payload.
@@ -155,18 +160,19 @@ pub(crate) fn apply_binop(
     lv: Value,
     rv: Value,
     instruction_count: &mut u64,
+    max_instructions: u64,
 ) -> Result<Value, MizuError> {
     match (op, lv, rv) {
         // Num operations — Int×Int uses checked arithmetic to catch overflow in release builds.
         (BinOp::Add, Value::Int(l), Value::Int(r)) => l
             .checked_add(r)
             .map(Value::Int)
-            .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
+            .ok_or(MizuError::IntegerOverflow),
 
         (BinOp::Sub, Value::Int(l), Value::Int(r)) => l
             .checked_sub(r)
             .map(Value::Int)
-            .ok_or_else(|| MizuError::ExecutionError("integer overflow".to_owned())),
+            .ok_or(MizuError::IntegerOverflow),
 
         // `l` and `r` are already scaled by DECIMAL_SCALE, so their raw
         // product is scaled by DECIMAL_SCALE^2 and must be divided down by
@@ -182,7 +188,7 @@ pub(crate) fn apply_binop(
             let scaled = product / (crate::core::types::DECIMAL_SCALE as i128);
             i64::try_from(scaled)
                 .map(Value::Int)
-                .map_err(|_| MizuError::ExecutionError("integer overflow".to_owned()))
+                .map_err(|_| MizuError::IntegerOverflow)
         }
 
         (BinOp::Div, Value::Int(l), Value::Int(r)) => {
@@ -196,7 +202,7 @@ pub(crate) fn apply_binop(
             let quotient = numerator / (r as i128);
             i64::try_from(quotient)
                 .map(Value::Int)
-                .map_err(|_| MizuError::ExecutionError("integer overflow".to_owned()))
+                .map_err(|_| MizuError::IntegerOverflow)
         },
 
         // String concatenation via `+`: charge the combined length before
@@ -207,7 +213,7 @@ pub(crate) fn apply_binop(
         (BinOp::Add, Value::String(l), Value::String(r)) => {
             let concat_cost = (l.len() as u64).saturating_add(r.len() as u64);
             *instruction_count = instruction_count.saturating_add(concat_cost);
-            if *instruction_count > *crate::core::types::MAX_INSTRUCTIONS {
+            if *instruction_count > max_instructions {
                 return Err(MizuError::Timeout);
             }
             let mut buf = String::with_capacity(l.len() + r.len());

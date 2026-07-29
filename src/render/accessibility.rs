@@ -305,7 +305,7 @@ mod tests {
     fn roles_and_names_match_the_fixture() {
         let (tree, node_id_to_u32, button_id, input_id, labeled_image_id, bare_image_id) =
             build_fixture();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
 
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
         let by_id: HashMap<AccessNodeId, &AccessNode> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
@@ -354,7 +354,7 @@ mod tests {
         for (i, n) in tree.nodes().enumerate() {
             node_id_to_u32.insert(n.id(), i as u32);
         }
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
         let by_id: HashMap<AccessNodeId, &AccessNode> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
 
@@ -380,7 +380,7 @@ mod tests {
         for (i, n) in tree.nodes().enumerate() {
             node_id_to_u32.insert(n.id(), i as u32);
         }
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
         let named = update
             .nodes
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn focus_in_tree_update_tracks_focused_node() {
         let (tree, node_id_to_u32, button_id, input_id, ..) = build_fixture();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
 
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, Some(input_id), &store);
         assert_eq!(update.focus, access_id(EPOCH, node_id_to_u32[&input_id]));
@@ -465,7 +465,7 @@ mod tests {
         // nodes as the old ones moved about, prunes a subtree it should not,
         // and then unwraps a `None` (tree.rs:350).
         let (tree, node_id_to_u32, ..) = build_fixture();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
 
         let first = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
         // Same DOM, same u32 numbering — only the generation differs, which
@@ -571,7 +571,7 @@ mod tests {
         // that depends on the consumer's internal bookkeeping order. With ids
         // reused between the two documents, 53 of the 169 pairs below panic;
         // with `access_id`'s generations making them disjoint, none do.
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
 
         for (generation, (before, after)) in SHAPES
             .iter()
@@ -600,7 +600,7 @@ mod tests {
         // root is pruned, and pruning a node the update also declared is
         // what turns into the panic.
         let (tree, node_id_to_u32, ..) = build_fixture();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
 
         let by_id: HashMap<AccessNodeId, &AccessNode> =

@@ -791,6 +791,7 @@
         );
 
         // Interpolating `{user.name}` should resolve from the overlay (Bob).
+        let store = store.freeze();
         let name_result = store
             .interpolate_with_overlay("{user.name}", &overlay)
             .expect("interpolation must not error");

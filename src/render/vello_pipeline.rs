@@ -1241,7 +1241,7 @@ mod tests {
         let mut font_cx = parley::FontContext::new();
         font_cx.collection.load_system_fonts();
         let mut layout_cx = parley::LayoutContext::new();
-        let mut store = VariableStore::new();
+        let mut store = VariableStore::new().freeze();
         let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
 
@@ -1324,6 +1324,7 @@ mod tests {
             "lista",
             Value::List(Arc::new(vec![make_record("A"), make_record("B")])),
         );
+        let mut store = store.freeze();
 
         // Build DOM: Window -> Each(item in lista) -> Text("{item.name}")
         let mut tree = Tree::new(MizuNode {
@@ -1485,6 +1486,7 @@ mod tests {
             "rows",
             Value::List(Arc::new(vec![Value::Null, Value::Null, Value::Null])),
         );
+        let mut store = store.freeze();
 
         // DOM: Window → Each → Box
         let mut tree = Tree::new(MizuNode {
@@ -1752,6 +1754,7 @@ mod tests {
         let mut store = VariableStore::new();
         // Intern a variable "active" and set it to true in the global store.
         let active_sym = store.interner.get_or_intern("active");
+        let mut store = store.freeze();
         store.state_machine.global_store.insert(active_sym, Value::Bool(true));
 
         let mut cond_arena = ExprArena::new();
@@ -1903,8 +1906,9 @@ mod tests {
         style_rules.insert("on".to_string(), StyleRules { z_index: 1, ..Default::default() });
         style_rules.insert("off".to_string(), StyleRules { z_index: 2, ..Default::default() });
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
         store.set("flag", Value::Bool(true));
+        let mut store = store.freeze();
 
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx = parley::LayoutContext::new();
@@ -1954,7 +1958,7 @@ mod tests {
             "flag=true must resolve the ternary to the \"on\" branch's style rules"
         );
 
-        ctx.store.set("flag", Value::Bool(false));
+        ctx.store.set_runtime("flag", Value::Bool(false));
         let resolved = evaluate_conditional_classes(tree.root().value(), &mut ctx);
         assert_eq!(
             resolved.z_index, 2,
@@ -1975,6 +1979,7 @@ mod tests {
         let mut store = VariableStore::new();
         // Global: "flag" = false
         let flag_sym = store.interner.get_or_intern("flag");
+        let mut store = store.freeze();
         store.state_machine.global_store.insert(flag_sym, Value::Bool(false));
 
         // The conditional class condition: `flag`

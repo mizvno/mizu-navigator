@@ -456,9 +456,10 @@
         let item_sym = store.interner.get_or_intern("item");
         let mut arena = ExprArena::new();
         let base = arena.alloc(Expr::Variable(item_sym));
+        let field_sym = store.interner.get_or_intern("name");
         let expr = Expr::FieldAccess {
             base,
-            field: Arc::from("name"),
+            field: field_sym,
         };
 
         let funcs: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
@@ -482,9 +483,10 @@
         let item_sym = store.interner.get_or_intern("item");
         let mut arena = ExprArena::new();
         let base = arena.alloc(Expr::Variable(item_sym));
+        let field_sym = store.interner.get_or_intern("missing");
         let expr = Expr::FieldAccess {
             base,
-            field: Arc::from("missing"),
+            field: field_sym,
         };
 
         let funcs: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
@@ -507,9 +509,10 @@
         let item_sym = store.interner.get_or_intern("item");
         let mut arena = ExprArena::new();
         let base = arena.alloc(Expr::Variable(item_sym));
+        let field_sym = store.interner.get_or_intern("field");
         let expr = Expr::FieldAccess {
             base,
-            field: Arc::from("field"),
+            field: field_sym,
         };
 
         let funcs: FxHashMap<Symbol, MizuFunction> = FxHashMap::default();
@@ -1914,12 +1917,11 @@
         let sym_a = interner.get_or_intern("alpha");
         let sym_b = interner.get_or_intern("beta");
 
-        interner.freeze();
+        let interner = interner.freeze();
 
         // Existing symbols must still resolve to the same ID post-freeze.
-        assert_eq!(interner.get_or_intern("alpha"), sym_a);
-        assert_eq!(interner.get_or_intern("beta"), sym_b);
         assert_eq!(interner.get("alpha"), Some(sym_a));
+        assert_eq!(interner.get("beta"), Some(sym_b));
         assert_eq!(interner.resolve(sym_a), Some("alpha"));
     }
 

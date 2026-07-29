@@ -884,8 +884,9 @@ mod tests {
 
     fn setup_test_store(items: Vec<Value>) -> VariableStore {
         let interner = StringInterner::new();
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
         store.set("items", Value::List(Arc::new(items)));
+        let store = store.freeze();
         store
     }
 

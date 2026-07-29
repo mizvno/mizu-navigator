@@ -117,7 +117,7 @@ pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_
     tab.reset_redirect_count();
     tab
         .store
-        .set("window_url", crate::core::types::Value::from(url.clone()));
+        .set_runtime("window_url", crate::core::types::Value::from(url.clone()));
 
     let current_dir = std::env::current_dir().unwrap_or_default();
     match crate::parser::split_source_with_origin(
@@ -143,6 +143,7 @@ pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_
                     &blocks.logic_block,
                     &mut new_interner,
                     &logic_fns,
+                    500,
                 ) {
                     Ok(b) => b,
                     Err(e) => {

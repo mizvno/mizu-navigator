@@ -122,13 +122,37 @@ pub fn run_window_loop(
     // with the real parsed document state.
     {
         let tab = manager.active_mut();
-        tab.store = VariableStore::with_interner(interner);
+        let mut interner = interner;
+        interner.get_or_intern("$form");
+        for rt in &root_timers {
+            if let crate::parser::Action::Assign { target, .. } = &rt.action {
+                interner.get_or_intern(target);
+            }
+        }
+        for node in tab.dom.nodes() {
+            for event in node.value().events.values() {
+                match event {
+                    crate::parser::EventBlock::Click { action } | crate::parser::EventBlock::Submit { action } => {
+                        if let crate::parser::Action::Assign { target, .. } = action {
+                            interner.get_or_intern(target);
+                        }
+                    }
+                }
+            }
+            if let Some(text) = node.value().attributes.get("content") {
+                let vars = crate::render::text_engine::extract_placeholders(text);
+                for var in vars {
+                    interner.get_or_intern(&var);
+                }
+            }
+        }
+        tab.store = crate::core::types::VariableStore { state_machine: Default::default(), interner }.freeze();
         tab.url_registry = url_registry;
         tab.computed_bindings = computed_bindings;
         tab.root_timers = root_timers;
 
         // Inject the startup URL into the store
-        tab.store.set(
+        tab.store.set_runtime(
             "window_url",
             crate::core::types::Value::from(initial_url.clone()),
         );
@@ -146,7 +170,7 @@ pub fn run_window_loop(
                     0,
                 )
             {
-                tab.store.set_symbol(sym, val);
+                tab.store.state_machine.set_global(sym, val);
             }
         }
 
@@ -171,11 +195,7 @@ pub fn run_window_loop(
         tab.rebuild_dependency_index();
     }
     manager.active().trigger_logic_reload(&manager.logic_tx);
-    {
-        let tab = manager.active_mut();
-        tab.store.interner.freeze();
-        tab.setup_timers();
-    }
+    manager.active_mut().setup_timers();
 
     let root_node = manager.active().dom.root().value();
     if root_node.primitive != Primitive::Doc {
@@ -1711,7 +1731,7 @@ fn dispatch_redraw_requested(
     surface_texture.present();
 
     // Expose scroll state to the logic store
-    tab.store.set(
+    tab.store.set_runtime(
         "root_scroll_y",
         crate::core::types::Value::Int(
             (tab.root_scroll_offset_y as f64 * crate::core::types::DECIMAL_SCALE as f64).round() as i64,

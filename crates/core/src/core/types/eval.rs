@@ -7,71 +7,8 @@ use std::sync::{Arc, LazyLock};
 use crate::core::errors::MizuError;
 use crate::parser::logic::{BinOp, Expr, ExprArena, MizuFunction, apply_binop, check_type, type_name};
 
-use super::interner::{StringInterner, Symbol};
+use super::interner::{FrozenInterner, StringInterner, Symbol};
 use super::value::Value;
-
-/// Maximum number of AST node evaluations allowed per single top-level action.
-///
-/// This is the sole enforcement mechanism for Turing-incompleteness.  It is a
-/// pure integer comparison — no hardware clock is read anywhere in the hot
-/// loop.  Callers must reset `StateMachine::instruction_count` to `0` before
-/// each top-level `evaluate` call so the budget applies per action, not
-/// cumulatively across the session.
-///
-/// 20 000 instructions covers deeply-nested real expressions with significant
-/// headroom while still bounding worst-case execution to microseconds on any
-/// modern CPU — *provided* every charge tracks real cost. A flat AST-node
-/// charge is only safe for genuinely O(1) work (arithmetic, comparisons,
-/// variable lookups); operations whose native cost scales with data size
-/// (`filter`/`count`'s list scan, `sort`'s `n·log₂n` comparisons, string
-/// concatenation's `len(l)+len(r)` allocation) pre-charge that size against
-/// the budget *before* doing the work, so a single AST node can never hide
-/// more than one unit of real cost per charged instruction. With that
-/// invariant held, a tight ~1 ns/instruction loop bounds worst-case
-/// execution to roughly 20 000 × 1 ns = 20 µs of *actual* work, not just
-/// 20 000 AST-node visits — well inside any UI frame budget.
-///
-/// An unmeasured starting value (see the module doc on
-/// [`crate::core::config`]), overridable for a single run via the
-/// `MIZU_MAX_INSTRUCTIONS` environment variable. Note: `formal/MizuFormal/Budget.lean`'s
-/// `T1_reaction_bound` theorem prices a reaction in terms of this constant's
-/// *default* value — overriding it at runtime does not invalidate anything
-/// already running, but the proof no longer describes the overridden run.
-pub static MAX_INSTRUCTIONS: LazyLock<u64> =
-    LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_INSTRUCTIONS", 20_000));
-
-/// Maximum number of `comp` (computed/derived variable) bindings a single
-/// document may declare.
-///
-/// [`MAX_INSTRUCTIONS`] bounds the cost of evaluating *one* expression, but
-/// [`crate::parser::logic::recompute_computed_bindings`] resets and re-applies
-/// that budget for *every* comp binding that fires in a cascading recompute
-/// (see `formal/MizuFormal/Budget.lean`'s `T1_reaction_bound`, which prices a
-/// whole reaction at `(1 + #comps) · MAX_INSTRUCTIONS`). That theorem is an
-/// honest bound *in terms of the document* — it does not, by itself, bound
-/// the number of comps a document may declare. Without this cap, a document
-/// with thousands of comps all transitively depending on one mutable
-/// variable would let a single event legitimately burn `#comps ×
-/// MAX_INSTRUCTIONS` of real interpreter work, which is a practical DoS
-/// vector for a document loaded from an untrusted origin even though no
-/// individual budget check is violated.
-///
-/// This is enforced at parse time (see `parser::logic::parse_computed_with_functions`),
-/// so an over-large document is rejected with a clear `ParseError` at load
-/// time rather than degrading silently (or timing out undiagnosably) at
-/// first interaction.
-///
-/// 500 is a conservative **starting value**, not a value derived from
-/// telemetry of real documents: the example/reference documents shipped in
-/// this repository (`docs/reference/examples/*.mizu`) use at most two `comp`
-/// bindings, so there is no existing corpus of legitimate high-comp-count
-/// documents to calibrate against. Revisit this constant if real usage
-/// demonstrates a legitimate need for more.
-///
-/// Overridable for a single run via `MIZU_MAX_COMP_BINDINGS` (see the module
-/// doc on [`crate::core::config`]).
-pub static MAX_COMP_BINDINGS: LazyLock<usize> =
-    LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_COMP_BINDINGS", 500));
 
 /// Maximum recursion depth for [`StateMachine::evaluate`].
 ///
@@ -87,7 +24,7 @@ pub static MAX_COMP_BINDINGS: LazyLock<usize> =
 pub const MAX_EVAL_DEPTH: u32 = 256;
 
 /// Data-oriented flat state machine with a contiguous local variable stack and O(1) global lookup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StateMachine {
     /// Global variable store keyed by Symbol.
     /// Uses FxHashMap (rustc-hash) instead of the SipHash default because Symbol is a u32
@@ -104,8 +41,10 @@ pub struct StateMachine {
     /// Lookup rule: the *last* index in the list is the innermost (shadow-winning) binding.
     /// A binding is in scope when its index ≥ the current frame_pointer.
     pub local_index: FxHashMap<Symbol, Vec<usize>>,
-    /// Running count of evaluation steps since the last reset; see [`MAX_INSTRUCTIONS`].
+    /// Running count of evaluation steps since the last reset.
     pub instruction_count: u64,
+    /// Maximum allowed instructions before evaluation is aborted.
+    pub max_instructions: u64,
     /// Current `evaluate` recursion depth; see [`MAX_EVAL_DEPTH`].
     pub eval_depth: u32,
     /// Capability actions (network calls, storage writes, navigation, …)
@@ -122,16 +61,23 @@ pub struct StateMachine {
     pub computed_var_syms: FxHashSet<Symbol>,
 }
 
+impl Default for StateMachine {
+    fn default() -> Self {
+        Self::new(20_000)
+    }
+}
+
 impl StateMachine {
     /// Creates an empty state machine with pre-allocated capacity for
     /// globals, locals, and the undo log.
-    pub fn new() -> Self {
+    pub fn new(max_instructions: u64) -> Self {
         Self {
             global_store: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             local_stack: Vec::with_capacity(128),
             local_symbols: Vec::with_capacity(128),
             local_index: FxHashMap::default(),
             instruction_count: 0,
+            max_instructions,
             eval_depth: 0,
             accumulated_actions: Vec::new(),
             undo_log: Vec::with_capacity(64),
@@ -207,7 +153,7 @@ impl StateMachine {
     /// Looks up `name` in `interner`, then resolves the resulting symbol as a
     /// local (if in scope) or a non-null global.  Returns `None` if `name` is
     /// unknown or bound to nothing.
-    pub fn get_value_by_name(&self, name: &str, interner: &StringInterner) -> Option<&Value> {
+    pub fn get_value_by_name(&self, name: &str, interner: &FrozenInterner) -> Option<&Value> {
         if let Some(sym) = interner.get(name) {
             if let Some(val) = self.get_local(sym, 0) {
                 return Some(val);
@@ -226,80 +172,53 @@ impl StateMachine {
     pub fn interpolate_into(
         &self,
         raw_text: &str,
-        interner: &StringInterner,
+        interner: &FrozenInterner,
         buffer: &mut String,
     ) -> Result<(), MizuError> {
         self.interpolate_into_with_overlay(raw_text, interner, None, buffer)
     }
 
-    /// Core interpolation engine.  When `overlay` is `Some`, its entries are
-    /// consulted first for every `{var}` placeholder; the global store is the
-    /// fallback.  This avoids cloning the entire `StateMachine` just to inject
-    /// a handful of per-iteration bindings (the hot-path for `each` loops).
-    ///
-    /// Variable resolution order:
-    ///   1. `overlay[name]` — if present and `overlay` is `Some`
-    ///   2. `self.get_value_by_name(name, interner)` — global store fallback
-    ///
-    /// Walks `raw_text` one `char` at a time (via `chars().peekable()`)
-    /// rather than scanning for `{`/`\` in bulk: `\{`, `\}`, and `\\` escapes
-    /// have to be recognised inline, so a chunked/`memchr`-based scan would
-    /// still need the same per-character escape check inside each chunk —
-    /// it isn't a free win. Revisit only if profiling on real documents shows
-    /// this is a measurable cost, not on the assumption that char-by-char is
-    /// inherently slow.
+    /// Core interpolation engine. Uses lean, manual string slicing with `str::find`
+    /// for fast bulk memory scanning.
     pub(super) fn interpolate_into_with_overlay(
         &self,
         raw_text: &str,
-        interner: &StringInterner,
+        interner: &FrozenInterner,
         overlay: Option<&HashMap<String, Value>>,
         buffer: &mut String,
     ) -> Result<(), MizuError> {
         use std::fmt::Write;
-        let mut chars = raw_text.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(&next_c) = chars.peek() {
-                    if next_c == '\\' || next_c == '{' || next_c == '}' {
-                        buffer.push(next_c);
-                        chars.next();
+        let mut rest = raw_text;
+        
+        while let Some(idx) = rest.find(|c| c == '{' || c == '\\') {
+            buffer.push_str(&rest[..idx]);
+            
+            let c = rest.as_bytes()[idx];
+            if c == b'\\' {
+                rest = &rest[idx + 1..];
+                if let Some(next_char) = rest.chars().next() {
+                    if next_char == '\\' || next_char == '{' || next_char == '}' {
+                        buffer.push(next_char);
+                        rest = &rest[next_char.len_utf8()..];
                     } else {
                         buffer.push('\\');
                     }
                 } else {
                     buffer.push('\\');
                 }
-            } else if c == '{' {
-                let mut var_name = String::new();
-                let mut closed = false;
-                while let Some(&next_c) = chars.peek() {
-                    if next_c == '}' {
-                        chars.next();
-                        closed = true;
-                        break;
-                    } else if next_c == '{' {
-                        break;
-                    } else {
-                        var_name.push(next_c);
-                        chars.next();
-                    }
-                }
-                if closed {
+            } else if c == b'{' {
+                rest = &rest[idx + 1..];
+                // Check for double curly brace `{{` which could mean escaped brace, but
+                // Mizu format actually uses `\{` for escaping. For now we just look for `}`.
+                if let Some(end_idx) = rest.find('}') {
+                    let var_name = &rest[..end_idx];
+                    
                     if var_name.contains('.') {
-                        // Dot-path: resolve `{a.b.c}` by walking record fields.
-                        // resolve_dot_path navigates via references — no intermediate
-                        // Value is cloned; only the final leaf is formatted.
                         const MAX_RECORD_DEPTH: usize = 64;
                         let mut parts = var_name.splitn(MAX_RECORD_DEPTH, '.');
                         let root = parts.next().unwrap_or("");
                         let segments: Vec<&str> = parts.collect();
 
-                        // Phase 1: try overlay for the root segment.
-                        // `handled` is true ONLY when a leaf value was actually written to
-                        // `buffer`. If the overlay owns the root key but the full dot-path
-                        // resolves to `None`, `handled` stays `false` so execution falls
-                        // through to Phase 2 — fixing the silent shadowing bug where a local
-                        // variable lacking a nested field would block the global store's path.
                         let handled = if let Some(root_val) =
                             overlay.and_then(|map| map.get(root))
                         {
@@ -334,14 +253,14 @@ impl StateMachine {
                         }
                     } else {
                         let handled = overlay
-                            .and_then(|map| map.get(var_name.as_str()))
+                            .and_then(|map| map.get(var_name))
                             .map(|val| {
                                 let _ = write!(buffer, "{}", val);
                             })
                             .is_some();
 
                         if !handled {
-                            if let Some(val) = self.get_value_by_name(&var_name, interner) {
+                            if let Some(val) = self.get_value_by_name(var_name, interner) {
                                 let _ = write!(buffer, "{}", val);
                             } else {
                                 let _ = write!(buffer, "{{{}}}", var_name);
@@ -349,14 +268,13 @@ impl StateMachine {
                             }
                         }
                     }
+                    rest = &rest[end_idx + 1..];
                 } else {
                     buffer.push('{');
-                    buffer.push_str(&var_name);
                 }
-            } else {
-                buffer.push(c);
             }
         }
+        buffer.push_str(rest);
         Ok(())
     }
 
@@ -376,11 +294,11 @@ impl StateMachine {
         expr: &Expr,
         frame_pointer: usize,
         functions: &FxHashMap<Symbol, MizuFunction>,
-        interner: &StringInterner,
+        interner: &FrozenInterner,
         arena: &ExprArena,
     ) -> Result<Value, MizuError> {
         self.instruction_count += 1;
-        if self.instruction_count > *MAX_INSTRUCTIONS {
+        if self.instruction_count > self.max_instructions {
             return Err(MizuError::Timeout);
         }
         self.eval_depth += 1;
@@ -400,7 +318,7 @@ impl StateMachine {
         expr: &Expr,
         frame_pointer: usize,
         functions: &FxHashMap<Symbol, MizuFunction>,
-        interner: &StringInterner,
+        interner: &FrozenInterner,
         arena: &ExprArena,
     ) -> Result<Value, MizuError> {
         match expr {
@@ -421,7 +339,7 @@ impl StateMachine {
             Expr::BinaryOp { left, op, right } => {
                 let lv = self.evaluate(&arena[*left], frame_pointer, functions, interner, arena)?;
                 let rv = self.evaluate(&arena[*right], frame_pointer, functions, interner, arena)?;
-                apply_binop(op, lv, rv, &mut self.instruction_count)
+                apply_binop(op, lv, rv, &mut self.instruction_count, self.max_instructions)
             }
             Expr::FunctionCall { name: sym, args_start, args_len } => {
                 let args = arena.args(*args_start, *args_len);
@@ -571,7 +489,7 @@ impl StateMachine {
                                 .sum();
                             self.instruction_count = self.instruction_count.saturating_add(extra);
                         }
-                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                        if self.instruction_count > self.max_instructions {
                             return Err(MizuError::Timeout);
                         }
                         let binop = match op.as_ref() {
@@ -597,7 +515,7 @@ impl StateMachine {
                                     return false;
                                 };
                                 match &binop {
-                                    Some(op) => apply_binop(op, field_v.clone(), target.clone(), &mut ic)
+                                    Some(op) => apply_binop(op, field_v.clone(), target.clone(), &mut ic, self.max_instructions)
                                         .map(|v| matches!(v, Value::Bool(true)))
                                         .unwrap_or(false),
                                     None => match (field_v, &target) {
@@ -628,7 +546,7 @@ impl StateMachine {
                         };
                         self.instruction_count =
                             self.instruction_count.saturating_add(list.len() as u64);
-                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                        if self.instruction_count > self.max_instructions {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
@@ -697,7 +615,7 @@ impl StateMachine {
                         let sorting_cost = (n as u64).saturating_mul(log2_n as u64);
                         self.instruction_count =
                             self.instruction_count.saturating_add(sorting_cost);
-                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                        if self.instruction_count > self.max_instructions {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
@@ -760,7 +678,7 @@ impl StateMachine {
                             Value::String(s) => {
                                 let max_possible_chars = s.len() as u64;
                                 if self.instruction_count.saturating_add(max_possible_chars)
-                                    > *MAX_INSTRUCTIONS
+                                    > self.max_instructions
                                 {
                                     return Err(MizuError::Timeout);
                                 }
@@ -830,7 +748,7 @@ impl StateMachine {
                         // O(n) native operation must pre-charge its size).
                         self.instruction_count =
                             self.instruction_count.saturating_add(haystack.len() as u64);
-                        if self.instruction_count > *MAX_INSTRUCTIONS {
+                        if self.instruction_count > self.max_instructions {
                             return Err(MizuError::Timeout);
                         }
                         return Ok(Value::Bool(haystack.contains(needle.as_ref())));
@@ -950,10 +868,11 @@ impl StateMachine {
                         found: type_name(&base_val),
                     });
                 }
+                let field_str = interner.resolve(*field).unwrap_or("");
                 base_val
-                    .get_field(field.as_ref())
+                    .get_field(field_str)
                     .cloned()
-                    .ok_or_else(|| MizuError::VariableNotFound(field.to_string()))
+                    .ok_or_else(|| MizuError::VariableNotFound(field_str.to_string()))
             }
         }
     }

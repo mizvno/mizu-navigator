@@ -438,8 +438,9 @@ mod tests {
                 args_start,
                 args_len,
             };
-            let mut machine = StateMachine::new();
+            let mut machine = StateMachine::new(crate::core::config::CONFIG.max_instructions);
             let no_functions = Default::default();
+            let interner = interner.freeze();
             let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);
             assert!(
                 result.is_err(),

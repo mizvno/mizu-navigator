@@ -272,7 +272,7 @@
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
-        let store = crate::core::types::VariableStore::new();
+        let store = crate::core::types::VariableStore::new().freeze();
         // No user gesture (has_user_gesture = false) — must be blocked.
         let result = apply_clipboard_action(
             "sensitive-data",
@@ -307,7 +307,7 @@
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let result = apply_clipboard_action(
             "my-node",
             &tree,
@@ -333,7 +333,7 @@
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let result = apply_clipboard_action(
             "nonexistent-id",
             &tree,
@@ -362,7 +362,7 @@
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let text = apply_clipboard_action(
             "label",
             &tree,

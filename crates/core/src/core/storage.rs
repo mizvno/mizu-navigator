@@ -187,7 +187,7 @@ fn derive_key_from_env_override(
 }
 
 pub fn derive_or_create_key(domain: &ValidatedDomain) -> Result<Zeroizing<[u8; 32]>, MizuError> {
-    if let Some(key) = derive_key_from_env_override(std::env::var("MIZU_MASTER_KEY").ok(), domain)? {
+    if let Some(key) = derive_key_from_env_override(crate::core::config::CONFIG.master_key.clone(), domain)? {
         return Ok(key);
     }
 
@@ -253,43 +253,21 @@ pub fn derive_record_key(master_key: &[u8; 32], variable_name: &str) -> Result<Z
 }
 
 /// Encrypts `plaintext` with AES-256-GCM using a record-specific key and returns `nonce || ciphertext`.
-///
-/// Thin wrapper around [`encrypt_record_with_rng`] that always draws the
-/// nonce from a fresh [`OsRng`] round-trip. Any caller other than
-/// [`StorageEngine::write_batch`] should keep using this — the per-record
-/// `OsRng` cost only matters when it's paid `n` times in a loop inside one
-/// open write transaction.
-pub fn encrypt_record(master_key: &[u8; 32], variable_name: &str, plaintext: &[u8]) -> Result<Vec<u8>, MizuError> {
-    let mut rng = OsRng;
-    encrypt_record_with_rng(master_key, variable_name, plaintext, &mut rng)
-}
-
-/// Encrypts `plaintext` with AES-256-GCM using a record-specific key,
-/// drawing the nonce from the caller-supplied `rng` instead of always
-/// hitting [`OsRng`] directly.
-///
-/// [`StorageEngine::write_batch`] seeds one fast CSPRNG from `OsRng` per
-/// batch and reuses it across every record in that batch, instead of
-/// paying `OsRng`'s uncached OS round-trip cost `n` times inside a single
-/// open `redb` write transaction. This is safe against AES-GCM's
-/// catastrophic nonce-reuse failure mode because that failure mode is
-/// reuse *under the same key*, and [`derive_record_key`] derives a
-/// distinct 32-byte key per record (via HKDF-SHA256, keyed on
-/// `variable_name`) — nonce reuse across *different* keys carries no such
-/// risk. If `derive_record_key` ever stops deriving a key that's unique
-/// per record, this safety argument needs to be re-derived, not assumed
-/// to still hold.
-pub fn encrypt_record_with_rng(
+/// 
+/// Nonces are drawn from `OsRng`. This is safe against AES-GCM's catastrophic 
+/// nonce-reuse failure mode because that failure mode is reuse *under the same key*, 
+/// and `derive_record_key` derives a distinct 32-byte key per record (via HKDF-SHA256, 
+/// keyed on `variable_name`) — nonce reuse across *different* keys carries no such risk.
+pub fn encrypt_record(
     master_key: &[u8; 32],
     variable_name: &str,
     plaintext: &[u8],
-    rng: &mut impl RngCore,
 ) -> Result<Vec<u8>, MizuError> {
     let key = derive_record_key(master_key, variable_name)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_ref()));
     drop(key); // record key is single-use; scrub it now instead of at function end.
     let mut nonce_bytes = [0u8; 12];
-    rng.fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // Single allocation for nonce || plaintext, encrypted in place below —
@@ -480,19 +458,13 @@ impl StorageEngine {
     }
 
     /// Writes every `(key, value)` pair in `records` in a single `redb`
-    /// transaction. Nonces for the whole batch are drawn from one
-    /// [`rand_chacha::ChaCha8Rng`] seeded from [`OsRng`], instead of paying
-    /// `OsRng`'s uncached OS round-trip cost once per record inside the
-    /// open transaction — see [`encrypt_record_with_rng`] for why this is
-    /// safe against nonce reuse.
+    /// transaction. Nonces are drawn from `OsRng` directly inside `encrypt_record`.
     pub fn write_batch<'a, I>(&self, records: I) -> Result<(), MizuError>
     where
         I: IntoIterator<Item = (&'a str, &'a Value)>,
     {
         self.write_batch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let mut rng = rand_chacha::ChaCha8Rng::from_rng(OsRng)
-            .map_err(|e| MizuError::ExecutionError(format!("RNG seed: {e}")))?;
         let write_txn = self.db.begin_write()
             .map_err(|e| MizuError::ExecutionError(format!("redb begin_write: {e}")))?;
         {
@@ -502,7 +474,7 @@ impl StorageEngine {
                 let json = to_json(value)?;
                 let plaintext = serde_json::to_vec(&json)
                     .map_err(|e| MizuError::ExecutionError(format!("json encode: {e}")))?;
-                let blob = encrypt_record_with_rng(&self.master_key, key, &plaintext, &mut rng)?;
+                let blob = encrypt_record(&self.master_key, key, &plaintext)?;
                 table.insert(key, blob.as_slice())
                     .map_err(|e| MizuError::ExecutionError(format!("redb insert: {e}")))?;
             }
@@ -766,12 +738,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    /// Regression test for the batch-seeded `ChaCha8Rng` nonce path
-    /// (`write_batch`/`encrypt_record_with_rng`): a batch RNG bug that
-    /// produced a fixed or repeating nonce sequence would be a real AES-GCM
+    /// Regression test for the `write_batch` nonce path:
+    /// a bug that produced a fixed or repeating nonce sequence would be a real AES-GCM
     /// security regression (nonce reuse *under the same key* is
     /// catastrophic), and only a test that inspects the raw stored nonces
-    /// directly â€” not just round-trip correctness â€” would catch it. Reads
+    /// directly — not just round-trip correctness — would catch it. Reads
     /// the raw `nonce || ciphertext` blobs straight out of the `redb` table
     /// (bypassing `decrypt_record`) and asserts all nonces in the batch are
     /// distinct.

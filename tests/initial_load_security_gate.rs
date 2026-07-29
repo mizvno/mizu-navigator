@@ -49,7 +49,7 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
 
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
     let computed_bindings =
-        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns)?;
+        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns, mizu_core::core::config::CONFIG.max_comp_bindings)?;
     let root_timers = parse_root_timers(&parsed.logic_block, &mut interner)?;
 
     let (_style_rules, _style_variants) = parse_style_with_variants(&parsed.style_block)?;

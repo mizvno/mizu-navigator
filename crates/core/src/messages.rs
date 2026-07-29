@@ -33,14 +33,14 @@ pub struct ReloadPayload {
     /// Click action mappings, keyed by the u32 id of the triggering node.
     pub click_actions: HashMap<u32, Action>,
     /// Submit action mappings, keyed by the u32 id of the node carrying the
-    /// `submit -> â€¦` event (typically a `button type "submit"`).
+    /// `submit -> …` event (typically a `button type "submit"`).
     pub submit_actions: HashMap<u32, Action>,
     /// Actions of root-level `timer <interval> -> <action>` declarations from
     /// the `logic` block, in declaration order.  Fired via
     /// [`UiEvent::RootTimer`] with the matching index.
     pub root_timer_actions: Vec<Action>,
-    /// Frozen name â†” symbol table shared between the UI thread and the worker.
-    pub interner: StringInterner,
+    /// Frozen name ↔ symbol table shared between the UI thread and the worker.
+    pub interner: crate::core::types::FrozenInterner,
     /// Non-null global variables at reload time, as `(name, value)` pairs.
     pub initial_variables: Vec<(String, Value)>,
     /// Compile-time endpoint alias table from the document's `urls` block.

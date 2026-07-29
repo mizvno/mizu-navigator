@@ -618,10 +618,8 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
         let mut store = crate::core::types::VariableStore::new();
-        // `target_variable` must be a real interned symbol: execute_capability_action
-        // resolves it to a name (not a Symbol) before it crosses into the
-        // network worker thread, which holds no interner at all.
         let target_variable = store.interner.get_or_intern("result");
+        let mut store = store.freeze();
         let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
 
         let payload = Value::String(Arc::from(r#"{"who":"mizu"}"#));
@@ -679,6 +677,7 @@ mod tests {
             let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
             let mut store = crate::core::types::VariableStore::new();
             let target_variable = store.interner.get_or_intern("result");
+            let mut store = store.freeze();
             let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
 
             super::execute_capability_action(
@@ -726,6 +725,7 @@ mod tests {
         let target_variable = store.interner.get_or_intern("weather_report");
         let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
 
+        let mut store = store.freeze();
         super::execute_capability_action(
             &mut store,
             &network_tx,
@@ -764,7 +764,7 @@ mod tests {
         let (network_tx, mut network_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
-        let mut store = crate::core::types::VariableStore::new();
+        let mut store = crate::core::types::VariableStore::new().freeze();
         let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
 
         let outcome = super::execute_capability_action(

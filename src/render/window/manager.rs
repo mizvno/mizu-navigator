@@ -678,7 +678,7 @@ impl TabState {
             taffy,
             node_to_taffy_id,
             root_taffy_id,
-            store: VariableStore::new(),
+            store: VariableStore::new().freeze(),
             logic_fns,
             scroll_offsets: HashMap::new(),
             focused_node: None,
@@ -982,8 +982,9 @@ impl TabState {
             if let Some(text) = val.attributes.get("content") {
                 let vars = crate::render::text_engine::extract_placeholders(text);
                 for var in vars {
-                    let sym = self.store.interner.get_or_intern(&var);
-                    self.dependency_index.entry(sym).or_default().push(id);
+                    if let Some(sym) = self.store.interner.get(&var) {
+                        self.dependency_index.entry(sym).or_default().push(id);
+                    }
                 }
             }
         }
@@ -1019,29 +1020,7 @@ impl TabState {
         // payload) -- see StringInterner's Clone impl for the measurement
         // method and the reasoning for not optimizing this call. This fires
         // on document reload, not per frame/interaction.
-        let mut interner = self.store.interner.clone();
-        for node in self.dom.nodes() {
-            for event in node.value().events.values() {
-                match event {
-                    EventBlock::Click { action } | EventBlock::Submit { action } => {
-                        if let Action::Assign { target, .. } = action {
-                            interner.get_or_intern(target);
-                        }
-                    }
-                }
-            }
-        }
-        if !submit_actions.is_empty() {
-            // The `$form` magic record must survive the interner freeze so
-            // the logic worker can populate it on submission.
-            interner.get_or_intern("$form");
-        }
-        // Root-timer assign targets must also survive the freeze.
-        for rt in &self.root_timers {
-            if let Action::Assign { target, .. } = &rt.action {
-                interner.get_or_intern(target);
-            }
-        }
+        let interner = self.store.interner.clone();
 
         let mut initial_variables = Vec::new();
         for (&sym, val) in &self.store.state_machine.global_store {
@@ -1213,17 +1192,11 @@ pub(super) fn reload_tab_document(
     tab.each_container_offset_y.clear();
 
     tab.rebuild_node_mappings();
-    tab.store = VariableStore::with_interner(interner);
-    tab.store
-        .set("window_url", Value::from(tab.chrome_state.url.clone()));
+    tab.store = crate::core::types::VariableStore { state_machine: Default::default(), interner }.freeze();
+    tab.store.set_runtime("window_url", Value::from(tab.chrome_state.url.clone()));
     tab.rebuild_dependency_index();
 
     tab.trigger_logic_reload(ctx.logic_tx);
-    // Freeze the UI interner so any runtime symbol additions (network results,
-    // form fields not declared in logic) are flagged in logs — the logic worker
-    // already holds a pre-freeze clone, so post-freeze symbols would diverge
-    // between threads if they were ever used as raw IDs in inter-thread messages.
-    tab.store.interner.freeze();
 
     tab.setup_timers();
     Ok(())

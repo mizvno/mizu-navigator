@@ -24,9 +24,9 @@ mod store;
 mod tests;
 mod value;
 
-pub use eval::{MAX_COMP_BINDINGS, MAX_EVAL_DEPTH, MAX_INSTRUCTIONS, StateMachine};
+pub use eval::{MAX_EVAL_DEPTH, StateMachine};
 #[cfg(test)]
 use eval::{compare_values, field_value, variant_weight};
-pub use interner::{StringInterner, Symbol};
+pub use interner::{FrozenInterner, StringInterner, Symbol};
 pub use store::VariableStore;
 pub use value::{DECIMAL_SCALE, FileHandleData, Value, from_json, to_json};

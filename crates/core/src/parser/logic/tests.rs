@@ -2286,7 +2286,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let mut ic = 0u64;
         let l = 5 * crate::core::types::DECIMAL_SCALE;
         let r = 2 * crate::core::types::DECIMAL_SCALE;
-        let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic).unwrap();
+        let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic, 10_000).unwrap();
         assert_eq!(result, Value::Int(crate::core::types::DECIMAL_SCALE * 5 / 2));
     }
 
@@ -2298,6 +2298,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
             Value::Int(10 * crate::core::types::DECIMAL_SCALE),
             Value::Int(0),
             &mut ic,
+            10_000,
         );
         assert!(
             matches!(result, Err(MizuError::DivisionByZero)),
@@ -2362,8 +2363,9 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let computed = super::parse_computed(src, &mut interner).unwrap();
         assert_eq!(computed.len(), 1);
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
         let derived_sym = store.interner.get_or_intern("derived");
+        let mut store = store.freeze();
         store.state_machine.computed_var_syms.insert(derived_sym);
 
         let fns = FxHashMap::default();
@@ -2387,8 +2389,9 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let computed = super::parse_computed(src, &mut interner).unwrap();
         let reverse_index = super::build_comp_reverse_index(&computed);
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
         store.set("total", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+        let mut store = store.freeze();
 
         let fns = FxHashMap::default();
         let all_syms: FxHashSet<Symbol> =
@@ -2406,8 +2409,9 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let computed = super::parse_computed(src, &mut interner).unwrap();
         let reverse_index = super::build_comp_reverse_index(&computed);
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
         store.set("x", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
+        let mut store = store.freeze();
         let fns = FxHashMap::default();
 
         let all_syms: FxHashSet<Symbol> =
@@ -2418,7 +2422,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
         // Mutate x and recompute
         store.state_machine.undo_log.clear();
-        store.set("x", Value::Int(7 * crate::core::types::DECIMAL_SCALE));
+        let x_sym = store.interner.get("x").unwrap();
+        store.state_machine.set_global(x_sym, Value::Int(7 * crate::core::types::DECIMAL_SCALE));
         let x_sym = store.interner.get("x").unwrap();
         let mutated: FxHashSet<Symbol> = [x_sym].into_iter().collect();
         super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
@@ -2433,7 +2438,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let src = "    f(a: num) : a + z\n    comp y = f(x)\n";
         let mut interner = StringInterner::new();
         let fns = super::parse_logic(src, &mut interner).unwrap();
-        let computed = super::parse_computed_with_functions(src, &mut interner, &fns).unwrap();
+        let computed = super::parse_computed_with_functions(src, &mut interner, &fns, 500).unwrap();
         let reverse_index = super::build_comp_reverse_index(&computed);
         assert_eq!(computed.len(), 1);
 
@@ -2443,9 +2448,13 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
             "comp must transitively depend on the global `z` read inside `f`"
         );
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore {
+            state_machine: Default::default(),
+            interner,
+        };
         store.set("x", Value::Int(1 * crate::core::types::DECIMAL_SCALE));
         store.set("z", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
+        let mut store = store.freeze();
 
         let all_syms: FxHashSet<Symbol> =
             store.state_machine.global_store.keys().copied().collect();
@@ -2455,7 +2464,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
         // Mutate ONLY z — y must recompute through the transitive dependency.
         store.state_machine.undo_log.clear();
-        store.set("z", Value::Int(20 * crate::core::types::DECIMAL_SCALE));
+        let z_sym_again = store.interner.get("z").unwrap();
+        store.state_machine.set_global(z_sym_again, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
         let mutated: FxHashSet<Symbol> = [z_sym].into_iter().collect();
         super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
         assert_eq!(*store.state_machine.get_global(y_sym), Value::Int(21 * crate::core::types::DECIMAL_SCALE));
@@ -2478,8 +2488,12 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
             .unwrap();
         assert!(a_pos < b_pos, "a must precede b in topological order");
 
-        let mut store = VariableStore::with_interner(interner);
+        let mut store = crate::core::types::VariableStore {
+            state_machine: Default::default(),
+            interner,
+        };
         store.set("x", Value::Int(3 * crate::core::types::DECIMAL_SCALE));
+        let mut store = store.freeze();
         let fns = FxHashMap::default();
         let reverse_index = super::build_comp_reverse_index(&computed);
 
@@ -2588,12 +2602,13 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
                 random_comp_dag(&mut rng, &mut interner, n_base, n_comps, max_deps);
             let reverse_index = super::build_comp_reverse_index(&bindings);
 
+            let interner = interner.freeze();
             let mut store_old = VariableStore::with_interner(interner.clone());
             let mut store_new = VariableStore::with_interner(interner);
             for (gi, &sym) in base_syms.iter().enumerate() {
                 let v = Value::Int((gi as i64 + 1) * 10);
-                store_old.set_symbol(sym, v.clone());
-                store_new.set_symbol(sym, v);
+                store_old.state_machine.set_global(sym, v.clone());
+                store_new.state_machine.set_global(sym, v);
             }
 
             // Initial load: every base global counts as mutated, as a real
@@ -2620,8 +2635,8 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
                 }
                 for &sym in &mutated {
                     let v = Value::Int((rng.next_u64() % 1000) as i64);
-                    store_old.set_symbol(sym, v.clone());
-                    store_new.set_symbol(sym, v);
+                    store_old.state_machine.set_global(sym, v.clone());
+                    store_new.state_machine.set_global(sym, v);
                 }
 
                 let changed_old = super::recompute_computed_bindings_naive_scan(
@@ -2683,11 +2698,12 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
         let reverse_index = super::build_comp_reverse_index(&bindings);
         let fns = FxHashMap::default();
 
+        let interner = interner.freeze();
         let mut store_old = VariableStore::with_interner(interner.clone());
         let mut store_new = VariableStore::with_interner(interner);
         for &sym in &base_syms {
-            store_old.set_symbol(sym, Value::Int(0));
-            store_new.set_symbol(sym, Value::Int(0));
+            store_old.state_machine.set_global(sym, Value::Int(0));
+            store_new.state_machine.set_global(sym, Value::Int(0));
         }
 
         // Every event mutates the same single variable, which affects
@@ -2697,7 +2713,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
         let start_old = std::time::Instant::now();
         for n in 0..N_EVENTS {
-            store_old.set_symbol(target, Value::Int(n as i64));
+            store_old.state_machine.set_global(target, Value::Int(n as i64));
             let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
             super::recompute_computed_bindings_naive_scan(&mut store_old, &bindings, &fns, &mutated);
         }
@@ -2705,7 +2721,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
 
         let start_new = std::time::Instant::now();
         for n in 0..N_EVENTS {
-            store_new.set_symbol(target, Value::Int(n as i64));
+            store_new.state_machine.set_global(target, Value::Int(n as i64));
             let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
             super::recompute_computed_bindings(
                 &mut store_new, &bindings, &fns, &mutated, &reverse_index,

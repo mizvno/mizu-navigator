@@ -728,7 +728,7 @@ fn binop_str(op: &BinOp) -> &'static str {
 ///
 /// Depth is naturally bounded: the parser rejects nesting beyond
 /// `MAX_PARSE_DEPTH` (256), well within the native stack.
-pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &StringInterner) -> String {
+pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &crate::core::types::FrozenInterner) -> String {
     match e {
         Expr::Literal(v) => match v {
             Value::String(s) => format!("\"{s}\""),
@@ -773,7 +773,7 @@ pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &StringInterner) -> St
 }
 
 /// Renders an action back to compact Mizu-like source.
-pub fn format_action(a: &Action, interner: &StringInterner) -> String {
+pub fn format_action(a: &Action, interner: &crate::core::types::FrozenInterner) -> String {
     match a {
         Action::Assign { target, expr } => {
             format!("{target} = {}", format_expr(expr.root(), &expr.arena, interner))
@@ -805,6 +805,7 @@ mod tests {
         let expr =
             crate::parser::logic::parse_expr_standalone("count > 4 && !busy", &mut interner)
                 .unwrap();
+        let interner = interner.freeze();
         assert_eq!(format_expr(expr.root(), &expr.arena, &interner), "count > 4 && !busy");
     }
 
@@ -813,6 +814,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let action =
             crate::parser::logic::parse_action("count = count + 1", &mut interner).unwrap();
+        let interner = interner.freeze();
         assert_eq!(format_action(&action, &interner), "count = count + 1");
     }
 

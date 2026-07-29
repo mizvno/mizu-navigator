@@ -390,7 +390,7 @@ mod tests {
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
 
@@ -458,7 +458,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
 
@@ -549,7 +549,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
 
@@ -656,7 +656,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
@@ -695,7 +695,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
@@ -765,7 +765,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
@@ -829,7 +829,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
         let style_rules: HashMap<String, StyleRules> = HashMap::new();
@@ -871,7 +871,7 @@ mod tests {
         font_cx.collection.load_system_fonts();
         let mut layout_cx: parley::LayoutContext<vello::peniko::Color> =
             parley::LayoutContext::new();
-        let store = VariableStore::new();
+        let store = VariableStore::new().freeze();
         let local_inputs = rustc_hash::FxHashMap::default();
         let node_id_to_u32 = HashMap::new();
         let env = no_op_render_env();
