@@ -1236,7 +1236,13 @@ fn dispatch_redraw_requested(
     // actual redraw, not per state change, so a per-frame
     // timer document can't spam the AT.
     a11y_adapter.update_if_active(|| {
-        build_a11y_tree(&tab.dom, &tab.node_id_to_u32, tab.focused_node, &tab.store)
+        build_a11y_tree(
+                    tab.a11y_epoch,
+                    &tab.dom,
+                    &tab.node_id_to_u32,
+                    tab.focused_node,
+                    &tab.store,
+                )
     });
 
     let device = &render_cx.devices[surface.dev_id].device;
@@ -1932,7 +1938,13 @@ fn dispatch_accesskit_event(
     match ak_event.window_event {
         accesskit_winit::WindowEvent::InitialTreeRequested => {
             a11y_adapter.update_if_active(|| {
-                build_a11y_tree(&tab.dom, &tab.node_id_to_u32, tab.focused_node, &tab.store)
+                build_a11y_tree(
+                    tab.a11y_epoch,
+                    &tab.dom,
+                    &tab.node_id_to_u32,
+                    tab.focused_node,
+                    &tab.store,
+                )
             });
         }
         accesskit_winit::WindowEvent::ActionRequested(request) => {
@@ -1940,7 +1952,7 @@ fn dispatch_accesskit_event(
             // real user gesture — route it through the *same*
             // gesture-gated dispatch keyboard activation (ux-1) uses,
             // never a second path into the evaluator.
-            let Some(ego_id) = resolve_ego_id(&tab.u32_to_node_id, request.target) else {
+            let Some(ego_id) = resolve_ego_id(tab.a11y_epoch, &tab.u32_to_node_id, request.target) else {
                 return;
             };
             let mut redraw = false;

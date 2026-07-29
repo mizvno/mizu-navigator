@@ -983,6 +983,36 @@
     }
 
     #[test]
+    fn a11y_epochs_are_never_reused_across_documents_or_tabs() {
+        // `rebuild_node_mappings` renumbers nodes from zero, so the epoch is
+        // the only thing telling the accessibility layer that node 3 of the
+        // new mapping is not node 3 of the old one. Reuse is what makes the
+        // accesskit consumer prune a live subtree and panic.
+        let (mut manager, _keepalive) = make_minimal_manager();
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(manager.active().a11y_epoch));
+
+        for _ in 0..3 {
+            manager.active_mut().rebuild_node_mappings();
+            assert!(
+                seen.insert(manager.active().a11y_epoch),
+                "a document reload must not reuse an epoch"
+            );
+        }
+
+        let second = manager.open_tab(TEST_URL).expect("opens");
+        manager.switch_to_tab(second);
+        assert!(
+            seen.insert(manager.active().a11y_epoch),
+            "tabs share one accesskit adapter, so their epochs must differ too"
+        );
+        assert!(
+            manager.active().a11y_epoch != 0,
+            "epoch 0 would make a node id indistinguishable from a bare u32 id"
+        );
+    }
+
+    #[test]
     fn close_tab_refuses_the_last_tab() {
         let (mut manager, _keepalive) = make_minimal_manager();
         let only = manager.active().id;

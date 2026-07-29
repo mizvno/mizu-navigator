@@ -2573,6 +2573,7 @@ name = "mizu-navigator"
 version = "0.1.0"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_winit",
  "aes-gcm",
  "arboard",

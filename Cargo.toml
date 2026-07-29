@@ -85,6 +85,11 @@ lto = true
 strip = "symbols"
 
 [dev-dependencies]
+# The tree consumer that `accesskit_winit` drives on the platform side. Pulled
+# in for tests only, so the accessibility updates we emit can be fed to the
+# real consumer instead of to an assumption about how it reacts — it panics on
+# input shapes `accesskit`'s own types happily represent.
+accesskit_consumer = "0.18"
 futures-util = "0.3.33"
 multer = "3.1.0"
 tempfile = "3"

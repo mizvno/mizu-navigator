@@ -24,6 +24,23 @@ use super::history::HistoryStack;
 use crate::render::preferences::UserPreferences;
 use crate::render::security::CapabilityPolicy;
 
+/// Source of [`TabState::a11y_epoch`] values.
+///
+/// Process-wide rather than per-tab: every tab feeds the same long-lived
+/// accesskit adapter, so two tabs numbering their nodes from zero would
+/// collide with each other exactly as two successive documents in one tab do.
+static A11Y_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Returns a generation number no mapping has used before.
+///
+/// Wrapping would need a document load every millisecond for seven weeks
+/// straight; if it somehow happened, the counter skips zero and the worst
+/// case is one confused accessibility update, not unsoundness.
+fn next_a11y_epoch() -> u32 {
+    let epoch = A11Y_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if epoch == 0 { A11Y_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { epoch }
+}
+
 /// Serialises worker spawning against anything observing the process-wide
 /// `SPAWN_COUNT` totals.
 ///
@@ -152,6 +169,11 @@ pub struct TabState {
     pub u32_to_node_id: HashMap<u32, EgoNodeId>,
     /// Next u32 allocator for the bidirectional node mapping.
     pub next_u32_id: u32,
+    /// Generation of this tab's node mapping, bumped by
+    /// [`Self::rebuild_node_mappings`] and used to keep accessibility node ids
+    /// from colliding across documents and tabs — see
+    /// [`crate::render::accessibility::access_id`].
+    pub a11y_epoch: u32,
     /// Inverted dependency index mapping global variables to the DOM nodes
     /// that depend on them.
     pub dependency_index: HashMap<Symbol, Vec<EgoNodeId>>,
@@ -654,6 +676,9 @@ impl TabState {
             node_id_to_u32: HashMap::new(),
             u32_to_node_id: HashMap::new(),
             next_u32_id: 0,
+            // Superseded by `rebuild_node_mappings` at the end of this
+            // constructor, before any accessibility tree is built.
+            a11y_epoch: 0,
             dependency_index: HashMap::new(),
             text_layouts: HashMap::new(),
             text_dimensions: HashMap::new(),
@@ -912,7 +937,13 @@ impl TabState {
     }
 
     /// Rebuilds bidirectional u32 mappings for all DOM nodes.
+    ///
+    /// Numbering restarts from zero, so the ids handed out here mean nothing
+    /// outside the mapping they belong to. [`Self::a11y_epoch`] advances with
+    /// every rebuild to say so: it is what stops the accessibility layer from
+    /// reading a fresh document's node 3 as the previous document's node 3.
     pub fn rebuild_node_mappings(&mut self) {
+        self.a11y_epoch = next_a11y_epoch();
         self.node_id_to_u32.clear();
         self.u32_to_node_id.clear();
         let mut next_id = 0;
