@@ -55,6 +55,7 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(10)]
     fn is_local_host_agrees_with_ip_addr_loopback() {
         let a: u8 = kani::any();
         let b: u8 = kani::any();

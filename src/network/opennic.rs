@@ -259,6 +259,11 @@ fn is_transient_dns_error(e: &MizuError) -> bool {
     }
 }
 
+#[cfg(kani)]
+fn is_transient_dns_error(_e: &MizuError) -> bool {
+    false
+}
+
 
 /// Resolves `domain` via the split-horizon DoT pool and returns a [`SocketAddr`]
 /// for `port`.
