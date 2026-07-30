@@ -98,3 +98,22 @@ accesskit_consumer = "0.18"
 futures-util = "0.3.33"
 multer = "3.1.0"
 tempfile = "3"
+
+# A harness with no `#[kani::unwind]` would otherwise run with no bound at all,
+# and `MizuError::MultipleErrors(Vec<MizuError>)` makes `drop_in_place` on it
+# recursive — CBMC unwinds that recursion forever rather than failing, which is
+# how the security harnesses came to appear hung. Any harness that can
+# construct a `MizuError` needs a bound; this makes forgetting one produce a
+# slow proof or an unwinding-assertion failure instead of a run that never ends.
+#
+# Harnesses that need a different bound still set `#[kani::unwind]` themselves,
+# and that attribute wins over this default — the quota proofs deliberately use
+# 2, which is enough for their (leaf-variant only) errors and ~16x faster than 3.
+#
+# This has to live in the workspace root: Kani reads `[workspace.metadata.kani]`
+# and silently ignores the same table under `[package.metadata.kani]` in
+# `crates/core/Cargo.toml`, with no warning that the setting did nothing.
+# Confirm it is live with `cargo kani --verbose` and look for `--unwind` in the
+# `cbmc` command line.
+[workspace.metadata.kani]
+flags = { default-unwind = "12" }
