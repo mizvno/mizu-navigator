@@ -257,10 +257,13 @@ pub(super) fn dispatch_form_submit(
         crate::render::inspector::log::EventKind::Submit,
         format!("form submit ({} fields)", fields.len()),
     );
-    let _ = logic_tx.send((tab.id, UiEvent::SubmitForm {
-        submitter_node_id: submitter_u32,
-        fields,
-    }));
+    let _ = logic_tx.send((
+        tab.id,
+        UiEvent::SubmitForm {
+            submitter_node_id: submitter_u32,
+            fields,
+        },
+    ));
     true
 }
 /// Extracts the text content of the DOM node identified by `node_id_str`.

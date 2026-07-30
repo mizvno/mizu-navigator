@@ -100,7 +100,13 @@ pub fn parse_computed_with_functions(
         collect_vars(expr.root(), &expr.arena, &mut dep_set);
         // Union the globals read inside every function reachable from the RHS,
         // so mutations to those globals also trigger a recompute.
-        collect_reachable_function_reads(expr.root(), &expr.arena, functions, &function_names, &mut dep_set);
+        collect_reachable_function_reads(
+            expr.root(),
+            &expr.arena,
+            functions,
+            &function_names,
+            &mut dep_set,
+        );
         // Function names are code references, not data dependencies.
         for fname in &function_names {
             dep_set.remove(fname);
@@ -227,7 +233,7 @@ pub fn build_comp_reverse_index(bindings: &[ComputedBinding]) -> CompReverseInde
 /// via [`build_comp_reverse_index`] (typically cached once at document load
 /// time rather than rebuilt on every call).
 /// Any newly evaluated comp binding that produces a changed value is recorded in
-/// `store.state_machine.undo_log` via [`VariableStore::set_symbol`], so it will be
+/// `store.evaluator.undo_log` via [`VariableStore::set_symbol`], so it will be
 /// picked up by the logic worker's `send_response` along with the original mutations.
 ///
 /// Returns a superset of `mutated` extended with the symbols of any comp bindings
@@ -280,11 +286,14 @@ pub fn recompute_computed_bindings(
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
-        store.state_machine.instruction_count = 0;
-        if let Ok(val) = store
-            .state_machine
-            .evaluate(cb.expr.root(), 0, functions, &store.interner, &cb.expr.arena)
-        {
+        store.evaluator.instruction_count = 0;
+        if let Ok(val) = store.evaluator.evaluate(
+            cb.expr.root(),
+            0,
+            functions,
+            &store.interner,
+            &cb.expr.arena,
+        ) {
             store.set_symbol(cb.name, val);
             if changed.insert(cb.name)
                 && let Some(idxs) = reverse_index.get(&cb.name)
@@ -315,18 +324,20 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
-        store.state_machine.instruction_count = 0;
-        if let Ok(val) = store
-            .state_machine
-            .evaluate(cb.expr.root(), 0, functions, &store.interner, &cb.expr.arena)
-        {
+        store.evaluator.instruction_count = 0;
+        if let Ok(val) = store.evaluator.evaluate(
+            cb.expr.root(),
+            0,
+            functions,
+            &store.interner,
+            &cb.expr.arena,
+        ) {
             store.set_symbol(cb.name, val);
             changed.insert(cb.name);
         }
     }
     changed
 }
-
 
 /// Walks `expr` and collects every [`Expr::Variable`] symbol into `out`.
 ///
@@ -344,7 +355,11 @@ fn collect_vars(expr: &Expr, arena: &ExprArena, out: &mut FxHashSet<Symbol>) {
             collect_vars(&arena[*left], arena, out);
             collect_vars(&arena[*right], arena, out);
         }
-        Expr::FunctionCall { args_start, args_len, .. } => {
+        Expr::FunctionCall {
+            args_start,
+            args_len,
+            ..
+        } => {
             for &arg in arena.args(*args_start, *args_len) {
                 collect_vars(&arena[arg], arena, out);
             }
@@ -385,7 +400,11 @@ pub(super) fn collect_calls(
             collect_calls(&arena[*left], arena, out, function_names);
             collect_calls(&arena[*right], arena, out, function_names);
         }
-        Expr::FunctionCall { name: sym, args_start, args_len } => {
+        Expr::FunctionCall {
+            name: sym,
+            args_start,
+            args_len,
+        } => {
             out.insert(*sym);
             for &arg in arena.args(*args_start, *args_len) {
                 collect_calls(&arena[arg], arena, out, function_names);
@@ -438,7 +457,12 @@ fn collect_reachable_function_reads(
         };
         collect_vars(func.body.root(), &func.body.arena, out);
         let mut nested_calls: FxHashSet<Symbol> = FxHashSet::default();
-        collect_calls(func.body.root(), &func.body.arena, &mut nested_calls, function_names);
+        collect_calls(
+            func.body.root(),
+            &func.body.arena,
+            &mut nested_calls,
+            function_names,
+        );
         worklist.extend(nested_calls);
     }
 }

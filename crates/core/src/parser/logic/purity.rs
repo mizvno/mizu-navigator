@@ -19,8 +19,15 @@ use super::ast::{Expr, ExprArena, MizuFunction};
 /// its name here, or it will be incorrectly rejected as effectful
 /// (fail-secure in the wrong direction, but loud — a parse error — not
 /// silent).
-const KNOWN_PURE_BUILTINS: &[&str] =
-    &["filter", "count", "sort", "length", "to_string", "contains", "has_field"];
+const KNOWN_PURE_BUILTINS: &[&str] = &[
+    "filter",
+    "count",
+    "sort",
+    "length",
+    "to_string",
+    "contains",
+    "has_field",
+];
 
 /// Walks `expr` and returns the name of the first side-effecting function
 /// call found, or `None` if the expression is pure.
@@ -39,9 +46,15 @@ pub fn find_side_effect_call(
 ) -> Option<String> {
     match expr {
         Expr::Literal(_) | Expr::Variable(_) => None,
-        Expr::BinaryOp { left, right, .. } => find_side_effect_call(&arena[*left], arena, interner, functions)
-            .or_else(|| find_side_effect_call(&arena[*right], arena, interner, functions)),
-        Expr::FunctionCall { name, args_start, args_len } => {
+        Expr::BinaryOp { left, right, .. } => {
+            find_side_effect_call(&arena[*left], arena, interner, functions)
+                .or_else(|| find_side_effect_call(&arena[*right], arena, interner, functions))
+        }
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
             if !functions.contains_key(name)
                 && let Some(n) = interner.resolve(*name)
                 && !KNOWN_PURE_BUILTINS.contains(&n)
@@ -55,8 +68,10 @@ pub fn find_side_effect_call(
             }
             None
         }
-        Expr::Let { value, body, .. } => find_side_effect_call(&arena[*value], arena, interner, functions)
-            .or_else(|| find_side_effect_call(&arena[*body], arena, interner, functions)),
+        Expr::Let { value, body, .. } => {
+            find_side_effect_call(&arena[*value], arena, interner, functions)
+                .or_else(|| find_side_effect_call(&arena[*body], arena, interner, functions))
+        }
         Expr::Not(inner) => find_side_effect_call(&arena[*inner], arena, interner, functions),
         Expr::IfElse {
             condition,
@@ -65,6 +80,8 @@ pub fn find_side_effect_call(
         } => find_side_effect_call(&arena[*condition], arena, interner, functions)
             .or_else(|| find_side_effect_call(&arena[*then_expr], arena, interner, functions))
             .or_else(|| find_side_effect_call(&arena[*else_expr], arena, interner, functions)),
-        Expr::FieldAccess { base, .. } => find_side_effect_call(&arena[*base], arena, interner, functions),
+        Expr::FieldAccess { base, .. } => {
+            find_side_effect_call(&arena[*base], arena, interner, functions)
+        }
     }
 }

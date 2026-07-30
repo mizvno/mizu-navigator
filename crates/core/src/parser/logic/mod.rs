@@ -92,16 +92,16 @@ pub use ast::{
     Action, BinOp, ComputedBinding, Expr, ExprArena, ExprId, ExprTree, MizuFunction, NetworkMethod,
     PayloadFormat, RootTimer, TimerInterval, ValueType,
 };
+#[cfg(test)]
+pub(crate) use comp::recompute_computed_bindings_naive_scan;
 pub use comp::{
     CompReverseIndex, build_comp_reverse_index, parse_computed, parse_computed_with_functions,
     recompute_computed_bindings,
 };
-#[cfg(test)]
-pub(crate) use comp::recompute_computed_bindings_naive_scan;
-pub use eval::{evaluate, execute_action};
 pub(crate) use eval::{apply_binop, check_type, type_name};
+pub use eval::{evaluate, execute_action};
+pub(crate) use parse::path_param_ok;
 pub use parse::{
     parse_action, parse_action_with_urls, parse_expr_standalone, parse_logic, parse_root_timers,
 };
-pub(crate) use parse::path_param_ok;
 pub use purity::find_side_effect_call;

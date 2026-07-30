@@ -281,7 +281,12 @@ pub fn scroll_by(
     window_height: f32,
     chrome_height: f32,
 ) -> f32 {
-    clamp_scroll(offset + delta_y * SCROLL_STEP, log, window_height, chrome_height)
+    clamp_scroll(
+        offset + delta_y * SCROLL_STEP,
+        log,
+        window_height,
+        chrome_height,
+    )
 }
 
 // ── Row layout ────────────────────────────────────────────────────────────────
@@ -359,9 +364,21 @@ fn paint_header(scene: &mut Scene, ctx: &mut SidebarPaintContext<'_>) {
     let top = ctx.chrome_height as f64;
     let right = panel_right() as f64;
     let band = Rect::new(0.0, top, right, top + HEADER_HEIGHT as f64);
-    scene.fill(Fill::NonZero, ctx.transform, ctx.palette.strip_bg, None, &band);
+    scene.fill(
+        Fill::NonZero,
+        ctx.transform,
+        ctx.palette.strip_bg,
+        None,
+        &band,
+    );
 
-    let title = build_text("History", TITLE_FONT_SIZE, false, ctx.font_cx, ctx.layout_cx);
+    let title = build_text(
+        "History",
+        TITLE_FONT_SIZE,
+        false,
+        ctx.font_cx,
+        ctx.layout_cx,
+    );
     draw_text(
         scene,
         &title,
@@ -397,7 +414,13 @@ fn paint_header(scene: &mut Scene, ctx: &mut SidebarPaintContext<'_>) {
         right,
         top + HEADER_HEIGHT as f64,
     );
-    scene.fill(Fill::NonZero, ctx.transform, ctx.palette.url_border_idle, None, &hairline);
+    scene.fill(
+        Fill::NonZero,
+        ctx.transform,
+        ctx.palette.url_border_idle,
+        None,
+        &hairline,
+    );
 }
 
 /// Paints a day-group header: a quiet label with a rule running to the
@@ -659,7 +682,10 @@ mod tests {
     fn log_with(n: usize) -> HistoryLog {
         let mut log = HistoryLog::default();
         for i in 0..n {
-            log.push(VisitRecord::new(format!("mizu://test/{i}"), format!("Page {i}")));
+            log.push(VisitRecord::new(
+                format!("mizu://test/{i}"),
+                format!("Page {i}"),
+            ));
         }
         log
     }
@@ -671,7 +697,10 @@ mod tests {
 
     #[test]
     fn panel_is_docked_to_the_left_edge() {
-        assert!(contains_x(0.0), "the panel starts at the window's left edge");
+        assert!(
+            contains_x(0.0),
+            "the panel starts at the window's left edge"
+        );
         assert!(contains_x(SIDEBAR_WIDTH - 1.0));
         assert!(!contains_x(SIDEBAR_WIDTH), "and ends at its own width");
     }

@@ -158,10 +158,7 @@ mod tests {
     #[test]
     fn test_at_sign_in_domain_rejected() {
         // `user[:pass]@host` syntax can be used to spoof the displayed origin.
-        let cases = [
-            "mizu://user@evil.com/page",
-            "mizu://user:pass@evil.com/",
-        ];
+        let cases = ["mizu://user@evil.com/page", "mizu://user:pass@evil.com/"];
         for uri in cases {
             let result = MizuUri::parse(uri);
             assert!(

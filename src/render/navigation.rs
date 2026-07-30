@@ -38,4 +38,6 @@
 
 #![forbid(unsafe_code)]
 
-pub use mizu_core::security::navigation::{NavigationInitiator, NavigationVerdict, check_navigation};
+pub use mizu_core::security::navigation::{
+    NavigationInitiator, NavigationVerdict, check_navigation,
+};

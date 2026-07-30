@@ -3,7 +3,6 @@
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
-
 use crate::core::types::Value;
 use crate::render::navigation::{NavigationInitiator, NavigationVerdict, check_navigation};
 use crate::render::security::CapabilityPolicy;
@@ -110,13 +109,17 @@ pub(crate) fn chrome_url_to_file_sandbox_base(chrome_url: &str) -> Option<String
 ///
 /// Called both from the file:// fast path in `navigate_to_url` (synchronous
 /// disk read) and from `process_network_result` (async QUIC fetch result).
-pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_>, url: String, source: String) {
+pub(super) fn handle_navigate_success(
+    tab: &mut TabState,
+    ctx: &mut WindowCtx<'_>,
+    url: String,
+    source: String,
+) {
     tracing::debug!(url = %url, "navigate success");
     tab.chrome_state.url = url.clone();
     tab.chrome_state.loading = false;
     tab.reset_redirect_count();
-    tab
-        .store
+    tab.store
         .set_runtime("window_url", crate::core::types::Value::from(url.clone()));
 
     let current_dir = std::env::current_dir().unwrap_or_default();
@@ -291,35 +294,50 @@ pub(super) fn handle_navigate_success(tab: &mut TabState, ctx: &mut WindowCtx<'_
 /// network worker onto the manager's state.
 ///
 /// Called from the `AboutToWait` drain loop — never from a blocking context.
-pub(super) fn process_network_result(tab: &mut TabState, ctx: &mut WindowCtx<'_>, res: crate::network::NetworkResult) {
+pub(super) fn process_network_result(
+    tab: &mut TabState,
+    ctx: &mut WindowCtx<'_>,
+    res: crate::network::NetworkResult,
+) {
     use crate::network::NetworkResult;
     use crate::render::inspector::log::NetOutcome;
     match res {
-        NetworkResult::Success { tab: _, target_var, data } => {
+        NetworkResult::Success {
+            tab: _,
+            target_var,
+            data,
+        } => {
             let bytes = match &data {
                 Value::String(s) => Some(s.len()),
                 _ => None,
             };
-            tab
-                .inspector_log
+            tab.inspector_log
                 .complete_net(&target_var, NetOutcome::Ok, bytes);
             // `UiEvent::UpdateVariable` carries the resolved name, not a
             // Symbol: `target_var` already is that name (see the
             // `/* FIX SYMBOL */` fix in `execute_capability_action`), and
             // the worker resolves it against its own frozen interner via
             // `set_runtime` — no interner lookup needed on this side at all.
-            let _ = ctx.logic_tx
-                .send((tab.id, crate::network::UiEvent::UpdateVariable {
+            let _ = ctx.logic_tx.send((
+                tab.id,
+                crate::network::UiEvent::UpdateVariable {
                     name: target_var,
                     value: data,
-                }));
-            let _ = ctx.logic_tx
-                .send((tab.id, crate::network::UiEvent::UpdateVariable {
+                },
+            ));
+            let _ = ctx.logic_tx.send((
+                tab.id,
+                crate::network::UiEvent::UpdateVariable {
                     name: "stato_navigazione".to_string(),
                     value: crate::core::types::Value::from("Completato.".to_string()),
-                }));
+                },
+            ));
         }
-        NetworkResult::FetchFailed { tab: _, target_var, error } => {
+        NetworkResult::FetchFailed {
+            tab: _,
+            target_var,
+            error,
+        } => {
             tracing::error!(error = ?error, target = %target_var, "fetch failed");
             tab.inspector_log.complete_net(
                 &target_var,
@@ -328,33 +346,38 @@ pub(super) fn process_network_result(tab: &mut TabState, ctx: &mut WindowCtx<'_>
             );
             // Write a readable error where the response would have gone, so
             // the document shows it (e.g. `Status: error: connection refused`).
-            let _ = ctx.logic_tx
-                .send((tab.id, crate::network::UiEvent::UpdateVariable {
+            let _ = ctx.logic_tx.send((
+                tab.id,
+                crate::network::UiEvent::UpdateVariable {
                     name: target_var,
                     value: crate::core::types::Value::from(format!("error: {error}")),
-                }));
+                },
+            ));
         }
         NetworkResult::Error(_, e) => {
             tracing::error!(error = ?e, "network error");
-            tab
-                .inspector_log
+            tab.inspector_log
                 .complete_latest_pending(NetOutcome::Failed(e.to_string()));
             tab.chrome_state.loading = false;
-            let _ = ctx.logic_tx
-                .send((tab.id, crate::network::UiEvent::UpdateVariable {
+            let _ = ctx.logic_tx.send((
+                tab.id,
+                crate::network::UiEvent::UpdateVariable {
                     name: "stato_navigazione".to_string(),
                     value: crate::core::types::Value::from(format!("Errore: {e}")),
-                }));
+                },
+            ));
         }
-        NetworkResult::NavigateSuccess { tab: _, url, source } => {
-            tab
-                .inspector_log
+        NetworkResult::NavigateSuccess {
+            tab: _,
+            url,
+            source,
+        } => {
+            tab.inspector_log
                 .complete_net(&url, NetOutcome::Ok, Some(source.len()));
             handle_navigate_success(tab, ctx, url, source);
         }
         NetworkResult::NavigationRedirect { tab: _, new_url } => {
-            tab
-                .inspector_log
+            tab.inspector_log
                 .complete_latest_pending(NetOutcome::Redirect);
             if tab.register_redirect() {
                 tracing::debug!(
@@ -378,9 +401,7 @@ pub(super) fn process_network_result(tab: &mut TabState, ctx: &mut WindowCtx<'_>
                     tab,
                     ctx,
                     new_url,
-                    NavigationInitiator::RedirectOf(Box::new(
-                        NavigationInitiator::UserGesture,
-                    )),
+                    NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::UserGesture)),
                 );
             } else {
                 tracing::error!(
@@ -388,25 +409,24 @@ pub(super) fn process_network_result(tab: &mut TabState, ctx: &mut WindowCtx<'_>
                     "redirect limit exceeded; aborting navigation"
                 );
                 tab.chrome_state.loading = false;
-                let _ = ctx.logic_tx
-                    .send((tab.id, crate::network::UiEvent::UpdateVariable {
+                let _ = ctx.logic_tx.send((
+                    tab.id,
+                    crate::network::UiEvent::UpdateVariable {
                         name: "stato_navigazione".to_string(),
                         value: crate::core::types::Value::from(
                             "Errore: troppi redirect".to_string(),
                         ),
-                    }));
+                    },
+                ));
             }
         }
         NetworkResult::FetchImageSuccess { tab: _, url, image } => {
-            tab
-                .inspector_log
-                .push_net_done("IMG", &url, NetOutcome::Ok);
+            tab.inspector_log.push_net_done("IMG", &url, NetOutcome::Ok);
             ctx.image_cache.put(url.clone(), AssetSlot::Ready(image));
             rebuild_tab_taffy_after_image(tab, ctx);
         }
         NetworkResult::FetchImageFailed { tab: _, url, error } => {
-            tab
-                .inspector_log
+            tab.inspector_log
                 .push_net_done("IMG", &url, NetOutcome::Failed(error.to_string()));
             ctx.image_cache.put(url.clone(), AssetSlot::Failed);
             tracing::error!(url = %url, error = ?error, "image load failed");
@@ -483,7 +503,8 @@ pub(super) fn rebuild_tab_taffy_after_image(tab: &mut TabState, ctx: &mut Window
 /// - `file://` documents are loaded directly; `mizu://` dispatches
 ///   `NetworkCmd::Navigate` to the network worker.
 pub(super) fn navigate_to_url(
-    tab: &mut TabState, ctx: &mut WindowCtx<'_>,
+    tab: &mut TabState,
+    ctx: &mut WindowCtx<'_>,
     url: String,
     initiator: NavigationInitiator,
 ) {
@@ -589,16 +610,13 @@ pub(super) fn navigate_to_url(
                 }
             } else if target.starts_with("mizu://") {
                 tab.chrome_state.loading = true;
-                tab
-                    .inspector_log
+                tab.inspector_log
                     .push_net_start("NAV", &target, Some(target.clone()));
                 // N2: this is the ONLY site that emits NetworkCmd::Navigate.
-                let _ = ctx
-                    .network_tx
-                    .send(crate::network::NetworkCmd::Navigate {
-                        tab: tab.id,
-                        url: target,
-                    });
+                let _ = ctx.network_tx.send(crate::network::NetworkCmd::Navigate {
+                    tab: tab.id,
+                    url: target,
+                });
             }
         }
         NavigationVerdict::Block(reason) => {
@@ -608,11 +626,8 @@ pub(super) fn navigate_to_url(
                 reason = reason,
                 "navigation blocked by policy"
             );
-            tab.inspector_log.push_net_blocked(
-                "NAV",
-                &resolved_url,
-                reason.to_string(),
-            );
+            tab.inspector_log
+                .push_net_blocked("NAV", &resolved_url, reason.to_string());
             tab.chrome_state.loading = false;
             // A blocked history step must not leave a stale scroll restore
             // hanging around for some later, unrelated navigation.

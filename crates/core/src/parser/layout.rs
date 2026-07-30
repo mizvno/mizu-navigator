@@ -19,11 +19,10 @@ use rustc_hash::FxHashMap;
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value};
 use crate::parser::logic::{
-    Action, Expr, ExprArena, ExprTree, MizuFunction, find_side_effect_call,
-    parse_action_with_urls, parse_expr_standalone,
+    Action, Expr, ExprArena, ExprTree, MizuFunction, find_side_effect_call, parse_action_with_urls,
+    parse_expr_standalone,
 };
 use crate::parser::urls::{EndpointKind, UrlRegistry};
-
 
 /// The valid structural primitives in Mizu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +99,11 @@ impl MizuNode {
     /// a style selector was written against.
     pub fn style_tag_name(&self) -> std::borrow::Cow<'_, str> {
         if self.primitive == Primitive::Heading {
-            let level = self.attributes.get("level").map(String::as_str).unwrap_or("1");
+            let level = self
+                .attributes
+                .get("level")
+                .map(String::as_str)
+                .unwrap_or("1");
             std::borrow::Cow::Owned(format!("h{level}"))
         } else {
             std::borrow::Cow::Borrowed(self.primitive.as_str())
@@ -160,7 +163,6 @@ pub enum ConditionalClass {
         expr: ExprTree,
     },
 }
-
 
 /// Returns the number of leading space characters in `line`.
 #[inline]
@@ -267,10 +269,12 @@ fn is_valid_lang_tag(value: &str) -> bool {
 fn find_non_literal_string_branch(expr: &Expr, arena: &ExprArena) -> Option<&'static str> {
     match expr {
         Expr::Literal(Value::String(_)) => None,
-        Expr::IfElse { then_expr, else_expr, .. } => {
-            find_non_literal_string_branch(&arena[*then_expr], arena)
-                .or_else(|| find_non_literal_string_branch(&arena[*else_expr], arena))
-        }
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => find_non_literal_string_branch(&arena[*then_expr], arena)
+            .or_else(|| find_non_literal_string_branch(&arena[*else_expr], arena)),
         Expr::Literal(_) => Some("a non-string literal"),
         Expr::Variable(_) => Some("a variable"),
         Expr::FieldAccess { .. } => Some("a field access"),
@@ -314,7 +318,8 @@ fn parse_attributes_and_events(
             ));
         } else if key == "download" {
             return Err(MizuError::ParseError(
-                "download -> alias is no longer supported; use click -> download(alias)".to_string(),
+                "download -> alias is no longer supported; use click -> download(alias)"
+                    .to_string(),
             ));
         } else if key == "click" || key == "submit" {
             let rest_trimmed = rest.trim_start();
@@ -561,7 +566,6 @@ fn parse_primitive_and_attrs(
     ))
 }
 
-
 /// Parses the `layout_block` produced by [`super::split_source`] into a
 /// hierarchical, arena-based DOM tree.
 ///
@@ -578,7 +582,13 @@ pub fn parse_layout(
     layout_content: &str,
     interner: &mut StringInterner,
 ) -> Result<Tree<MizuNode>, MizuError> {
-    parse_layout_with_urls(layout_content, interner, None, false, &rustc_hash::FxHashMap::default())
+    parse_layout_with_urls(
+        layout_content,
+        interner,
+        None,
+        false,
+        &rustc_hash::FxHashMap::default(),
+    )
 }
 
 /// Like [`parse_layout`] but accepts an optional [`UrlRegistry`] for media alias validation
@@ -670,7 +680,8 @@ pub fn parse_layout_with_urls(
             ));
         } else if first_word == "download" {
             return Err(MizuError::ParseError(
-                "download -> alias is no longer supported; use click -> download(alias)".to_string(),
+                "download -> alias is no longer supported; use click -> download(alias)"
+                    .to_string(),
             ));
         } else if first_word == "every" {
             return Err(MizuError::ParseError(format!(
@@ -806,8 +817,7 @@ pub fn parse_layout_with_urls(
                         line_idx + 1
                     )));
                 }
-                if let Some(bad_branch) = find_non_literal_string_branch(expr.root(), &expr.arena)
-                {
+                if let Some(bad_branch) = find_non_literal_string_branch(expr.root(), &expr.arena) {
                     return Err(MizuError::ParseError(format!(
                         "line {}: ternary conditional class `class {rest}` has {bad_branch} \
                          as a branch; every branch must be a string literal",
@@ -1025,7 +1035,6 @@ pub fn parse_layout_with_urls(
     Ok(tree)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{ConditionalClass, EventBlock, Primitive, parse_layout, parse_layout_with_urls};
@@ -1041,7 +1050,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"undeclared_alias\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -1070,7 +1085,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"test.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         assert!(
             result.is_ok(),
             "direct filename with extension must bypass guard: {result:?}"
@@ -1083,7 +1104,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"./img/logo.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         assert!(
             result.is_ok(),
             "relative path with slash must bypass guard: {result:?}"
@@ -1097,7 +1124,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"file:///etc/passwd\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), true, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            true,
+            &rustc_hash::FxHashMap::default(),
+        );
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -1120,7 +1153,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"file:///home/user/img.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         assert!(
             result.is_ok(),
             "file:// must be allowed in local-origin documents: {result:?}"
@@ -1134,7 +1173,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"mizu://cdn.example.com/img.png\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         assert!(
             matches!(result, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
             "mizu:// URL in src must be rejected: {result:?}"
@@ -1148,7 +1193,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"cdn_icons\"\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -1387,7 +1438,11 @@ mod tests {
                 .find(|n| n.value().primitive == Primitive::Text)
                 .expect("inline text must become a child Text node, like every non-doc primitive");
             assert_eq!(
-                text_child.value().attributes.get("content").map(|s| s.as_str()),
+                text_child
+                    .value()
+                    .attributes
+                    .get("content")
+                    .map(|s| s.as_str()),
                 Some("Section title")
             );
         }
@@ -1774,7 +1829,14 @@ mod tests {
         );
 
         let layout = "doc\n    image src \"logo\"\n";
-        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
+        let tree = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        )
+        .unwrap();
         let img = tree
             .root()
             .children()
@@ -1804,7 +1866,10 @@ mod tests {
                     msg.contains("media alias"),
                     "error must point at media aliases, got: {msg}"
                 );
-                assert!(msg.contains("line 2"), "error must carry line number, got: {msg}");
+                assert!(
+                    msg.contains("line 2"),
+                    "error must carry line number, got: {msg}"
+                );
             }
             other => panic!("expected ParseError for absolute src (no registry), got: {other:?}"),
         }
@@ -1812,7 +1877,13 @@ mod tests {
         // Same rejection even when a registry is supplied.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
-        let with_registry = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let with_registry = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         assert!(
             matches!(with_registry, Err(MizuError::ParseError(ref m)) if m.contains("absolute URLs are not allowed in src")),
             "absolute src must be rejected with a registry too, got: {with_registry:?}"
@@ -1853,7 +1924,14 @@ mod tests {
         );
 
         let layout = "doc\n    button\n        click -> download(backup_alias)\n";
-        let tree = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default()).unwrap();
+        let tree = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        )
+        .unwrap();
         let btn = tree
             .root()
             .children()
@@ -1868,7 +1946,12 @@ mod tests {
             EventBlock::Click {
                 action: Action::Eval(tree),
             } => {
-                let Expr::FunctionCall { name, args_start, args_len } = tree.root() else {
+                let Expr::FunctionCall {
+                    name,
+                    args_start,
+                    args_len,
+                } = tree.root()
+                else {
                     panic!("expected FunctionCall root, got {:?}", tree.root());
                 };
                 let args = tree.arena.args(*args_start, *args_len);
@@ -1920,7 +2003,13 @@ mod tests {
         );
 
         let layout = "doc\n    button\n        click -> download(api_alias)\n";
-        let result = parse_layout_with_urls(layout, &mut interner, Some(&registry), false, &rustc_hash::FxHashMap::default());
+        let result = parse_layout_with_urls(
+            layout,
+            &mut interner,
+            Some(&registry),
+            false,
+            &rustc_hash::FxHashMap::default(),
+        );
         match result {
             Err(MizuError::ParseError(msg)) => {
                 assert!(
@@ -1979,9 +2068,16 @@ mod tests {
             panic!("expected ConditionalClass::Toggle");
         };
 
-        let mut store = VariableStore::with_interner(interner);
-        store.set("flag", Value::Bool(true));
-        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let mut store = VariableStore::with_interner(interner.freeze());
+        store.set_runtime("flag", Value::Bool(true));
+        let result = evaluate(
+            condition.root(),
+            &condition.arena,
+            &mut store,
+            &FxHashMap::default(),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Bool(true),
@@ -2009,9 +2105,16 @@ mod tests {
             panic!("expected ConditionalClass::Toggle");
         };
 
-        let mut store = VariableStore::with_interner(interner);
-        store.set("flag", Value::Bool(false));
-        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let mut store = VariableStore::with_interner(interner.freeze());
+        store.set_runtime("flag", Value::Bool(false));
+        let result = evaluate(
+            condition.root(),
+            &condition.arena,
+            &mut store,
+            &FxHashMap::default(),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Bool(false),
@@ -2036,10 +2139,10 @@ mod tests {
             .unwrap();
         assert_eq!(box_node.value().conditional_classes.len(), 3);
 
-        let mut store = VariableStore::with_interner(interner);
-        store.set("flag_a", Value::Bool(true));
-        store.set("flag_b", Value::Bool(false));
-        store.set("flag_c", Value::Bool(true));
+        let mut store = VariableStore::with_interner(interner.freeze());
+        store.set_runtime("flag_a", Value::Bool(true));
+        store.set_runtime("flag_b", Value::Bool(false));
+        store.set_runtime("flag_c", Value::Bool(true));
 
         let fns: FxHashMap<_, _> = FxHashMap::default();
         let ccs = &box_node.value().conditional_classes;
@@ -2083,14 +2186,24 @@ mod tests {
             Vec::<(std::sync::Arc<str>, crate::core::types::Value)>::new();
         record_map.push((Arc::from("done"), Value::Bool(true)));
 
-        let mut store = VariableStore::with_interner(interner);
-        store.set("item", { record_map.sort_by(|a, b| a.0.cmp(&b.0)); Value::Record(Arc::from(record_map)) });
+        let mut store = VariableStore::with_interner(interner.freeze());
+        store.set_runtime("item", {
+            record_map.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::record_from_unsorted(record_map)
+        });
 
         let ConditionalClass::Toggle { condition, .. } = &box_node.value().conditional_classes[0]
         else {
             panic!("expected ConditionalClass::Toggle");
         };
-        let result = evaluate(condition.root(), &condition.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let result = evaluate(
+            condition.root(),
+            &condition.arena,
+            &mut store,
+            &FxHashMap::default(),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Bool(true),
@@ -2137,13 +2250,27 @@ mod tests {
             panic!("expected ConditionalClass::Ternary");
         };
 
-        let mut store = VariableStore::with_interner(interner);
-        store.set("flag", Value::Bool(true));
-        let result = evaluate(expr.root(), &expr.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        let mut store = VariableStore::with_interner(interner.freeze());
+        store.set_runtime("flag", Value::Bool(true));
+        let result = evaluate(
+            expr.root(),
+            &expr.arena,
+            &mut store,
+            &FxHashMap::default(),
+            0,
+        )
+        .unwrap();
         assert_eq!(result, Value::String(std::sync::Arc::from("on")));
 
-        store.set("flag", Value::Bool(false));
-        let result = evaluate(expr.root(), &expr.arena, &mut store, &FxHashMap::default(), 0).unwrap();
+        store.set_runtime("flag", Value::Bool(false));
+        let result = evaluate(
+            expr.root(),
+            &expr.arena,
+            &mut store,
+            &FxHashMap::default(),
+            0,
+        )
+        .unwrap();
         assert_eq!(result, Value::String(std::sync::Arc::from("off")));
     }
 
@@ -2165,8 +2292,7 @@ mod tests {
 
     #[test]
     fn ternary_conditional_class_nested_ternary_is_accepted() {
-        let layout =
-            "doc\n    box\n        class a ? \"x\" : b ? \"y\" : \"z\"\n";
+        let layout = "doc\n    box\n        class a ? \"x\" : b ? \"y\" : \"z\"\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -2251,8 +2377,7 @@ mod tests {
         // Edge case: a `?` inside a quoted string within a toggle condition
         // must not be mistaken for a ternary -- the `if` keyword at the
         // second token position is checked before any ternary attempt.
-        let layout =
-            "doc\n    box\n        class active if content == \"is this ok?\"\n";
+        let layout = "doc\n    box\n        class active if content == \"is this ok?\"\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
         let box_node = tree
@@ -2273,7 +2398,10 @@ mod tests {
         let layout = "doc\n    box\n        class active if flag\n    box\n        class flag ? \"on\" : \"off\"\n    box\n        class if flag then \"on\" else \"off\"\n";
         let mut interner = StringInterner::new();
         let tree = parse_layout(layout, &mut interner).unwrap();
-        let mut boxes = tree.root().children().filter(|n| n.value().primitive == Primitive::Box);
+        let mut boxes = tree
+            .root()
+            .children()
+            .filter(|n| n.value().primitive == Primitive::Box);
 
         let toggle_box = boxes.next().unwrap();
         assert!(matches!(

@@ -1,4 +1,4 @@
-﻿//! # Executable Reference Test Suite
+//! # Executable Reference Test Suite
 //!
 //! Machine-checks every `.mizu` example in `docs/reference/examples/`.
 //! Fixtures whose filenames start with `err_` are expected to fail at parse
@@ -10,8 +10,8 @@
 
 use std::path::Path;
 
-use mizu::parser::{parse_layout, parse_logic, parse_style, parse_urls, split_source};
 use mizu::core::types::StringInterner;
+use mizu::parser::{parse_layout, parse_logic, parse_style, parse_urls, split_source};
 
 /// Root directory of the fixture files, relative to the crate root (where
 /// `cargo test` runs).
@@ -93,9 +93,7 @@ fn reference_examples_are_parseable() {
 
         if is_error_fixture {
             if result.is_ok() {
-                failures.push(format!(
-                    "EXPECTED FAILURE but got Ok: {name}"
-                ));
+                failures.push(format!("EXPECTED FAILURE but got Ok: {name}"));
             }
         } else if let Err(e) = result {
             failures.push(format!("UNEXPECTED FAILURE: {e}"));
@@ -114,8 +112,14 @@ fn reference_examples_are_parseable() {
         "reference_examples: {}/{} fixtures passed ({} ok, {} error-expected)",
         entries.len(),
         entries.len(),
-        entries.iter().filter(|e| !e.file_name().to_string_lossy().starts_with("err_")).count(),
-        entries.iter().filter(|e| e.file_name().to_string_lossy().starts_with("err_")).count(),
+        entries
+            .iter()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("err_"))
+            .count(),
+        entries
+            .iter()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("err_"))
+            .count(),
     );
 }
 
@@ -149,15 +153,15 @@ macro_rules! fixture_err {
     };
 }
 
-fixture_ok!(fixture_01_minimal,       "01_minimal.mizu");
-fixture_ok!(fixture_02_logic_basics,  "02_logic_basics.mizu");
-fixture_ok!(fixture_03_counter,       "03_counter.mizu");
-fixture_ok!(fixture_04_urls_fetch,    "04_urls_fetch.mizu");
-fixture_ok!(fixture_05_comp,          "05_comp.mizu");
-fixture_ok!(fixture_06_each,          "06_each.mizu");
-fixture_ok!(fixture_07_timer,         "07_timer.mizu");
-fixture_ok!(fixture_08_style,         "08_style.mizu");
+fixture_ok!(fixture_01_minimal, "01_minimal.mizu");
+fixture_ok!(fixture_02_logic_basics, "02_logic_basics.mizu");
+fixture_ok!(fixture_03_counter, "03_counter.mizu");
+fixture_ok!(fixture_04_urls_fetch, "04_urls_fetch.mizu");
+fixture_ok!(fixture_05_comp, "05_comp.mizu");
+fixture_ok!(fixture_06_each, "06_each.mizu");
+fixture_ok!(fixture_07_timer, "07_timer.mizu");
+fixture_ok!(fixture_08_style, "08_style.mizu");
 
-fixture_err!(fixture_err_recursion,        "err_recursion.mizu");
-fixture_err!(fixture_err_nested_each,      "err_nested_each.mizu");
+fixture_err!(fixture_err_recursion, "err_recursion.mizu");
+fixture_err!(fixture_err_nested_each, "err_nested_each.mizu");
 fixture_err!(fixture_err_absolute_img_src, "err_absolute_img_src.mizu");

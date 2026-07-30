@@ -6,9 +6,9 @@
 //!
 //! * [`interner`] — `Symbol` and `StringInterner`.
 //! * [`value`] — the `Value` enum and JSON (de)serialization.
-//! * [`eval`] — `StateMachine`, the evaluator, and the runtime budget
+//! * [`eval`] — `Evaluator`, the evaluator, and the runtime budget
 //!   constants (`MAX_INSTRUCTIONS`, `MAX_COMP_BINDINGS`, `MAX_EVAL_DEPTH`).
-//! * [`store`] — `VariableStore`, the `StateMachine` + `StringInterner`
+//! * [`store`] — `VariableStore`, the `Evaluator` + `StringInterner`
 //!   wrapper used throughout the rest of the crate.
 //!
 //! Every item that was previously a direct member of this module is
@@ -24,9 +24,9 @@ mod store;
 mod tests;
 mod value;
 
-pub use eval::{MAX_EVAL_DEPTH, StateMachine};
+pub use eval::{Evaluator, MAX_EVAL_DEPTH};
 #[cfg(test)]
 use eval::{compare_values, field_value, variant_weight};
 pub use interner::{FrozenInterner, StringInterner, Symbol};
 pub use store::VariableStore;
-pub use value::{DECIMAL_SCALE, FileHandleData, Value, from_json, to_json};
+pub use value::{DECIMAL_SCALE, FileHandleData, Value, RecordField, hash_field, from_json, to_json};

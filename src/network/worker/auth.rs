@@ -48,7 +48,6 @@ pub(super) fn load_valid_entry(
     Ok(Some(entry))
 }
 
-
 /// Response headers that must never become visible to document logic —
 /// i.e. must never end up inside the [`crate::core::types::Value`] bound to
 /// a `NetworkCall`'s `target_var` — regardless of any future change that
@@ -70,7 +69,8 @@ pub(super) fn load_valid_entry(
 /// design); the bare `Mizu-` prefix reservation mirrors the matching
 /// request-header denylist in
 /// `crates/core/src/parser/logic/parse.rs`'s `validate_header_name`.
-const RESPONSE_HEADER_STRIP_LIST_EXACT: &[&str] = &["mizu-auth-set", "set-cookie", "www-authenticate"];
+const RESPONSE_HEADER_STRIP_LIST_EXACT: &[&str] =
+    &["mizu-auth-set", "set-cookie", "www-authenticate"];
 
 /// Returns `true` if `name` (checked case-insensitively) must never be
 /// surfaced to document logic — see [`RESPONSE_HEADER_STRIP_LIST_EXACT`]'s
@@ -287,7 +287,10 @@ mod tests {
             ))
             .unwrap(),
         );
-        headers.insert("set-cookie", http::HeaderValue::from_str("session=abc").unwrap());
+        headers.insert(
+            "set-cookie",
+            http::HeaderValue::from_str("session=abc").unwrap(),
+        );
 
         let body = br#"{"ok":true}"#;
         let domain = "mizu-auth-strip-test.example";

@@ -48,8 +48,12 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
     };
 
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
-    let computed_bindings =
-        parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns, mizu_core::core::config::CONFIG.max_comp_bindings)?;
+    let computed_bindings = parse_computed_with_functions(
+        &parsed.logic_block,
+        &mut interner,
+        &logic_fns,
+        mizu_core::core::config::CONFIG.max_comp_bindings,
+    )?;
     let root_timers = parse_root_timers(&parsed.logic_block, &mut interner)?;
 
     let (_style_rules, _style_variants) = parse_style_with_variants(&parsed.style_block)?;
@@ -62,7 +66,13 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
         &logic_fns,
     )?;
 
-    check_types(&dom_tree, &root_timers, &logic_fns, &computed_bindings, &interner)?;
+    check_types(
+        &dom_tree,
+        &root_timers,
+        &logic_fns,
+        &computed_bindings,
+        &interner,
+    )?;
     check_information_flow(
         &dom_tree,
         &root_timers,
@@ -117,7 +127,10 @@ fn initial_load_rejects_ungated_network_data_into_navigate() {
 #[test]
 fn initial_load_still_accepts_every_reference_example() {
     let fixtures_dir = Path::new("docs/reference/examples");
-    assert!(fixtures_dir.exists(), "fixtures directory not found; run from crate root");
+    assert!(
+        fixtures_dir.exists(),
+        "fixtures directory not found; run from crate root"
+    );
 
     let mut failures: HashMap<String, String> = HashMap::new();
     for entry in std::fs::read_dir(fixtures_dir).expect("read fixtures dir") {

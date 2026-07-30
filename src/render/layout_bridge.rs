@@ -6,7 +6,10 @@ use crate::parser::style::StyleVariant;
 use crate::parser::{MizuNode, MizuOverflow, Primitive, StyleRules};
 use crate::render::bidi::{ResolvedDirection, resolve_direction};
 use crate::render::image_codec::AssetSlot;
-use crate::render::responsive::{RenderEnvironment, ResolvedDimension, ViewportSize, resolve_dimension, resolve_matching_variants};
+use crate::render::responsive::{
+    RenderEnvironment, ResolvedDimension, ViewportSize, resolve_dimension,
+    resolve_matching_variants,
+};
 use ego_tree::{NodeId as EgoNodeId, NodeRef, Tree};
 use std::collections::HashMap;
 use taffy::{
@@ -14,7 +17,6 @@ use taffy::{
     geometry::Size,
     style::{FlexDirection, Overflow, Style},
 };
-
 
 /// Mapping from template DOM node IDs to their per-iteration synthetic Taffy
 /// node IDs.  `paint_each` installs this as a temporary override so that
@@ -32,23 +34,26 @@ pub type EachIterationOverrides = HashMap<EgoNodeId, taffy::prelude::NodeId>;
 /// An unmeasured starting value, overridable for a single run via
 /// `MIZU_MAX_SYNTHETIC_LAYOUT_NODES` (see the module doc on
 /// [`crate::core::config`]).
-pub static MAX_SYNTHETIC_LAYOUT_NODES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    crate::core::config::env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", 20_000)
-});
+pub static MAX_SYNTHETIC_LAYOUT_NODES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        crate::core::config::env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", 20_000)
+    });
 
 /// Default estimated row height (logical px) used to decide which rows of an
 /// `Each` list fall inside the virtualized window before any row of that
 /// block has actually been measured. Refined every frame from real Taffy
 /// measurements once available — see `MizuWindowManager::each_row_height_estimate`.
-pub static DEFAULT_ROW_HEIGHT_ESTIMATE_PX: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
-    crate::core::config::env_override("MIZU_EACH_ROW_HEIGHT_ESTIMATE_PX", 96.0)
-});
+pub static DEFAULT_ROW_HEIGHT_ESTIMATE_PX: std::sync::LazyLock<f32> =
+    std::sync::LazyLock::new(|| {
+        crate::core::config::env_override("MIZU_EACH_ROW_HEIGHT_ESTIMATE_PX", 96.0)
+    });
 
 /// Extra rows of slack expanded on each side of the visible viewport, so
 /// small scroll deltas don't force a re-expansion every frame.
-pub static VIRTUALIZATION_BUFFER_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    crate::core::config::env_override("MIZU_EACH_VIRTUALIZATION_BUFFER_ROWS", 6)
-});
+pub static VIRTUALIZATION_BUFFER_ROWS: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        crate::core::config::env_override("MIZU_EACH_VIRTUALIZATION_BUFFER_ROWS", 6)
+    });
 
 /// One entry per *visible* list element: `(row_container_taffy_id, override_map)`.
 /// Indexed relative to the block's `EachExpansion::window_start`, not the
@@ -77,7 +82,6 @@ pub struct EachExpansion {
     /// position back to an absolute list index.
     pub window_start: HashMap<EgoNodeId, usize>,
 }
-
 
 /// Expands every `Each` node in the DOM into N synthetic Taffy subtrees
 /// (one per list element) so that `taffy.compute_layout` sees the full
@@ -217,8 +221,8 @@ pub fn expand_each_nodes(
         EachExpansion::default()
     };
 
-    let mut remaining_budget = MAX_SYNTHETIC_LAYOUT_NODES
-        .saturating_sub(expansion.all_synthetic_ids.len());
+    let mut remaining_budget =
+        MAX_SYNTHETIC_LAYOUT_NODES.saturating_sub(expansion.all_synthetic_ids.len());
 
     // Collect Each-node metadata without holding tree borrows.
     let each_nodes: Vec<(EgoNodeId, String)> = dom
@@ -284,14 +288,20 @@ pub fn expand_each_nodes(
         let wanted_last = ((rel_bottom / row_h).ceil().max(0.0) as usize).clamp(first, n);
         let wanted_rows = wanted_last - first;
 
-        let max_rows = if budget_per_row == 0 { 0 } else { remaining_budget / budget_per_row };
+        let max_rows = if budget_per_row == 0 {
+            0
+        } else {
+            remaining_budget / budget_per_row
+        };
         let visible_rows = wanted_rows.min(max_rows);
         let last = first + visible_rows;
 
         if visible_rows < wanted_rows {
             // Budget-clamped — distinct from rows simply outside the
             // virtualized window (those are expected and unremarkable).
-            expansion.truncated.insert(each_dom_id, wanted_rows - visible_rows);
+            expansion
+                .truncated
+                .insert(each_dom_id, wanted_rows - visible_rows);
         }
         remaining_budget = remaining_budget.saturating_sub(visible_rows * budget_per_row);
 
@@ -497,7 +507,11 @@ fn to_taffy_length_percentage_auto(
 /// `margin-inline-*`/`padding-inline-*` to a physical left/right side and
 /// mirrors a `row` flex container to `RowReverse` under RTL — see
 /// `docs/design/bidi.md`.
-pub fn translate_style(rules: &StyleRules, viewport: ViewportSize, dir: ResolvedDirection) -> Style {
+pub fn translate_style(
+    rules: &StyleRules,
+    viewport: ViewportSize,
+    dir: ResolvedDirection,
+) -> Style {
     let mut style = Style::default();
     let is_rtl = dir.is_rtl_for_layout();
 
@@ -706,7 +720,11 @@ pub fn build_taffy_tree(
     if let Some(ref k) = id_key {
         selectors.push(k.as_str());
     }
-    merged_rules.merge_from(&resolve_matching_variants(ctx.variants, &selectors, ctx.env));
+    merged_rules.merge_from(&resolve_matching_variants(
+        ctx.variants,
+        &selectors,
+        ctx.env,
+    ));
 
     // ux-7: resolved once per node via `dir` attribute inheritance (an
     // O(depth) ancestor walk — see `render::bidi`'s doc for the cost class).
@@ -787,7 +805,7 @@ pub fn build_taffy_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{Value, VariableStore, StringInterner};
+    use crate::core::types::{StringInterner, Value, VariableStore};
     use crate::parser::layout::parse_layout;
     use crate::parser::style::parse_style_with_variants;
     use crate::render::preferences::ColorScheme;
@@ -884,7 +902,10 @@ mod tests {
 
     fn setup_test_store(items: Vec<Value>) -> VariableStore {
         let interner = StringInterner::new();
-        let mut store = crate::core::types::VariableStore { state_machine: Default::default(), interner };
+        let mut store = crate::core::types::VariableStore {
+            evaluator: Default::default(),
+            interner,
+        };
         store.set("items", Value::List(Arc::new(items)));
         let store = store.freeze();
         store
@@ -898,9 +919,12 @@ mod tests {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
-            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+            node_to_taffy.insert(
+                node.id(),
+                taffy.new_leaf(taffy::style::Style::default()).unwrap(),
+            );
         }
-        
+
         let prev = EachExpansion::default();
         let expansion = expand_each_nodes(
             &dom,
@@ -916,11 +940,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(expansion.truncated.is_empty(), "Small list should not be truncated");
+        assert!(
+            expansion.truncated.is_empty(),
+            "Small list should not be truncated"
+        );
         let each_node = dom.root().children().next().unwrap().id();
         assert_eq!(expansion.groups.get(&each_node).unwrap().len(), 5);
     }
-    
+
     #[test]
     fn each_huge_list_clamped_to_budget() {
         let mut interner = StringInterner::new();
@@ -929,9 +956,12 @@ mod tests {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
-            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+            node_to_taffy.insert(
+                node.id(),
+                taffy.new_leaf(taffy::style::Style::default()).unwrap(),
+            );
         }
-        
+
         let prev = EachExpansion::default();
         // An oversized viewport makes the *needed* virtualization window span
         // the whole list, isolating the budget-clamp path from windowing —
@@ -954,7 +984,10 @@ mod tests {
         let each_node = dom.root().children().next().unwrap().id();
         let truncated = expansion.truncated.get(&each_node).copied().unwrap_or(0);
         assert!(truncated > 0, "Huge list must be truncated");
-        assert_eq!(expansion.groups.get(&each_node).unwrap().len() + truncated, *MAX_SYNTHETIC_LAYOUT_NODES + 100);
+        assert_eq!(
+            expansion.groups.get(&each_node).unwrap().len() + truncated,
+            *MAX_SYNTHETIC_LAYOUT_NODES + 100
+        );
     }
 
     #[test]
@@ -965,7 +998,10 @@ mod tests {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
-            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+            node_to_taffy.insert(
+                node.id(),
+                taffy.new_leaf(taffy::style::Style::default()).unwrap(),
+            );
         }
 
         let prev = EachExpansion::default();
@@ -994,7 +1030,11 @@ mod tests {
             "only a small window of rows near the viewport should be expanded, got {window_len}"
         );
         assert_eq!(
-            expansion.window_start.get(&each_node).copied().unwrap_or(999),
+            expansion
+                .window_start
+                .get(&each_node)
+                .copied()
+                .unwrap_or(999),
             0,
             "scrolled to the top, the window should start at index 0"
         );
@@ -1008,7 +1048,10 @@ mod tests {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
-            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+            node_to_taffy.insert(
+                node.id(),
+                taffy.new_leaf(taffy::style::Style::default()).unwrap(),
+            );
         }
         let each_node = dom.root().children().next().unwrap().id();
 
@@ -1057,12 +1100,15 @@ mod tests {
         let mut taffy = TaffyTree::new();
         let mut node_to_taffy = HashMap::new();
         for node in dom.nodes() {
-            node_to_taffy.insert(node.id(), taffy.new_leaf(taffy::style::Style::default()).unwrap());
+            node_to_taffy.insert(
+                node.id(),
+                taffy.new_leaf(taffy::style::Style::default()).unwrap(),
+            );
         }
-        
+
         let mut expansion = EachExpansion::default();
         let mut base_node_count = 0;
-        
+
         for i in 0..5 {
             expansion = expand_each_nodes(
                 &dom,
@@ -1081,7 +1127,10 @@ mod tests {
             if i == 0 {
                 base_node_count = total_nodes;
             } else {
-                assert_eq!(total_nodes, base_node_count, "Taffy arena should not grow across repeated expansions");
+                assert_eq!(
+                    total_nodes, base_node_count,
+                    "Taffy arena should not grow across repeated expansions"
+                );
             }
         }
     }
@@ -1135,12 +1184,24 @@ mod tests {
         rules.padding_inline_start = Some(crate::parser::MizuDimension::Pixels(5.0));
 
         let ltr_style = translate_style(&rules, vp, ResolvedDirection::Ltr);
-        assert_eq!(ltr_style.padding.left, taffy::style::LengthPercentage::Length(5.0));
-        assert_eq!(ltr_style.padding.right, taffy::style::LengthPercentage::Length(0.0));
+        assert_eq!(
+            ltr_style.padding.left,
+            taffy::style::LengthPercentage::Length(5.0)
+        );
+        assert_eq!(
+            ltr_style.padding.right,
+            taffy::style::LengthPercentage::Length(0.0)
+        );
 
         let rtl_style = translate_style(&rules, vp, ResolvedDirection::Rtl);
-        assert_eq!(rtl_style.padding.right, taffy::style::LengthPercentage::Length(5.0));
-        assert_eq!(rtl_style.padding.left, taffy::style::LengthPercentage::Length(0.0));
+        assert_eq!(
+            rtl_style.padding.right,
+            taffy::style::LengthPercentage::Length(5.0)
+        );
+        assert_eq!(
+            rtl_style.padding.left,
+            taffy::style::LengthPercentage::Length(0.0)
+        );
     }
 
     #[test]
@@ -1157,10 +1218,22 @@ mod tests {
         rules.margin_inline_start = Some(crate::parser::MizuDimension::Pixels(30.0));
 
         let style = translate_style(&rules, vp, ResolvedDirection::Ltr);
-        assert_eq!(style.margin.left, taffy::style::LengthPercentageAuto::Length(30.0));
-        assert_eq!(style.margin.right, taffy::style::LengthPercentageAuto::Length(8.0));
-        assert_eq!(style.margin.top, taffy::style::LengthPercentageAuto::Length(8.0));
-        assert_eq!(style.margin.bottom, taffy::style::LengthPercentageAuto::Length(8.0));
+        assert_eq!(
+            style.margin.left,
+            taffy::style::LengthPercentageAuto::Length(30.0)
+        );
+        assert_eq!(
+            style.margin.right,
+            taffy::style::LengthPercentageAuto::Length(8.0)
+        );
+        assert_eq!(
+            style.margin.top,
+            taffy::style::LengthPercentageAuto::Length(8.0)
+        );
+        assert_eq!(
+            style.margin.bottom,
+            taffy::style::LengthPercentageAuto::Length(8.0)
+        );
     }
 
     #[test]
@@ -1206,11 +1279,7 @@ mod tests {
         // build_taffy_tree's flex-direction mirroring, via resolve_direction's
         // ancestor walk — not just translate_style's unit-level behavior.
         let mut interner = StringInterner::new();
-        let dom = parse_layout(
-            "doc dir=rtl\n    box class row\n",
-            &mut interner,
-        )
-        .unwrap();
+        let dom = parse_layout("doc dir=rtl\n    box class row\n", &mut interner).unwrap();
         let style = "    .row\n        flex-direction row\n";
         let (style_rules, variants) = parse_style_with_variants(style).unwrap();
         let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());

@@ -206,12 +206,7 @@ pub fn panel_left(window_logical_width: f32) -> f32 {
 /// currently displayed (same build the paint pass used).
 ///
 /// Returns `true` when the click changed inspector state (needs a redraw).
-pub fn handle_panel_click(
-    state: &mut InspectorState,
-    rows: &[model::Row],
-    x: f32,
-    y: f32,
-) -> bool {
+pub fn handle_panel_click(state: &mut InspectorState, rows: &[model::Row], x: f32, y: f32) -> bool {
     // ── Tab bar ──────────────────────────────────────────────────────────
     if y < TAB_BAR_HEIGHT {
         if x >= PANEL_WIDTH - PICKER_BTN_WIDTH {

@@ -337,7 +337,11 @@ mod tests {
     #[test]
     fn chrome_palette_meets_wcag_aa_contrast() {
         const MIN_AA: f64 = 4.5;
-        let palettes = [("dark", DARK), ("light", LIGHT), ("high-contrast", HIGH_CONTRAST)];
+        let palettes = [
+            ("dark", DARK),
+            ("light", LIGHT),
+            ("high-contrast", HIGH_CONTRAST),
+        ];
         for (name, p) in palettes {
             let btn_ratio = contrast_ratio(p.btn_text, p.btn_bg);
             assert!(
@@ -352,8 +356,16 @@ mod tests {
             for (label, fg, bg) in [
                 ("active tab title", p.tab_text, p.tab_active_bg),
                 ("inactive tab title", p.tab_text_inactive, p.tab_inactive_bg),
-                ("close glyph on active tab", p.tab_close_glyph, p.tab_active_bg),
-                ("close glyph on inactive tab", p.tab_close_glyph, p.tab_inactive_bg),
+                (
+                    "close glyph on active tab",
+                    p.tab_close_glyph,
+                    p.tab_active_bg,
+                ),
+                (
+                    "close glyph on inactive tab",
+                    p.tab_close_glyph,
+                    p.tab_inactive_bg,
+                ),
                 // The inspector paints its rows straight onto the bar
                 // background, so its semantic colors are held to the same bar.
                 ("ok text on panel", p.ok_dot, p.bar_bg),
@@ -383,7 +395,10 @@ mod tests {
     fn contrast_ratio_identical_colors_is_one() {
         let c = Color::rgba8(128, 128, 128, 255);
         let ratio = contrast_ratio(c, c);
-        assert!((ratio - 1.0).abs() < 0.01, "identical colors must have ratio 1.0, got {ratio}");
+        assert!(
+            (ratio - 1.0).abs() < 0.01,
+            "identical colors must have ratio 1.0, got {ratio}"
+        );
     }
 
     #[test]
@@ -398,7 +413,10 @@ mod tests {
         // Mid-gray on mid-gray: contrast ~1.0, must be replaced.
         let fg = Color::rgba8(140, 140, 140, 255);
         let bg = Color::rgba8(120, 120, 120, 255);
-        assert!(contrast_ratio(fg, bg) < 4.5, "test setup must start non-compliant");
+        assert!(
+            contrast_ratio(fg, bg) < 4.5,
+            "test setup must start non-compliant"
+        );
         let fixed = enforce_min_contrast(fg, bg, 4.5);
         assert!(
             contrast_ratio(fixed, bg) >= 4.5,
@@ -417,7 +435,7 @@ mod tests {
         // for it" but "the evaluator has no such capability"), for every
         // plausible name a document-readable color-scheme primitive might
         // have used, and confirm each fails as an undefined function.
-        use crate::core::types::{StateMachine, StringInterner};
+        use crate::core::types::{Evaluator, StringInterner};
         use crate::parser::logic::{Expr, ExprArena};
 
         for candidate in [
@@ -438,7 +456,7 @@ mod tests {
                 args_start,
                 args_len,
             };
-            let mut machine = StateMachine::new(crate::core::config::CONFIG.max_instructions);
+            let mut machine = Evaluator::new(crate::core::config::CONFIG.max_instructions);
             let no_functions = Default::default();
             let interner = interner.freeze();
             let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);

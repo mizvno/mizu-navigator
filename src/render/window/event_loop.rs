@@ -18,7 +18,7 @@ use winit::{
 };
 
 use crate::core::errors::MizuError;
-use crate::core::types::{StringInterner, Symbol, VariableStore};
+use crate::core::types::{StringInterner, Symbol};
 use crate::network::UiEvent;
 use crate::parser::logic::{ComputedBinding, MizuFunction, RootTimer};
 use crate::parser::{MizuNode, MizuOverflow, Primitive, StyleRules};
@@ -34,8 +34,8 @@ use crate::render::accessibility::{MizuUserEvent, build_a11y_tree, resolve_ego_i
 
 use super::focus::find_click_and_submit;
 use super::input::{
-    apply_clipboard_action, dispatch_click_gesture, dispatch_file_input_click, dispatch_form_submit,
-    find_form_submitter, is_file_input, push_input_text,
+    apply_clipboard_action, dispatch_click_gesture, dispatch_file_input_click,
+    dispatch_form_submit, find_form_submitter, is_file_input, push_input_text,
 };
 use super::manager::{
     MizuWindowManager, execute_tab_capability_action, refresh_tab_virtualized_windows,
@@ -132,7 +132,8 @@ pub fn run_window_loop(
         for node in tab.dom.nodes() {
             for event in node.value().events.values() {
                 match event {
-                    crate::parser::EventBlock::Click { action } | crate::parser::EventBlock::Submit { action } => {
+                    crate::parser::EventBlock::Click { action }
+                    | crate::parser::EventBlock::Submit { action } => {
                         if let crate::parser::Action::Assign { target, .. } = action {
                             interner.get_or_intern(target);
                         }
@@ -146,7 +147,11 @@ pub fn run_window_loop(
                 }
             }
         }
-        tab.store = crate::core::types::VariableStore { state_machine: Default::default(), interner }.freeze();
+        tab.store = crate::core::types::VariableStore {
+            evaluator: Default::default(),
+            interner,
+        }
+        .freeze();
         tab.url_registry = url_registry;
         tab.computed_bindings = computed_bindings;
         tab.root_timers = root_timers;
@@ -170,13 +175,13 @@ pub fn run_window_loop(
                     0,
                 )
             {
-                tab.store.state_machine.set_global(sym, val);
+                tab.store.evaluator.set_global(sym, val);
             }
         }
 
         // Pre-seed comp vars in the render store.
         let all_syms: rustc_hash::FxHashSet<Symbol> =
-            tab.store.state_machine.global_store.keys().copied().collect();
+            tab.store.evaluator.global_store.keys().copied().collect();
         let computed = tab.computed_bindings.clone();
         let fns = tab.logic_fns.clone();
         let reverse_index = crate::parser::logic::build_comp_reverse_index(&computed);
@@ -187,7 +192,7 @@ pub fn run_window_loop(
             &all_syms,
             &reverse_index,
         );
-        tab.store.state_machine.undo_log.clear();
+        tab.store.evaluator.undo_log.clear();
 
         // Rebuild node mappings and dependency index using the correct, fully-populated interner.
         // This ensures that variable dependency tracking works correctly from startup.
@@ -199,9 +204,7 @@ pub fn run_window_loop(
 
     let root_node = manager.active().dom.root().value();
     if root_node.primitive != Primitive::Doc {
-        return Err(MizuError::ParseError(
-            "Root element must be a `doc`".into(),
-        ));
+        return Err(MizuError::ParseError("Root element must be a `doc`".into()));
     }
 
     // `doc`'s explicit `title "..."` attribute sets the OS window title —
@@ -230,7 +233,8 @@ pub fn run_window_loop(
     // Delivers accesskit's initial-tree/action/deactivation events through
     // the same `Event::UserEvent` channel as everything else in this loop —
     // no separate thread, no separate handler wiring.
-    let mut a11y_adapter = accesskit_winit::Adapter::with_event_loop_proxy(&window, accesskit_proxy);
+    let mut a11y_adapter =
+        accesskit_winit::Adapter::with_event_loop_proxy(&window, accesskit_proxy);
 
     let initial_size = window.inner_size();
     let scale_factor = window.scale_factor();
@@ -294,7 +298,14 @@ pub fn run_window_loop(
                     window.request_redraw();
                 }
                 WindowEvent::Resized(physical_size) => {
-                    dispatch_resized(&mut manager, &mut render_cx, &mut surface, &window, elwt, *physical_size);
+                    dispatch_resized(
+                        &mut manager,
+                        &mut render_cx,
+                        &mut surface,
+                        &window,
+                        elwt,
+                        *physical_size,
+                    );
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     dispatch_cursor_moved(&mut manager, &window, *position, &mut mouse);
@@ -429,9 +440,13 @@ fn dispatch_cursor_moved(
     let tab_count = manager.tabs.len();
     let dropdown_count = {
         let tab = manager.active();
-        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+        if tab.chrome_state.focused {
+            tab.chrome_state.suggestions.len()
+        } else {
+            0
+        }
     };
-    
+
     let mut dropdown_hovered = false;
     if dropdown_count > 0 {
         let layout = crate::render::chrome_vello::ChromeLayout {
@@ -444,7 +459,7 @@ fn dispatch_cursor_moved(
             mouse.last_logical_y,
             &layout,
         );
-        
+
         let tab = manager.active_mut();
         if let crate::render::chrome_vello::ChromeHitZone::AutocompleteSuggestion(i) = hit_zone {
             if tab.chrome_state.hovered_suggestion != Some(i) {
@@ -464,7 +479,7 @@ fn dispatch_cursor_moved(
             window.request_redraw();
         }
     }
-    
+
     if dropdown_hovered {
         return;
     }
@@ -540,7 +555,11 @@ fn dispatch_chrome_click(
 ) {
     let dropdown_count = {
         let tab = manager.active();
-        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+        if tab.chrome_state.focused {
+            tab.chrome_state.suggestions.len()
+        } else {
+            0
+        }
     };
     let layout = crate::render::chrome_vello::ChromeLayout {
         window_width: logical_width,
@@ -603,7 +622,7 @@ fn dispatch_chrome_click(
                 let fc = &mut ctx.font_cx;
                 let lc = &mut ctx.layout_cx;
                 cs.set_cursor_from_click(mouse.last_logical_x, bar_left, fc, lc);
-                
+
                 if mouse.click_count == 2 {
                     cs.select_word_at_cursor();
                 } else if mouse.click_count >= 3 {
@@ -626,12 +645,12 @@ fn dispatch_chrome_click(
             } else {
                 tab.chrome_state.url.trim().to_string()
             };
-            
+
             let mut url = target_url;
             if !url.is_empty() && !url.contains("://") {
                 url = format!("mizu://{url}");
             }
-            
+
             tab.chrome_state.url = url.clone();
             tab.chrome_state.cursor = tab.chrome_state.url.len();
             tab.chrome_state.selection = None;
@@ -639,7 +658,7 @@ fn dispatch_chrome_click(
             tab.chrome_state.suggestions.clear();
             tab.chrome_state.selected_suggestion = None;
             tab.chrome_state.inline_completion = None;
-            
+
             tab.chrome_state.loading = true;
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
@@ -689,7 +708,11 @@ fn dispatch_inspector_panel_click(
 /// Handles a left-click while the element picker is active: selects the
 /// node under the cursor instead of triggering its action. Returns `true`
 /// when the picker was active (and therefore consumed the click).
-fn dispatch_picker_click(manager: &mut MizuWindowManager, window: &Window, mouse: &MouseState) -> bool {
+fn dispatch_picker_click(
+    manager: &mut MizuWindowManager,
+    window: &Window,
+    mouse: &MouseState,
+) -> bool {
     let (tab, _ctx) = manager.split_active();
     if !(tab.inspector.open && tab.inspector.picker) {
         return false;
@@ -712,7 +735,8 @@ fn dispatch_picker_click(manager: &mut MizuWindowManager, window: &Window, mouse
         if let Some(idx) = rows.iter().position(|r| r.node == Some(hit_id)) {
             let logical_height = window.inner_size().height as f32 / window.scale_factor() as f32;
             let viewport_h =
-                (logical_height - CHROME_HEIGHT - crate::render::inspector::TAB_BAR_HEIGHT).max(0.0);
+                (logical_height - CHROME_HEIGHT - crate::render::inspector::TAB_BAR_HEIGHT)
+                    .max(0.0);
             tab.inspector.scroll_to_row(idx, viewport_h);
         }
     }
@@ -818,7 +842,7 @@ fn dispatch_mouse_pressed(
     let dx = mouse.last_logical_x - mouse.last_click_pos.map(|(x, _)| x).unwrap_or(-1000.0);
     let dy = mouse.last_logical_y - mouse.last_click_pos.map(|(_, y)| y).unwrap_or(-1000.0);
     let dist = (dx * dx + dy * dy).sqrt();
-    
+
     if let Some(last_time) = mouse.last_click_time {
         if now.duration_since(last_time) < std::time::Duration::from_millis(500) && dist < 5.0 {
             mouse.click_count += 1;
@@ -833,15 +857,24 @@ fn dispatch_mouse_pressed(
 
     let dropdown_count = {
         let tab = manager.active();
-        if tab.chrome_state.focused { tab.chrome_state.suggestions.len() } else { 0 }
+        if tab.chrome_state.focused {
+            tab.chrome_state.suggestions.len()
+        } else {
+            0
+        }
     };
-    let dropdown_h = if dropdown_count > 0 { dropdown_count as f32 * 24.0 + 8.0 } else { 0.0 };
-    let url_bar_right = (logical_width - crate::render::chrome_vello::STATUS_W).max(crate::render::chrome_vello::URL_BAR_X + 10.0);
-    let in_dropdown = dropdown_count > 0 &&
-                      mouse.last_logical_y >= CHROME_HEIGHT &&
-                      mouse.last_logical_y < CHROME_HEIGHT + dropdown_h &&
-                      mouse.last_logical_x >= crate::render::chrome_vello::URL_BAR_X &&
-                      mouse.last_logical_x < url_bar_right;
+    let dropdown_h = if dropdown_count > 0 {
+        dropdown_count as f32 * 24.0 + 8.0
+    } else {
+        0.0
+    };
+    let url_bar_right = (logical_width - crate::render::chrome_vello::STATUS_W)
+        .max(crate::render::chrome_vello::URL_BAR_X + 10.0);
+    let in_dropdown = dropdown_count > 0
+        && mouse.last_logical_y >= CHROME_HEIGHT
+        && mouse.last_logical_y < CHROME_HEIGHT + dropdown_h
+        && mouse.last_logical_x >= crate::render::chrome_vello::URL_BAR_X
+        && mouse.last_logical_x < url_bar_right;
 
     if mouse.last_logical_y < CHROME_HEIGHT || in_dropdown {
         dispatch_chrome_click(manager, window, elwt, mouse, logical_width);
@@ -892,7 +925,10 @@ fn dispatch_history_sidebar_click(
         HistorySidebarHit::Entry(index) => {
             // Copy the URL out before the split borrow: navigation needs
             // `&mut` on the manager, which the log borrow would block.
-            let url = manager.history_log.get(index).map(|record| record.url.clone());
+            let url = manager
+                .history_log
+                .get(index)
+                .map(|record| record.url.clone());
             if let Some(url) = url {
                 // The panel stays open, so a mis-clicked entry costs one
                 // more click rather than a re-open — the sidebar is a list
@@ -914,7 +950,9 @@ fn dispatch_history_sidebar_click(
 /// bar is: a document-controlled title carrying an RLO override could
 /// otherwise repaint itself over a neighbouring tab's label, which is a
 /// spoofing vector, not a cosmetic bug.
-fn tab_strip_entries(manager: &MizuWindowManager) -> Vec<crate::render::chrome_vello::TabStripEntry> {
+fn tab_strip_entries(
+    manager: &MizuWindowManager,
+) -> Vec<crate::render::chrome_vello::TabStripEntry> {
     let active = manager.active().id;
     manager
         .tabs
@@ -1000,7 +1038,9 @@ fn handle_tab_shortcuts(
             }
             retitle_window(manager, window);
         }
-        Key::Character(c) if c.as_str().len() == 1 && c.as_str().chars().all(|ch| ch.is_ascii_digit()) => {
+        Key::Character(c)
+            if c.as_str().len() == 1 && c.as_str().chars().all(|ch| ch.is_ascii_digit()) =>
+        {
             let d = c.as_str().as_bytes()[0] - b'0';
             if d == 0 {
                 return false;
@@ -1021,7 +1061,11 @@ fn handle_tab_shortcuts(
         Key::Named(NamedKey::Tab) => {
             let n = manager.tabs.len();
             let cur = manager.active_tab_index();
-            let next = if shift { (cur + n - 1) % n } else { (cur + 1) % n };
+            let next = if shift {
+                (cur + n - 1) % n
+            } else {
+                (cur + 1) % n
+            };
             let id = manager.tabs[next].id;
             manager.switch_to_tab(id);
             retitle_window(manager, window);
@@ -1045,7 +1089,13 @@ fn handle_global_key_shortcuts(
         tab.inspector.toggle();
         let physical_size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        if let Err(e) = resize_tab_viewport(tab, &mut ctx, physical_size.width as f32 / scale, physical_size.height as f32 / scale, None) {
+        if let Err(e) = resize_tab_viewport(
+            tab,
+            &mut ctx,
+            physical_size.width as f32 / scale,
+            physical_size.height as f32 / scale,
+            None,
+        ) {
             tracing::error!("layout recalculation failed on inspector toggle: {e}");
         }
         window.request_redraw();
@@ -1085,13 +1135,17 @@ fn handle_chrome_key(
             return false;
         }
     }
-    
+
     let url_before = manager.active().chrome_state.url.clone();
 
     let action = {
         let (tab, ctx) = manager.split_active();
         let cs = &mut tab.chrome_state;
-        cs.handle_key(&key_event.logical_key, key_event.text.as_deref(), ctx.modifiers)
+        cs.handle_key(
+            &key_event.logical_key,
+            key_event.text.as_deref(),
+            ctx.modifiers,
+        )
     };
 
     match action {
@@ -1144,17 +1198,18 @@ fn handle_chrome_key(
         let cs = &mut tab.chrome_state;
         cs.suggestions = suggestions;
         cs.selected_suggestion = None;
-        
+
         if let Some(first) = cs.suggestions.first() {
             let url_lower = first.url.to_lowercase();
             let query_lower = url_after.to_lowercase();
-            
-            let without_scheme = url_lower.strip_prefix("mizu://")
+
+            let without_scheme = url_lower
+                .strip_prefix("mizu://")
                 .or_else(|| url_lower.strip_prefix("file://"))
                 .or_else(|| url_lower.strip_prefix("https://"))
                 .or_else(|| url_lower.strip_prefix("http://"))
                 .unwrap_or(&url_lower);
-            
+
             if url_lower.starts_with(&query_lower) {
                 cs.inline_completion = Some(first.url[url_after.len()..].to_string());
             } else if without_scheme.starts_with(&query_lower) {
@@ -1328,7 +1383,13 @@ fn handle_escape_fallback(
         tab.inspector.toggle();
         let physical_size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        if let Err(e) = resize_tab_viewport(tab, &mut ctx, physical_size.width as f32 / scale, physical_size.height as f32 / scale, None) {
+        if let Err(e) = resize_tab_viewport(
+            tab,
+            &mut ctx,
+            physical_size.width as f32 / scale,
+            physical_size.height as f32 / scale,
+            None,
+        ) {
             tracing::error!("layout recalculation failed on inspector close: {e}");
         }
         window.request_redraw();
@@ -1469,7 +1530,10 @@ fn dispatch_mouse_wheel(
             break;
         }
 
-        candidate = tab.dom.get(node_id).and_then(|n| n.parent().map(|p| p.id()));
+        candidate = tab
+            .dom
+            .get(node_id)
+            .and_then(|n| n.parent().map(|p| p.id()));
     }
 
     if scrolled {
@@ -1534,12 +1598,12 @@ fn dispatch_redraw_requested(
     // timer document can't spam the AT.
     a11y_adapter.update_if_active(|| {
         build_a11y_tree(
-                    tab.a11y_epoch,
-                    &tab.dom,
-                    &tab.node_id_to_u32,
-                    tab.focused_node,
-                    &tab.store,
-                )
+            tab.a11y_epoch,
+            &tab.dom,
+            &tab.node_id_to_u32,
+            tab.focused_node,
+            &tab.store,
+        )
     });
 
     let device = &render_cx.devices[surface.dev_id].device;
@@ -1568,8 +1632,8 @@ fn dispatch_redraw_requested(
         &content_clip,
     );
 
-    let dom_transform =
-        Affine::scale(scale) * Affine::translate((0.0, (CHROME_HEIGHT - tab.root_scroll_offset_y) as f64));
+    let dom_transform = Affine::scale(scale)
+        * Affine::translate((0.0, (CHROME_HEIGHT - tab.root_scroll_offset_y) as f64));
 
     let has_animations;
     {
@@ -1723,7 +1787,9 @@ fn dispatch_redraw_requested(
         antialiasing_method: AaConfig::Area,
     };
 
-    if let Err(e) = renderer.render_to_surface(device, queue, &scene, &surface_texture, &render_params) {
+    if let Err(e) =
+        renderer.render_to_surface(device, queue, &scene, &surface_texture, &render_params)
+    {
         tracing::error!("render_to_surface failed: {e}");
         return;
     }
@@ -1734,7 +1800,8 @@ fn dispatch_redraw_requested(
     tab.store.set_runtime(
         "root_scroll_y",
         crate::core::types::Value::Int(
-            (tab.root_scroll_offset_y as f64 * crate::core::types::DECIMAL_SCALE as f64).round() as i64,
+            (tab.root_scroll_offset_y as f64 * crate::core::types::DECIMAL_SCALE as f64).round()
+                as i64,
         ),
     );
 }
@@ -1844,7 +1911,7 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
                         crate::render::inspector::log::EventKind::Mutation,
                         format!("{name_str} = {val}"),
                     );
-                    tab.store.state_machine.set_global(sym, val);
+                    tab.store.evaluator.set_global(sym, val);
                     tab.recent_mutations.insert(sym, std::time::Instant::now());
                     if is_active {
                         state_changed = true;
@@ -1868,7 +1935,9 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
                             NavigationInitiator::DocumentLogic
                         };
                         navigate_to_url(tab, &mut ctx, url, initiator);
-                    } else if let crate::network::RuntimeAction::CopyToClipboard { node_id } = &action {
+                    } else if let crate::network::RuntimeAction::CopyToClipboard { node_id } =
+                        &action
+                    {
                         // Clipboard is intercepted here (not in execute_capability_action)
                         // so we can enforce the user-gesture gate and do DOM lookup.
                         let node_id = node_id.clone();
@@ -1908,7 +1977,11 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
 /// Recomputes text layout for every node depending on a mutated symbol (or
 /// carrying dirty typing state), marking Taffy nodes dirty and triggering a
 /// viewport re-layout if any dimensions actually changed.
-fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, mutated_symbols: Vec<Symbol>) {
+fn recompute_dirty_layout(
+    manager: &mut MizuWindowManager,
+    window: &Window,
+    mutated_symbols: Vec<Symbol>,
+) {
     let (tab, mut ctx) = manager.split_active();
     tab.setup_timers();
 
@@ -1978,7 +2051,8 @@ fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, muta
 
                     let dimensions_changed = match old_dims {
                         Some(old) => {
-                            (old.0 - new_dims.0).abs() > f32::EPSILON || (old.1 - new_dims.1).abs() > f32::EPSILON
+                            (old.0 - new_dims.0).abs() > f32::EPSILON
+                                || (old.1 - new_dims.1).abs() > f32::EPSILON
                         }
                         None => true,
                     };
@@ -2005,7 +2079,9 @@ fn recompute_dirty_layout(manager: &mut MizuWindowManager, window: &Window, muta
         } else {
             Some(dirty_list_names)
         };
-        if let Err(e) = resize_tab_viewport(tab, &mut ctx, logical_width, logical_height, dirty_lists) {
+        if let Err(e) =
+            resize_tab_viewport(tab, &mut ctx, logical_width, logical_height, dirty_lists)
+        {
             tracing::error!("layout recalculation failed after state update: {e}");
         }
     }
@@ -2080,7 +2156,10 @@ fn schedule_next_wakeup(
                     }
                     if let Some(interval_ms) = interval {
                         let next_deadline = now + std::time::Duration::from_millis(interval_ms);
-                        tab.root_timer_queue.entry(next_deadline).or_default().push(idx);
+                        tab.root_timer_queue
+                            .entry(next_deadline)
+                            .or_default()
+                            .push(idx);
                     }
                 }
             }
@@ -2116,10 +2195,13 @@ fn schedule_next_wakeup(
     if tab.inspector.open
         && matches!(
             tab.inspector.tab,
-            crate::render::inspector::InspectorTab::Events | crate::render::inspector::InspectorTab::Logic
+            crate::render::inspector::InspectorTab::Events
+                | crate::render::inspector::InspectorTab::Logic
         )
     {
-        if now.duration_since(tab.inspector.last_events_refresh) >= std::time::Duration::from_millis(500) {
+        if now.duration_since(tab.inspector.last_events_refresh)
+            >= std::time::Duration::from_millis(500)
+        {
             tab.inspector.last_events_refresh = now;
             window.request_redraw();
         }
@@ -2134,7 +2216,11 @@ fn schedule_next_wakeup(
     let any_loading = loading;
     if any_loading {
         let poll_deadline = std::time::Instant::now() + std::time::Duration::from_millis(16);
-        next_wakeup = Some(next_wakeup.map(|d: std::time::Instant| d.min(poll_deadline)).unwrap_or(poll_deadline));
+        next_wakeup = Some(
+            next_wakeup
+                .map(|d: std::time::Instant| d.min(poll_deadline))
+                .unwrap_or(poll_deadline),
+        );
     }
 
     // The split borrow of `manager` ends here, so the window-level throttle
@@ -2188,7 +2274,12 @@ fn fire_background_timers(
     now: std::time::Instant,
 ) -> Option<(bool, Option<std::time::Instant>)> {
     let active = manager.active().id;
-    let ids: Vec<_> = manager.tabs.iter().map(|t| t.id).filter(|id| *id != active).collect();
+    let ids: Vec<_> = manager
+        .tabs
+        .iter()
+        .map(|t| t.id)
+        .filter(|id| *id != active)
+        .collect();
     if ids.is_empty() {
         return None;
     }
@@ -2217,7 +2308,10 @@ fn fire_background_timers(
                 if let Some(interval_ms) = interval {
                     let throttled = background_timer_period(interval_ms);
                     let next_deadline = now + std::time::Duration::from_millis(throttled);
-                    tab.root_timer_queue.entry(next_deadline).or_default().push(idx);
+                    tab.root_timer_queue
+                        .entry(next_deadline)
+                        .or_default()
+                        .push(idx);
                 }
             }
         }
@@ -2278,7 +2372,8 @@ fn dispatch_accesskit_event(
             // real user gesture — route it through the *same*
             // gesture-gated dispatch keyboard activation (ux-1) uses,
             // never a second path into the evaluator.
-            let Some(ego_id) = resolve_ego_id(tab.a11y_epoch, &tab.u32_to_node_id, request.target) else {
+            let Some(ego_id) = resolve_ego_id(tab.a11y_epoch, &tab.u32_to_node_id, request.target)
+            else {
                 return;
             };
             let mut redraw = false;

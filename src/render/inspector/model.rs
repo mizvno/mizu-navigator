@@ -13,7 +13,7 @@ use std::time::Instant;
 use ego_tree::{NodeId as EgoNodeId, Tree};
 use rustc_hash::FxHashMap;
 
-use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
+use crate::core::types::{Symbol, Value, VariableStore};
 use crate::parser::logic::{
     Action, BinOp, ComputedBinding, Expr, ExprArena, MizuFunction, RootTimer, TimerInterval,
 };
@@ -297,7 +297,10 @@ fn style_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
     let node = node_ref.value();
     let mut rows = Vec::new();
     let truncated = src.each_expansion.truncated.get(&sel).copied();
-    rows.push(Row::header(format!("SELECTED  {}", node_label(node, truncated))));
+    rows.push(Row::header(format!(
+        "SELECTED  {}",
+        node_label(node, truncated)
+    )));
 
     // ── Box metrics ──────────────────────────────────────────────────────
     if let Some(&t_id) = src.node_to_taffy_id.get(&sel)
@@ -339,7 +342,10 @@ fn style_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
         let mut eval_store = src.store.clone();
         for cc in &node.conditional_classes {
             match cc {
-                ConditionalClass::Toggle { class_name, condition } => {
+                ConditionalClass::Toggle {
+                    class_name,
+                    condition,
+                } => {
                     let active = crate::parser::logic::evaluate(
                         condition.root(),
                         &condition.arena,
@@ -407,14 +413,18 @@ const MUTATION_FLASH: std::time::Duration = std::time::Duration::from_millis(150
 
 fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
     let mut rows = Vec::new();
-    
+
     // ── Information Flow ──────────────────────────────────────────────────
     rows.push(Row::header("INFORMATION FLOW"));
     if let Some((sources, sinks, violations)) = state.flow_metrics {
         rows.push(Row::plain(
             1,
             format!("flow: {sources} sources, {sinks} sinks, {violations} violations"),
-            if violations == 0 { RowKind::Good } else { RowKind::Bad },
+            if violations == 0 {
+                RowKind::Good
+            } else {
+                RowKind::Bad
+            },
         ));
     } else {
         rows.push(Row::plain(1, "flow metrics not available", RowKind::Dim));
@@ -435,7 +445,7 @@ fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
     rows.push(Row::header("VARIABLES"));
     let mut vars: Vec<(String, String, bool)> = src
         .store
-        .state_machine
+        .evaluator
         .global_store
         .iter()
         .filter(|(sym, _)| !comp_names.contains(sym))
@@ -450,7 +460,11 @@ fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
         rows.push(Row::plain(1, "(none)", RowKind::Dim));
     }
     for (name, val, fresh) in vars {
-        let kind = if fresh { RowKind::Accent } else { RowKind::Normal };
+        let kind = if fresh {
+            RowKind::Accent
+        } else {
+            RowKind::Normal
+        };
         rows.push(Row::plain(1, format!("{name} = {val}"), kind));
     }
 
@@ -463,7 +477,7 @@ fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
         let name = interner.resolve(cb.name).unwrap_or("?");
         let current = src
             .store
-            .state_machine
+            .evaluator
             .global_store
             .get(&cb.name)
             .map(fmt_value)
@@ -475,7 +489,10 @@ fn logic_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
         };
         rows.push(Row::plain(
             1,
-            format!("comp {name} = {}", format_expr(cb.expr.root(), &cb.expr.arena, interner)),
+            format!(
+                "comp {name} = {}",
+                format_expr(cb.expr.root(), &cb.expr.arena, interner)
+            ),
             kind,
         ));
         let deps: Vec<&str> = cb
@@ -645,7 +662,11 @@ fn network_rows(src: &InspectorSources<'_>) -> Vec<Row> {
         .collect();
     endpoints.sort();
     if endpoints.is_empty() {
-        rows.push(Row::plain(1, "(none — no network access declared)", RowKind::Dim));
+        rows.push(Row::plain(
+            1,
+            "(none — no network access declared)",
+            RowKind::Dim,
+        ));
     }
     for ep in endpoints {
         rows.push(Row::plain(1, ep, RowKind::Normal));
@@ -728,7 +749,11 @@ fn binop_str(op: &BinOp) -> &'static str {
 ///
 /// Depth is naturally bounded: the parser rejects nesting beyond
 /// `MAX_PARSE_DEPTH` (256), well within the native stack.
-pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &crate::core::types::FrozenInterner) -> String {
+pub fn format_expr(
+    e: &Expr,
+    arena: &ExprArena,
+    interner: &crate::core::types::FrozenInterner,
+) -> String {
     match e {
         Expr::Literal(v) => match v {
             Value::String(s) => format!("\"{s}\""),
@@ -741,8 +766,16 @@ pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &crate::core::types::F
             binop_str(op),
             format_expr(&arena[*right], arena, interner)
         ),
-        Expr::FunctionCall { name, args_start, args_len } => {
-            let args: Vec<String> = arena.args(*args_start, *args_len).iter().map(|&a| format_expr(&arena[a], arena, interner)).collect();
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
+            let args: Vec<String> = arena
+                .args(*args_start, *args_len)
+                .iter()
+                .map(|&a| format_expr(&arena[a], arena, interner))
+                .collect();
             format!(
                 "{}({})",
                 interner.resolve(*name).unwrap_or("?"),
@@ -766,8 +799,12 @@ pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &crate::core::types::F
             format_expr(&arena[*then_expr], arena, interner),
             format_expr(&arena[*else_expr], arena, interner)
         ),
-        Expr::FieldAccess { base, field } => {
-            format!("{}.{field}", format_expr(&arena[*base], arena, interner))
+        Expr::FieldAccess { base, field, field_hash: _ } => {
+            let field_name = interner.resolve(*field).unwrap_or("?");
+            format!(
+                "{}.{field_name}",
+                format_expr(&arena[*base], arena, interner)
+            )
         }
     }
 }
@@ -776,10 +813,15 @@ pub fn format_expr(e: &Expr, arena: &ExprArena, interner: &crate::core::types::F
 pub fn format_action(a: &Action, interner: &crate::core::types::FrozenInterner) -> String {
     match a {
         Action::Assign { target, expr } => {
-            format!("{target} = {}", format_expr(expr.root(), &expr.arena, interner))
+            format!(
+                "{target} = {}",
+                format_expr(expr.root(), &expr.arena, interner)
+            )
         }
         Action::Eval(e) => format_expr(e.root(), &e.arena, interner),
-        Action::Navigate { url } => format!("navigate {}", format_expr(url.root(), &url.arena, interner)),
+        Action::Navigate { url } => {
+            format!("navigate {}", format_expr(url.root(), &url.arena, interner))
+        }
         Action::NetworkCall {
             method,
             alias_sym,
@@ -802,11 +844,13 @@ mod tests {
     #[test]
     fn format_expr_roundtrips_simple_source() {
         let mut interner = StringInterner::new();
-        let expr =
-            crate::parser::logic::parse_expr_standalone("count > 4 && !busy", &mut interner)
-                .unwrap();
+        let expr = crate::parser::logic::parse_expr_standalone("count > 4 && !busy", &mut interner)
+            .unwrap();
         let interner = interner.freeze();
-        assert_eq!(format_expr(expr.root(), &expr.arena, &interner), "count > 4 && !busy");
+        assert_eq!(
+            format_expr(expr.root(), &expr.arena, &interner),
+            "count > 4 && !busy"
+        );
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! AST and function/action type definitions for the Mizu logic block.
 
-use std::sync::Arc;
 
 use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value};
@@ -46,7 +45,6 @@ impl std::fmt::Display for ValueType {
         }
     }
 }
-
 
 /// HTTP method for a compile-time–validated network call.
 ///
@@ -140,7 +138,6 @@ impl PayloadFormat {
     }
 }
 
-
 /// A recurring timer declared at the root of the `logic` block.
 ///
 /// Syntax: `timer <interval> -> <action>`
@@ -229,7 +226,10 @@ impl ExprArena {
     /// Creates a new, empty arena.
     #[must_use]
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), args_pool: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            args_pool: Vec::new(),
+        }
     }
 
     /// Appends `expr` to the arena and returns its new [`ExprId`].
@@ -408,6 +408,8 @@ pub enum Expr {
         base: ExprId,
         /// The field name to look up in the record.
         field: Symbol,
+        /// The precomputed 32-bit hash of the field name for O(log N) lookup.
+        field_hash: u32,
     },
 }
 
@@ -540,7 +542,12 @@ mod tests {
             args_start,
             args_len,
         };
-        let Expr::FunctionCall { args_start, args_len, .. } = call else {
+        let Expr::FunctionCall {
+            args_start,
+            args_len,
+            ..
+        } = call
+        else {
             unreachable!()
         };
         assert_eq!(arena.args(args_start, args_len), &[arg0]);

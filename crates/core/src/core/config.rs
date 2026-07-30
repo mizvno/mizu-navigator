@@ -75,15 +75,22 @@ pub struct MizuConfig {
     pub storage_batch_max_keys: usize,
     pub max_redirects: u32,
     pub mizu_port: u16,
-    
+
     // Experimental budget overrides
-    #[serde(skip)] pub max_instructions: u64,
-    #[serde(skip)] pub max_comp_bindings: usize,
-    #[serde(skip)] pub max_synthetic_layout_nodes: usize,
-    #[serde(skip)] pub input_max_bytes: usize,
-    #[serde(skip)] pub max_parse_depth: usize,
-    #[serde(skip)] pub max_token_ttl_secs: u64,
-    #[serde(skip)] pub master_key: Option<String>,
+    #[serde(skip)]
+    pub max_instructions: u64,
+    #[serde(skip)]
+    pub max_comp_bindings: usize,
+    #[serde(skip)]
+    pub max_synthetic_layout_nodes: usize,
+    #[serde(skip)]
+    pub input_max_bytes: usize,
+    #[serde(skip)]
+    pub max_parse_depth: usize,
+    #[serde(skip)]
+    pub max_token_ttl_secs: u64,
+    #[serde(skip)]
+    pub master_key: Option<String>,
 }
 
 impl Default for MizuConfig {
@@ -142,38 +149,46 @@ fn config_path() -> PathBuf {
 /// so a typo doesn't silently do nothing.
 fn load() -> MizuConfig {
     let path = config_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return MizuConfig::default(),
-    };
-    match toml::from_str::<MizuConfig>(&text) {
-        Ok(mut cfg) => {
-            cfg.max_instructions = env_override("MIZU_MAX_INSTRUCTIONS", cfg.max_instructions);
-            cfg.max_comp_bindings = env_override("MIZU_MAX_COMP_BINDINGS", cfg.max_comp_bindings);
-            cfg.max_synthetic_layout_nodes = env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", cfg.max_synthetic_layout_nodes);
-            cfg.input_max_bytes = env_override("MIZU_INPUT_MAX_BYTES", cfg.input_max_bytes);
-            cfg.max_parse_depth = env_override("MIZU_MAX_PARSE_DEPTH", cfg.max_parse_depth);
-            cfg.max_token_ttl_secs = env_override("MIZU_MAX_TOKEN_TTL_SECS", cfg.max_token_ttl_secs);
-            cfg.master_key = std::env::var("MIZU_MASTER_KEY").ok();
-            cfg
+    let cfg = match std::fs::read_to_string(&path) {
+        // No config authored yet — the normal case. Defaults, but the
+        // environment still gets its say below.
+        Err(_) => MizuConfig::default(),
+        Ok(text) => match toml::from_str::<MizuConfig>(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to parse config.toml; using default settings"
+                );
+                MizuConfig::default()
+            }
         },
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "failed to parse config.toml; using default settings"
-            );
-            let mut cfg = MizuConfig::default();
-            cfg.max_instructions = env_override("MIZU_MAX_INSTRUCTIONS", cfg.max_instructions);
-            cfg.max_comp_bindings = env_override("MIZU_MAX_COMP_BINDINGS", cfg.max_comp_bindings);
-            cfg.max_synthetic_layout_nodes = env_override("MIZU_MAX_SYNTHETIC_LAYOUT_NODES", cfg.max_synthetic_layout_nodes);
-            cfg.input_max_bytes = env_override("MIZU_INPUT_MAX_BYTES", cfg.input_max_bytes);
-            cfg.max_parse_depth = env_override("MIZU_MAX_PARSE_DEPTH", cfg.max_parse_depth);
-            cfg.max_token_ttl_secs = env_override("MIZU_MAX_TOKEN_TTL_SECS", cfg.max_token_ttl_secs);
-            cfg.master_key = std::env::var("MIZU_MASTER_KEY").ok();
-            cfg
-        }
-    }
+    };
+    apply_env_overrides(cfg)
+}
+
+/// Layers the `MIZU_*` environment overrides on top of `cfg`.
+///
+/// Applied on **every** path out of [`load`], including the missing-file one.
+/// It used to be skipped there via an early `return MizuConfig::default()`,
+/// which meant that on any machine without a `config.toml` — documented right
+/// above as the normal case — every override silently did nothing. That took
+/// `MIZU_MASTER_KEY` with it, so the headless/recovery break-glass path in
+/// `storage::derive_or_create_key` was dead by default and storage fell
+/// through to the OS keyring it exists to bypass.
+fn apply_env_overrides(mut cfg: MizuConfig) -> MizuConfig {
+    cfg.max_instructions = env_override("MIZU_MAX_INSTRUCTIONS", cfg.max_instructions);
+    cfg.max_comp_bindings = env_override("MIZU_MAX_COMP_BINDINGS", cfg.max_comp_bindings);
+    cfg.max_synthetic_layout_nodes = env_override(
+        "MIZU_MAX_SYNTHETIC_LAYOUT_NODES",
+        cfg.max_synthetic_layout_nodes,
+    );
+    cfg.input_max_bytes = env_override("MIZU_INPUT_MAX_BYTES", cfg.input_max_bytes);
+    cfg.max_parse_depth = env_override("MIZU_MAX_PARSE_DEPTH", cfg.max_parse_depth);
+    cfg.max_token_ttl_secs = env_override("MIZU_MAX_TOKEN_TTL_SECS", cfg.max_token_ttl_secs);
+    cfg.master_key = std::env::var("MIZU_MASTER_KEY").ok();
+    cfg
 }
 
 /// Process-wide operational settings, loaded once on first access.
@@ -245,10 +260,7 @@ mod tests {
             cfg.connect_timeout_secs,
             MizuConfig::default().connect_timeout_secs
         );
-        assert_eq!(
-            cfg.max_redirects,
-            MizuConfig::default().max_redirects
-        );
+        assert_eq!(cfg.max_redirects, MizuConfig::default().max_redirects);
     }
 
     #[test]
@@ -284,9 +296,14 @@ mod tests {
     #[test]
     fn config_path_lands_under_a_mizu_directory_with_the_right_filename() {
         let path = config_path();
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("config.toml"));
         assert_eq!(
-            path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            path.file_name().and_then(|n| n.to_str()),
+            Some("config.toml")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("mizu")
         );
     }

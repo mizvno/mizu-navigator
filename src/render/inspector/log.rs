@@ -193,12 +193,7 @@ impl InspectorLog {
     /// If no matching entry exists (e.g. the start rolled out of the ring),
     /// a standalone completed entry is appended instead so the outcome is
     /// never lost.
-    pub fn complete_net(
-        &mut self,
-        correlation: &str,
-        outcome: NetOutcome,
-        bytes: Option<usize>,
-    ) {
+    pub fn complete_net(&mut self, correlation: &str, outcome: NetOutcome, bytes: Option<usize>) {
         let now = Instant::now();
         if let Some(entry) = self.network.iter_mut().rev().find(|e| {
             e.outcome == NetOutcome::Pending && e.correlation.as_deref() == Some(correlation)

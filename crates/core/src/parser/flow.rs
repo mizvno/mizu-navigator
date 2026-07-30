@@ -24,8 +24,8 @@
 
 use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
-use crate::parser::logic::{Action, Expr, ExprArena, ExprTree, MizuFunction, ComputedBinding};
-use crate::parser::layout::{MizuNode, EventBlock};
+use crate::parser::layout::{EventBlock, MizuNode};
+use crate::parser::logic::{Action, ComputedBinding, Expr, ExprArena, ExprTree, MizuFunction};
 use crate::parser::urls::UrlRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -102,14 +102,22 @@ pub fn check_information_flow(
 
     // NetworkCall target_var is tainted (values from the network)
     for (_, action) in &actions {
-        if let Action::NetworkCall { target_var, method, alias_sym, .. } = action
+        if let Action::NetworkCall {
+            target_var,
+            method,
+            alias_sym,
+            ..
+        } = action
             && let Some(sym) = interner.get(target_var)
         {
             tainted_vars.insert(sym);
             let alias_name = interner.resolve(*alias_sym).unwrap_or("<unknown>");
-            taint_origins.insert(sym, TaintOrigin::NetworkResponse {
-                action_desc: format!("{method:?}({alias_name})"),
-            });
+            taint_origins.insert(
+                sym,
+                TaintOrigin::NetworkResponse {
+                    action_desc: format!("{method:?}({alias_name})"),
+                },
+            );
         }
     }
 
@@ -117,70 +125,149 @@ pub fn check_information_flow(
 
     // â”€â”€ Propagation (fixpoint) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut worklist: Vec<Symbol> = tainted_vars.iter().copied().collect();
 
-        // Propagate through user-defined functions
-        for (sym, func) in functions {
-            if !tainted_functions.contains(sym)
-                && is_expr_tainted(func.body.root(), &func.body.arena, &tainted_vars, &tainted_functions, gst_sym)
-            {
-                tainted_functions.insert(*sym);
-                changed = true;
+    #[derive(Clone)]
+    enum Dependent<'a> {
+        Function(Symbol),
+        Comp(&'a ComputedBinding),
+        Assign(Symbol),
+    }
+
+    let mut graph: FxHashMap<Symbol, Vec<Dependent>> = FxHashMap::default();
+
+    fn extract_deps(
+        expr: &crate::parser::logic::Expr,
+        arena: &crate::parser::logic::ExprArena,
+        gst_sym: Option<Symbol>,
+        deps: &mut FxHashSet<Symbol>,
+    ) {
+        use crate::parser::logic::Expr;
+        match expr {
+            Expr::Variable(sym) => {
+                deps.insert(*sym);
             }
-        }
-
-        // Propagate through ComputedBindings
-        for comp in comps {
-            if !tainted_vars.contains(&comp.name)
-                && is_expr_tainted(comp.expr.root(), &comp.expr.arena, &tainted_vars, &tainted_functions, gst_sym)
-            {
-                tainted_vars.insert(comp.name);
-                // Track the propagation origin for diagnostics
-                if let Some(source_sym) = find_tainted_var_in_expr(
-                    comp.expr.root(), &comp.expr.arena, &tainted_vars, &tainted_functions, gst_sym,
-                ) {
-                    let from_name = interner.resolve(source_sym)
-                        .unwrap_or("<unknown>").to_string();
-                    taint_origins.insert(comp.name, TaintOrigin::Propagated {
-                        from_var: from_name,
-                    });
+            Expr::FunctionCall {
+                name,
+                args_start,
+                args_len,
+            } => {
+                if Some(*name) != gst_sym {
+                    deps.insert(*name);
                 }
-                changed = true;
+                for arg_idx in 0..*args_len {
+                    extract_deps(
+                        &arena[arena.args(*args_start, *args_len)[arg_idx as usize]],
+                        arena,
+                        gst_sym,
+                        deps,
+                    );
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                extract_deps(&arena[*left], arena, gst_sym, deps);
+                extract_deps(&arena[*right], arena, gst_sym, deps);
+            }
+            Expr::Not(operand) => {
+                extract_deps(&arena[*operand], arena, gst_sym, deps);
+            }
+            Expr::FieldAccess { base, .. } => {
+                extract_deps(&arena[*base], arena, gst_sym, deps);
+            }
+            Expr::Let { value, body, .. } => {
+                extract_deps(&arena[*value], arena, gst_sym, deps);
+                extract_deps(&arena[*body], arena, gst_sym, deps);
+            }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                extract_deps(&arena[*condition], arena, gst_sym, deps);
+                extract_deps(&arena[*then_expr], arena, gst_sym, deps);
+                extract_deps(&arena[*else_expr], arena, gst_sym, deps);
+            }
+            Expr::Literal(_) => {}
+        }
+    }
+    // Build the graph
+    for (sym, func) in functions {
+        let mut deps = FxHashSet::default();
+        extract_deps(func.body.root(), &func.body.arena, gst_sym, &mut deps);
+        for dep in deps {
+            graph
+                .entry(dep)
+                .or_default()
+                .push(Dependent::Function(*sym));
+        }
+    }
+
+    for comp in comps {
+        let mut deps = FxHashSet::default();
+        extract_deps(comp.expr.root(), &comp.expr.arena, gst_sym, &mut deps);
+        for dep in deps {
+            graph.entry(dep).or_default().push(Dependent::Comp(comp));
+        }
+    }
+
+    for (_, action) in &actions {
+        if let Action::Assign { target, expr } = action {
+            if let Some(target_sym) = interner.get(target) {
+                let mut deps = FxHashSet::default();
+                extract_deps(expr.root(), &expr.arena, gst_sym, &mut deps);
+                for dep in deps {
+                    graph
+                        .entry(dep)
+                        .or_default()
+                        .push(Dependent::Assign(target_sym));
+                }
             }
         }
+    }
 
-        // Propagate through Assign actions
-        for (_, action) in &actions {
-            match action {
-                Action::Assign { target, expr } => {
-                    if let Some(target_sym) = interner.get(target)
-                        && !tainted_vars.contains(&target_sym)
-                        && is_expr_tainted(expr.root(), &expr.arena, &tainted_vars, &tainted_functions, gst_sym)
-                    {
-                        tainted_vars.insert(target_sym);
-                        if let Some(source_sym) = find_tainted_var_in_expr(
-                            expr.root(), &expr.arena, &tainted_vars, &tainted_functions, gst_sym,
-                        ) {
-                            let from_name = interner.resolve(source_sym)
-                                .unwrap_or("<unknown>").to_string();
-                            taint_origins.insert(target_sym, TaintOrigin::Propagated {
-                                from_var: from_name,
-                            });
+    while let Some(tainted_sym) = worklist.pop() {
+        if let Some(dependents) = graph.get(&tainted_sym) {
+            for dep in dependents {
+                match dep {
+                    Dependent::Function(sym) => {
+                        if !tainted_functions.contains(sym) {
+                            tainted_functions.insert(*sym);
+                            worklist.push(*sym);
                         }
-                        changed = true;
+                    }
+                    Dependent::Comp(comp) => {
+                        if !tainted_vars.contains(&comp.name) {
+                            tainted_vars.insert(comp.name);
+                            worklist.push(comp.name);
+                            let from_name = interner
+                                .resolve(tainted_sym)
+                                .unwrap_or("<unknown>")
+                                .to_string();
+                            taint_origins.insert(
+                                comp.name,
+                                TaintOrigin::Propagated {
+                                    from_var: from_name,
+                                },
+                            );
+                        }
+                    }
+                    Dependent::Assign(target_sym) => {
+                        if !tainted_vars.contains(target_sym) {
+                            tainted_vars.insert(*target_sym);
+                            worklist.push(*target_sym);
+                            let from_name = interner
+                                .resolve(tainted_sym)
+                                .unwrap_or("<unknown>")
+                                .to_string();
+                            taint_origins.insert(
+                                *target_sym,
+                                TaintOrigin::Propagated {
+                                    from_var: from_name,
+                                },
+                            );
+                        }
                     }
                 }
-                Action::NetworkCall { target_var, .. } => {
-                    if let Some(target_sym) = interner.get(target_var)
-                        && !tainted_vars.contains(&target_sym)
-                    {
-                        tainted_vars.insert(target_sym);
-                        changed = true;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -202,14 +289,29 @@ pub fn check_information_flow(
     if let Some(gst_sym) = gst_sym {
         let mut gst_targets = Vec::new();
         for func in functions.values() {
-            collect_get_system_time_targets(func.body.root(), &func.body.arena, gst_sym, &mut gst_targets);
+            collect_get_system_time_targets(
+                func.body.root(),
+                &func.body.arena,
+                gst_sym,
+                &mut gst_targets,
+            );
         }
         for comp in comps {
-            collect_get_system_time_targets(comp.expr.root(), &comp.expr.arena, gst_sym, &mut gst_targets);
+            collect_get_system_time_targets(
+                comp.expr.root(),
+                &comp.expr.arena,
+                gst_sym,
+                &mut gst_targets,
+            );
         }
         for (_, action) in &actions {
             for tree in action_exprs(action) {
-                collect_get_system_time_targets(tree.root(), &tree.arena, gst_sym, &mut gst_targets);
+                collect_get_system_time_targets(
+                    tree.root(),
+                    &tree.arena,
+                    gst_sym,
+                    &mut gst_targets,
+                );
             }
         }
         for target in gst_targets {
@@ -232,13 +334,24 @@ pub fn check_information_flow(
         // percent-encoded).  See SECURITY-INVARIANTS.md Â§5, gate G2.
         if let Action::Navigate { url } = action {
             num_sinks += 1;
-            if is_expr_tainted(url.root(), &url.arena, &tainted_vars, &tainted_functions, gst_sym) {
+            if is_expr_tainted(
+                url.root(),
+                &url.arena,
+                &tainted_vars,
+                &tainted_functions,
+                gst_sym,
+            ) {
                 // Gate G1: user-gesture navigation discharges taint
                 if *ctx != ActionContext::UserGesture {
                     // Build diagnostic path (F3)
                     let path = build_taint_path(
-                        url.root(), &url.arena, &tainted_vars, &tainted_functions,
-                        &taint_origins, interner, gst_sym,
+                        url.root(),
+                        &url.arena,
+                        &tainted_vars,
+                        &tainted_functions,
+                        &taint_origins,
+                        interner,
+                        gst_sym,
                     );
                     return Err(MizuError::ParseError(format!(
                         "Information Flow Violation: {path} reaches 'navigate' \
@@ -261,7 +374,12 @@ fn action_exprs(action: &Action) -> Vec<&ExprTree> {
         Action::Eval(e) => vec![e],
         Action::Assign { expr, .. } => vec![expr],
         Action::Navigate { url } => vec![url],
-        Action::NetworkCall { payload, path_param, headers, .. } => {
+        Action::NetworkCall {
+            payload,
+            path_param,
+            headers,
+            ..
+        } => {
             let mut exprs = Vec::new();
             if let Some(p) = payload {
                 exprs.push(p);
@@ -284,14 +402,23 @@ fn action_exprs(action: &Action) -> Vec<&ExprTree> {
 /// (`parser::logic.rs`), every call found here has a statically-known
 /// target â€” the whole point of this walk is to make that target visible to
 /// the checker, exactly as an `Action::Assign`'s target already is.
-fn collect_get_system_time_targets(expr: &Expr, arena: &ExprArena, gst_sym: Symbol, out: &mut Vec<Symbol>) {
+fn collect_get_system_time_targets(
+    expr: &Expr,
+    arena: &ExprArena,
+    gst_sym: Symbol,
+    out: &mut Vec<Symbol>,
+) {
     match expr {
         Expr::Literal(_) | Expr::Variable(_) => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_get_system_time_targets(&arena[*left], arena, gst_sym, out);
             collect_get_system_time_targets(&arena[*right], arena, gst_sym, out);
         }
-        Expr::FunctionCall { name, args_start, args_len } => {
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
             let args = arena.args(*args_start, *args_len);
             if *name == gst_sym
                 && let [id] = args
@@ -308,12 +435,18 @@ fn collect_get_system_time_targets(expr: &Expr, arena: &ExprArena, gst_sym: Symb
             collect_get_system_time_targets(&arena[*body], arena, gst_sym, out);
         }
         Expr::Not(inner) => collect_get_system_time_targets(&arena[*inner], arena, gst_sym, out),
-        Expr::IfElse { condition, then_expr, else_expr } => {
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             collect_get_system_time_targets(&arena[*condition], arena, gst_sym, out);
             collect_get_system_time_targets(&arena[*then_expr], arena, gst_sym, out);
             collect_get_system_time_targets(&arena[*else_expr], arena, gst_sym, out);
         }
-        Expr::FieldAccess { base, .. } => collect_get_system_time_targets(&arena[*base], arena, gst_sym, out),
+        Expr::FieldAccess { base, .. } => {
+            collect_get_system_time_targets(&arena[*base], arena, gst_sym, out)
+        }
     }
 }
 
@@ -334,10 +467,25 @@ fn is_expr_tainted(
         Expr::Variable(sym) => tainted_vars.contains(sym),
         Expr::Literal(_) => false,
         Expr::BinaryOp { left, right, .. } => {
-            is_expr_tainted(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(
+                &arena[*left],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            ) || is_expr_tainted(
+                &arena[*right],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
         }
-        Expr::FunctionCall { name, args_start, args_len } => {
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
             if Some(*name) == gst_sym {
                 return false;
             }
@@ -352,18 +500,59 @@ fn is_expr_tainted(
             false
         }
         Expr::Let { value, body, .. } => {
-            is_expr_tainted(&arena[*value], arena, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(&arena[*body], arena, tainted_vars, tainted_functions, gst_sym)
+            is_expr_tainted(
+                &arena[*value],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            ) || is_expr_tainted(
+                &arena[*body],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
         }
-        Expr::Not(inner) => is_expr_tainted(&arena[*inner], arena, tainted_vars, tainted_functions, gst_sym),
-        Expr::IfElse { condition, then_expr, else_expr } => {
-            is_expr_tainted(&arena[*condition], arena, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(&arena[*then_expr], arena, tainted_vars, tainted_functions, gst_sym)
-                || is_expr_tainted(&arena[*else_expr], arena, tainted_vars, tainted_functions, gst_sym)
+        Expr::Not(inner) => is_expr_tainted(
+            &arena[*inner],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        ),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            is_expr_tainted(
+                &arena[*condition],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            ) || is_expr_tainted(
+                &arena[*then_expr],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            ) || is_expr_tainted(
+                &arena[*else_expr],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
         }
-        Expr::FieldAccess { base, .. } => {
-            is_expr_tainted(&arena[*base], arena, tainted_vars, tainted_functions, gst_sym)
-        }
+        Expr::FieldAccess { base, .. } => is_expr_tainted(
+            &arena[*base],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        ),
     }
 }
 
@@ -378,14 +567,34 @@ fn find_tainted_var_in_expr(
 ) -> Option<Symbol> {
     match expr {
         Expr::Variable(sym) => {
-            if tainted_vars.contains(sym) { Some(*sym) } else { None }
+            if tainted_vars.contains(sym) {
+                Some(*sym)
+            } else {
+                None
+            }
         }
         Expr::Literal(_) => None,
-        Expr::BinaryOp { left, right, .. } => {
-            find_tainted_var_in_expr(&arena[*left], arena, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(&arena[*right], arena, tainted_vars, tainted_functions, gst_sym))
-        }
-        Expr::FunctionCall { name, args_start, args_len } => {
+        Expr::BinaryOp { left, right, .. } => find_tainted_var_in_expr(
+            &arena[*left],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        )
+        .or_else(|| {
+            find_tainted_var_in_expr(
+                &arena[*right],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
+        }),
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
             if Some(*name) == gst_sym {
                 return None;
             }
@@ -393,25 +602,77 @@ fn find_tainted_var_in_expr(
                 return Some(*name);
             }
             for &arg in arena.args(*args_start, *args_len) {
-                if let Some(s) = find_tainted_var_in_expr(&arena[arg], arena, tainted_vars, tainted_functions, gst_sym) {
+                if let Some(s) = find_tainted_var_in_expr(
+                    &arena[arg],
+                    arena,
+                    tainted_vars,
+                    tainted_functions,
+                    gst_sym,
+                ) {
                     return Some(s);
                 }
             }
             None
         }
-        Expr::Let { value, body, .. } => {
-            find_tainted_var_in_expr(&arena[*value], arena, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(&arena[*body], arena, tainted_vars, tainted_functions, gst_sym))
-        }
-        Expr::Not(inner) => find_tainted_var_in_expr(&arena[*inner], arena, tainted_vars, tainted_functions, gst_sym),
-        Expr::IfElse { condition, then_expr, else_expr } => {
-            find_tainted_var_in_expr(&arena[*condition], arena, tainted_vars, tainted_functions, gst_sym)
-                .or_else(|| find_tainted_var_in_expr(&arena[*then_expr], arena, tainted_vars, tainted_functions, gst_sym))
-                .or_else(|| find_tainted_var_in_expr(&arena[*else_expr], arena, tainted_vars, tainted_functions, gst_sym))
-        }
-        Expr::FieldAccess { base, .. } => {
-            find_tainted_var_in_expr(&arena[*base], arena, tainted_vars, tainted_functions, gst_sym)
-        }
+        Expr::Let { value, body, .. } => find_tainted_var_in_expr(
+            &arena[*value],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        )
+        .or_else(|| {
+            find_tainted_var_in_expr(
+                &arena[*body],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
+        }),
+        Expr::Not(inner) => find_tainted_var_in_expr(
+            &arena[*inner],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        ),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => find_tainted_var_in_expr(
+            &arena[*condition],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        )
+        .or_else(|| {
+            find_tainted_var_in_expr(
+                &arena[*then_expr],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
+        })
+        .or_else(|| {
+            find_tainted_var_in_expr(
+                &arena[*else_expr],
+                arena,
+                tainted_vars,
+                tainted_functions,
+                gst_sym,
+            )
+        }),
+        Expr::FieldAccess { base, .. } => find_tainted_var_in_expr(
+            &arena[*base],
+            arena,
+            tainted_vars,
+            tainted_functions,
+            gst_sym,
+        ),
     }
 }
 
@@ -444,7 +705,9 @@ fn build_taint_path(
     interner: &crate::core::types::StringInterner,
     gst_sym: Option<Symbol>,
 ) -> String {
-    if let Some(sym) = find_tainted_var_in_expr(expr, arena, tainted_vars, tainted_functions, gst_sym) {
+    if let Some(sym) =
+        find_tainted_var_in_expr(expr, arena, tainted_vars, tainted_functions, gst_sym)
+    {
         let var_name = interner.resolve(sym).unwrap_or("<unknown>");
         if let Some(origin) = origins.get(&sym) {
             match origin {
@@ -466,25 +729,33 @@ fn build_taint_path(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::types::StringInterner;
-    use crate::parser::urls::parse_urls;
-    use crate::parser::logic::{parse_logic, parse_computed_with_functions, parse_root_timers};
     use crate::parser::layout::parse_layout_with_urls;
+    use crate::parser::logic::{parse_computed_with_functions, parse_logic, parse_root_timers};
     use crate::parser::splitter::split_source_with_origin;
+    use crate::parser::urls::parse_urls;
 
     fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), MizuError> {
         let current_dir = std::env::current_dir().unwrap_or_default();
-        let blocks = split_source_with_origin(src, &current_dir, crate::parser::Origin::Network).unwrap();
+        let blocks =
+            split_source_with_origin(src, &current_dir, crate::parser::Origin::Network).unwrap();
         let mut interner = StringInterner::new();
         let urls = parse_urls(&blocks.urls_block, &mut interner).unwrap_or_default();
         let functions = parse_logic(&blocks.logic_block, &mut interner).unwrap_or_default();
-        let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions).unwrap_or_default();
+        let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions, crate::core::config::CONFIG.max_comp_bindings)
+            .unwrap_or_default();
         let timers = parse_root_timers(&blocks.logic_block, &mut interner).unwrap_or_default();
-        let dom = parse_layout_with_urls(&blocks.layout_block, &mut interner, Some(&urls), true, &functions).unwrap();
+        let dom = parse_layout_with_urls(
+            &blocks.layout_block,
+            &mut interner,
+            Some(&urls),
+            true,
+            &functions,
+        )
+        .unwrap();
 
         check_information_flow(&dom, &timers, &functions, &comps, &urls, &interner)
     }
@@ -505,8 +776,14 @@ layout
         let res = check_flow_doc(doc);
         assert!(res.is_err(), "Expected flow violation");
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("navigate"), "error should mention navigate: {msg}");
-        assert!(msg.contains("data"), "error should mention the tainted var: {msg}");
+        assert!(
+            msg.contains("navigate"),
+            "error should mention navigate: {msg}"
+        );
+        assert!(
+            msg.contains("data"),
+            "error should mention the tainted var: {msg}"
+        );
     }
 
     #[test]
@@ -568,7 +845,10 @@ layout
     doc
         "#;
         let res = check_flow_doc(doc);
-        assert!(res.is_ok(), "path_param should be allowed (gated by construction)");
+        assert!(
+            res.is_ok(),
+            "path_param should be allowed (gated by construction)"
+        );
     }
 
     // â”€â”€ Taint propagation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -587,7 +867,10 @@ layout
     doc
         "#;
         let res = check_flow_doc(doc);
-        assert!(res.is_err(), "FieldAccess on tainted var should propagate taint");
+        assert!(
+            res.is_err(),
+            "FieldAccess on tainted var should propagate taint"
+        );
     }
 
     #[test]
@@ -635,7 +918,10 @@ layout
     doc
         "#;
         let res = check_flow_doc(doc);
-        assert!(res.is_err(), "Function returning tainted arg should propagate taint");
+        assert!(
+            res.is_err(),
+            "Function returning tainted arg should propagate taint"
+        );
     }
 
     #[test]
@@ -652,7 +938,10 @@ layout
     doc
         "#;
         let res = check_flow_doc(doc);
-        assert!(res.is_err(), "Function reading tainted global should propagate taint");
+        assert!(
+            res.is_err(),
+            "Function reading tainted global should propagate taint"
+        );
     }
 
     // â”€â”€ Precision / over-approximation test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -674,8 +963,10 @@ layout
         "#;
         let res = check_flow_doc(doc);
         // This SHOULD be rejected by the conservative checker (over-approximation)
-        assert!(res.is_err(),
-            "Conservative checker should reject: dead branch still reads tainted var");
+        assert!(
+            res.is_err(),
+            "Conservative checker should reject: dead branch still reads tainted var"
+        );
     }
 
     // â”€â”€ get_system_time: static write-target (RM-04) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -698,7 +989,10 @@ layout
             "Expected rejection: get_system_time cannot target a comp variable"
         );
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("derived"), "error should name the comp var: {msg}");
+        assert!(
+            msg.contains("derived"),
+            "error should name the comp var: {msg}"
+        );
         assert!(
             msg.contains("computed") || msg.contains("comp"),
             "error should explain why: {msg}"
@@ -756,7 +1050,10 @@ layout
         assert!(res.is_err());
         let msg = res.unwrap_err().to_string();
         // F3: error message should mention the tainted variable and its source
-        assert!(msg.contains("next"), "diagnostic should name the tainted var: {msg}");
+        assert!(
+            msg.contains("next"),
+            "diagnostic should name the tainted var: {msg}"
+        );
         assert!(
             msg.contains("GET") || msg.contains("feed") || msg.contains("navigate"),
             "diagnostic should mention the source or sink: {msg}"

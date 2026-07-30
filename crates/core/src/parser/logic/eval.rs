@@ -17,32 +17,37 @@ pub fn execute_action(
     functions: &FxHashMap<Symbol, MizuFunction>,
 ) -> Result<bool, MizuError> {
     // Reset the instruction counter so the budget applies per action, not cumulatively.
-    store.state_machine.instruction_count = 0;
+    store.evaluator.instruction_count = 0;
     match action {
         Action::Assign { target, expr } => {
             if let Some(sym) = store.interner.get(target)
-                && store.state_machine.computed_var_syms.contains(&sym)
+                && store.evaluator.computed_var_syms.contains(&sym)
             {
                 return Err(MizuError::ExecutionError(format!(
                     "cannot assign to computed variable `{target}`"
                 )));
             }
-            let result = store
-                .state_machine
-                .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
+            let result = store.evaluator.evaluate(
+                expr.root(),
+                0,
+                functions,
+                &store.interner,
+                &expr.arena,
+            )?;
             store.set_runtime(target, result);
             Ok(true)
         }
         Action::Eval(expr) => {
             store
-                .state_machine
+                .evaluator
                 .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
             Ok(false)
         }
         Action::Navigate { url } => {
-            let eval_url = store
-                .state_machine
-                .evaluate(url.root(), 0, functions, &store.interner, &url.arena)?;
+            let eval_url =
+                store
+                    .evaluator
+                    .evaluate(url.root(), 0, functions, &store.interner, &url.arena)?;
             let url_str = match eval_url {
                 Value::String(s) => s.to_string(),
                 _ => {
@@ -53,7 +58,7 @@ pub fn execute_action(
             };
 
             store
-                .state_machine
+                .evaluator
                 .accumulated_actions
                 .push(crate::messages::RuntimeAction::Navigate { url: url_str });
             Ok(true)
@@ -71,16 +76,20 @@ pub fn execute_action(
             let payload_val = if let Some(p) = payload {
                 Some(
                     store
-                        .state_machine
+                        .evaluator
                         .evaluate(p.root(), 0, functions, &store.interner, &p.arena)?,
                 )
             } else {
                 None
             };
             let path_param_str = if let Some(pp) = path_param {
-                let v = store
-                    .state_machine
-                    .evaluate(pp.root(), 0, functions, &store.interner, &pp.arena)?;
+                let v = store.evaluator.evaluate(
+                    pp.root(),
+                    0,
+                    functions,
+                    &store.interner,
+                    &pp.arena,
+                )?;
                 let s = match v {
                     Value::String(s) => s.to_string(),
                     Value::Int(n) => n.to_string(),
@@ -110,13 +119,19 @@ pub fn execute_action(
             // payload.
             let mut header_values = Vec::with_capacity(headers.len());
             for (name, expr) in headers {
-                let v = store
-                    .state_machine
-                    .evaluate(expr.root(), 0, functions, &store.interner, &expr.arena)?;
+                let v = store.evaluator.evaluate(
+                    expr.root(),
+                    0,
+                    functions,
+                    &store.interner,
+                    &expr.arena,
+                )?;
                 header_values.push((name.clone(), v));
             }
-            store.state_machine.accumulated_actions.push(
-                crate::messages::RuntimeAction::NetworkCall {
+            store
+                .evaluator
+                .accumulated_actions
+                .push(crate::messages::RuntimeAction::NetworkCall {
                     method: method.clone(),
                     endpoint_symbol: alias_sym.0,
                     payload: payload_val,
@@ -124,8 +139,7 @@ pub fn execute_action(
                     target_variable,
                     format: *format,
                     headers: header_values,
-                },
-            );
+                });
             Ok(true)
         }
     }
@@ -142,9 +156,9 @@ pub fn evaluate(
     functions: &FxHashMap<Symbol, MizuFunction>,
     frame_pointer: usize,
 ) -> Result<Value, MizuError> {
-    store.state_machine.instruction_count = 0;
+    store.evaluator.instruction_count = 0;
     store
-        .state_machine
+        .evaluator
         .evaluate(expr, frame_pointer, functions, &store.interner, arena)
 }
 
@@ -203,7 +217,7 @@ pub(crate) fn apply_binop(
             i64::try_from(quotient)
                 .map(Value::Int)
                 .map_err(|_| MizuError::IntegerOverflow)
-        },
+        }
 
         // String concatenation via `+`: charge the combined length before
         // allocating, mirroring filter/count/sort — otherwise a chain of
@@ -304,12 +318,14 @@ pub(crate) fn check_type(
             if fields.len() != expected_fields.len() {
                 all_ok = false;
             } else {
-                for ((found_name, found_val), (exp_name, exp_type)) in fields.iter().zip(expected_fields.iter()) {
-                    if found_name.as_ref() != exp_name.as_ref() {
+                for (found_field, (exp_name, exp_type)) in
+                    fields.iter().zip(expected_fields.iter())
+                {
+                    if found_field.key.as_ref() != exp_name.as_ref() {
                         all_ok = false;
                         break;
                     }
-                    if check_type(found_val, exp_type, func_name, param_name).is_err() {
+                    if check_type(&found_field.value, exp_type, func_name, param_name).is_err() {
                         all_ok = false;
                         break;
                     }

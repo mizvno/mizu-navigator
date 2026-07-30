@@ -42,15 +42,12 @@ mod tests_backpressure;
 mod tests_insecure_dev;
 mod tls;
 
-pub(crate) use h3_pool::{
-    H3ConnectionPool, QUIC_KEEP_ALIVE_INTERVAL,
-    QUIC_MAX_IDLE_TIMEOUT,
-};
+pub(crate) use h3_pool::{H3ConnectionPool, QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 pub(crate) use storage_debounce::StorageWriteDebouncer;
-pub(crate) use tls::is_local_host;
 #[cfg(test)]
 #[allow(unused_imports)] // only used by a test gated on not(feature = "insecure-dev")
 pub(crate) use tls::INSECURE_DEV_ACTIVE;
+pub(crate) use tls::is_local_host;
 
 use auth::parse_http_response;
 use fetch::{handle_fetch, handle_fetch_file, handle_fetch_raw};
@@ -111,10 +108,10 @@ pub fn spawn_network_thread(
             Ok(rt) => rt,
             Err(e) => {
                 if tx
-                    .blocking_send(NetworkResult::Error(None, MizuError::Network(format!(
-                        "Tokio error: {}",
-                        e
-                    ))))
+                    .blocking_send(NetworkResult::Error(
+                        None,
+                        MizuError::Network(format!("Tokio error: {}", e)),
+                    ))
                     .is_err()
                 {
                     tracing::warn!(

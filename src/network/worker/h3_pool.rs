@@ -158,9 +158,7 @@ impl H3ConnectionPool {
     /// than waiting out [`CONNECT_TIMEOUT`].
     pub(crate) fn new_with_connect_timeout(connect_timeout: Duration) -> Self {
         Self {
-            connections: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             connect_timeout,
         }
     }

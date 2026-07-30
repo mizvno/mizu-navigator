@@ -37,18 +37,20 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use mizu_core::core::types::{StringInterner, Value, VariableStore};
 use mizu_core::parser::logic::{
-    evaluate, parse_computed_with_functions, parse_expr_standalone, parse_logic,
-    parse_root_timers,
+    evaluate, parse_computed_with_functions, parse_expr_standalone, parse_logic, parse_root_timers,
 };
-use mizu_core::parser::{parse_layout_with_urls, parse_style_with_variants, parse_urls, split_source};
+use mizu_core::parser::{
+    parse_layout_with_urls, parse_style_with_variants, parse_urls, split_source,
+};
 
 /// Relative to `crates/core` (this benchmark's own crate root, which is
 /// `cargo bench`'s working directory).
 const SHOWCASE_PATH: &str = "../../docs/reference/examples/showcase.mizu";
 
 fn read_showcase() -> String {
-    std::fs::read_to_string(SHOWCASE_PATH)
-        .unwrap_or_else(|e| panic!("read {SHOWCASE_PATH}: {e} (run from the workspace or crates/core)"))
+    std::fs::read_to_string(SHOWCASE_PATH).unwrap_or_else(|e| {
+        panic!("read {SHOWCASE_PATH}: {e} (run from the workspace or crates/core)")
+    })
 }
 
 /// The full document compile pipeline `src/main.rs` runs on every initial
@@ -68,9 +70,16 @@ fn bench_full_parse(c: &mut Criterion) {
             let url_registry = parse_urls(&parsed.urls_block, &mut interner).unwrap();
             let logic_fns = parse_logic(&parsed.logic_block, &mut interner).unwrap();
             let computed =
-                parse_computed_with_functions(&parsed.logic_block, &mut interner, &logic_fns).unwrap();
+                parse_computed_with_functions(
+                    &parsed.logic_block,
+                    &mut interner,
+                    &logic_fns,
+                    mizu_core::core::config::CONFIG.max_comp_bindings,
+                )
+                    .unwrap();
             let timers = parse_root_timers(&parsed.logic_block, &mut interner).unwrap();
-            let (style_rules, style_variants) = parse_style_with_variants(&parsed.style_block).unwrap();
+            let (style_rules, style_variants) =
+                parse_style_with_variants(&parsed.style_block).unwrap();
             let dom = parse_layout_with_urls(
                 &parsed.layout_block,
                 &mut interner,
@@ -98,8 +107,11 @@ fn bench_function_call_eval(c: &mut Criterion) {
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner).unwrap();
 
     let call = parse_expr_standalone("clamp(counter, 0, 100)", &mut interner).unwrap();
-    let mut store = VariableStore::with_interner(interner);
-    store.set("counter", Value::from(42i64));
+    // `counter` must be interned before the table freezes; afterwards only
+    // `set_runtime` is available and it drops names the table doesn't know.
+    interner.get_or_intern("counter");
+    let mut store = VariableStore::with_interner(interner.freeze());
+    store.set_runtime("counter", Value::from(42i64));
 
     c.bench_function("eval_clamp_call_showcase_mizu", |b| {
         b.iter(|| {

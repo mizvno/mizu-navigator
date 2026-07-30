@@ -24,16 +24,16 @@
 
 use std::collections::HashMap;
 
-use mizu::core::storage::{ValidatedDomain, StorageEngine, read_storage};
-use mizu::core::types::{StringInterner, Symbol, Value, StateMachine};
+use mizu::core::storage::{StorageEngine, ValidatedDomain, read_storage};
+use mizu::core::types::{Evaluator, StringInterner, Symbol, Value};
+use mizu::parser::Origin;
 use mizu::parser::flow::check_information_flow;
 use mizu::parser::layout::parse_layout_with_urls;
 use mizu::parser::logic::{
-    ExprArena, parse_computed_with_functions, parse_logic, parse_root_timers, Expr,
+    Expr, ExprArena, parse_computed_with_functions, parse_logic, parse_root_timers,
 };
 use mizu::parser::splitter::split_source_with_origin;
 use mizu::parser::urls::parse_urls;
-use mizu::parser::Origin;
 
 /// Points `StorageEngine::open`/`read_storage` at an isolated temp directory
 /// and supplies a headless master key, so this test never touches the real
@@ -69,11 +69,22 @@ fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), mizu::core::errors
     let mut interner = StringInterner::new();
     let urls = parse_urls(&blocks.urls_block, &mut interner).unwrap_or_default();
     let functions = parse_logic(&blocks.logic_block, &mut interner).unwrap_or_default();
-    let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions, mizu_core::core::config::CONFIG.max_comp_bindings)
-        .unwrap_or_default();
+    let comps = parse_computed_with_functions(
+        &blocks.logic_block,
+        &mut interner,
+        &functions,
+        mizu_core::core::config::CONFIG.max_comp_bindings,
+    )
+    .unwrap_or_default();
     let timers = parse_root_timers(&blocks.logic_block, &mut interner).unwrap_or_default();
-    let dom = parse_layout_with_urls(&blocks.layout_block, &mut interner, Some(&urls), true, &functions)
-        .expect("parse_layout_with_urls");
+    let dom = parse_layout_with_urls(
+        &blocks.layout_block,
+        &mut interner,
+        Some(&urls),
+        true,
+        &functions,
+    )
+    .expect("parse_layout_with_urls");
 
     check_information_flow(&dom, &timers, &functions, &comps, &urls, &interner)
 }
@@ -115,7 +126,7 @@ fn storage_rehydration_taint_end_to_end() {
     // `rehydrated`? Answer: no such expression exists in the language.
     // `read_local`/`load_local` is neither a built-in (see
     // `SIDE_EFFECT_BUILTINS` and the `FunctionCall` match arms in
-    // `core::types::StateMachine::evaluate_impl`) nor could it resolve to a
+    // `core::types::Evaluator::evaluate_impl`) nor could it resolve to a
     // user function (documents never declare one, since the parser has no
     // syntax that would bind storage to a name). Constructing the call
     // directly as an `Expr` (bypassing the text parser entirely, so this
@@ -132,7 +143,7 @@ fn storage_rehydration_taint_end_to_end() {
         args_start,
         args_len,
     };
-    let mut machine = StateMachine::new(mizu_core::core::config::CONFIG.max_instructions);
+    let mut machine = Evaluator::new(mizu_core::core::config::CONFIG.max_instructions);
     let no_functions = Default::default();
     let interner = interner.freeze();
     let result = machine.evaluate(&call, 0, &no_functions, &interner, &arena);

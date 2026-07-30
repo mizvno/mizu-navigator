@@ -191,12 +191,17 @@ mod tests {
         width 100%
 ";
         let (base, variants) = parse_style_with_variants(style).unwrap();
-        assert_eq!(base["sidebar"].width, Some(crate::parser::MizuDimension::Pixels(240.0)));
+        assert_eq!(
+            base["sidebar"].width,
+            Some(crate::parser::MizuDimension::Pixels(240.0))
+        );
 
         let narrow = env(500.0, ColorScheme::Dark);
-        let resolved_narrow = base["sidebar"]
-            .clone()
-            .merge(resolve_matching_variants(&variants, &["sidebar"], &narrow));
+        let resolved_narrow = base["sidebar"].clone().merge(resolve_matching_variants(
+            &variants,
+            &["sidebar"],
+            &narrow,
+        ));
         assert_eq!(
             resolved_narrow.width,
             Some(crate::parser::MizuDimension::Percent(100.0)),
@@ -204,9 +209,11 @@ mod tests {
         );
 
         let wide = env(800.0, ColorScheme::Dark);
-        let resolved_wide = base["sidebar"]
-            .clone()
-            .merge(resolve_matching_variants(&variants, &["sidebar"], &wide));
+        let resolved_wide = base["sidebar"].clone().merge(resolve_matching_variants(
+            &variants,
+            &["sidebar"],
+            &wide,
+        ));
         assert_eq!(
             resolved_wide.width,
             Some(crate::parser::MizuDimension::Pixels(240.0)),
@@ -231,9 +238,10 @@ mod tests {
             (300.0, taffy::style::FlexDirection::Column),
         ] {
             let e = env(width, ColorScheme::Dark);
-            let resolved = base["panel"]
-                .clone()
-                .merge(resolve_matching_variants(&variants, &["panel"], &e));
+            let resolved =
+                base["panel"]
+                    .clone()
+                    .merge(resolve_matching_variants(&variants, &["panel"], &e));
             assert_eq!(
                 resolved.flex_direction,
                 Some(expected),
@@ -255,9 +263,10 @@ mod tests {
         let (base, variants) = parse_style_with_variants(style).unwrap();
 
         let dark = env(1000.0, ColorScheme::Dark);
-        let resolved_dark = base["card"]
-            .clone()
-            .merge(resolve_matching_variants(&variants, &["card"], &dark));
+        let resolved_dark =
+            base["card"]
+                .clone()
+                .merge(resolve_matching_variants(&variants, &["card"], &dark));
         assert_eq!(
             resolved_dark.background,
             Some(crate::parser::style::MizuBackground::Solid(
@@ -267,9 +276,10 @@ mod tests {
         );
 
         let light = env(1000.0, ColorScheme::Light);
-        let resolved_light = base["card"]
-            .clone()
-            .merge(resolve_matching_variants(&variants, &["card"], &light));
+        let resolved_light =
+            base["card"]
+                .clone()
+                .merge(resolve_matching_variants(&variants, &["card"], &light));
         assert_eq!(
             resolved_light.background,
             Some(crate::parser::style::MizuBackground::Solid(
@@ -291,9 +301,10 @@ mod tests {
 
         for (width, expect_flex) in [(500.0, false), (700.0, true), (901.0, false)] {
             let e = env(width, ColorScheme::Dark);
-            let resolved = base["banner"]
-                .clone()
-                .merge(resolve_matching_variants(&variants, &["banner"], &e));
+            let resolved =
+                base["banner"]
+                    .clone()
+                    .merge(resolve_matching_variants(&variants, &["banner"], &e));
             let is_flex = resolved.display == Some(taffy::style::Display::Flex);
             assert_eq!(
                 is_flex, expect_flex,

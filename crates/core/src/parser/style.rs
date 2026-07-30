@@ -63,7 +63,6 @@ use taffy::style::{AlignItems, Display, FlexDirection, JustifyContent};
 
 use crate::core::errors::MizuError;
 
-
 /// An RGBA colour parsed from a Mizu hex literal (`#rgb`, `#rrggbb`, or
 /// `#rrggbbaa`).
 ///
@@ -122,7 +121,6 @@ pub enum MizuBackgroundSize {
     /// Tiles the image at its natural size to fill the node box.
     Tile,
 }
-
 
 /// Controls how a container's children behave when they overflow its bounds.
 ///
@@ -371,35 +369,93 @@ impl StyleRules {
     /// the incoming rules (e.g. a `HashMap` lookup) — it clones only the
     /// individual fields that actually win, rather than the entire struct.
     pub fn merge_from(&mut self, other: &Self) {
-        if other.width.is_some() { self.width = other.width; }
-        if other.height.is_some() { self.height = other.height; }
-        if other.padding.is_some() { self.padding = other.padding; }
-        if other.margin.is_some() { self.margin = other.margin; }
-        if other.gap.is_some() { self.gap = other.gap; }
-        if other.margin_inline_start.is_some() { self.margin_inline_start = other.margin_inline_start; }
-        if other.margin_inline_end.is_some() { self.margin_inline_end = other.margin_inline_end; }
-        if other.padding_inline_start.is_some() { self.padding_inline_start = other.padding_inline_start; }
-        if other.padding_inline_end.is_some() { self.padding_inline_end = other.padding_inline_end; }
-        if other.flex_direction.is_some() { self.flex_direction = other.flex_direction; }
-        if other.justify.is_some() { self.justify = other.justify; }
-        if other.align.is_some() { self.align = other.align; }
-        if other.background.is_some() { self.background = other.background.clone(); }
-        if other.background_image.is_some() { self.background_image = other.background_image.clone(); }
-        if other.background_size.is_some() { self.background_size = other.background_size; }
-        if other.color.is_some() { self.color = other.color.clone(); }
-        if other.font_size.is_some() { self.font_size = other.font_size; }
-        if other.border_radius.is_some() { self.border_radius = other.border_radius; }
-        if other.border_width.is_some() { self.border_width = other.border_width; }
-        if other.border_color.is_some() { self.border_color = other.border_color.clone(); }
-        if other.font_family.is_some() { self.font_family = other.font_family; }
-        if other.font_weight.is_some() { self.font_weight = other.font_weight; }
-        if other.font_style.is_some() { self.font_style = other.font_style; }
-        if other.text_align.is_some() { self.text_align = other.text_align; }
-        if other.line_height.is_some() { self.line_height = other.line_height; }
-        if other.underline.is_some() { self.underline = other.underline; }
-        if other.overflow != MizuOverflow::Visible { self.overflow = other.overflow; }
-        if other.z_index != 0 { self.z_index = other.z_index; }
-        if other.display.is_some() { self.display = other.display; }
+        if other.width.is_some() {
+            self.width = other.width;
+        }
+        if other.height.is_some() {
+            self.height = other.height;
+        }
+        if other.padding.is_some() {
+            self.padding = other.padding;
+        }
+        if other.margin.is_some() {
+            self.margin = other.margin;
+        }
+        if other.gap.is_some() {
+            self.gap = other.gap;
+        }
+        if other.margin_inline_start.is_some() {
+            self.margin_inline_start = other.margin_inline_start;
+        }
+        if other.margin_inline_end.is_some() {
+            self.margin_inline_end = other.margin_inline_end;
+        }
+        if other.padding_inline_start.is_some() {
+            self.padding_inline_start = other.padding_inline_start;
+        }
+        if other.padding_inline_end.is_some() {
+            self.padding_inline_end = other.padding_inline_end;
+        }
+        if other.flex_direction.is_some() {
+            self.flex_direction = other.flex_direction;
+        }
+        if other.justify.is_some() {
+            self.justify = other.justify;
+        }
+        if other.align.is_some() {
+            self.align = other.align;
+        }
+        if other.background.is_some() {
+            self.background = other.background.clone();
+        }
+        if other.background_image.is_some() {
+            self.background_image = other.background_image.clone();
+        }
+        if other.background_size.is_some() {
+            self.background_size = other.background_size;
+        }
+        if other.color.is_some() {
+            self.color = other.color.clone();
+        }
+        if other.font_size.is_some() {
+            self.font_size = other.font_size;
+        }
+        if other.border_radius.is_some() {
+            self.border_radius = other.border_radius;
+        }
+        if other.border_width.is_some() {
+            self.border_width = other.border_width;
+        }
+        if other.border_color.is_some() {
+            self.border_color = other.border_color.clone();
+        }
+        if other.font_family.is_some() {
+            self.font_family = other.font_family;
+        }
+        if other.font_weight.is_some() {
+            self.font_weight = other.font_weight;
+        }
+        if other.font_style.is_some() {
+            self.font_style = other.font_style;
+        }
+        if other.text_align.is_some() {
+            self.text_align = other.text_align;
+        }
+        if other.line_height.is_some() {
+            self.line_height = other.line_height;
+        }
+        if other.underline.is_some() {
+            self.underline = other.underline;
+        }
+        if other.overflow != MizuOverflow::Visible {
+            self.overflow = other.overflow;
+        }
+        if other.z_index != 0 {
+            self.z_index = other.z_index;
+        }
+        if other.display.is_some() {
+            self.display = other.display;
+        }
     }
 
     /// Merges another set of rules into this one. `other` rules take precedence
@@ -501,7 +557,6 @@ impl StyleRules {
         self
     }
 }
-
 
 /// Parses the `style_block` produced by [`super::split_source`] into a
 /// `HashMap` keyed by class name (without the leading `.`).
@@ -649,8 +704,20 @@ pub fn parse_style_with_variants(
             } else {
                 let is_valid_tag = matches!(
                     selector_name.to_lowercase().as_str(),
-                    "doc" | "box" | "text" | "button" | "input" | "image" | "markdown" | "form"
-                        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    "doc"
+                        | "box"
+                        | "text"
+                        | "button"
+                        | "input"
+                        | "image"
+                        | "markdown"
+                        | "form"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
                 );
                 if !is_valid_tag {
                     return Err(MizuError::ParseError(format!(
@@ -772,7 +839,6 @@ fn parse_variant_conditions(
     }
     Ok(conditions)
 }
-
 
 /// Routes a single `key value` pair into the appropriate field of `rules`.
 fn apply_property(
@@ -969,7 +1035,6 @@ fn apply_property(
     }
     Ok(())
 }
-
 
 /// Returns the number of leading space characters in `line`.
 ///
@@ -1271,13 +1336,12 @@ fn parse_align_items(value: &str, line_num: usize) -> Result<AlignItems, MizuErr
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
         AlignItems, Display, FlexDirection, JustifyContent, MizuBackground, MizuColor,
-        MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign, VariantCondition,
-        parse_color, parse_style, parse_style_with_variants,
+        MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign,
+        VariantCondition, parse_color, parse_style, parse_style_with_variants,
     };
     use crate::core::errors::MizuError;
 
@@ -1300,7 +1364,9 @@ mod tests {
         let style = "  .hero\n    background-image \"assets/bg.png\"\n";
         let rules = parse_style(style).expect("relative background-image must parse");
         assert_eq!(
-            rules.get("hero").and_then(|r| r.background_image.as_deref()),
+            rules
+                .get("hero")
+                .and_then(|r| r.background_image.as_deref()),
             Some("assets/bg.png"),
             "relative background-image path must be preserved"
         );
@@ -1825,7 +1891,8 @@ mod tests {
 
     #[test]
     fn id_and_class_of_the_same_bare_name_do_not_collide() {
-        let block = "    .card\n        background #111111\n    #card\n        background #222222\n";
+        let block =
+            "    .card\n        background #111111\n    #card\n        background #222222\n";
         let rules = parse_style(block).unwrap();
         assert_eq!(
             rules["card"].background,
@@ -2335,7 +2402,9 @@ mod tests {
         let override_block = "    .active\n        font-weight normal\n";
         let base_rules = parse_style(base).unwrap();
         let override_rules = parse_style(override_block).unwrap();
-        let merged = base_rules["base"].clone().merge(override_rules["active"].clone());
+        let merged = base_rules["base"]
+            .clone()
+            .merge(override_rules["active"].clone());
         assert_eq!(merged.font_weight, Some(400.0), "override must win");
         assert_eq!(
             merged.text_align,
@@ -2381,7 +2450,10 @@ mod tests {
     fn viewport_height_unit_parsed() {
         let block = "    .box\n        height 100vh\n";
         let rules = parse_style(block).unwrap();
-        assert_eq!(rules["box"].height, Some(MizuDimension::ViewportHeight(100.0)));
+        assert_eq!(
+            rules["box"].height,
+            Some(MizuDimension::ViewportHeight(100.0))
+        );
     }
 
     #[test]
@@ -2453,7 +2525,10 @@ mod tests {
         assert_eq!(base["sidebar"].width, Some(MizuDimension::Pixels(240.0)));
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].selector, "sidebar");
-        assert_eq!(variants[0].conditions, vec![VariantCondition::MinWidth(600.0)]);
+        assert_eq!(
+            variants[0].conditions,
+            vec![VariantCondition::MinWidth(600.0)]
+        );
         assert_eq!(variants[0].rules.width, Some(MizuDimension::Pixels(300.0)));
     }
 
@@ -2461,8 +2536,14 @@ mod tests {
     fn variant_max_width_parsed() {
         let style = "    .box @max-width 599\n        flex-direction column\n";
         let (base, variants) = parse_style_with_variants(style).unwrap();
-        assert!(base.is_empty(), "a purely-conditioned selector must not appear in the base map");
-        assert_eq!(variants[0].conditions, vec![VariantCondition::MaxWidth(599.0)]);
+        assert!(
+            base.is_empty(),
+            "a purely-conditioned selector must not appear in the base map"
+        );
+        assert_eq!(
+            variants[0].conditions,
+            vec![VariantCondition::MaxWidth(599.0)]
+        );
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! `file://`/HTTP(S) fetch dispatch and H3 request execution.
 
-
 use quinn::Endpoint;
 
 use crate::core::errors::MizuError;
@@ -16,7 +15,10 @@ use super::h3_pool::{H3ConnectionPool, REQUEST_TIMEOUT};
 /// If `None`, all `file://` access is denied (security default).  If `Some`,
 /// the resolved path must start with the base; escape attempts return
 /// [`MizuError::SecurityViolation`].
-pub(super) fn handle_fetch_file(url_str: &str, sandbox_base: Option<&str>) -> Result<Vec<u8>, MizuError> {
+pub(super) fn handle_fetch_file(
+    url_str: &str,
+    sandbox_base: Option<&str>,
+) -> Result<Vec<u8>, MizuError> {
     let path_str = url_str
         .strip_prefix("file:///")
         .or_else(|| url_str.strip_prefix("file://"))
@@ -367,16 +369,23 @@ mod tests {
             &[("X-Idempotency-Key".to_string(), "abc-123".to_string())],
         )
         .unwrap();
-        assert_eq!(
-            req.headers().get("x-idempotency-key").unwrap(),
-            "abc-123"
-        );
+        assert_eq!(req.headers().get("x-idempotency-key").unwrap(), "abc-123");
     }
 
     #[test]
     fn content_type_is_set_from_format() {
-        let req = build_h3_request(&uri(), "POST", None, Some("application/yaml".to_string()), &[]).unwrap();
-        assert_eq!(req.headers().get(http::header::CONTENT_TYPE).unwrap(), "application/yaml");
+        let req = build_h3_request(
+            &uri(),
+            "POST",
+            None,
+            Some("application/yaml".to_string()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            req.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/yaml"
+        );
     }
 
     #[test]

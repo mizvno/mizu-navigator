@@ -140,7 +140,7 @@ pub enum MizuError {
 }
 
 // Regression guard: `MizuError` sits in `Result<Value, MizuError>` on the
-// evaluator's hot path (see `StateMachine::evaluate`). Measured at 40 bytes
+// evaluator's hot path (see `Evaluator::evaluate`). Measured at 40 bytes
 // before boxing `TypeError::expected`, 32 bytes after — see
 // PROMPT-thin-mizuerror.md for the measurement method. If this assertion
 // fires, a new/changed variant has re-grown the enum; re-run the same
@@ -189,13 +189,11 @@ mod tests {
         }
     }
 
-
     #[test]
     fn variable_not_found_stores_identifier() {
         let err = MizuError::VariableNotFound("total_price".to_owned());
         assert_eq!(err.to_string(), "variable not found: `total_price`");
     }
-
 
     #[test]
     fn io_error_converts_via_from() {

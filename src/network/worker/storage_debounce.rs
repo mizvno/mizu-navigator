@@ -54,9 +54,8 @@ use std::time::Duration;
 /// 100–250ms range suggested for this kind of UI-driven debounce: long enough
 /// to coalesce a burst of per-keystroke/per-frame writes, short enough that
 /// the durability window above stays unnoticeable in practice.
-pub(crate) static STORAGE_DEBOUNCE_WINDOW: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_millis(crate::core::config::CONFIG.storage_debounce_window_ms)
-});
+pub(crate) static STORAGE_DEBOUNCE_WINDOW: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_millis(crate::core::config::CONFIG.storage_debounce_window_ms));
 
 /// Maximum number of distinct keys buffered for one domain before a flush is
 /// forced immediately, regardless of how much of `STORAGE_DEBOUNCE_WINDOW`
@@ -81,7 +80,14 @@ pub(crate) struct StorageWriteDebouncer {
     /// that repeated writes to the same key within one window collapse to
     /// last-write-wins instead of encrypting/inserting each one individually
     /// when the batch is eventually committed.
-    pending: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, crate::core::types::Value>>>>,
+    pending: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, crate::core::types::Value>,
+            >,
+        >,
+    >,
     window: Duration,
     max_keys: usize,
 }

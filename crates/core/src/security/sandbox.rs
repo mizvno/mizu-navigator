@@ -46,10 +46,7 @@ fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
 /// first-time navigation, unit tests).  Returns `false` when either canonical
 /// path is empty (escape detected) or when the target does not start with
 /// `sandbox_base`.
-pub fn file_sandbox_contains(
-    sandbox_base: &std::path::Path,
-    target: &std::path::Path,
-) -> bool {
+pub fn file_sandbox_contains(sandbox_base: &std::path::Path, target: &std::path::Path) -> bool {
     let canon_base = strip_verbatim_prefix(
         std::fs::canonicalize(sandbox_base)
             .unwrap_or_else(|_| normalize_path_components(sandbox_base)),
@@ -100,8 +97,7 @@ mod kani_proofs {
 
     #[kani::proof]
     fn normalize_path_components_escape_above_root_is_empty() {
-        let normalized =
-            normalize_path_components(std::path::Path::new("../../etc/passwd"));
+        let normalized = normalize_path_components(std::path::Path::new("../../etc/passwd"));
         assert!(normalized.as_os_str().is_empty());
     }
 

@@ -98,13 +98,21 @@ fn now_secs() -> u64 {
 impl VisitRecord {
     /// Records a visit to `url` with `title`, stamped with the current time.
     pub fn new(url: String, title: String) -> Self {
-        Self { url, title, timestamp_secs: now_secs() }
+        Self {
+            url,
+            title,
+            timestamp_secs: now_secs(),
+        }
     }
 
     /// The label the sidebar shows for this visit: the title when non-empty,
     /// otherwise the URL.
     pub fn display_label(&self) -> &str {
-        if self.title.is_empty() { &self.url } else { &self.title }
+        if self.title.is_empty() {
+            &self.url
+        } else {
+            &self.title
+        }
     }
 
     /// Whole days elapsed since this visit (0 = today, 1 = yesterday, …),
@@ -311,7 +319,7 @@ impl HistoryLog {
             return Vec::new();
         }
         let query_lower = query.to_lowercase();
-        
+
         let mut results = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
 
@@ -321,30 +329,30 @@ impl HistoryLog {
             }
             let url_lower = record.url.to_lowercase();
             let title_lower = record.title.to_lowercase();
-            
-            let without_scheme = url_lower.strip_prefix("mizu://")
+
+            let without_scheme = url_lower
+                .strip_prefix("mizu://")
                 .or_else(|| url_lower.strip_prefix("file://"))
                 .or_else(|| url_lower.strip_prefix("https://"))
                 .or_else(|| url_lower.strip_prefix("http://"))
                 .unwrap_or(&url_lower);
-                            
-            let is_prefix = url_lower.starts_with(&query_lower) || without_scheme.starts_with(&query_lower);
-            
+
+            let is_prefix =
+                url_lower.starts_with(&query_lower) || without_scheme.starts_with(&query_lower);
+
             if is_prefix || url_lower.contains(&query_lower) || title_lower.contains(&query_lower) {
                 results.push((is_prefix, record.clone()));
                 seen_urls.insert(record.url.clone());
             }
         }
-        
+
         // Stable sort to keep newest-first order, but prioritize prefix matches.
-        results.sort_by(|a, b| {
-            match (a.0, b.0) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            }
+        results.sort_by(|a, b| match (a.0, b.0) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
         });
-        
+
         results.into_iter().take(limit).map(|(_, r)| r).collect()
     }
 
@@ -410,7 +418,11 @@ impl HistoryLog {
     fn from_newest_first(records: Vec<VisitRecord>) -> Self {
         let mut deque: VecDeque<VisitRecord> = records.into_iter().collect();
         deque.truncate(MAX_LOG_ENTRIES);
-        Self { records: deque, dirty: false, last_save: None }
+        Self {
+            records: deque,
+            dirty: false,
+            last_save: None,
+        }
     }
 
     /// Saves the log if it has changed and [`AUTOSAVE_INTERVAL`] has passed
@@ -525,7 +537,9 @@ fn decrypt_blob(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
     }
     let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher.decrypt(Nonce::from_slice(nonce_bytes), ciphertext).ok()
+    cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .ok()
 }
 
 // ── Encryption key management ─────────────────────────────────────────────────
@@ -548,7 +562,7 @@ const KEYRING_HISTORY_KEY: &str = "history-encryption-key";
 #[cfg(target_os = "windows")]
 fn get_or_create_history_key() -> Option<[u8; 32]> {
     let path = data_dir().join("history_key.bin");
-    
+
     // Try to load an existing key.
     if let Ok(blob) = std::fs::read(&path) {
         match windows_dpapi::decrypt_data(&blob, windows_dpapi::Scope::User, None) {
@@ -747,7 +761,10 @@ mod tests {
     use super::*;
 
     fn entry(url: &str) -> HistoryEntry {
-        HistoryEntry { url: url.to_string(), scroll_y: 0.0 }
+        HistoryEntry {
+            url: url.to_string(),
+            scroll_y: 0.0,
+        }
     }
 
     /// A visit `days` whole days in the past, with no title.
@@ -833,13 +850,20 @@ mod tests {
         for i in 0..(MAX_HISTORY_ENTRIES + 1) {
             h.record_navigation(entry(&format!("page-{i}")));
         }
-        assert_eq!(h.back.len(), MAX_HISTORY_ENTRIES, "back stack must be capped");
+        assert_eq!(
+            h.back.len(),
+            MAX_HISTORY_ENTRIES,
+            "back stack must be capped"
+        );
         assert_eq!(
             h.back.first().unwrap().url,
             "page-1",
             "oldest entry (page-0) must have been dropped"
         );
-        assert_eq!(h.back.last().unwrap().url, format!("page-{MAX_HISTORY_ENTRIES}"));
+        assert_eq!(
+            h.back.last().unwrap().url,
+            format!("page-{MAX_HISTORY_ENTRIES}")
+        );
     }
 
     #[test]
@@ -864,9 +888,15 @@ mod tests {
     #[test]
     fn scroll_y_round_trips_through_a_history_step() {
         let mut h = HistoryStack::default();
-        h.record_navigation(HistoryEntry { url: "A".to_string(), scroll_y: 420.0 });
+        h.record_navigation(HistoryEntry {
+            url: "A".to_string(),
+            scroll_y: 420.0,
+        });
         let target = h
-            .go_back(HistoryEntry { url: "B".to_string(), scroll_y: 0.0 })
+            .go_back(HistoryEntry {
+                url: "B".to_string(),
+                scroll_y: 0.0,
+            })
             .unwrap();
         assert_eq!(target.scroll_y, 420.0);
     }
@@ -926,7 +956,11 @@ mod tests {
         let groups = log.grouped_by_day();
         let labels: Vec<&str> = groups.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["Today", "Yesterday", "2 days ago"]);
-        assert_eq!(groups[0].1.len(), 2, "same-day visits collapse into one group");
+        assert_eq!(
+            groups[0].1.len(),
+            2,
+            "same-day visits collapse into one group"
+        );
         assert_eq!(
             groups[0].1[0].url, "today-b",
             "the newest visit leads its group"
@@ -950,8 +984,16 @@ mod tests {
     fn encrypted_blob_round_trips_and_detects_tampering() {
         let key = [7u8; 32];
         let records = vec![
-            VisitRecord { url: "mizu://test/a".into(), title: "A".into(), timestamp_secs: 1_000 },
-            VisitRecord { url: "mizu://test/b".into(), title: String::new(), timestamp_secs: 2_000 },
+            VisitRecord {
+                url: "mizu://test/a".into(),
+                title: "A".into(),
+                timestamp_secs: 1_000,
+            },
+            VisitRecord {
+                url: "mizu://test/b".into(),
+                title: String::new(),
+                timestamp_secs: 2_000,
+            },
         ];
         let plaintext = serde_json::to_vec(&records).unwrap();
 
@@ -1011,14 +1053,22 @@ mod tests {
 
     #[test]
     fn unknown_or_future_timestamps_count_as_today() {
-        let unknown = VisitRecord { url: "a".into(), title: String::new(), timestamp_secs: 0 };
+        let unknown = VisitRecord {
+            url: "a".into(),
+            title: String::new(),
+            timestamp_secs: 0,
+        };
         assert_eq!(unknown.day_label(), "Today");
         let future = VisitRecord {
             url: "b".into(),
             title: String::new(),
             timestamp_secs: now_secs() + 86_400,
         };
-        assert_eq!(future.day_label(), "Today", "clock skew must not invent a group");
+        assert_eq!(
+            future.day_label(),
+            "Today",
+            "clock skew must not invent a group"
+        );
     }
 
     #[test]

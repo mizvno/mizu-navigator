@@ -12,12 +12,12 @@ use vello::peniko::{Color, Fill};
 use parley::style::{FontFamily, FontFamilyName, GenericFamily, LineHeight, StyleProperty};
 
 use crate::render::chrome_vello::CHROME_HEIGHT;
-use crate::render::preferences::ChromePalette;
 use crate::render::inspector::model::{Row, RowKind};
 use crate::render::inspector::{
     InspectorState, InspectorTab, PANEL_WIDTH, PICKER_BTN_WIDTH, ROW_HEIGHT, TAB_BAR_HEIGHT,
     panel_left,
 };
+use crate::render::preferences::ChromePalette;
 
 /// Font size of panel text.
 const FONT_SIZE: f32 = 11.5;
@@ -143,14 +143,26 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
         ctx.window_width as f64,
         ctx.window_height as f64,
     );
-    scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &panel_rect);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.bar_bg,
+        None,
+        &panel_rect,
+    );
     let divider = Rect::new(
         left as f64,
         top as f64,
         (left + 1.0) as f64,
         ctx.window_height as f64,
     );
-    scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &divider);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.url_border_idle,
+        None,
+        &divider,
+    );
 
     // ── Tab bar ──────────────────────────────────────────────────────────
     let tab_strip_width = PANEL_WIDTH - PICKER_BTN_WIDTH;
@@ -164,14 +176,26 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
                 (x0 + tab_width) as f64,
                 (top + TAB_BAR_HEIGHT) as f64,
             );
-            scene.fill(Fill::NonZero, transform, ctx.palette.tab_active_bg, None, &r);
+            scene.fill(
+                Fill::NonZero,
+                transform,
+                ctx.palette.tab_active_bg,
+                None,
+                &r,
+            );
             let underline = Rect::new(
                 x0 as f64,
                 (top + TAB_BAR_HEIGHT - ACTIVE_UNDERLINE_H) as f64,
                 (x0 + tab_width) as f64,
                 (top + TAB_BAR_HEIGHT) as f64,
             );
-            scene.fill(Fill::NonZero, transform, ctx.palette.url_border_focused, None, &underline);
+            scene.fill(
+                Fill::NonZero,
+                transform,
+                ctx.palette.url_border_focused,
+                None,
+                &underline,
+            );
         }
         let color = if *tab == ctx.state.tab {
             ctx.palette.tab_text
@@ -195,14 +219,26 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
             (picker_x0 + PICKER_BTN_WIDTH) as f64,
             (top + TAB_BAR_HEIGHT) as f64,
         );
-        scene.fill(Fill::NonZero, transform, ctx.palette.tab_active_bg, None, &r);
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.tab_active_bg,
+            None,
+            &r,
+        );
         let underline = Rect::new(
             picker_x0 as f64,
             (top + TAB_BAR_HEIGHT - ACTIVE_UNDERLINE_H) as f64,
             (picker_x0 + PICKER_BTN_WIDTH) as f64,
             (top + TAB_BAR_HEIGHT) as f64,
         );
-        scene.fill(Fill::NonZero, transform, ctx.palette.url_border_focused, None, &underline);
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.url_border_focused,
+            None,
+            &underline,
+        );
     }
     let picker_color = if ctx.state.picker {
         ctx.palette.tab_text
@@ -220,7 +256,13 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
         ctx.window_width as f64,
         (top + TAB_BAR_HEIGHT + 1.0) as f64,
     );
-    scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &bar_divider);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.url_border_idle,
+        None,
+        &bar_divider,
+    );
 
     // ── Content: scroll clamp + visible slice ────────────────────────────
     let content_top = top + TAB_BAR_HEIGHT + 1.0;
@@ -284,7 +326,13 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
             (ctx.window_width - 2.0) as f64,
             (thumb_y + thumb_h) as f64,
         );
-        scene.fill(Fill::NonZero, transform, ctx.palette.url_border_idle, None, &r);
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.url_border_idle,
+            None,
+            &r,
+        );
     }
 }
 
@@ -294,13 +342,10 @@ pub fn paint_panel(scene: &mut Scene, ctx: &mut PanelPaintContext<'_>) {
 pub fn paint_node_highlight(scene: &mut Scene, rect: Rect, scale: f32, palette: &ChromePalette) {
     let transform = Affine::scale(scale as f64);
     let accent = palette.url_border_focused;
-    let fill = Color { a: HIGHLIGHT_FILL_ALPHA, ..accent };
+    let fill = Color {
+        a: HIGHLIGHT_FILL_ALPHA,
+        ..accent
+    };
     scene.fill(Fill::NonZero, transform, fill, None, &rect);
-    scene.stroke(
-        &Stroke::new(1.5),
-        transform,
-        accent,
-        None,
-        &rect,
-    );
+    scene.stroke(&Stroke::new(1.5), transform, accent, None, &rect);
 }

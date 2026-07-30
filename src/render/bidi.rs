@@ -131,7 +131,11 @@ fn is_bidi_override_or_isolate(c: char) -> bool {
 /// isolates for correct multilingual authoring.
 pub fn strip_bidi_overrides(s: &str) -> std::borrow::Cow<'_, str> {
     if s.chars().any(is_bidi_override_or_isolate) {
-        std::borrow::Cow::Owned(s.chars().filter(|c| !is_bidi_override_or_isolate(*c)).collect())
+        std::borrow::Cow::Owned(
+            s.chars()
+                .filter(|c| !is_bidi_override_or_isolate(*c))
+                .collect(),
+        )
     } else {
         std::borrow::Cow::Borrowed(s)
     }
@@ -203,7 +207,10 @@ mod tests {
     fn resolve_direction_child_overrides_ancestor() {
         let mut tree = ego_tree::Tree::new(node(Some("rtl")));
         let child_id = tree.root_mut().append(node(Some("ltr"))).id();
-        assert_eq!(resolve_direction(tree.get(child_id).unwrap()), ResolvedDirection::Ltr);
+        assert_eq!(
+            resolve_direction(tree.get(child_id).unwrap()),
+            ResolvedDirection::Ltr
+        );
     }
 
     #[test]
@@ -248,7 +255,10 @@ mod tests {
     fn resolve_lang_child_overrides_ancestor() {
         let mut tree = ego_tree::Tree::new(lang_node(Some("en")));
         let child_id = tree.root_mut().append(lang_node(Some("ja"))).id();
-        assert_eq!(resolve_lang(tree.get(child_id).unwrap()), Some("ja".to_string()));
+        assert_eq!(
+            resolve_lang(tree.get(child_id).unwrap()),
+            Some("ja".to_string())
+        );
     }
 
     #[test]

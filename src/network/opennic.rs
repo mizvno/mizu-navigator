@@ -53,7 +53,6 @@ use hickory_resolver::{
 
 use crate::core::errors::MizuError;
 
-
 /// Primary DoT servers for standard ICANN domains.
 ///
 /// Two providers are included for redundancy:
@@ -93,10 +92,9 @@ static OPENNIC_DOT_SERVERS: &[(&str, u16, &str)] = &[
 ///
 /// Source: <https://wiki.opennic.org/opennic/dot>  (as of 2024-06)
 const OPENNIC_TLDS: &[&str] = &[
-    "bbs", "chan", "cyb", "dyn", "epic", "free", "fur", "geek", "gopher", "indy", "libre",
-    "neo", "null", "o", "oss", "oz", "parody", "pirate", "te", "uu",
+    "bbs", "chan", "cyb", "dyn", "epic", "free", "fur", "geek", "gopher", "indy", "libre", "neo",
+    "null", "o", "oss", "oz", "parody", "pirate", "te", "uu",
 ];
-
 
 /// Which resolver pool should handle a DNS query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +128,6 @@ pub fn select_pool_for_domain(domain: &str) -> DnsPool {
     }
 }
 
-
 /// Split-horizon DoT resolver for Mizu.
 ///
 /// Internally maintains two [`TokioAsyncResolver`] pools:
@@ -148,7 +145,6 @@ pub struct MizuDnsResolver {
 /// Mizu protocol port used on every `mizu://` server.
 pub static MIZU_PORT: std::sync::LazyLock<u16> =
     std::sync::LazyLock::new(|| crate::core::config::CONFIG.mizu_port);
-
 
 /// Builds [`NameServerConfig`] entries for the given server list.
 ///
@@ -199,7 +195,6 @@ pub fn build_opennic_resolver() -> MizuDnsResolver {
         opennic: build_resolver_from_pool(OPENNIC_DOT_SERVERS),
     }
 }
-
 
 /// Tries `primary_lookup` first; if it returns a transient network error,
 /// retries transparently via `fallback_lookup`.
@@ -264,7 +259,6 @@ fn is_transient_dns_error(_e: &MizuError) -> bool {
     false
 }
 
-
 /// Resolves `domain` via the split-horizon DoT pool and returns a [`SocketAddr`]
 /// for `port`.
 ///
@@ -328,16 +322,13 @@ async fn resolve_ip(
     port: u16,
 ) -> Result<SocketAddr, MizuError> {
     let bare = fqdn.trim_end_matches('.').to_owned();
-    let lookup = resolver
-        .lookup_ip(fqdn.as_str())
-        .await
-        .map_err(|e| {
-            tracing::debug!(domain = %bare, error = %e, "DoT lookup failed");
-            #[cfg(not(kani))]
-            return MizuError::DnsError(e);
-            #[cfg(kani)]
-            return MizuError::Network(e.to_string());
-        })?;
+    let lookup = resolver.lookup_ip(fqdn.as_str()).await.map_err(|e| {
+        tracing::debug!(domain = %bare, error = %e, "DoT lookup failed");
+        #[cfg(not(kani))]
+        return MizuError::DnsError(e);
+        #[cfg(kani)]
+        return MizuError::Network(e.to_string());
+    })?;
 
     let mut ipv6_fallback: Option<SocketAddr> = None;
     for ip in lookup.iter() {
@@ -360,7 +351,6 @@ async fn resolve_ip(
         "DoT: no address returned for '{bare}'"
     )))
 }
-
 
 #[cfg(all(test, not(kani)))]
 mod tests {
@@ -555,8 +545,7 @@ mod tests {
         // NoRecordsFound would be more precise but requires constructing a
         // hickory_proto Query struct; Message correctly exercises the "not
         // Timeout / not Io → no retry" gate.
-        let dns_err =
-            ResolveError::from(ResolveErrorKind::Message("no records found (NXDOMAIN)"));
+        let dns_err = ResolveError::from(ResolveErrorKind::Message("no records found (NXDOMAIN)"));
         let primary_nxdomain =
             std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(dns_err)));
         let secondary_would_succeed = std::future::ready(Ok::<SocketAddr, _>(SocketAddr::from((

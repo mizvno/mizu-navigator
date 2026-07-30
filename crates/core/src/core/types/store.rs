@@ -1,19 +1,19 @@
-//! `VariableStore`, the `StateMachine` + `StringInterner` wrapper.
+//! `VariableStore`, the `Evaluator` + `StringInterner` wrapper.
 
 use std::collections::HashMap;
 
 use crate::core::errors::MizuError;
 
-use super::eval::StateMachine;
+use super::eval::Evaluator;
 use super::interner::{FrozenInterner, StringInterner, Symbol};
 use super::value::Value;
 
-/// A backwards compatibility layer wrapping StateMachine and StringInterner.
+/// A backwards compatibility layer wrapping Evaluator and StringInterner.
 #[derive(Debug, Clone, Default)]
 pub struct VariableStore<I = FrozenInterner> {
     /// The underlying flat evaluator state (globals, locals, budgets, queued actions).
-    pub state_machine: StateMachine,
-    /// Name ↔ `Symbol` mapping shared with `state_machine`'s expressions.
+    pub evaluator: Evaluator,
+    /// Name ↔ `Symbol` mapping shared with `evaluator`'s expressions.
     pub interner: I,
 }
 
@@ -22,7 +22,7 @@ impl VariableStore<StringInterner> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state_machine: StateMachine::default(),
+            evaluator: Evaluator::default(),
             interner: StringInterner::new(),
         }
     }
@@ -30,14 +30,14 @@ impl VariableStore<StringInterner> {
     /// Freezes the store's interner, transitioning to a runtime-safe VariableStore.
     pub fn freeze(self) -> VariableStore<FrozenInterner> {
         VariableStore {
-            state_machine: self.state_machine,
+            evaluator: self.evaluator,
             interner: self.interner.freeze(),
         }
     }
 
     /// Binds `sym` directly to `value`, bypassing name interning.
     pub fn set_symbol(&mut self, sym: Symbol, value: impl Into<Value>) {
-        self.state_machine.set_global(sym, value.into());
+        self.evaluator.set_global(sym, value.into());
     }
 
     /// Binds `name` to `value`.
@@ -45,7 +45,7 @@ impl VariableStore<StringInterner> {
         let name_str = name.into();
         let value_val = value.into();
         let sym = self.interner.get_or_intern(&name_str);
-        self.state_machine.set_global(sym, value_val);
+        self.evaluator.set_global(sym, value_val);
     }
 }
 
@@ -54,14 +54,14 @@ impl VariableStore<FrozenInterner> {
     #[must_use]
     pub fn with_interner(interner: FrozenInterner) -> Self {
         Self {
-            state_machine: StateMachine::default(),
+            evaluator: Evaluator::default(),
             interner,
         }
     }
 
     /// Binds `sym` directly to `value`, bypassing name interning.
     pub fn set_symbol(&mut self, sym: Symbol, value: impl Into<Value>) {
-        self.state_machine.set_global(sym, value.into());
+        self.evaluator.set_global(sym, value.into());
     }
 
     /// Frozen-safe version of `set`.
@@ -71,7 +71,7 @@ impl VariableStore<FrozenInterner> {
     /// the interner, the call is a no-op and a `tracing::debug!` is emitted.
     pub fn set_runtime(&mut self, name: &str, value: impl Into<Value>) {
         if let Some(sym) = self.interner.get(name) {
-            self.state_machine.set_global(sym, value.into());
+            self.evaluator.set_global(sym, value.into());
         } else {
             tracing::debug!(
                 name,
@@ -85,10 +85,10 @@ impl VariableStore<FrozenInterner> {
     /// Looks up `name` as a local (frame 0) or non-null global.
     pub fn get(&self, name: &str) -> Result<&Value, MizuError> {
         if let Some(sym) = self.interner.get(name) {
-            if let Some(val) = self.state_machine.get_local(sym, 0) {
+            if let Some(val) = self.evaluator.get_local(sym, 0) {
                 return Ok(val);
             }
-            let val = self.state_machine.get_global(sym);
+            let val = self.evaluator.get_global(sym);
             if !matches!(val, Value::Null) {
                 return Ok(val);
             }
@@ -100,7 +100,7 @@ impl VariableStore<FrozenInterner> {
     /// the corresponding variable's value.
     pub fn interpolate(&self, text: &str) -> Result<String, MizuError> {
         let mut buf = String::with_capacity(text.len());
-        self.state_machine
+        self.evaluator
             .interpolate_into(text, &self.interner, &mut buf)?;
         Ok(buf)
     }
@@ -117,7 +117,7 @@ impl VariableStore<FrozenInterner> {
         } else {
             Some(overlay)
         };
-        self.state_machine.interpolate_into_with_overlay(
+        self.evaluator.interpolate_into_with_overlay(
             text,
             &self.interner,
             overlay_opt,

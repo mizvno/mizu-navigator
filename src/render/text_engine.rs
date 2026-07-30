@@ -44,7 +44,9 @@
 
 use crate::core::errors::MizuError;
 use crate::core::types::VariableStore;
-use crate::parser::{MizuFontFamily, MizuFontStyle, MizuNode, MizuTextAlign, Primitive, StyleRules};
+use crate::parser::{
+    MizuFontFamily, MizuFontStyle, MizuNode, MizuTextAlign, Primitive, StyleRules,
+};
 use crate::render::vello_pipeline::to_vello_color;
 use ego_tree::{NodeId as EgoNodeId, Tree};
 use std::borrow::Cow;
@@ -227,10 +229,13 @@ pub fn calculate_node_text(
             None => Cow::Owned(raw_text),
         }
     } else {
-        interpolated = ctx.store.interpolate(&raw_text).unwrap_or_else(|e| match &e {
-            MizuError::BindingNotFound(name) => format!("{{missing: {}}}", name),
-            _ => format!("{{error: {}}}", e),
-        });
+        interpolated = ctx
+            .store
+            .interpolate(&raw_text)
+            .unwrap_or_else(|e| match &e {
+                MizuError::BindingNotFound(name) => format!("{{missing: {}}}", name),
+                _ => format!("{{error: {}}}", e),
+            });
         match dir.prepend_mark() {
             Some(mark) => {
                 let mut s = String::with_capacity(interpolated.len() + mark.len_utf8());
@@ -242,7 +247,9 @@ pub fn calculate_node_text(
         }
     };
 
-    let mut builder = ctx.layout_cx.ranged_builder(ctx.font_cx, &text_to_draw, 1.0, true);
+    let mut builder = ctx
+        .layout_cx
+        .ranged_builder(ctx.font_cx, &text_to_draw, 1.0, true);
 
     // Resolve the author's generic (`sans-serif`/`serif`/`monospace`, default
     // sans-serif) to a *single* `parley::GenericFamily` entry rather than a
@@ -259,9 +266,8 @@ pub fn calculate_node_text(
         MizuFontFamily::Serif => parley::style::GenericFamily::Serif,
         MizuFontFamily::Monospace => parley::style::GenericFamily::Monospace,
     };
-    let font_family = parley::style::FontFamily::Single(parley::style::FontFamilyName::Generic(
-        generic_family,
-    ));
+    let font_family =
+        parley::style::FontFamily::Single(parley::style::FontFamilyName::Generic(generic_family));
     builder.push_default(parley::style::StyleProperty::FontFamily(font_family));
     // ux-8: the resolved `lang` (ancestor-inherited, see render::bidi::resolve_lang)
     // feeds fontique's per-run fallback query as a locale hint — it disambiguates
@@ -650,7 +656,10 @@ mod tests {
             iterator_context: None,
             conditional_classes: Vec::new(),
         });
-        let node_id = tree.root_mut().append(text_node_with_lang("こんにちは", None)).id();
+        let node_id = tree
+            .root_mut()
+            .append(text_node_with_lang("こんにちは", None))
+            .id();
 
         let mut font_cx = parley::FontContext::new();
         font_cx.collection.load_system_fonts();
@@ -716,7 +725,10 @@ mod tests {
                 render_env: &no_op_render_env(),
             },
         );
-        assert!(result.is_some(), "no lang anywhere must still produce a layout");
+        assert!(
+            result.is_some(),
+            "no lang anywhere must still produce a layout"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -757,7 +769,11 @@ mod tests {
         // " World" (Latin). A single-direction run would collapse to one
         // GlyphRun; a correctly bidi-processed line splits into multiple
         // runs at the direction boundaries.
-        let node = text_node_with_dir("Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} World", "label", None);
+        let node = text_node_with_dir(
+            "Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} World",
+            "label",
+            None,
+        );
         let tree = Tree::new(node);
         let node_id = tree.root().id();
 
@@ -822,7 +838,11 @@ mod tests {
         });
         let node_id = tree
             .root_mut()
-            .append(text_node_with_dir("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", "label", None))
+            .append(text_node_with_dir(
+                "\u{05E9}\u{05DC}\u{05D5}\u{05DD}",
+                "label",
+                None,
+            ))
             .id();
 
         let mut font_cx = parley::FontContext::new();

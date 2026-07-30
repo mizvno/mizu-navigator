@@ -4,14 +4,13 @@ use crate::core::storage::ValidatedDomain;
 use crate::core::types::{Value, VariableStore};
 use crate::network::{RuntimeAction, UiEvent};
 
-
+pub use mizu_core::security::quota::{
+    CapabilityPolicy, STORAGE_QUOTA_BYTES_LOCAL_FILE, STORAGE_QUOTA_BYTES_LOCALHOST,
+    STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC,
+};
 pub(crate) use mizu_core::security::sandbox::file_sandbox_contains;
 #[cfg(test)]
 pub(crate) use mizu_core::security::sandbox::normalize_path_components;
-pub use mizu_core::security::quota::{
-    CapabilityPolicy, STORAGE_QUOTA_BYTES_LOCALHOST, STORAGE_QUOTA_BYTES_LOCAL_FILE,
-    STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC,
-};
 
 /// Estimates the serialized byte size of a [`Value`].
 ///
@@ -28,7 +27,7 @@ pub fn estimate_value_bytes(value: &Value) -> usize {
         Value::List(items) => items.iter().map(estimate_value_bytes).sum(),
         Value::Record(m) => m
             .iter()
-            .map(|(k, v)| k.len() + estimate_value_bytes(v))
+            .map(|f| f.key.len() + estimate_value_bytes(&f.value))
             .sum(),
         // Never actually persisted — `storage`'s `to_json` conversion
         // rejects `FileHandle` outright (see `Value::FileHandle`'s doc
@@ -56,9 +55,7 @@ pub fn get_current_domain(url: &str) -> ValidatedDomain {
         // Scan for '/', '?', or '#' — not just '/' — to match MizuUri::parse's strict
         // host boundary. Without this, `mizu://evil.com?q=x` yields domain "evil.com?q=x",
         // corrupting storage filenames and key derivations.
-        let end = rest
-            .find(['/', '?', '#'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         rest[..end].to_string()
     } else if let Some(path) = url.strip_prefix("file://") {
         let raw = path.trim_start_matches('/');
@@ -83,9 +80,7 @@ pub fn get_raw_domain(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("mizu://") {
         // Same strict boundary as MizuUri::parse and get_current_domain: scan for
         // '/', '?', or '#' so query strings cannot bleed into the domain token.
-        let end = rest
-            .find(['/', '?', '#'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         return rest[..end].to_string();
     }
     if let Some(path) = url.strip_prefix("file://") {
@@ -147,9 +142,8 @@ pub fn execute_capability_action(
                     .map(|u| !crate::network::worker::is_local_host(&u.domain))
                     .unwrap_or(true); // parse failure → fail-secure: treat as remote
             if chrome_url.starts_with("file://") && target_is_remote_mizu {
-                let reason = format!(
-                    "file:// origin blocked from outbound call to remote host {url}"
-                );
+                let reason =
+                    format!("file:// origin blocked from outbound call to remote host {url}");
                 tracing::warn!(url = %url, "SecurityViolation: {reason}");
                 return CapabilityOutcome::Blocked(reason);
             }
@@ -244,7 +238,9 @@ pub fn execute_capability_action(
             CapabilityOutcome::Dispatched
         }
         RuntimeAction::Navigate { url } => {
-            if let Err(e) = network_tx.send(crate::network::NetworkCmd::Navigate { tab: tab_id, url }) {
+            if let Err(e) =
+                network_tx.send(crate::network::NetworkCmd::Navigate { tab: tab_id, url })
+            {
                 tracing::warn!(error = %e, "network channel closed; Navigate command dropped");
             }
             CapabilityOutcome::Dispatched
@@ -310,7 +306,6 @@ mod tests {
     use crate::core::types::Value;
     use std::sync::Arc;
 
-
     #[test]
     fn test_storage_quota_enforcement() {
         let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
@@ -361,7 +356,6 @@ mod tests {
         assert_eq!(estimate_value_bytes(&v), s.len());
     }
 
-
     #[test]
     fn file_origin_gets_local_file_quota() {
         let file_policy = CapabilityPolicy::new("file:///home/user/app/index.mizu");
@@ -371,7 +365,6 @@ mod tests {
         assert!(file_policy.quota_bytes > remote_policy.quota_bytes);
         assert!(file_policy.quota_bytes < local_policy.quota_bytes);
     }
-
 
     #[test]
     fn normalize_path_resolves_dotdot() {
@@ -428,7 +421,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn distinct_file_urls_get_distinct_domains() {
         // Two different local documents must map to two distinct storage
@@ -459,7 +451,6 @@ mod tests {
         let b = get_current_domain("mizu://app-b.mizu/index.mizu");
         assert_ne!(a.as_str(), b.as_str());
     }
-
 
     #[test]
     fn get_current_domain_strips_query_from_mizu_url() {
@@ -497,10 +488,12 @@ mod tests {
     #[test]
     fn get_raw_domain_clean_url_unchanged() {
         use super::get_raw_domain;
-        assert_eq!(get_raw_domain("mizu://example.opennic/page"), "example.opennic");
+        assert_eq!(
+            get_raw_domain("mizu://example.opennic/page"),
+            "example.opennic"
+        );
         assert_eq!(get_raw_domain("mizu://example.opennic"), "example.opennic");
     }
-
 
     #[test]
     fn capability_policy_query_injection_cannot_grant_localhost_quota() {
@@ -574,7 +567,10 @@ mod tests {
         // the logic that now backs execute_capability_action.
         let target_url = "mizu://evil.com/data?host=localhost";
         let uri = crate::network::uri::MizuUri::parse(target_url).expect("must parse");
-        assert_eq!(uri.domain, "evil.com", "domain must be 'evil.com', not 'evil.com...'");
+        assert_eq!(
+            uri.domain, "evil.com",
+            "domain must be 'evil.com', not 'evil.com...'"
+        );
         assert!(
             !crate::network::worker::is_local_host(&uri.domain),
             "evil.com is not local — call from file:// must be blocked"
@@ -598,10 +594,7 @@ mod tests {
         // A URL that MizuUri cannot parse (e.g. uses a different scheme) should be
         // treated as remote (blocked) rather than allowed — fail-secure.
         let parse_result = crate::network::uri::MizuUri::parse("https://evil.com/data");
-        assert!(
-            parse_result.is_err(),
-            "non-mizu:// URL must fail to parse"
-        );
+        assert!(parse_result.is_err(), "non-mizu:// URL must fail to parse");
         // In execute_capability_action the .unwrap_or(true) makes parse failures block the call.
     }
 
@@ -698,7 +691,10 @@ mod tests {
             );
 
             match network_rx.try_recv() {
-                Ok(crate::network::NetworkCmd::Fetch { format: sent_format, .. }) => {
+                Ok(crate::network::NetworkCmd::Fetch {
+                    format: sent_format,
+                    ..
+                }) => {
                     assert_eq!(
                         sent_format, format,
                         "format must survive the ResolvedCall → Fetch dispatch"

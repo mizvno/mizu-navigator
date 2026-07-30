@@ -9,7 +9,10 @@ use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value};
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
-use super::ast::{Action, BinOp, Expr, ExprArena, ExprTree, MizuFunction, NetworkMethod, PayloadFormat, RootTimer, TimerInterval, ValueType};
+use super::ast::{
+    Action, BinOp, Expr, ExprArena, ExprTree, MizuFunction, NetworkMethod, PayloadFormat,
+    RootTimer, TimerInterval, ValueType,
+};
 use super::comp::collect_calls;
 use super::lexer::{Cursor, Token, assert_cursor_empty, leading_spaces, lex};
 
@@ -251,7 +254,8 @@ pub(super) fn parse_expr(
                             .to_string(),
                     ));
                 }
-                let arg_ids: Vec<super::ast::ExprId> = args.into_iter().map(|a| arena.alloc(a)).collect();
+                let arg_ids: Vec<super::ast::ExprId> =
+                    args.into_iter().map(|a| arena.alloc(a)).collect();
                 let (args_start, args_len) = arena.push_args(&arg_ids)?;
                 Expr::FunctionCall {
                     name: interner.get_or_intern(name),
@@ -310,8 +314,11 @@ pub(super) fn parse_expr(
                 break;
             }
             cursor.next(); // consume `.`
-            let field = match cursor.next() {
-                Some(Token::Ident(name)) => interner.get_or_intern(name),
+            let (field, field_hash) = match cursor.next() {
+                Some(Token::Ident(name)) => (
+                    interner.get_or_intern(name),
+                    crate::core::types::hash_field(name)
+                ),
                 other => {
                     return Err(MizuError::ParseError(format!(
                         "expected field name after `.`, got: {other:?}"
@@ -319,10 +326,7 @@ pub(super) fn parse_expr(
                 }
             };
             let base = arena.alloc(lhs);
-            lhs = Expr::FieldAccess {
-                base,
-                field,
-            };
+            lhs = Expr::FieldAccess { base, field, field_hash };
             continue;
         }
 
@@ -379,11 +383,7 @@ pub(super) fn parse_expr(
         let rhs = parse_expr(cursor, right_bp, depth + 1, interner, arena)?;
         let left = arena.alloc(lhs);
         let right = arena.alloc(rhs);
-        lhs = Expr::BinaryOp {
-            left,
-            op,
-            right,
-        };
+        lhs = Expr::BinaryOp { left, op, right };
     }
 
     Ok(lhs)
@@ -429,7 +429,6 @@ const fn infix_binding_power(op: &BinOp) -> (u8, u8) {
         BinOp::Mul | BinOp::Div => (20, 21),
     }
 }
-
 
 /// Parses a single function definition block.
 ///
@@ -535,7 +534,10 @@ fn parse_function_block(
 /// Supported types: `num`, `string`/`str`, `bool`, `list`.
 /// Writing `dict`, `record`, or `any` produces a `ParseError` (use an
 /// unannotated parameter instead).
-fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result<ValueType, String> {
+fn parse_type(
+    cursor: &mut Cursor<'_>,
+    _interner: &mut StringInterner,
+) -> Result<ValueType, String> {
     let mut base_type = match cursor.next() {
         Some(Token::Ident(name)) => match name.to_lowercase().as_str() {
             "num" | "number" => ValueType::Num,
@@ -543,19 +545,19 @@ fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result
             "bool" | "boolean" => ValueType::Bool,
             "list" => {
                 match cursor.next() {
-                    Some(Token::Lt) => {},
+                    Some(Token::Lt) => {}
                     other => return Err(format!("expected `<` after `list`, got {other:?}")),
                 }
                 let inner = parse_type(cursor, _interner)?;
                 match cursor.next() {
-                    Some(Token::Gt) => {},
+                    Some(Token::Gt) => {}
                     other => return Err(format!("expected `>` after list type, got {other:?}")),
                 }
                 ValueType::List(Box::new(inner))
             }
             "record" => {
                 match cursor.next() {
-                    Some(Token::LBrace) => {},
+                    Some(Token::LBrace) => {}
                     other => return Err(format!("expected `{{` after `record`, got {other:?}")),
                 }
                 let mut fields = Vec::new();
@@ -565,8 +567,10 @@ fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result
                         other => return Err(format!("expected field name, got {other:?}")),
                     };
                     match cursor.next() {
-                        Some(Token::Colon) => {},
-                        other => return Err(format!("expected `:` after field name, got {other:?}")),
+                        Some(Token::Colon) => {}
+                        other => {
+                            return Err(format!("expected `:` after field name, got {other:?}"));
+                        }
                     }
                     let field_type = parse_type(cursor, _interner)?;
                     fields.push((field_name, field_type));
@@ -575,14 +579,25 @@ fn parse_type(cursor: &mut Cursor<'_>, _interner: &mut StringInterner) -> Result
                     }
                 }
                 match cursor.next() {
-                    Some(Token::RBrace) => {},
-                    other => return Err(format!("expected `}}` after record fields, got {other:?}")),
+                    Some(Token::RBrace) => {}
+                    other => {
+                        return Err(format!("expected `}}` after record fields, got {other:?}"));
+                    }
                 }
                 fields.sort_by(|a, b| a.0.cmp(&b.0));
                 ValueType::Record(fields)
             }
-            "dict" | "any" => return Err(format!("type `{}` is not supported; use: num, string, bool, list<T>, record{{...}}, or T?", name)),
-            other => return Err(format!("unknown type `{other}`; valid types: num, string, bool, list<T>, record{{...}}, or T?")),
+            "dict" | "any" => {
+                return Err(format!(
+                    "type `{}` is not supported; use: num, string, bool, list<T>, record{{...}}, or T?",
+                    name
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unknown type `{other}`; valid types: num, string, bool, list<T>, record{{...}}, or T?"
+                ));
+            }
         },
         other => return Err(format!("expected type name, got {other:?}")),
     };
@@ -604,22 +619,29 @@ fn parse_params(
     }
     let tokens = lex(param_str)?;
     let mut cursor = Cursor::new(&tokens);
-    
+
     while !matches!(cursor.peek(), None | Some(Token::Newline)) {
         let name = match cursor.next() {
             Some(Token::Ident(n)) => *n,
-            other => return Err(MizuError::ParseError(format!("expected parameter name, got {other:?}"))),
+            other => {
+                return Err(MizuError::ParseError(format!(
+                    "expected parameter name, got {other:?}"
+                )));
+            }
         };
         match cursor.next() {
-            Some(Token::Colon) => {},
+            Some(Token::Colon) => {}
             _other => {
                 let fn_name = _context.split('(').next().unwrap_or(_context).trim();
-                return Err(MizuError::ParseError(format!("function `{}`: parameter `{}` requires a type annotation", fn_name, name)));
+                return Err(MizuError::ParseError(format!(
+                    "function `{}`: parameter `{}` requires a type annotation",
+                    fn_name, name
+                )));
             }
         }
         let vtype = parse_type(&mut cursor, interner).map_err(MizuError::ParseError)?;
         params.push((interner.get_or_intern(name), vtype));
-        
+
         if matches!(cursor.peek(), Some(Token::Comma)) {
             cursor.next();
         }
@@ -751,7 +773,6 @@ fn looks_like_binding(line: &str) -> bool {
     }
 }
 
-
 /// Parses the `logic_block` produced by [`super::split_source`] into a
 /// validated, recursion-free `HashMap` of function definitions.
 ///
@@ -852,7 +873,6 @@ pub fn parse_logic(
     Ok(functions)
 }
 
-
 /// Parses all `timer <interval> -> <action>` declarations from a `logic_block`.
 ///
 /// Timer lines are silently skipped by [`parse_logic`]; this function handles
@@ -931,7 +951,6 @@ pub fn parse_root_timers(
     Ok(timers)
 }
 
-
 /// Parses a standalone expression string into an [`ExprTree`].
 ///
 /// Used by the layout parser to parse conditional class conditions
@@ -941,7 +960,10 @@ pub fn parse_root_timers(
 ///
 /// Returns [`MizuError::ParseError`] if the input is syntactically invalid
 /// or if tokens remain unconsumed after the expression.
-pub fn parse_expr_standalone(expr: &str, interner: &mut StringInterner) -> Result<ExprTree, MizuError> {
+pub fn parse_expr_standalone(
+    expr: &str,
+    interner: &mut StringInterner,
+) -> Result<ExprTree, MizuError> {
     let tokens = lex(expr)?;
     let mut cursor = Cursor::new(&tokens);
     let tree = parse_expr_tree(&mut cursor, interner)?;
@@ -968,7 +990,12 @@ fn check_dag(functions: &FxHashMap<Symbol, MizuFunction>) -> Result<(), MizuErro
 
     for (&sym, func) in functions {
         let mut calls: FxHashSet<Symbol> = FxHashSet::default();
-        collect_calls(func.body.root(), &func.body.arena, &mut calls, &function_names);
+        collect_calls(
+            func.body.root(),
+            &func.body.arena,
+            &mut calls,
+            &function_names,
+        );
 
         for callee in calls {
             if functions.contains_key(&callee) {
@@ -1010,7 +1037,6 @@ fn check_dag(functions: &FxHashMap<Symbol, MizuFunction>) -> Result<(), MizuErro
 
     Ok(())
 }
-
 
 /// Finds the index of the `)` that closes the `(` at `open_idx`, scanning
 /// forward and tracking nesting depth. String literals (`"..."`, with `\`
@@ -1230,10 +1256,7 @@ pub fn parse_action_with_urls(
             headers.push((name, value_expr));
         }
 
-        assert_cursor_empty(
-            &rhs_cursor,
-            &format!("network call `{}`", method.as_str()),
-        )?;
+        assert_cursor_empty(&rhs_cursor, &format!("network call `{}`", method.as_str()))?;
 
         // Whether this verb carries a request body (POST, PUT, QUERY do; GET, DELETE do not).
         let has_body = matches!(

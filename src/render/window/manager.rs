@@ -9,20 +9,20 @@ use ego_tree::{NodeId as EgoNodeId, Tree};
 use taffy::{TaffyTree, geometry::Size, style::AvailableSpace};
 use winit::window::Window;
 
+use super::AssetSlot;
+use super::history::{HistoryLog, HistorySidebarState, HistoryStack};
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
 use crate::network::{ReloadPayload, RuntimeAction, TabId, UiEvent, WorkerResponse};
 use crate::parser::logic::{ComputedBinding, MizuFunction, RootTimer, TimerInterval};
 use crate::parser::style::StyleVariant;
-use crate::parser::{Action, EventBlock, MizuNode, StyleRules};
+use crate::parser::{EventBlock, MizuNode, StyleRules};
 use crate::render::chrome_vello::CHROME_HEIGHT;
 use crate::render::layout_bridge::{EachExpansion, expand_each_nodes};
-use crate::render::responsive::{RenderEnvironment, ViewportSize};
-use crate::render::security::get_raw_domain;
-use super::AssetSlot;
-use super::history::{HistoryLog, HistorySidebarState, HistoryStack};
 use crate::render::preferences::UserPreferences;
+use crate::render::responsive::{RenderEnvironment, ViewportSize};
 use crate::render::security::CapabilityPolicy;
+use crate::render::security::get_raw_domain;
 
 /// Source of [`TabState::a11y_epoch`] values.
 ///
@@ -38,7 +38,11 @@ static A11Y_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// case is one confused accessibility update, not unsoundness.
 fn next_a11y_epoch() -> u32 {
     let epoch = A11Y_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if epoch == 0 { A11Y_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { epoch }
+    if epoch == 0 {
+        A11Y_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        epoch
+    }
 }
 
 /// Serialises worker spawning against anything observing the process-wide
@@ -62,7 +66,9 @@ pub(crate) static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// behind, so a poisoned lock is still perfectly usable and failing here
 /// would only turn one test failure into a cascade.
 pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
-    SPAWN_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SPAWN_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Maximum number of consecutive server redirects honoured for a single
@@ -509,7 +515,10 @@ impl MizuWindowManager {
     /// while a background open (should one ever be added) must not.
     pub fn open_tab(&mut self, url: &str) -> Option<TabId> {
         if self.tabs.len() >= MAX_OPEN_TABS {
-            tracing::warn!(open = self.tabs.len(), "refusing to open tab: limit reached");
+            tracing::warn!(
+                open = self.tabs.len(),
+                "refusing to open tab: limit reached"
+            );
             return None;
         }
         let id = TabId(self.next_tab_id);
@@ -566,7 +575,8 @@ impl MizuWindowManager {
         for waiters in self.fetching_images.values_mut() {
             waiters.retain(|w| *w != id);
         }
-        self.fetching_images.retain(|_, waiters| !waiters.is_empty());
+        self.fetching_images
+            .retain(|_, waiters| !waiters.is_empty());
         self.tabs.remove(pos);
         // Browser convention: focus moves to the tab on the right, falling
         // back to the left when the closed tab was last.
@@ -769,8 +779,7 @@ impl MizuWindowManager {
             height: 600.0 - CHROME_HEIGHT,
         };
         let preferences = UserPreferences::default();
-        let mut image_cache =
-            lru::LruCache::new(IMAGE_CACHE_CAPACITY);
+        let mut image_cache = lru::LruCache::new(IMAGE_CACHE_CAPACITY);
 
         let tab = TabState::new(
             TabId(0),
@@ -831,7 +840,10 @@ impl MizuWindowManager {
     /// don't observe a disconnected peer mid-test.
     #[cfg(test)]
     pub(crate) fn new_headless(tabs: Vec<TabState>) -> (Self, TestChannelKeepAlive) {
-        assert!(!tabs.is_empty(), "a manager must always own at least one tab");
+        assert!(
+            !tabs.is_empty(),
+            "a manager must always own at least one tab"
+        );
         let (network_tx, network_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (network_result_tx, network_rx) = tokio::sync::mpsc::channel(16);
@@ -1023,7 +1035,7 @@ impl TabState {
         let interner = self.store.interner.clone();
 
         let mut initial_variables = Vec::new();
-        for (&sym, val) in &self.store.state_machine.global_store {
+        for (&sym, val) in &self.store.evaluator.global_store {
             if !matches!(val, crate::core::types::Value::Null)
                 && let Some(name) = self.store.interner.resolve(sym)
             {
@@ -1031,25 +1043,32 @@ impl TabState {
             }
         }
 
-        let _ = logic_tx.send((self.id, UiEvent::Reload(Box::new(ReloadPayload {
-            logic_fns: self.logic_fns.clone(),
-            click_actions,
-            submit_actions,
-            root_timer_actions: self.root_timers.iter().map(|rt| rt.action.clone()).collect(),
-            interner,
-            initial_variables,
-            url_registry: self.url_registry.clone(),
-            // For file:// documents, relative `api` endpoints resolve against
-            // localhost — the only meaningful host during local development
-            // (get_raw_domain would yield a filesystem-derived token that is
-            // not a routable hostname).
-            document_domain: if self.chrome_state.url.starts_with("file://") {
-                "localhost".to_string()
-            } else {
-                get_raw_domain(&self.chrome_state.url)
-            },
-            computed_bindings: self.computed_bindings.clone(),
-        }))));
+        let _ = logic_tx.send((
+            self.id,
+            UiEvent::Reload(Box::new(ReloadPayload {
+                logic_fns: self.logic_fns.clone(),
+                click_actions,
+                submit_actions,
+                root_timer_actions: self
+                    .root_timers
+                    .iter()
+                    .map(|rt| rt.action.clone())
+                    .collect(),
+                interner,
+                initial_variables,
+                url_registry: self.url_registry.clone(),
+                // For file:// documents, relative `api` endpoints resolve against
+                // localhost — the only meaningful host during local development
+                // (get_raw_domain would yield a filesystem-derived token that is
+                // not a routable hostname).
+                document_domain: if self.chrome_state.url.starts_with("file://") {
+                    "localhost".to_string()
+                } else {
+                    get_raw_domain(&self.chrome_state.url)
+                },
+                computed_bindings: self.computed_bindings.clone(),
+            })),
+        ));
     }
 
     /// Marks a node's cached text layout stale (after typing or a focus change
@@ -1192,8 +1211,13 @@ pub(super) fn reload_tab_document(
     tab.each_container_offset_y.clear();
 
     tab.rebuild_node_mappings();
-    tab.store = crate::core::types::VariableStore { state_machine: Default::default(), interner }.freeze();
-    tab.store.set_runtime("window_url", Value::from(tab.chrome_state.url.clone()));
+    tab.store = crate::core::types::VariableStore {
+        evaluator: Default::default(),
+        interner,
+    }
+    .freeze();
+    tab.store
+        .set_runtime("window_url", Value::from(tab.chrome_state.url.clone()));
     tab.rebuild_dependency_index();
 
     tab.trigger_logic_reload(ctx.logic_tx);
@@ -1308,8 +1332,10 @@ pub(super) fn resize_tab_viewport(
         let old_count = prev_truncated.get(node_id).copied().unwrap_or(0);
         if new_count != old_count {
             let msg = format!("budget exceeded: clamped list to hide {} items", new_count);
-            tab.inspector_log
-                .push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
+            tab.inspector_log.push_event(
+                crate::render::inspector::log::EventKind::Layout,
+                msg.clone(),
+            );
             tracing::warn!("{}", msg);
         }
     }
@@ -1319,8 +1345,10 @@ pub(super) fn resize_tab_viewport(
                 "budget restored: previously clamped {} items now visible",
                 old_count
             );
-            tab.inspector_log
-                .push_event(crate::render::inspector::log::EventKind::Layout, msg.clone());
+            tab.inspector_log.push_event(
+                crate::render::inspector::log::EventKind::Layout,
+                msg.clone(),
+            );
             tracing::warn!("{}", msg);
         }
     }
@@ -1435,7 +1463,8 @@ pub(super) fn refresh_tab_virtualized_windows(
     viewport_height: f32,
 ) -> Result<bool, MizuError> {
     let scroll_y = tab.root_scroll_offset_y;
-    let slack_rows = (*crate::render::layout_bridge::VIRTUALIZATION_BUFFER_ROWS / 2).max(1) as isize;
+    let slack_rows =
+        (*crate::render::layout_bridge::VIRTUALIZATION_BUFFER_ROWS / 2).max(1) as isize;
 
     let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
 

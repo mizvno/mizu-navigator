@@ -3,24 +3,25 @@
 /// Accent color for focus indication, shared between the chrome URL bar's
 /// focused-state border and the DOM keyboard-focus ring so the two read as
 /// the same visual language.
-pub(crate) const FOCUS_RING_COLOR: vello::peniko::Color = vello::peniko::Color::rgba8(85, 153, 255, 255);
+pub(crate) const FOCUS_RING_COLOR: vello::peniko::Color =
+    vello::peniko::Color::rgba8(85, 153, 255, 255);
 
-/// Bidirectional text direction resolution + URL-bar anti-spoofing
-/// sanitization (ux-7). See `docs/design/bidi.md`.
-pub mod bidi;
 /// Read-only accessibility tree (accesskit), derived from the same DOM the
 /// renderer paints.
 pub mod accessibility;
+/// Bidirectional text direction resolution + URL-bar anti-spoofing
+/// sanitization (ux-7). See `docs/design/bidi.md`.
+pub mod bidi;
 /// Native Vello-based browser chrome (navigation bar).
 pub mod chrome_vello;
-/// Spatial hit-testing for input events.
-pub mod hit_test;
 /// History sidebar panel (Ctrl+H): persistent browsing history grouped by day.
 pub mod history_sidebar;
-/// In-window developer inspector panel (F12).
-pub mod inspector;
+/// Spatial hit-testing for input events.
+pub mod hit_test;
 /// Image and animation decoders.
 pub mod image_codec;
+/// In-window developer inspector panel (F12).
+pub mod inspector;
 /// Layout tree builder and translator.
 pub mod layout_bridge;
 /// Unified navigation policy — single choke point for all document-level

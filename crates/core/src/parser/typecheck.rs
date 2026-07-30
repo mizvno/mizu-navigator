@@ -10,7 +10,6 @@
 //! taint.
 //!
 
-
 use crate::core::errors::MizuError;
 use crate::core::types::Symbol;
 use crate::parser::layout::{EventBlock, MizuNode};
@@ -33,7 +32,13 @@ pub fn check_types(
     let mut global_env = Env::default();
 
     for comp in comps {
-        let ty = infer(comp.expr.root(), &comp.expr.arena, &global_env, functions, interner)?;
+        let ty = infer(
+            comp.expr.root(),
+            &comp.expr.arena,
+            &global_env,
+            functions,
+            interner,
+        )?;
         global_env.insert(comp.name, ty);
     }
 
@@ -42,7 +47,13 @@ pub fn check_types(
         for (sym, ty_ann) in &func.params {
             local_env.insert(*sym, Some(ty_ann.clone()));
         }
-        infer(func.body.root(), &func.body.arena, &local_env, functions, interner)?;
+        infer(
+            func.body.root(),
+            &func.body.arena,
+            &local_env,
+            functions,
+            interner,
+        )?;
     }
 
     for node in dom.nodes() {
@@ -87,7 +98,13 @@ fn check_action(
                 infer(p.root(), &p.arena, env, functions, interner)?;
             }
             for (_, value_expr) in headers {
-                infer(value_expr.root(), &value_expr.arena, env, functions, interner)?;
+                infer(
+                    value_expr.root(),
+                    &value_expr.arena,
+                    env,
+                    functions,
+                    interner,
+                )?;
             }
         }
     }
@@ -157,14 +174,14 @@ fn infer(
 ) -> Result<Option<ValueType>, MizuError> {
     match expr {
         Expr::Literal(val) => match val {
-            crate::core::types::Value::Int(_) => {
-                Ok(Some(ValueType::Num))
-            }
+            crate::core::types::Value::Int(_) => Ok(Some(ValueType::Num)),
             crate::core::types::Value::String(_) => Ok(Some(ValueType::Str)),
             crate::core::types::Value::Bool(_) => Ok(Some(ValueType::Bool)),
             crate::core::types::Value::List(_) => Ok(None),
             crate::core::types::Value::Record(_) => Ok(None),
-            crate::core::types::Value::Null => Ok(Some(ValueType::Nullable(Box::new(ValueType::Num)))),
+            crate::core::types::Value::Null => {
+                Ok(Some(ValueType::Nullable(Box::new(ValueType::Num))))
+            }
             // Unreachable in practice: there is no source-level literal
             // syntax that produces a `FileHandle` (only the `type "file"`
             // input's native picker does), but the match must stay
@@ -183,8 +200,14 @@ fn infer(
             infer(&arena[*right], arena, env, functions, interner)?;
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ok(Some(ValueType::Num)),
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
-                | BinOp::And | BinOp::Or => Ok(Some(ValueType::Bool)),
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Le
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or => Ok(Some(ValueType::Bool)),
             }
         }
         Expr::Let { name, value, body } => {
@@ -211,7 +234,7 @@ fn infer(
                 Ok(None)
             }
         }
-        Expr::FieldAccess { base, field } => {
+        Expr::FieldAccess { base, field, field_hash: _ } => {
             let base_ty = infer(&arena[*base], arena, env, functions, interner)?;
             match base_ty {
                 Some(ValueType::Record(fields)) => {
@@ -236,7 +259,11 @@ fn infer(
                 None => Ok(None),
             }
         }
-        Expr::FunctionCall { name, args_start, args_len } => {
+        Expr::FunctionCall {
+            name,
+            args_start,
+            args_len,
+        } => {
             let args = arena.args(*args_start, *args_len);
             let func_name = interner.resolve(*name).unwrap_or("");
             if func_name == "filter" && args.len() == 4 {
@@ -278,7 +305,9 @@ fn infer(
             } else if func_name == "length" && args.len() == 1 {
                 let arg_ty = infer(&arena[args[0]], arena, env, functions, interner)?;
                 match arg_ty {
-                    Some(ValueType::List(_)) | Some(ValueType::Str) | None => Ok(Some(ValueType::Num)),
+                    Some(ValueType::List(_)) | Some(ValueType::Str) | None => {
+                        Ok(Some(ValueType::Num))
+                    }
                     Some(other) => Err(MizuError::StaticTypeError(format!(
                         "length expects a list or string, got `{}`",
                         other
@@ -345,7 +374,6 @@ mod tests {
     use crate::core::types::StringInterner;
     use crate::parser::logic::parse_logic;
 
-
     // Helper to parse logic string and typecheck the functions
     fn check_logic_string(src: &str) -> Result<(), MizuError> {
         let mut interner = StringInterner::new();
@@ -365,7 +393,6 @@ mod tests {
         let src = "f(x: num) : x + 1";
         assert!(check_logic_string(src).is_ok());
     }
-
 
     #[test]
     fn missing_field_on_record_rejected() {
@@ -393,8 +420,9 @@ mod tests {
         let mut interner = StringInterner::new();
         let functions = FxHashMap::default();
         let env = Env::default();
-        let action = crate::parser::logic::parse_action("POST(orders, 42) -> resp as text", &mut interner)
-            .unwrap();
+        let action =
+            crate::parser::logic::parse_action("POST(orders, 42) -> resp as text", &mut interner)
+                .unwrap();
         let err = check_action(&action, &env, &functions, &interner).unwrap_err();
         assert!(matches!(err, MizuError::StaticTypeError(_)));
     }
@@ -436,7 +464,6 @@ mod tests {
         let err = check_action(&action, &env, &functions, &interner).unwrap_err();
         assert!(matches!(err, MizuError::StaticTypeError(_)));
     }
-
 }
 
 // This module intentionally has no Kani proofs.

@@ -391,12 +391,15 @@ impl ChromeState {
         if self.url.is_empty() {
             return;
         }
-        
+
         let chars: Vec<(usize, char)> = self.url.char_indices().collect();
-        let cursor_char_idx = chars.iter().position(|&(idx, _)| idx >= self.cursor).unwrap_or(chars.len());
-        
+        let cursor_char_idx = chars
+            .iter()
+            .position(|&(idx, _)| idx >= self.cursor)
+            .unwrap_or(chars.len());
+
         let is_separator = |c: char| " /.:?&=-".contains(c);
-        
+
         let mut i = cursor_char_idx;
         while i > 0 {
             let (_, c) = chars[i - 1];
@@ -405,8 +408,12 @@ impl ChromeState {
             }
             i -= 1;
         }
-        let mut start = if i < chars.len() { chars[i].0 } else { self.url.len() };
-        
+        let mut start = if i < chars.len() {
+            chars[i].0
+        } else {
+            self.url.len()
+        };
+
         let mut j = cursor_char_idx;
         while j < chars.len() {
             let (_, c) = chars[j];
@@ -415,13 +422,17 @@ impl ChromeState {
             }
             j += 1;
         }
-        let mut end = if j < chars.len() { chars[j].0 } else { self.url.len() };
-        
+        let mut end = if j < chars.len() {
+            chars[j].0
+        } else {
+            self.url.len()
+        };
+
         if start == end && cursor_char_idx < chars.len() {
             start = chars[cursor_char_idx].0;
             end = start + chars[cursor_char_idx].1.len_utf8();
         }
-        
+
         self.selection = Some((start, end));
         self.cursor = end;
     }
@@ -616,10 +627,14 @@ pub fn chrome_hit_zone(x: f32, y: f32, layout: &ChromeLayout) -> ChromeHitZone {
         let item_h = 24.0;
         let padding = 4.0;
         let dropdown_h = (layout.dropdown_count as f32) * item_h + padding * 2.0;
-        
+
         let url_bar_right = (layout.window_width - STATUS_W).max(URL_BAR_X + 10.0);
-        
-        if x >= URL_BAR_X && x < url_bar_right && y >= URL_BAR_Y + URL_BAR_H && y < URL_BAR_Y + URL_BAR_H + dropdown_h {
+
+        if x >= URL_BAR_X
+            && x < url_bar_right
+            && y >= URL_BAR_Y + URL_BAR_H
+            && y < URL_BAR_Y + URL_BAR_H + dropdown_h
+        {
             let relative_y = y - (URL_BAR_Y + URL_BAR_H + padding);
             if relative_y >= 0.0 {
                 let index = (relative_y / item_h) as usize;
@@ -822,7 +837,11 @@ fn get_icon_reload() -> &'static BezPath {
 
 fn get_icon_history() -> &'static BezPath {
     static ICON: OnceLock<BezPath> = OnceLock::new();
-    ICON.get_or_init(|| parse_svg_path(include_str!("../../assets/icons/clock-counter-clockwise-bold.svg")))
+    ICON.get_or_init(|| {
+        parse_svg_path(include_str!(
+            "../../assets/icons/clock-counter-clockwise-bold.svg"
+        ))
+    })
 }
 
 enum ButtonContent<'a> {
@@ -896,7 +915,7 @@ fn paint_toolbar_button(
             &underline,
         );
     }
-    
+
     match content {
         ButtonContent::Text(label) => {
             let layout = build_chrome_text_layout(label, ctx.font_cx, ctx.layout_cx);
@@ -909,7 +928,9 @@ fn paint_toolbar_button(
             let scale = icon_size / 256.0;
             let icon_x = x + (BTN_W - icon_size) / 2.0;
             let icon_y = BTN_Y + (BTN_H - icon_size) / 2.0;
-            let icon_transform = ctx.transform * Affine::translate((icon_x as f64, icon_y as f64)) * Affine::scale(scale as f64);
+            let icon_transform = ctx.transform
+                * Affine::translate((icon_x as f64, icon_y as f64))
+                * Affine::scale(scale as f64);
             scene.fill(Fill::NonZero, icon_transform, text_color, None, path);
         }
     }
@@ -997,15 +1018,31 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
 
     // ── Bar background ────────────────────────────────────────────────────────
     let bar_rect = Rect::new(0.0, 0.0, ctx.window_width as f64, CHROME_HEIGHT as f64);
-    scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &bar_rect);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.bar_bg,
+        None,
+        &bar_rect,
+    );
 
     // ── Tab strip ─────────────────────────────────────────────────────────────
     let strip_rect = Rect::new(0.0, 0.0, ctx.window_width as f64, TAB_STRIP_HEIGHT as f64);
-    scene.fill(Fill::NonZero, transform, ctx.palette.strip_bg, None, &strip_rect);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.strip_bg,
+        None,
+        &strip_rect,
+    );
     let layout = ChromeLayout {
         window_width: ctx.window_width,
         tab_count: ctx.tabs.len(),
-        dropdown_count: if ctx.state.focused { ctx.state.suggestions.len() } else { 0 },
+        dropdown_count: if ctx.state.focused {
+            ctx.state.suggestions.len()
+        } else {
+            0
+        },
     };
     for (i, rect) in tab_rects(&layout) {
         let Some(entry) = ctx.tabs.get(i) else {
@@ -1129,7 +1166,13 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
         (URL_BAR_Y + URL_BAR_H) as f64,
         4.0,
     );
-    scene.fill(Fill::NonZero, transform, ctx.palette.url_bg, None, &url_bar_rect);
+    scene.fill(
+        Fill::NonZero,
+        transform,
+        ctx.palette.url_bg,
+        None,
+        &url_bar_rect,
+    );
 
     // Border (thicker / brighter when focused)
     let border_color = if ctx.state.focused {
@@ -1170,7 +1213,13 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
             (text_left + x1) as f64,
             (URL_BAR_Y + URL_BAR_H) as f64,
         );
-        scene.fill(Fill::NonZero, transform, ctx.palette.select, None, &sel_rect);
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.select,
+            None,
+            &sel_rect,
+        );
     }
 
     // URL text
@@ -1210,7 +1259,13 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
             (cursor_x + 1.5) as f64,
             (URL_BAR_Y + URL_BAR_H - 3.0) as f64,
         );
-        scene.fill(Fill::NonZero, transform, ctx.palette.cursor, None, &cursor_rect);
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.cursor,
+            None,
+            &cursor_rect,
+        );
     }
 
     scene.pop_layer(); // end URL bar clip
@@ -1227,10 +1282,22 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
             (URL_BAR_Y + URL_BAR_H) as f64 + dropdown_h,
             4.0,
         );
-        
-        scene.fill(Fill::NonZero, transform, ctx.palette.bar_bg, None, &dropdown_rect);
-        scene.stroke(&Stroke::new(1.0), transform, ctx.palette.url_border_idle, None, &dropdown_rect);
-        
+
+        scene.fill(
+            Fill::NonZero,
+            transform,
+            ctx.palette.bar_bg,
+            None,
+            &dropdown_rect,
+        );
+        scene.stroke(
+            &Stroke::new(1.0),
+            transform,
+            ctx.palette.url_border_idle,
+            None,
+            &dropdown_rect,
+        );
+
         for (i, suggestion) in ctx.state.suggestions.iter().enumerate() {
             let item_y = (URL_BAR_Y + URL_BAR_H) as f64 + padding + (i as f64) * item_h;
             let item_rect = Rect::new(
@@ -1239,20 +1306,37 @@ pub fn paint_chrome(scene: &mut Scene, ctx: &mut ChromePaintContext<'_>) {
                 url_bar_right as f64,
                 item_y + item_h,
             );
-            
+
             if Some(i) == ctx.state.selected_suggestion {
-                scene.fill(Fill::NonZero, transform, ctx.palette.select, None, &item_rect);
+                scene.fill(
+                    Fill::NonZero,
+                    transform,
+                    ctx.palette.select,
+                    None,
+                    &item_rect,
+                );
             } else if Some(i) == ctx.state.hovered_suggestion {
-                scene.fill(Fill::NonZero, transform, ctx.palette.btn_bg, None, &item_rect);
+                scene.fill(
+                    Fill::NonZero,
+                    transform,
+                    ctx.palette.btn_bg,
+                    None,
+                    &item_rect,
+                );
             }
-            
+
             let title_str = if suggestion.title.is_empty() {
                 suggestion.url.clone()
             } else {
                 format!("{} - {}", suggestion.title, suggestion.url)
             };
-            
-            let elided = elide_to_width(&title_str, (url_bar_right - URL_BAR_X - 16.0) as f32, ctx.font_cx, ctx.layout_cx);
+
+            let elided = elide_to_width(
+                &title_str,
+                (url_bar_right - URL_BAR_X - 16.0) as f32,
+                ctx.font_cx,
+                ctx.layout_cx,
+            );
             let elided_layout = build_chrome_text_layout(&elided, ctx.font_cx, ctx.layout_cx);
             draw_text_layout(
                 scene,
@@ -1499,7 +1583,10 @@ mod tests {
 
     #[test]
     fn chrome_hit_zone_forward_button() {
-        assert_eq!(bar_zone(FORWARD_X + 5.0, 10.0), ChromeHitZone::ForwardButton);
+        assert_eq!(
+            bar_zone(FORWARD_X + 5.0, 10.0),
+            ChromeHitZone::ForwardButton
+        );
     }
 
     #[test]
@@ -1511,7 +1598,9 @@ mod tests {
     fn toolbar_buttons_do_not_overlap() {
         // Each button owns BTN_W pixels, and every pair must leave a gap:
         // that gap is what the "background between buttons" cases below hit.
-        let xs = [HISTORY_X, BACK_X, RELOAD_X, FORWARD_X, URL_BAR_X];
+        // Left to right as they are laid out, which is not the order the
+        // constants happen to be declared in.
+        let xs = [HISTORY_X, BACK_X, FORWARD_X, RELOAD_X, URL_BAR_X];
         for pair in xs.windows(2) {
             assert!(
                 pair[0] + BTN_W <= pair[1],

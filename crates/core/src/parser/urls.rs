@@ -28,7 +28,6 @@ use rustc_hash::FxHashMap;
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Symbol};
 
-
 /// Distinguishes REST API endpoints from media (binary asset) endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -55,7 +54,6 @@ pub struct UrlEndpoint {
 /// [`Symbol`] keys are interned at parse time so that downstream modules can
 /// look up endpoints in O(1) without heap allocation.
 pub type UrlRegistry = FxHashMap<Symbol, UrlEndpoint>;
-
 
 /// Parses the `urls` macro-block content into a [`UrlRegistry`].
 ///
@@ -163,7 +161,6 @@ pub fn parse_urls(content: &str, interner: &mut StringInterner) -> Result<UrlReg
 
     Ok(registry)
 }
-
 
 // No Kani harness for `parse_urls` here (see `SECURITY-INVARIANTS.md` §8 for
 // the rest of this crate's Kani coverage). `parse_urls` interns aliases via

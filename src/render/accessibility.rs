@@ -19,7 +19,10 @@
 
 use std::collections::HashMap;
 
-use accesskit::{Node as AccessNode, NodeBuilder, NodeClassSet, NodeId as AccessNodeId, Role, Tree as AccessTree, TreeUpdate};
+use accesskit::{
+    Node as AccessNode, NodeBuilder, NodeClassSet, NodeId as AccessNodeId, Role,
+    Tree as AccessTree, TreeUpdate,
+};
 use ego_tree::{NodeId as EgoNodeId, Tree};
 
 use crate::core::types::VariableStore;
@@ -131,7 +134,15 @@ pub fn build_a11y_tree(
         .map(|u32_id| access_id(epoch, u32_id))
         .unwrap_or(AccessNodeId(1));
 
-    build_node(epoch, root_ego_id, dom, node_id_to_u32, store, &mut classes, &mut nodes);
+    build_node(
+        epoch,
+        root_ego_id,
+        dom,
+        node_id_to_u32,
+        store,
+        &mut classes,
+        &mut nodes,
+    );
 
     let focus = focused_node
         .and_then(|id| node_id_to_u32.get(&id))
@@ -308,7 +319,8 @@ mod tests {
         let store = VariableStore::new().freeze();
 
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
-        let by_id: HashMap<AccessNodeId, &AccessNode> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+        let by_id: HashMap<AccessNodeId, &AccessNode> =
+            update.nodes.iter().map(|(id, n)| (*id, n)).collect();
 
         let button_node = by_id[&access_id(EPOCH, node_id_to_u32[&button_id])];
         assert_eq!(button_node.role(), Role::Button);
@@ -356,7 +368,8 @@ mod tests {
         }
         let store = VariableStore::new().freeze();
         let update = build_a11y_tree(EPOCH, &tree, &node_id_to_u32, None, &store);
-        let by_id: HashMap<AccessNodeId, &AccessNode> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
+        let by_id: HashMap<AccessNodeId, &AccessNode> =
+            update.nodes.iter().map(|(id, n)| (*id, n)).collect();
 
         let h1_node = by_id[&access_id(EPOCH, node_id_to_u32[&h1_id])];
         assert_eq!(h1_node.role(), Role::Heading);
@@ -434,14 +447,20 @@ mod tests {
             u32_to_node_id.insert(u32_id, ego);
         }
         let ak_id = access_id(EPOCH, node_id_to_u32[&button_id]);
-        assert_eq!(resolve_ego_id(EPOCH, &u32_to_node_id, ak_id), Some(button_id));
+        assert_eq!(
+            resolve_ego_id(EPOCH, &u32_to_node_id, ak_id),
+            Some(button_id)
+        );
 
         // An unknown id must resolve to None, not panic or alias another node.
         assert_eq!(
             resolve_ego_id(EPOCH, &u32_to_node_id, access_id(EPOCH, 999_999)),
             None
         );
-        assert_eq!(resolve_ego_id(EPOCH, &u32_to_node_id, AccessNodeId(0)), None);
+        assert_eq!(
+            resolve_ego_id(EPOCH, &u32_to_node_id, AccessNodeId(0)),
+            None
+        );
     }
 
     #[test]

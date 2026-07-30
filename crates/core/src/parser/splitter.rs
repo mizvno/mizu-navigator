@@ -43,7 +43,6 @@ use std::path::Path;
 
 use crate::core::errors::MizuError;
 
-
 /// The output of a successful [`split_source`] call.
 ///
 /// Each field holds the raw, comment-stripped, import-resolved content of the
@@ -79,7 +78,6 @@ pub struct ParsedSource {
     /// Comment-stripped content of the `urls` macro-block (URL registry).
     pub urls_block: String,
 }
-
 
 /// Tracks which macro-block is currently being accumulated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +117,6 @@ pub enum Origin {
 fn is_import_directive(trimmed: &str) -> bool {
     trimmed.starts_with("import ") || trimmed.starts_with("include ")
 }
-
 
 /// Splits a raw `.mizu` source string into three isolated macro-block buffers.
 ///
@@ -291,7 +288,6 @@ pub fn split_source_with_origin(
     })
 }
 
-
 /// Appends `line` followed by a newline to `buf`.
 #[inline]
 fn push_line(buf: &mut String, line: &str) {
@@ -460,9 +456,8 @@ fn process_import(
     style_buf: &mut String,
     line_number: usize,
 ) -> Result<(), MizuError> {
-    let import_path = parse_import_path(trimmed_line).map_err(|e| {
-        MizuError::ParseError(format!("line {line_number}: {e}"))
-    })?;
+    let import_path = parse_import_path(trimmed_line)
+        .map_err(|e| MizuError::ParseError(format!("line {line_number}: {e}")))?;
 
     let target = resolve_import_target(import_path)
         .map_err(|e| MizuError::ParseError(format!("line {line_number}: {e}")))?;
@@ -513,7 +508,6 @@ fn process_import(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{Origin, ParsedSource, split_source, split_source_with_origin, strip_comment};
@@ -556,7 +550,10 @@ mod tests {
     fn strip_comment_after_unquoted_url() {
         // A real comment after an unquoted URL is delimited by whitespace.
         let line = "  media logo mizu://cdn.example.com/x.png // the logo";
-        assert_eq!(strip_comment(line), "  media logo mizu://cdn.example.com/x.png ");
+        assert_eq!(
+            strip_comment(line),
+            "  media logo mizu://cdn.example.com/x.png "
+        );
     }
 
     #[test]

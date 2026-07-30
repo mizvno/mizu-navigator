@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::core::types::{StringInterner, Symbol, Value};
+use crate::core::types::{Symbol, Value};
 use crate::parser::logic::{NetworkMethod, PayloadFormat};
 use crate::parser::{Action, MizuFunction};
 use rustc_hash::FxHashMap;

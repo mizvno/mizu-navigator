@@ -34,9 +34,9 @@ use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand_core::{RngCore, SeedableRng};
-use sha2::{Digest, Sha256};
+use rand_core::RngCore;
 use redb::ReadableTable;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -47,8 +47,8 @@ use crate::core::types::{Value, from_json, to_json};
 /// The single table definition for redb storage.
 /// Key: Variable name (`&str`)
 /// Value: `nonce || ciphertext` (`&[u8]`)
-pub const STORAGE_TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("mizu_storage");
-
+pub const STORAGE_TABLE: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("mizu_storage");
 
 /// A validated, opaque domain identifier whose inner value is the lowercase
 /// SHA-256 hex digest of the normalised raw domain string.
@@ -67,7 +67,6 @@ impl ValidatedDomain {
         &self.0
     }
 }
-
 
 /// Returns the path where the encrypted storage file for `domain` will live.
 pub fn mizu_storage_path(domain: &ValidatedDomain) -> PathBuf {
@@ -92,7 +91,6 @@ pub fn mizu_storage_path(domain: &ValidatedDomain) -> PathBuf {
     let filename = format!("{}.enc", domain.as_str());
     dir.join(filename)
 }
-
 
 const KEYRING_SERVICE: &str = "mizu_storage";
 
@@ -187,14 +185,19 @@ fn derive_key_from_env_override(
 }
 
 pub fn derive_or_create_key(domain: &ValidatedDomain) -> Result<Zeroizing<[u8; 32]>, MizuError> {
-    if let Some(key) = derive_key_from_env_override(crate::core::config::CONFIG.master_key.clone(), domain)? {
+    if let Some(key) =
+        derive_key_from_env_override(crate::core::config::CONFIG.master_key.clone(), domain)?
+    {
         return Ok(key);
     }
 
     let entry = match keyring::Entry::new(KEYRING_SERVICE, domain.as_str()) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!("keyring unavailable ({}); set MIZU_MASTER_KEY for headless operation", e);
+            tracing::warn!(
+                "keyring unavailable ({}); set MIZU_MASTER_KEY for headless operation",
+                e
+            );
             return Err(MizuError::ExecutionError(format!("keyring open: {e}")));
         }
     };
@@ -211,7 +214,10 @@ pub fn derive_or_create_key(domain: &ValidatedDomain) -> Result<Zeroizing<[u8; 3
             Ok(Zeroizing::new(raw_key.into()))
         }
         Err(e) => {
-            tracing::warn!("keyring read failed ({}); set MIZU_MASTER_KEY for headless operation", e);
+            tracing::warn!(
+                "keyring read failed ({}); set MIZU_MASTER_KEY for headless operation",
+                e
+            );
             Err(MizuError::ExecutionError(format!("keyring read: {e}")))
         }
     }
@@ -244,7 +250,10 @@ pub fn derive_or_create_key(domain: &ValidatedDomain) -> Result<Zeroizing<[u8; 3
 /// call, so it is wrapped in `Zeroizing` -- both call sites (`encrypt_record`,
 /// `decrypt_record`) drop it explicitly right after building the cipher from
 /// it, rather than letting it sit on the stack until the end of the function.
-pub fn derive_record_key(master_key: &[u8; 32], variable_name: &str) -> Result<Zeroizing<[u8; 32]>, MizuError> {
+pub fn derive_record_key(
+    master_key: &[u8; 32],
+    variable_name: &str,
+) -> Result<Zeroizing<[u8; 32]>, MizuError> {
     let hk = Hkdf::<Sha256>::new(None, master_key);
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(variable_name.as_bytes(), out.as_mut())
@@ -253,10 +262,10 @@ pub fn derive_record_key(master_key: &[u8; 32], variable_name: &str) -> Result<Z
 }
 
 /// Encrypts `plaintext` with AES-256-GCM using a record-specific key and returns `nonce || ciphertext`.
-/// 
-/// Nonces are drawn from `OsRng`. This is safe against AES-GCM's catastrophic 
-/// nonce-reuse failure mode because that failure mode is reuse *under the same key*, 
-/// and `derive_record_key` derives a distinct 32-byte key per record (via HKDF-SHA256, 
+///
+/// Nonces are drawn from `OsRng`. This is safe against AES-GCM's catastrophic
+/// nonce-reuse failure mode because that failure mode is reuse *under the same key*,
+/// and `derive_record_key` derives a distinct 32-byte key per record (via HKDF-SHA256,
 /// keyed on `variable_name`) — nonce reuse across *different* keys carries no such risk.
 pub fn encrypt_record(
     master_key: &[u8; 32],
@@ -288,9 +297,15 @@ pub fn encrypt_record(
 }
 
 /// Decrypts a blob produced by `encrypt_record`.
-pub fn decrypt_record(master_key: &[u8; 32], variable_name: &str, blob: &[u8]) -> Result<Vec<u8>, MizuError> {
+pub fn decrypt_record(
+    master_key: &[u8; 32],
+    variable_name: &str,
+    blob: &[u8],
+) -> Result<Vec<u8>, MizuError> {
     if blob.len() < 12 {
-        return Err(MizuError::ExecutionError("storage blob too short (missing nonce)".to_owned()));
+        return Err(MizuError::ExecutionError(
+            "storage blob too short (missing nonce)".to_owned(),
+        ));
     }
     let key = derive_record_key(master_key, variable_name)?;
     let (nonce_bytes, ciphertext) = blob.split_at(12);
@@ -301,7 +316,6 @@ pub fn decrypt_record(master_key: &[u8; 32], variable_name: &str, blob: &[u8]) -
         .decrypt(nonce, ciphertext)
         .map_err(|e| MizuError::ExecutionError(format!("AES-GCM decrypt: {e}")))
 }
-
 
 /// Opens the redb database for the given domain.
 ///
@@ -347,13 +361,16 @@ pub fn open_db(domain: &ValidatedDomain) -> Result<redb::Database, MizuError> {
         .map_err(|e| MizuError::ExecutionError(format!("redb create: {e}")))?;
 
     // Ensure the table is created
-    let write_txn = db.begin_write()
+    let write_txn = db
+        .begin_write()
         .map_err(|e| MizuError::ExecutionError(format!("redb begin_write: {e}")))?;
     {
-        let _ = write_txn.open_table(STORAGE_TABLE)
+        let _ = write_txn
+            .open_table(STORAGE_TABLE)
             .map_err(|e| MizuError::ExecutionError(format!("redb open_table: {e}")))?;
     }
-    write_txn.commit()
+    write_txn
+        .commit()
         .map_err(|e| MizuError::ExecutionError(format!("redb commit: {e}")))?;
 
     Ok(db)
@@ -401,7 +418,8 @@ impl StorageEngine {
     /// made against this engine so far. Test-only introspection used to
     /// verify that debounced batching actually reduces transaction count.
     pub fn write_batch_call_count(&self) -> usize {
-        self.write_batch_calls.load(std::sync::atomic::Ordering::SeqCst)
+        self.write_batch_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Decrypts and parses every record in this domain's table into an
@@ -420,9 +438,11 @@ impl StorageEngine {
     /// is seeded from the live in-memory store, not from disk) — only tests
     /// exercise it today.
     pub fn read_all(&self) -> Result<HashMap<String, Value>, MizuError> {
-        let read_txn = self.db.begin_read()
+        let read_txn = self
+            .db
+            .begin_read()
             .map_err(|e| MizuError::ExecutionError(format!("redb begin_read: {e}")))?;
-        
+
         let table = match read_txn.open_table(STORAGE_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
@@ -430,27 +450,31 @@ impl StorageEngine {
         };
 
         let mut map = HashMap::new();
-        let iter = table.iter().map_err(|e| MizuError::ExecutionError(format!("redb iter: {e}")))?;
+        let iter = table
+            .iter()
+            .map_err(|e| MizuError::ExecutionError(format!("redb iter: {e}")))?;
         for result in iter {
-            let (k, v) = result.map_err(|e| MizuError::ExecutionError(format!("redb iter item: {e}")))?;
+            let (k, v) =
+                result.map_err(|e| MizuError::ExecutionError(format!("redb iter item: {e}")))?;
             let key_str = k.value();
             let blob = v.value();
 
             match decrypt_record(&self.master_key, key_str, blob) {
-                Ok(plaintext) => {
-                    match serde_json::from_slice::<serde_json::Value>(&plaintext) {
-                        Ok(json) => match from_json(&json) {
-                            Ok(value) => {
-                                map.insert(key_str.to_string(), value);
-                            }
-                            Err(e) => tracing::warn!(
-                                "failed to convert json to Value for storage key '{}': {}",
-                                key_str, e
-                            ),
-                        },
-                        Err(e) => tracing::warn!("failed to decode json for storage key '{}': {}", key_str, e),
+                Ok(plaintext) => match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+                    Ok(json) => match from_json(&json) {
+                        Ok(value) => {
+                            map.insert(key_str.to_string(), value);
+                        }
+                        Err(e) => tracing::warn!(
+                            "failed to convert json to Value for storage key '{}': {}",
+                            key_str,
+                            e
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::warn!("failed to decode json for storage key '{}': {}", key_str, e)
                     }
-                }
+                },
                 Err(e) => tracing::warn!("failed to decrypt storage key '{}': {}", key_str, e),
             }
         }
@@ -463,23 +487,29 @@ impl StorageEngine {
     where
         I: IntoIterator<Item = (&'a str, &'a Value)>,
     {
-        self.write_batch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.write_batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let write_txn = self.db.begin_write()
+        let write_txn = self
+            .db
+            .begin_write()
             .map_err(|e| MizuError::ExecutionError(format!("redb begin_write: {e}")))?;
         {
-            let mut table = write_txn.open_table(STORAGE_TABLE)
+            let mut table = write_txn
+                .open_table(STORAGE_TABLE)
                 .map_err(|e| MizuError::ExecutionError(format!("redb open_table: {e}")))?;
             for (key, value) in records {
                 let json = to_json(value)?;
                 let plaintext = serde_json::to_vec(&json)
                     .map_err(|e| MizuError::ExecutionError(format!("json encode: {e}")))?;
                 let blob = encrypt_record(&self.master_key, key, &plaintext)?;
-                table.insert(key, blob.as_slice())
+                table
+                    .insert(key, blob.as_slice())
                     .map_err(|e| MizuError::ExecutionError(format!("redb insert: {e}")))?;
             }
         }
-        write_txn.commit()
+        write_txn
+            .commit()
             .map_err(|e| MizuError::ExecutionError(format!("redb commit: {e}")))?;
         Ok(())
     }
@@ -517,7 +547,10 @@ impl StoragePool {
 
     /// Returns the cached engine for `domain`, opening (and caching) it on
     /// first access.
-    pub fn get_or_open(&self, domain: &ValidatedDomain) -> Result<std::sync::Arc<StorageEngine>, MizuError> {
+    pub fn get_or_open(
+        &self,
+        domain: &ValidatedDomain,
+    ) -> Result<std::sync::Arc<StorageEngine>, MizuError> {
         let mut engines = self.engines.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(engine) = engines.get(domain.as_str()) {
             return Ok(engine.clone());
@@ -540,7 +573,12 @@ impl StoragePool {
     /// resulting durability tradeoff). This method remains the immediate,
     /// non-debounced write primitive for any caller that needs a single
     /// write to be durable the instant it returns.
-    pub fn write_record(&self, domain: &ValidatedDomain, key: &str, value: &Value) -> Result<(), MizuError> {
+    pub fn write_record(
+        &self,
+        domain: &ValidatedDomain,
+        key: &str,
+        value: &Value,
+    ) -> Result<(), MizuError> {
         let engine = self.get_or_open(domain)?;
         engine.write_batch(std::iter::once((key, value)))
     }
@@ -669,7 +707,11 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             struct MessageVisitor(String);
             impl tracing::field::Visit for MessageVisitor {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
                     if field.name() == "message" {
                         self.0 = format!("{value:?}");
                     }
@@ -709,14 +751,14 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join("mizu_test_redb");
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let path = tmp_dir.join("test.com.enc");
-        
+
         let db = redb::Database::create(&path).unwrap();
         let write_txn = db.begin_write().unwrap();
         {
             let _ = write_txn.open_table(STORAGE_TABLE).unwrap();
         }
         write_txn.commit().unwrap();
-        
+
         let master_key = [0x42u8; 32];
         let engine = StorageEngine {
             db,
@@ -728,7 +770,9 @@ mod tests {
         data.insert("hello".to_string(), Value::from("world"));
         data.insert("answer".to_string(), Value::Int(42));
 
-        engine.write_batch(data.iter().map(|(k, v)| (k.as_str(), v))).expect("write_batch");
+        engine
+            .write_batch(data.iter().map(|(k, v)| (k.as_str(), v)))
+            .expect("write_batch");
 
         let read_data = engine.read_all().expect("read_all");
 
@@ -769,7 +813,8 @@ mod tests {
         const N: usize = 50;
         let keys: Vec<String> = (0..N).map(|i| format!("var_{i}")).collect();
         let values: Vec<Value> = (0..N).map(|i| Value::Int(i as i64)).collect();
-        let records: Vec<(&str, &Value)> = keys.iter().map(String::as_str).zip(values.iter()).collect();
+        let records: Vec<(&str, &Value)> =
+            keys.iter().map(String::as_str).zip(values.iter()).collect();
 
         engine.write_batch(records).expect("write_batch");
 
@@ -777,8 +822,16 @@ mod tests {
         let table = read_txn.open_table(STORAGE_TABLE).unwrap();
         let mut nonces: Vec<[u8; 12]> = Vec::with_capacity(N);
         for key in &keys {
-            let blob = table.get(key.as_str()).unwrap().expect("record must exist").value().to_vec();
-            assert!(blob.len() >= 12, "stored blob must be at least 12 bytes (nonce)");
+            let blob = table
+                .get(key.as_str())
+                .unwrap()
+                .expect("record must exist")
+                .value()
+                .to_vec();
+            assert!(
+                blob.len() >= 12,
+                "stored blob must be at least 12 bytes (nonce)"
+            );
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&blob[..12]);
             nonces.push(nonce);
@@ -837,7 +890,9 @@ mod tests {
             .write_batch(data.iter().map(|(k, v)| (k.as_str(), v)))
             .expect("write_batch");
 
-        let read_data = engine.read_all().expect("read_all must not fail for the whole domain");
+        let read_data = engine
+            .read_all()
+            .expect("read_all must not fail for the whole domain");
 
         assert_eq!(read_data.get("normal"), Some(&Value::from("still here")));
         assert!(
@@ -870,7 +925,9 @@ mod tests {
 
         // A cached domain must return the exact same Arc, never re-opening
         // the keyring/redb file â€” this is what makes per-write dispatch cheap.
-        let fetched = pool.get_or_open(&domain).expect("cached engine must be returned");
+        let fetched = pool
+            .get_or_open(&domain)
+            .expect("cached engine must be returned");
         assert!(
             std::sync::Arc::ptr_eq(&fetched, &engine),
             "get_or_open must reuse the cached engine, not open a new one"

@@ -165,9 +165,7 @@ pub fn check_navigation(
             return NavigationVerdict::Allow(effective_target.to_owned());
         }
 
-        return NavigationVerdict::Block(
-            "cross-origin navigation without user gesture blocked",
-        );
+        return NavigationVerdict::Block("cross-origin navigation without user gesture blocked");
     }
 
     // Any other scheme — fail secure.
@@ -406,14 +404,10 @@ mod tests {
     #[test]
     fn deeply_nested_redirect_preserves_gesture() {
         // UserGesture → Redirect → Redirect → still user agency
-        let initiator = NavigationInitiator::RedirectOf(Box::new(
-            NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::UserGesture)),
-        ));
-        let v = check_navigation(
-            "mizu://a.com/page",
-            "mizu://c.com/page",
-            &initiator,
-        );
+        let initiator = NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::RedirectOf(
+            Box::new(NavigationInitiator::UserGesture),
+        )));
+        let v = check_navigation("mizu://a.com/page", "mizu://c.com/page", &initiator);
         assert!(
             matches!(v, NavigationVerdict::Allow(_)),
             "deeply nested redirect with root gesture must be allowed: {v:?}"
@@ -422,14 +416,10 @@ mod tests {
 
     #[test]
     fn deeply_nested_redirect_without_gesture_blocked() {
-        let initiator = NavigationInitiator::RedirectOf(Box::new(
-            NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::DocumentLogic)),
-        ));
-        let v = check_navigation(
-            "mizu://a.com/page",
-            "mizu://c.com/page",
-            &initiator,
-        );
+        let initiator = NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::RedirectOf(
+            Box::new(NavigationInitiator::DocumentLogic),
+        )));
+        let v = check_navigation("mizu://a.com/page", "mizu://c.com/page", &initiator);
         assert_eq!(
             v,
             NavigationVerdict::Block("cross-origin navigation without user gesture blocked"),
@@ -456,24 +446,15 @@ mod tests {
     fn mizu_domain_extracts_host() {
         assert_eq!(mizu_domain("mizu://example.com/path"), Some("example.com"));
         assert_eq!(mizu_domain("mizu://example.com"), Some("example.com"));
-        assert_eq!(
-            mizu_domain("mizu://example.com?q=1"),
-            Some("example.com")
-        );
+        assert_eq!(mizu_domain("mizu://example.com?q=1"), Some("example.com"));
         assert_eq!(mizu_domain("mizu:///path"), None);
         assert_eq!(mizu_domain("file:///path"), None);
     }
 
     #[test]
     fn same_origin_comparison() {
-        assert!(is_same_origin(
-            "mizu://a.com/page1",
-            "mizu://a.com/page2"
-        ));
-        assert!(!is_same_origin(
-            "mizu://a.com/page",
-            "mizu://b.com/page"
-        ));
+        assert!(is_same_origin("mizu://a.com/page1", "mizu://a.com/page2"));
+        assert!(!is_same_origin("mizu://a.com/page", "mizu://b.com/page"));
         assert!(!is_same_origin("file:///path", "mizu://a.com/page"));
     }
 
@@ -481,9 +462,9 @@ mod tests {
     fn has_user_agency_unwraps_redirects() {
         assert!(has_user_agency(&NavigationInitiator::UserGesture));
         assert!(!has_user_agency(&NavigationInitiator::DocumentLogic));
-        assert!(has_user_agency(&NavigationInitiator::RedirectOf(
-            Box::new(NavigationInitiator::UserGesture)
-        )));
+        assert!(has_user_agency(&NavigationInitiator::RedirectOf(Box::new(
+            NavigationInitiator::UserGesture
+        ))));
         assert!(!has_user_agency(&NavigationInitiator::RedirectOf(
             Box::new(NavigationInitiator::DocumentLogic)
         )));

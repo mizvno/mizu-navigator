@@ -121,7 +121,11 @@ pub(super) fn lex(source: &str) -> Result<Vec<Token<'_>>, MizuError> {
 
 /// Scans a single line's *content* (already stripped of leading whitespace)
 /// and appends tokens to `out`.
-fn lex_line<'a>(content: &'a str, out: &mut Vec<Token<'a>>, line_num: usize) -> Result<(), MizuError> {
+fn lex_line<'a>(
+    content: &'a str,
+    out: &mut Vec<Token<'a>>,
+    line_num: usize,
+) -> Result<(), MizuError> {
     let bytes = content.as_bytes();
     let mut i = 0usize;
 
@@ -258,7 +262,6 @@ fn lex_line<'a>(content: &'a str, out: &mut Vec<Token<'a>>, line_num: usize) -> 
     Ok(())
 }
 
-
 /// A simple indexed cursor over a token stream.
 pub(super) struct Cursor<'a> {
     tokens: &'a [Token<'a>],
@@ -359,7 +362,6 @@ pub(super) fn assert_cursor_empty(cursor: &Cursor<'_>, context: &str) -> Result<
     }
     Ok(())
 }
-
 
 /// Returns the number of leading space characters in `line`.
 #[inline]
