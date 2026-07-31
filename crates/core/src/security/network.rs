@@ -9,7 +9,19 @@
 /// the file→remote SSRF block, nor for the storage quota tier.  Only traffic
 /// that provably never leaves this machine is treated as local.
 pub fn is_local_host(host: &str) -> bool {
-    is_local_host_with(host, |h| h.parse::<std::net::IpAddr>().ok())
+    is_local_host_with(host, |h| {
+        if let Ok(parsed) = url::Host::parse(h) {
+            match parsed {
+                url::Host::Ipv4(ipv4) => Some(std::net::IpAddr::V4(ipv4)),
+                url::Host::Ipv6(ipv6) => Some(std::net::IpAddr::V6(ipv6)),
+                _ => None,
+            }
+        } else if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+            Some(ip)
+        } else {
+            None
+        }
+    })
 }
 
 /// The classification logic itself, with address parsing injected.
@@ -147,7 +159,7 @@ mod kani_proofs {
     /// End-to-end through the real parser, on the cases that matter: the
     /// harnesses above inject the parse result, so these pin the wiring.
     #[kani::proof]
-    #[kani::unwind(20)]
+    #[kani::unwind(30)]
     fn concrete_hosts_classify_correctly() {
         assert!(is_local_host("localhost"));
         assert!(is_local_host("api.localhost"));
@@ -155,6 +167,10 @@ mod kani_proofs {
         assert!(is_local_host("127.0.0.1"));
         assert!(is_local_host("127.255.255.254"));
         assert!(is_local_host("::1"));
+        assert!(is_local_host("[::1]"));
+        assert!(is_local_host("2130706433"));
+        assert!(is_local_host("0x7f.0.0.1"));
+        assert!(is_local_host("0177.0.0.1"));
 
         assert!(!is_local_host("notlocalhost"));
         assert!(!is_local_host("localhost.evil.com"));
