@@ -65,10 +65,10 @@ sections is accepted identically to one at the top of the file (see the
 **Implementing source:** `src/parser/splitter.rs` — `strip_comment`
 
 ```ebnf
-comment = "//" { any_char } ;
+comment = ";;" { any_char } ;
 ```
 
-`//` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `//` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `urls` block.
+`;;` is only treated as a comment when it appears at column 0 **or** immediately after ASCII whitespace.  A `;;` inside a double-quoted string is never a comment.  This rule preserves `mizu://` URLs in the `urls` block.
 
 ### Identifiers
 

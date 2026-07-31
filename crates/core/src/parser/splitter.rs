@@ -7,7 +7,7 @@
 //!
 //! ## Responsibilities (in order of execution)
 //!
-//! 1. **Comment stripping** — removes everything after the first `//` token
+//! 1. **Comment stripping** — removes everything after the first `;;` token
 //!    that is *not* inside a string literal, on every line.
 //! 2. **Import resolution** — resolves `import "file"` (or its synonym
 //!    `include "file"`) directives at indentation 0 by reading the target file
@@ -327,13 +327,13 @@ fn strip_comment(line: &str) -> &str {
             b'\\' if in_string => {
                 i += 1; // skip the escaped char (bounds-safe: i+1 may == len)
             }
-            // Outside a string, a `//` pair starts a comment — but only at the
-            // start of the line or after whitespace.  This keeps `//` inside
+            // Outside a string, a `;;` pair starts a comment — but only at the
+            // start of the line or after whitespace.  This keeps `;;` inside
             // unquoted URLs intact (`media logo mizu://cdn.example.com/x.png`
             // in the `urls` block must not lose everything after `mizu:`).
-            b'/' if !in_string
+            b';' if !in_string
                 && i + 1 < len
-                && bytes[i + 1] == b'/'
+                && bytes[i + 1] == b';'
                 && (i == 0 || bytes[i - 1].is_ascii_whitespace()) =>
             {
                 return &line[..i];
@@ -520,28 +520,28 @@ mod tests {
 
     #[test]
     fn strip_bare_comment() {
-        assert_eq!(strip_comment("// full line comment"), "");
+        assert_eq!(strip_comment(";; full line comment"), "");
     }
 
     #[test]
     fn strip_trailing_comment() {
         assert_eq!(
-            strip_comment("    tax(p: num) : p * 1.10 // apply VAT"),
+            strip_comment("    tax(p: num) : p * 1.10 ;; apply VAT"),
             "    tax(p: num) : p * 1.10 "
         );
     }
 
     #[test]
     fn strip_preserves_url_inside_string() {
-        // `//` inside a string literal must NOT be treated as a comment.
+        // `;;` inside a string literal must NOT be treated as a comment.
         let line = r#"    text "visit http://example.com for info""#;
         assert_eq!(strip_comment(line), line);
     }
 
     #[test]
     fn strip_preserves_unquoted_mizu_url() {
-        // `urls` block targets are unquoted: the `//` of the scheme must not
-        // start a comment (it is preceded by `:`, not whitespace).
+        // `urls` block targets are unquoted: the `:` in `mizu://` scheme must not
+        // start a comment (the `;;` token must be preceded by whitespace, not just `:` or `/`).
         let line = "  media logo mizu://cdn.example.com/logo.png";
         assert_eq!(strip_comment(line), line);
     }
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn strip_comment_after_unquoted_url() {
         // A real comment after an unquoted URL is delimited by whitespace.
-        let line = "  media logo mizu://cdn.example.com/x.png // the logo";
+        let line = "  media logo mizu://cdn.example.com/x.png ;; the logo";
         assert_eq!(
             strip_comment(line),
             "  media logo mizu://cdn.example.com/x.png "
@@ -559,20 +559,20 @@ mod tests {
     #[test]
     fn strip_comment_after_string() {
         // Comment follows a closed string — must be stripped.
-        let line = r#"    placeholder "User" // default value"#;
+        let line = r#"    placeholder "User" ;; default value"#;
         assert_eq!(strip_comment(line), r#"    placeholder "User" "#);
     }
 
     #[test]
     fn strip_escaped_quote_does_not_close_string() {
         // `\"` inside the string must not close the string context, so the
-        // trailing `// comment` must NOT be stripped (it's inside the string).
-        let line = r#"    text "she said \"//not a comment\"" // real comment"#;
+        // trailing `;; comment` must NOT be stripped (it's inside the string).
+        let line = r#"    text "she said \";;not a comment\"" ;; real comment"#;
         let stripped = strip_comment(line);
-        // The real comment at the end should be gone; the // inside the
+        // The real comment at the end should be gone; the ;; inside the
         // escaped string should survive.
-        assert!(stripped.contains(r#"\"//not a comment\""#));
-        assert!(!stripped.contains("// real comment"));
+        assert!(stripped.contains(r#"\";;not a comment\""#));
+        assert!(!stripped.contains(";; real comment"));
     }
 
     #[test]
@@ -655,9 +655,9 @@ logic
     #[test]
     fn split_source_with_only_comments_and_blank_lines() {
         let source = "\
-// this entire file is comments
+;; this entire file is comments
 
-// another comment
+;; another comment
 ";
         let parsed = split_source(source, Path::new(NO_IMPORT_DIR)).unwrap();
         assert!(parsed.logic_block.is_empty());
@@ -888,7 +888,7 @@ layout
 
     #[test]
     fn import_mss_comments_are_stripped() {
-        let mss_content = ".card // a card class\n    padding 10 // ten pixels\n";
+        let mss_content = ".card ;; a card class\n    padding 10 ;; ten pixels\n";
         let dir = write_temp_import("mizu_test_comments.mss", mss_content);
 
         let source = "import \"mizu_test_comments.mss\"\n";

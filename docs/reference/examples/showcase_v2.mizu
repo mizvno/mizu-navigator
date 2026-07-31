@@ -1,30 +1,30 @@
-// ─────────────────────────────────────────────────────────────────────────
-// Mizu Feature Showcase v2 — a single-file tour of the language, extended
-// with the payload-format, custom-header, and file-upload work (Phases 1-2).
-//
-// This is a didactic/manual-testing reference file (like showcase.mizu), not
-// part of the automated example suite — point the navigator at it and click
-// around against your own backend.
-//
-// ── Server contract ─────────────────────────────────────────────────────
-// Every endpoint below just needs to accept the request and answer with a
-// small JSON body (any shape) — the response is bound to a variable and
-// rendered as text via "{var}", so whatever comes back is visible.
-//
-//   GET    /api/v1/items                          -> list of items
-//   GET    /api/v1/items      (custom headers)     -> same, headers visible server-side
-//   DELETE /api/v1/items/3                         -> delete-by-path-param demo
-//   POST   /api/v1/search     (as query, verb=QUERY) -> search results
-//   POST   /api/v1/profile    Content-Type: application/json
-//   POST   /api/v1/login      Content-Type: application/x-www-form-urlencoded
-//   POST   /api/v1/notes      Content-Type: text/plain; charset=utf-8
-//   POST   /api/v1/settings   Content-Type: application/yaml
-//   POST   /api/v1/upload     Content-Type: multipart/form-data; boundary=...
-//                             (fields: "caption" text part, "avatar" file part)
-//
-// Log the incoming Content-Type and a couple of headers server-side to see
-// the format/header machinery in action.
-// ─────────────────────────────────────────────────────────────────────────
+;; ─────────────────────────────────────────────────────────────────────────
+;; Mizu Feature Showcase v2 — a single-file tour of the language, extended
+;; with the payload-format, custom-header, and file-upload work (Phases 1-2).
+;;
+;; This is a didactic/manual-testing reference file (like showcase.mizu), not
+;; part of the automated example suite — point the navigator at it and click
+;; around against your own backend.
+;;
+;; ── Server contract ─────────────────────────────────────────────────────
+;; Every endpoint below just needs to accept the request and answer with a
+;; small JSON body (any shape) — the response is bound to a variable and
+;; rendered as text via "{var}", so whatever comes back is visible.
+;;
+;;   GET    /api/v1/items                          -> list of items
+;;   GET    /api/v1/items      (custom headers)     -> same, headers visible server-side
+;;   DELETE /api/v1/items/3                         -> delete-by-path-param demo
+;;   POST   /api/v1/search     (as query, verb=QUERY) -> search results
+;;   POST   /api/v1/profile    Content-Type: application/json
+;;   POST   /api/v1/login      Content-Type: application/x-www-form-urlencoded
+;;   POST   /api/v1/notes      Content-Type: text/plain; charset=utf-8
+;;   POST   /api/v1/settings   Content-Type: application/yaml
+;;   POST   /api/v1/upload     Content-Type: multipart/form-data; boundary=...
+;;                             (fields: "caption" text part, "avatar" file part)
+;;
+;; Log the incoming Content-Type and a couple of headers server-side to see
+;; the format/header machinery in action.
+;; ─────────────────────────────────────────────────────────────────────────
 
 urls
     api items_api      /api/v1/items
@@ -35,19 +35,19 @@ urls
     api note_api       /api/v1/notes
     api settings_api   /api/v1/settings
     api upload_api     /api/v1/upload
-    // Placeholder target — point this at a real mizu:// media asset your
-    // server serves, or the image/download demos will simply fail at
-    // runtime (not a parse-time concern).
+    ;; Placeholder target — point this at a real mizu:// media asset your
+    ;; server serves, or the image/download demos will simply fail at
+    ;; runtime (not a parse-time concern).
     media hero_img mizu://assets.example/hero.png
 
 logic
-    // ── Reactive state ──────────────────────────────────────────────────
+    ;; ── Reactive state ──────────────────────────────────────────────────
     counter = 0
     elapsed_seconds = 0
     wall_clock_ms = 0
     api_key = "demo-key-123"
 
-    // ── Network response bindings ───────────────────────────────────────
+    ;; ── Network response bindings ───────────────────────────────────────
     items = null
     search_results = null
     delete_result = null
@@ -57,7 +57,7 @@ logic
     settings_result = null
     upload_result = null
 
-    // Pure, DAG-validated functions.
+    ;; Pure, DAG-validated functions.
     double(x: num) : x * 2
     greet(name: string) : "Hello, " + name + "!"
 
@@ -65,11 +65,11 @@ logic
         limited = if x > hi then hi else x
         if limited < lo then lo else limited
 
-    // `comp` — derived, read-only, recomputed whenever a dependency changes.
+    ;; `comp` — derived, read-only, recomputed whenever a dependency changes.
     comp doubled_counter = double(counter)
     comp progress = clamp(counter, 0, 10)
 
-    // Root timer — the only recurring behavior a document can declare.
+    ;; Root timer — the only recurring behavior a document can declare.
     timer 1000ms -> elapsed_seconds = elapsed_seconds + 1
 
 style
@@ -88,7 +88,7 @@ style
     .page @max-width 799
         width 100%
 
-    // ── Hero banner ──────────────────────────────────────────────────────
+    ;; ── Hero banner ──────────────────────────────────────────────────────
     .hero
         background linear-gradient(135deg, #1d2b53, #4c1d95)
         border-radius 16
@@ -117,7 +117,7 @@ style
         border-radius 999
         font-size 13
 
-    // ── Cards ────────────────────────────────────────────────────────────
+    ;; ── Cards ────────────────────────────────────────────────────────────
     .card
         background #131822
         border-color #1f2733
@@ -127,7 +127,7 @@ style
         flex-direction column
         gap 12
 
-    // Conditional highlight once the counter demo has real progress.
+    ;; Conditional highlight once the counter demo has real progress.
     .glowing
         border-color #7dd3fc
         border-width 2
@@ -211,7 +211,7 @@ style
 layout
     doc title "Mizu Feature Showcase"
         box class page
-            // ── Hero ─────────────────────────────────────────────────────
+            ;; ── Hero ─────────────────────────────────────────────────────
             box class hero
                 t "Mizu Feature Showcase" class hero-title
                 t "A GPU-rendered, sandboxed hypermedia runtime — no JavaScript, every network call declared and type-checked at parse time." class hero-subtitle
@@ -221,7 +221,7 @@ layout
                     t "Sandboxed network" class badge
                     t "Typed file uploads" class badge
 
-            // ── Reactive state + comp + conditional class ───────────────
+            ;; ── Reactive state + comp + conditional class ───────────────
             box class card
                 class glowing if counter >= 5
                 t "Reactive State & Derived Values" class card-title
@@ -233,7 +233,7 @@ layout
                 t "counter: {counter}  ·  doubled: {doubled_counter}  ·  progress: {progress}/10" class result-text
                 t "{greet(\"Mizu\")}" class result-text
 
-            // ── GET + each + DELETE + path_param ─────────────────────────
+            ;; ── GET + each + DELETE + path_param ─────────────────────────
             box class card
                 t "Fetching & Rendering Lists" class card-title
                 t "GET(alias) -> var, each over the response, and DELETE with a path parameter." class card-desc
@@ -244,7 +244,7 @@ layout
                     t "- {item.name}" class result-text
                 t "delete response: {delete_result}" class result-text
 
-            // ── QUERY via a submit form ──────────────────────────────────
+            ;; ── QUERY via a submit form ──────────────────────────────────
             box class card
                 t "Server-Side Search (QUERY)" class card-title
                 t "QUERY is Mizu's non-standard search verb — same shape as POST, dedicated intent." class card-desc
@@ -255,14 +255,14 @@ layout
                 each result in search_results
                     t "- {result.name}" class result-text
 
-            // ── Custom request headers ───────────────────────────────────
+            ;; ── Custom request headers ───────────────────────────────────
             box class card
                 t "Custom Request Headers" class card-title
                 t "header \"<name>\" <expr> attaches a runtime-evaluated header; the name is fixed and denylist-checked at parse time." class card-desc
                 box class row
                     button "Ping with X-Api-Key + X-Request-Id" click -> GET(items_api) -> items header "X-Api-Key" api_key header "X-Request-Id" counter
 
-            // ── Payload formats: json / form / text / yaml ───────────────
+            ;; ── Payload formats: json / form / text / yaml ───────────────
             box class card
                 t "Payload Formats" class card-title
                 t "An optional \"as <format>\" clause on any body-carrying network call selects the wire format and Content-Type." class card-desc
@@ -298,7 +298,7 @@ layout
                             button "Save Settings" submit -> POST(settings_api, $form) -> settings_result as yaml
                         t "{settings_result}" class result-text
 
-            // ── File upload: multipart/form-data ─────────────────────────
+            ;; ── File upload: multipart/form-data ─────────────────────────
             box class card
                 class glowing if upload_result != null
                 t "File Upload — as multipart" class card-title
@@ -310,7 +310,7 @@ layout
                     button "Upload" submit -> POST(upload_api, $form) -> upload_result as multipart
                 t "{upload_result}" class result-text
 
-            // ── Media + markdown ──────────────────────────────────────────
+            ;; ── Media + markdown ──────────────────────────────────────────
             box class card
                 t "Media & Rich Text" class card-title
                 image src "hero_img" alt "Mizu hero illustration"
@@ -321,7 +321,7 @@ layout
                     - No virtual DOM diffing
                 """
 
-            // ── Downloads, navigation, and the system clock ──────────────
+            ;; ── Downloads, navigation, and the system clock ──────────────
             box class card
                 t "Downloads, Navigation & the Clock" class card-title
                 box class row
