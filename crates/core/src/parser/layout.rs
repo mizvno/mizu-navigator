@@ -1,4 +1,4 @@
-//! # `layout` â€” Mizu Layout Parser & Arena-based DOM Constructor
+//! # `layout` — Mizu Layout Parser & Arena-based DOM Constructor
 //!
 //! This module implements Phase 5 of the Mizu compilation pipeline. It takes
 //! the raw `layout_block` produced by [`super::splitter`], tokenises and parses
@@ -85,7 +85,7 @@ pub struct MizuNode {
     pub attributes: FxHashMap<String, String>,
     /// Behavioral event blocks mapping (e.g. `click -> EventBlock::Click`).
     pub events: FxHashMap<String, EventBlock>,
-    /// For `each` nodes: `(item_variable, list_name)`, e.g. `each item in list` â†’ `("item", "list")`.
+    /// For `each` nodes: `(item_variable, list_name)`, e.g. `each item in list` → `("item", "list")`.
     pub iterator_context: Option<(String, String)>,
     /// Runtime-evaluated conditional classes (applied in declaration order after the base class).
     pub conditional_classes: Vec<ConditionalClass>,
@@ -218,7 +218,7 @@ fn parse_quoted_string(s: &str) -> Result<(String, &str), MizuError> {
 /// inside a Mizu logic expression.  Detecting them early in the action string
 /// produces a clear diagnostic instead of silent token loss.
 ///
-/// The list is intentionally conservative â€” it excludes ambiguous words like
+/// The list is intentionally conservative — it excludes ambiguous words like
 /// `type` or `width` that could legitimately be Mizu variable names.
 const LAYOUT_ATTR_KEYWORDS: &[&str] = &["class", "id", "src", "href", "alt", "dir"];
 
@@ -334,7 +334,7 @@ fn parse_attributes_and_events(
                 if let Some(kw) = find_trailing_layout_keyword(action_str) {
                     return Err(MizuError::ParseError(format!(
                         "layout attribute `{kw}` found inside `{key} ->` action\n  \
-                         hint: `{key} ->` consumes the entire line â€” move `{kw}` to \
+                         hint: `{key} ->` consumes the entire line — move `{kw}` to \
                          the element line:\n    \
                          bad:  button {key} -> action {kw} \"value\"\n    \
                          good: button {kw} \"value\"\n    \
@@ -417,7 +417,7 @@ fn parse_attributes_and_events(
         let final_value = value;
 
         // `dir` (ux-7): base text/layout direction, inherited down the
-        // tree â€” see `render::bidi` and `docs/design/bidi.md`. Validated
+        // tree — see `render::bidi` and `docs/design/bidi.md`. Validated
         // here (fail-secure allowlist, matching every other small-fixed-set
         // attribute/property in this codebase) rather than accepted as a
         // free-form string like `href`/`alt`.
@@ -457,7 +457,7 @@ fn parse_primitive_and_attrs(
     let (prim_name, rest) = split_first_word(content);
     let prim_lower = prim_name.to_lowercase();
 
-    // Handle `each` separately â€” it carries iterator_context, not attributes
+    // Handle `each` separately — it carries iterator_context, not attributes
     if prim_lower == "each" {
         let words: Vec<&str> = rest.split_whitespace().collect();
         if words.len() == 3 && words[1] == "in" {
@@ -578,7 +578,7 @@ fn parse_primitive_and_attrs(
 ///
 /// # Errors
 ///
-/// * [`MizuError::ParseError`] â€” if structural constraints are violated (e.g. root node
+/// * [`MizuError::ParseError`] — if structural constraints are violated (e.g. root node
 ///   is not `doc`, multiple roots are defined, or bad syntax), or if a media
 ///   alias is undeclared or points to a non-media endpoint.
 pub fn parse_layout(
@@ -675,7 +675,7 @@ pub fn parse_layout_with_urls(
         let indent = leading_spaces(line);
         let trimmed = line.trim();
 
-        // â”€â”€ Check for Event Blocks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── Check for Event Blocks ──────────────────────────────────────────
         let (first_word, rest) = split_first_word(trimmed);
         if first_word == "bind" {
             return Err(MizuError::ParseError(
@@ -754,9 +754,9 @@ pub fn parse_layout_with_urls(
             continue;
         }
 
-        // â”€â”€ Conditional class: `class <name> if <expr>` (toggle) or â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── Conditional class: `class <name> if <expr>` (toggle) or ─────────
         // `class <cond> ? "a" : "b"` (ternary, `if`/`then`/`else` spelling
-        // also accepted since it's the same underlying expression grammar) â”€
+        // also accepted since it's the same underlying expression grammar) ─
         if first_word == "class" {
             let (first_tok, rest2) = split_first_word(rest);
             if first_tok.is_empty() {
@@ -768,7 +768,7 @@ pub fn parse_layout_with_urls(
             let (second_tok, expr_str) = split_first_word(rest2);
 
             let conditional_class = if second_tok == "if" {
-                // â”€â”€ Toggle form: `class <name> if <expr>` â”€â”€
+                // ── Toggle form: `class <name> if <expr>` ──
                 let class_name = first_tok;
                 if expr_str.is_empty() {
                     return Err(MizuError::ParseError(format!(
@@ -786,7 +786,7 @@ pub fn parse_layout_with_urls(
                     find_side_effect_call(condition.root(), &condition.arena, interner, functions)
                 {
                     return Err(MizuError::ParseError(format!(
-                        "line {}: conditional class condition must be pure â€” \
+                        "line {}: conditional class condition must be pure — \
                          `{bad_fn}` is a side-effecting call",
                         line_idx + 1
                     )));
@@ -796,7 +796,7 @@ pub fn parse_layout_with_urls(
                     condition,
                 }
             } else {
-                // â”€â”€ Ternary form: `class <cond> ? "a" : "b"` â”€â”€
+                // ── Ternary form: `class <cond> ? "a" : "b"` ──
                 let expr = parse_expr_standalone(rest, interner).map_err(|e| {
                     MizuError::ParseError(format!(
                         "line {}: `class {rest}` is neither a valid `if` toggle nor a \
@@ -815,7 +815,7 @@ pub fn parse_layout_with_urls(
                     find_side_effect_call(expr.root(), &expr.arena, interner, functions)
                 {
                     return Err(MizuError::ParseError(format!(
-                        "line {}: conditional class condition must be pure â€” \
+                        "line {}: conditional class condition must be pure — \
                          `{bad_fn}` is a side-effecting call",
                         line_idx + 1
                     )));
@@ -859,13 +859,13 @@ pub fn parse_layout_with_urls(
             continue;
         }
 
-        // â”€â”€ Parse Primitive Nodes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── Parse Primitive Nodes ───────────────────────────────────────────
         let (mut node, is_markdown, inline_text) =
             parse_primitive_and_attrs(trimmed, line_idx + 1, interner)?;
 
-        // â”€â”€ Image src: reject absolute network URLs unconditionally â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── Image src: reject absolute network URLs unconditionally ─────────
         // A literal `mizu://` (or http[s]://) in `src` is a network channel
-        // that bypasses the `urls` registry entirely â€” a tracking-pixel /
+        // that bypasses the `urls` registry entirely — a tracking-pixel /
         // exfiltration vector. Only a declared `media` alias or a local
         // relative path is allowed. This runs regardless of whether a registry
         // was supplied, so the rule cannot be skipped.
@@ -881,10 +881,10 @@ pub fn parse_layout_with_urls(
             )));
         }
 
-        // â”€â”€ Compile-time media guard + alias resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── Compile-time media guard + alias resolution ─────────────────────
         // If a URL registry is provided, validate that `image src: alias`
         // points to a declared `media` endpoint and rewrite the attribute to
-        // the endpoint's absolute URL â€” the renderer consumes concrete URLs.
+        // the endpoint's absolute URL — the renderer consumes concrete URLs.
         // (`download(alias)` is validated in `parse_action_with_urls` at action parse time.)
         if let Some(registry) = url_registry
             && node.primitive == Primitive::Image
@@ -1073,17 +1073,17 @@ mod tests {
 
     #[test]
     fn media_guard_skipped_without_registry() {
-        // Without a registry (`None`), the guard must not fire â€” `parse_layout`
+        // Without a registry (`None`), the guard must not fire — `parse_layout`
         // keeps its lenient behaviour.
         let mut interner = StringInterner::new();
         let layout = "doc\n    image src \"anything\"\n";
         let result = parse_layout(layout, &mut interner);
-        assert!(result.is_ok(), "no registry â†’ no media guard: {result:?}");
+        assert!(result.is_ok(), "no registry → no media guard: {result:?}");
     }
 
     #[test]
     fn direct_path_src_skips_media_guard() {
-        // A plain filename with an extension is a direct path, not an alias â€”
+        // A plain filename with an extension is a direct path, not an alias —
         // the registry guard must not fire even when a registry is present.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn direct_path_with_slash_skips_guard() {
-        // A path containing `/` is always a direct path â€” guard skipped.
+        // A path containing `/` is always a direct path — guard skipped.
         let mut interner = StringInterner::new();
         let registry: UrlRegistry = rustc_hash::FxHashMap::default();
         let layout = "doc\n    image src \"./img/logo.png\"\n";
@@ -1526,7 +1526,7 @@ mod tests {
 
     #[test]
     fn test_every_inline_is_rejected() {
-        // The inline form (`t "x" every 1s -> â€¦`) must be rejected too.
+        // The inline form (`t "x" every 1s -> …`) must be rejected too.
         let layout = r#"
     doc
         text "Time" every 1s -> ticks = ticks + 1
@@ -1669,9 +1669,9 @@ mod tests {
         );
     }
 
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
     // Trailing layout keywords after actions must be hard errors, not silent loss
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_trailing_class_after_click_action_is_error() {
@@ -1812,9 +1812,9 @@ mod tests {
         assert!(result.is_err(), "expected error for invalid each syntax");
     }
 
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
     // `download(alias)` built-in function
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn media_alias_resolved_to_absolute_url() {
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_download_old_syntax_error() {
-        // `button download -> backup_alias` â†’ ParseError with migration hint
+        // `button download -> backup_alias` → ParseError with migration hint
         let layout = "doc\n    button download -> backup_alias\n";
         let mut interner = StringInterner::new();
         let result = parse_layout(layout, &mut interner);
@@ -2024,9 +2024,9 @@ mod tests {
         }
     }
 
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
     // Conditional classes
-    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_conditional_class_parsed() {
@@ -2053,7 +2053,7 @@ mod tests {
 
     #[test]
     fn test_conditional_class_applied() {
-        // Condition evaluates to true â†’ the expression result is Bool(true).
+        // Condition evaluates to true → the expression result is Bool(true).
         use crate::core::types::{Value, VariableStore};
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;
@@ -2090,7 +2090,7 @@ mod tests {
 
     #[test]
     fn test_conditional_class_not_applied() {
-        // Condition evaluates to false â†’ the expression result is Bool(false).
+        // Condition evaluates to false → the expression result is Bool(false).
         use crate::core::types::{Value, VariableStore};
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;
@@ -2127,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_multiple_conditional_classes() {
-        // Three classes: two conditions true, one false â†’ 2 truthy, 1 falsy.
+        // Three classes: two conditions true, one false → 2 truthy, 1 falsy.
         use crate::core::types::{Value, VariableStore};
         use crate::parser::logic::evaluate;
         use rustc_hash::FxHashMap;

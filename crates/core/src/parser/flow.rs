@@ -1,4 +1,4 @@
-//! # `flow` â€” Load-time Information Flow Checker
+//! # `flow` — Load-time Information Flow Checker
 //!
 //! Enforces invariant **F1** (gated information flow) from
 //! `SECURITY-INVARIANTS.md`.  Runs after `check_dag` and `comp` extraction,
@@ -17,8 +17,8 @@
 //!
 //! ## Soundness
 //!
-//! The checker is **sound** (never misses a real sourceâ†’sink flow) and **may be
-//! conservative** (over-approximation â†’ spurious rejection is acceptable).
+//! The checker is **sound** (never misses a real source→sink flow) and **may be
+//! conservative** (over-approximation → spurious rejection is acceptable).
 //! Any analysis uncertainty (unresolved symbol, unexpected node) is treated as
 //! tainted/rejected, never as clean.
 
@@ -39,7 +39,7 @@ pub enum ActionContext {
     NonInteractive,
 }
 
-/// Why a variable became tainted â€” used for diagnostic messages (F3).
+/// Why a variable became tainted — used for diagnostic messages (F3).
 #[derive(Debug, Clone)]
 enum TaintOrigin {
     /// Tainted because it receives the response from a network call.
@@ -53,7 +53,7 @@ enum TaintOrigin {
 /// Enforces invariant F1 (see `SECURITY-INVARIANTS.md`).  Sound, iterative
 /// propagation over the DAG.  Returns `(sources, sinks, violations)` on
 /// success, or the first violating flow as a parse error with a
-/// human-readable path (source var â†’ â€¦ â†’ sink).
+/// human-readable path (source var → … → sink).
 pub fn check_information_flow(
     dom: &ego_tree::Tree<MizuNode>,
     timers: &[crate::parser::logic::RootTimer],
@@ -64,7 +64,7 @@ pub fn check_information_flow(
 ) -> Result<(usize, usize, usize), MizuError> {
     // `get_system_time`'s single argument is a write-target identifier fixed
     // at parse time (`parser::logic.rs` rejects anything but a bare
-    // identifier there) â€” not a value read. `gst_sym` lets the taint walk
+    // identifier there) — not a value read. `gst_sym` lets the taint walk
     // recognise and skip over it structurally, the same way `Action::Assign`'s
     // own `target` is never itself taint-checked (only its RHS `expr` is).
     let gst_sym = interner.get("get_system_time");
@@ -92,7 +92,7 @@ pub fn check_information_flow(
         actions.push((ActionContext::NonInteractive, &timer.action));
     }
 
-    // â”€â”€ Initialize tainted sources â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Initialize tainted sources ──────────────────────────────────────────
 
     // $form fields are tainted (user input)
     if let Some(form_sym) = interner.get("$form") {
@@ -123,7 +123,7 @@ pub fn check_information_flow(
 
     let source_count = tainted_vars.len();
 
-    // â”€â”€ Propagation (fixpoint) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Propagation (fixpoint) ──────────────────────────────────────────────
 
     let mut worklist: Vec<Symbol> = tainted_vars.iter().copied().collect();
 
@@ -272,16 +272,16 @@ pub fn check_information_flow(
         }
     }
 
-    // â”€â”€ get_system_time targets: treat like Action::Assign with a static
-    // Symbol â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── get_system_time targets: treat like Action::Assign with a static
+    // Symbol ───────────────────────────────────────────────────────────────
     //
     // `get_system_time(target)` can appear anywhere an expression can (inside
-    // `Action::Eval`, an `Assign`'s RHS, a `comp`, a function body â€” it is
+    // `Action::Eval`, an `Assign`'s RHS, a `comp`, a function body — it is
     // not restricted to a top-level `Action` the way `Assign`/`Navigate`/
     // `NetworkCall` are). Now that its argument is a parse-time-fixed
     // Symbol (`parser::logic.rs`), every occurrence is enumerable: walk
-    // every expression the checker already has in hand â€” function bodies,
-    // `comp` RHSs, and every action's constituent expression(s) â€” and reject
+    // every expression the checker already has in hand — function bodies,
+    // `comp` RHSs, and every action's constituent expression(s) — and reject
     // the document if any target names a `comp` (computed) variable. This is
     // the same protection `execute_action` already gives ordinary `Assign`,
     // but enforced at load time (fail-closed) instead of only when the
@@ -325,13 +325,13 @@ pub fn check_information_flow(
         }
     }
 
-    // â”€â”€ Check sinks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Check sinks ─────────────────────────────────────────────────────────
 
     let mut num_sinks = 0;
     for (ctx, action) in &actions {
-        // path_param is NOT a sink â€” it is gated by construction via the
+        // path_param is NOT a sink — it is gated by construction via the
         // runtime A1+A2 validation (single segment, no delimiters,
-        // percent-encoded).  See SECURITY-INVARIANTS.md Â§5, gate G2.
+        // percent-encoded).  See SECURITY-INVARIANTS.md §5, gate G2.
         if let Action::Navigate { url } = action {
             num_sinks += 1;
             if is_expr_tainted(
@@ -367,7 +367,7 @@ pub fn check_information_flow(
 
 /// Every expression an `Action` directly embeds, in evaluation order.
 /// Used to walk the whole action graph looking for `get_system_time` calls,
-/// which â€” unlike `Navigate`/`NetworkCall`/`Assign` â€” are not a top-level
+/// which — unlike `Navigate`/`NetworkCall`/`Assign` — are not a top-level
 /// `Action` variant of their own and can be nested anywhere inside these.
 fn action_exprs(action: &Action) -> Vec<&ExprTree> {
     match action {
@@ -400,7 +400,7 @@ fn action_exprs(action: &Action) -> Vec<&ExprTree> {
 /// symbol (see `check_information_flow`). Since the parser now rejects any
 /// `get_system_time` argument that isn't a bare identifier
 /// (`parser::logic.rs`), every call found here has a statically-known
-/// target â€” the whole point of this walk is to make that target visible to
+/// target — the whole point of this walk is to make that target visible to
 /// the checker, exactly as an `Action::Assign`'s target already is.
 fn collect_get_system_time_targets(
     expr: &Expr,
@@ -454,7 +454,7 @@ fn collect_get_system_time_targets(
 ///
 /// `gst_sym`, if `Some`, is the interned `get_system_time` symbol: a call to
 /// it is skipped structurally (its argument names a write target, never
-/// read as a value â€” see the comment on `gst_sym` in
+/// read as a value — see the comment on `gst_sym` in
 /// `check_information_flow`) rather than walked like an ordinary argument.
 fn is_expr_tainted(
     expr: &Expr,
@@ -745,8 +745,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let urls = parse_urls(&blocks.urls_block, &mut interner).unwrap_or_default();
         let functions = parse_logic(&blocks.logic_block, &mut interner).unwrap_or_default();
-        let comps = parse_computed_with_functions(&blocks.logic_block, &mut interner, &functions, crate::core::config::CONFIG.max_comp_bindings)
-            .unwrap_or_default();
+        let comps = parse_computed_with_functions(
+            &blocks.logic_block,
+            &mut interner,
+            &functions,
+            crate::core::config::CONFIG.max_comp_bindings,
+        )
+        .unwrap_or_default();
         let timers = parse_root_timers(&blocks.logic_block, &mut interner).unwrap_or_default();
         let dom = parse_layout_with_urls(
             &blocks.layout_block,
@@ -760,7 +765,7 @@ mod tests {
         check_information_flow(&dom, &timers, &functions, &comps, &urls, &interner)
     }
 
-    // â”€â”€ Core flow violation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Core flow violation tests ───────────────────────────────────────────
 
     #[test]
     fn network_var_into_navigate_rejected() {
@@ -828,11 +833,11 @@ layout
         assert!(res.is_ok(), "Expected flow allowed for gesture");
     }
 
-    // â”€â”€ path_param is gated by construction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── path_param is gated by construction ─────────────────────────────────
 
     #[test]
     fn network_var_into_path_param_allowed_by_construction() {
-        // path_param is NOT a taint sink â€” it is gated by runtime A1+A2
+        // path_param is NOT a taint sink — it is gated by runtime A1+A2
         // validation.  This test verifies the design change from the previous
         // validate_path-based gate to the by-construction gate.
         let doc = r#"
@@ -851,7 +856,7 @@ layout
         );
     }
 
-    // â”€â”€ Taint propagation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Taint propagation tests ─────────────────────────────────────────────
 
     #[test]
     fn taint_propagates_through_binop_let_ifelse_fieldaccess() {
@@ -888,7 +893,7 @@ layout
 
     #[test]
     fn taint_through_comp_chain_rejected() {
-        // source â†’ comp â†’ sink: `data` (from GET) â†’ `comp derived = data` â†’
+        // source → comp → sink: `data` (from GET) → `comp derived = data` →
         // navigate `derived` without gesture should be rejected.
         let doc = r#"
 urls
@@ -944,11 +949,11 @@ layout
         );
     }
 
-    // â”€â”€ Precision / over-approximation test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Precision / over-approximation test ─────────────────────────────────
 
     #[test]
     fn over_approximation_may_reject_but_never_misses() {
-        // Documented case: `if true then "safe" else data` â€” the checker
+        // Documented case: `if true then "safe" else data` — the checker
         // conservatively marks this as tainted because the else branch reads
         // `data`, even though at runtime the else is never taken.
         // This is acceptable: sound over complete.
@@ -969,7 +974,7 @@ layout
         );
     }
 
-    // â”€â”€ get_system_time: static write-target (RM-04) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── get_system_time: static write-target (RM-04) ────────────────────────
 
     #[test]
     fn get_system_time_targeting_comp_variable_rejected() {
@@ -1017,7 +1022,7 @@ layout
     #[test]
     fn get_system_time_nested_in_assign_targeting_comp_rejected() {
         // The target-collecting walk must reach into every action's
-        // expression, not just bare `Action::Eval` â€” here it's nested as
+        // expression, not just bare `Action::Eval` — here it's nested as
         // the RHS of an Assign.
         let doc = r#"
 logic
@@ -1033,7 +1038,7 @@ layout
         );
     }
 
-    // â”€â”€ Diagnostics (F3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Diagnostics (F3) ────────────────────────────────────────────────────
 
     #[test]
     fn diagnostic_includes_source_and_sink() {
