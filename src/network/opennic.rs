@@ -39,7 +39,17 @@
 //! ## Special cases
 //!
 //! * Bare IP addresses → returned as-is (no DNS query issued).
-//! * `localhost` → resolves to `127.0.0.1` immediately (no DNS query issued).
+//! * `localhost` and `*.localhost` → resolve to `127.0.0.1` immediately (no
+//!   DNS query issued), per RFC 6761 §6.3.
+//!
+//! ## Address authorization
+//!
+//! Every address this module hands back has passed
+//! [`mizu_core::security::network::authorize_resolved_address`], which is what
+//! makes the rest of the stack's *textual* host classification meaningful. A
+//! name that the quota tier and the TLS verifier treat as remote cannot be
+//! pointed at loopback, the LAN, or a cloud metadata endpoint by whoever
+//! controls its DNS records. See [`resolve_domain`].
 
 #![forbid(unsafe_code)]
 
@@ -52,6 +62,9 @@ use hickory_resolver::{
 };
 
 use crate::core::errors::MizuError;
+use mizu_core::security::network::{
+    authorize_resolved_address, ends_with_ignore_ascii_case, is_publicly_routable,
+};
 
 /// Primary DoT servers for standard ICANN domains.
 ///
@@ -264,10 +277,21 @@ fn is_transient_dns_error(_e: &MizuError) -> bool {
 ///
 /// Resolution order:
 /// 1. Bare IP address → returned unchanged (no DNS query issued).
-/// 2. `localhost` → `127.0.0.1:port` (no DNS query issued).
+/// 2. `localhost` / `*.localhost` → `127.0.0.1:port` (no DNS query issued).
 /// 3. OpenNIC TLD → query the OpenNIC pool exclusively.
 /// 4. ICANN TLD → query the primary pool; on a transient failure, transparently
 ///    fall back to the OpenNIC pool (which also resolves ICANN upstreams).
+///
+/// # Address authorization
+///
+/// This is the only function in the crate that turns a hostname into an
+/// address, which makes it the only place the two can be checked against each
+/// other — so every answer leaves here having passed
+/// [`authorize_resolved_address`], and no caller can reach a socket address
+/// that has not. Records are filtered against the policy during selection (see
+/// [`resolve_ip`]) so that a name publishing both a routable and a
+/// non-routable address still connects, to the routable one; the check here is
+/// the enforcement point that produces the error.
 pub async fn resolve_domain(
     resolver: &MizuDnsResolver,
     domain: &str,
@@ -276,19 +300,27 @@ pub async fn resolve_domain(
     let bare = domain.trim_end_matches('.');
 
     // ── Direct IP — skip DNS entirely ────────────────────────────────────────
-    if let Ok(ip) = bare.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+    if let Some(ip) = mizu_core::security::network::parse_host_literal(bare) {
+        let addr = SocketAddr::new(ip, port);
+        authorize_resolved_address(bare, ip)?;
+        return Ok(addr);
     }
 
     // ── localhost shortcut — always loopback ──────────────────────────────────
-    if bare.eq_ignore_ascii_case("localhost") {
+    //
+    // Covers `*.localhost` too. RFC 6761 §6.3 reserves the whole subtree for
+    // the loopback interface and directs resolvers not to send those names to
+    // DNS at all; answering here rather than over the wire means a hostile
+    // resolver never gets the chance to answer for a name that would then
+    // receive loopback treatment elsewhere in the stack.
+    if bare.eq_ignore_ascii_case("localhost") || ends_with_ignore_ascii_case(bare, ".localhost") {
         return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
     }
 
     // Trailing dot → FQDN semantics; suppresses ndots/search-domain expansion.
     let fqdn = format!("{bare}.");
 
-    match select_pool_for_domain(bare) {
+    let addr = match select_pool_for_domain(bare) {
         DnsPool::Primary => {
             // Primary pool first (Quad9/Cloudflare); on transient failure the
             // OpenNIC Tier-2 pool acts as a backup (it also resolves ICANN via
@@ -304,13 +336,23 @@ pub async fn resolve_domain(
             // OpenNIC pool is the sole option.
             resolve_ip(resolver.opennic.clone(), fqdn, port).await
         }
-    }
+    }?;
+
+    authorize_resolved_address(bare, addr.ip())?;
+    Ok(addr)
 }
 
 /// Looks up `fqdn` via `resolver` and returns the best [`SocketAddr`] for `port`.
 ///
 /// Prefers IPv4 addresses; falls back to the first IPv6 address if no IPv4
 /// record is returned.
+///
+/// Records that are not publicly routable are skipped rather than rejected
+/// outright, so a name that publishes one usable address alongside a
+/// non-routable one still resolves. `fqdn` reaches here only for names — the
+/// literal-IP and `*.localhost` cases return before this is called — so
+/// "publicly routable" is the right filter for every address it sees, and
+/// [`resolve_domain`] re-checks the winner.
 ///
 /// Resolution errors are propagated as [`MizuError::DnsError`] (preserving the
 /// strongly-typed [`hickory_resolver::error::ResolveError`]) so that
@@ -331,7 +373,17 @@ async fn resolve_ip(
     })?;
 
     let mut ipv6_fallback: Option<SocketAddr> = None;
+    let mut saw_non_routable = false;
     for ip in lookup.iter() {
+        if !is_publicly_routable(ip) {
+            tracing::warn!(
+                domain = %bare,
+                %ip,
+                "DoT answer contains a non-routable address; skipping it"
+            );
+            saw_non_routable = true;
+            continue;
+        }
         let addr = SocketAddr::new(ip, port);
         if addr.is_ipv4() {
             tracing::debug!(domain = %bare, %addr, "DoT resolved (IPv4)");
@@ -345,6 +397,16 @@ async fn resolve_ip(
     if let Some(addr) = ipv6_fallback {
         tracing::debug!(domain = %bare, %addr, "DoT resolved (IPv6 fallback)");
         return Ok(addr);
+    }
+
+    // Distinguish "nothing came back" from "everything that came back pointed
+    // inward": the second is a rebinding attempt and must not be reported as a
+    // transient network failure, which would make the caller retry it against
+    // the fallback pool.
+    if saw_non_routable {
+        return Err(MizuError::SecurityViolation(format!(
+            "DNS rebinding blocked: every address returned for '{bare}' is non-routable"
+        )));
     }
 
     Err(MizuError::Network(format!(

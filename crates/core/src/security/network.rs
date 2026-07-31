@@ -1,4 +1,23 @@
-//! Local-host classification logic.
+//! Host classification and outbound-address authorization.
+//!
+//! Two questions live here, and keeping them apart is the point of the module:
+//!
+//! * [`is_local_host`] classifies a *spelling* — what the URL says. It gates
+//!   the insecure-dev TLS bypass and the storage quota tier.
+//! * [`authorize_resolved_address`] classifies a *destination* — where the
+//!   socket is about to go. It is the gate that makes the first question's
+//!   answer trustworthy.
+//!
+//! Without the second, the first is only as honest as whoever controls DNS
+//! for the name: `evil.com` is textually remote, so it is denied the localhost
+//! quota and the TLS bypass, and then an `A` record pointing at `127.0.0.1`
+//! sends the connection to a loopback service anyway. Classifying the name is
+//! not the same as constraining the connection, and only the latter can be
+//! enforced at the moment it matters.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use crate::core::errors::MizuError;
 
 /// Returns `true` when `host` is a loopback address (`127.0.0.0/8`, `::1`) or a
 /// loopback hostname (`localhost`, `*.localhost`).
@@ -8,20 +27,27 @@
 /// receive no special trust — neither for the insecure-dev TLS bypass, nor for
 /// the file→remote SSRF block, nor for the storage quota tier.  Only traffic
 /// that provably never leaves this machine is treated as local.
+///
+/// # Case
+///
+/// The name comparison is ASCII case-insensitive, and has to be. `mizu://` is
+/// a non-special URL scheme, so the `url` crate treats its host as an opaque
+/// host and does *not* lowercase it the way it would for `https://` —
+/// `MizuUri::parse("mizu://LOCALHOST/")` yields `LOCALHOST` verbatim. A
+/// case-sensitive check would call that name remote, hand it the remote
+/// storage quota and withhold the TLS bypass, while the resolver sent the
+/// connection to `127.0.0.1` regardless. DNS names are case-insensitive; the
+/// classification of one has to be too, or the two disagree about the same
+/// destination.
 pub fn is_local_host(host: &str) -> bool {
-    is_local_host_with(host, |h| {
-        if let Ok(parsed) = url::Host::parse(h) {
-            match parsed {
-                url::Host::Ipv4(ipv4) => Some(std::net::IpAddr::V4(ipv4)),
-                url::Host::Ipv6(ipv6) => Some(std::net::IpAddr::V6(ipv6)),
-                _ => None,
-            }
-        } else if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-            Some(ip)
-        } else {
-            None
-        }
-    })
+    is_local_host_with(host, parse_host_literal)
+}
+
+/// ASCII case-insensitive `ends_with`, without allocating a lowercased copy of
+/// `haystack`.
+pub fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// The classification logic itself, with address parsing injected.
@@ -37,13 +63,196 @@ pub fn is_local_host(host: &str) -> bool {
 /// SSRF block, and the real parser is exercised by the concrete cases and the
 /// unit tests below.
 fn is_local_host_with(host: &str, parse: impl Fn(&str) -> Option<std::net::IpAddr>) -> bool {
-    if host == "localhost" || host.ends_with(".localhost") {
+    if host.eq_ignore_ascii_case("localhost") || ends_with_ignore_ascii_case(host, ".localhost") {
         return true;
     }
     if let Some(addr) = parse(host) {
         return addr.is_loopback();
     }
     false
+}
+
+/// Parses `host` as a literal IP address, accepting every spelling a URL may
+/// use for one.
+///
+/// `url::Host::parse` first, because the URL specification's IPv4 parser
+/// accepts forms `IpAddr::from_str` rejects — `2130706433`, `0x7f.0.0.1`,
+/// `0177.0.0.1` are all `127.0.0.1` to a browser — and a check that missed
+/// them would classify a loopback literal as a name.
+pub fn parse_host_literal(host: &str) -> Option<IpAddr> {
+    match url::Host::parse(host) {
+        Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
+        Ok(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
+        Ok(url::Host::Domain(_)) => None,
+        Err(_) => host.parse::<IpAddr>().ok(),
+    }
+}
+
+/// Returns `true` when `ip` is a globally-routable unicast address — one that
+/// a public name is legitimately allowed to resolve to.
+///
+/// Everything else is a destination the machine can reach but the public
+/// internet cannot address: loopback, the RFC 1918 private ranges, the
+/// link-local block that carries cloud instance-metadata services
+/// (`169.254.169.254`), carrier-grade NAT, the documentation and benchmarking
+/// blocks, multicast, and the reserved space above `240.0.0.0`. For IPv6 the
+/// same list plus unique-local and the link-local unicast block.
+///
+/// Embedded-IPv4 forms are unwrapped and re-checked rather than treated as
+/// opaque IPv6: `::ffff:127.0.0.1`, `::127.0.0.1`, the 6to4 prefix and Teredo
+/// all carry a v4 address inside a v6 one, and each is a way to spell a
+/// blocked destination that a naive v6-only check would wave through.
+///
+/// This deliberately re-implements the classification rather than calling
+/// `IpAddr::is_global`, which is still unstable.
+pub fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_publicly_routable_v4(v4),
+        IpAddr::V6(v6) => is_publicly_routable_v6(v6),
+    }
+}
+
+fn is_publicly_routable_v4(v4: Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    !(v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        // 100.64.0.0/10 — carrier-grade NAT (RFC 6598).
+        || (a == 100 && (64..128).contains(&b))
+        // 192.0.0.0/24 — IETF protocol assignments (RFC 6890).
+        || (a == 192 && b == 0 && c == 0)
+        // 198.18.0.0/15 — benchmarking (RFC 2544).
+        || (a == 198 && (b == 18 || b == 19))
+        // 240.0.0.0/4 — reserved for future use (RFC 1112 §4).
+        || a >= 240)
+}
+
+fn is_publicly_routable_v6(v6: Ipv6Addr) -> bool {
+    // Unwrap any embedded IPv4 address and judge it by IPv4 rules.
+    if let Some(v4) = embedded_ipv4(v6) {
+        return is_publicly_routable_v4(v4);
+    }
+
+    let segments = v6.segments();
+    !(v6.is_unspecified()
+        || v6.is_loopback()
+        || v6.is_multicast()
+        // fc00::/7 — unique local addresses (RFC 4193).
+        || (segments[0] & 0xfe00) == 0xfc00
+        // fe80::/10 — link-local unicast (RFC 4291).
+        || (segments[0] & 0xffc0) == 0xfe80
+        // 2001:db8::/32 — documentation (RFC 3849).
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // 100::/64 — discard-only (RFC 6666).
+        || (segments[0] == 0x0100 && segments[1..4] == [0, 0, 0]))
+}
+
+/// Extracts the IPv4 address embedded in `v6`, for every transition mechanism
+/// that carries one.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segments = v6.segments();
+    // ::a.b.c.d — IPv4-compatible (deprecated, still parseable).
+    //
+    // `segments[6] != 0` excludes `::`, `::1` and the rest of `::/104`, which
+    // are not IPv4-compatible addresses at all: `::1` is loopback, and reading
+    // it as `0.0.0.1` would hand it to the IPv4 rules, which have no reason to
+    // reject that. Those cases fall through to the IPv6 checks, where
+    // `is_loopback` and `is_unspecified` catch them.
+    if segments[..6] == [0, 0, 0, 0, 0, 0] && segments[6] != 0 {
+        let [a, b] = [segments[6], segments[7]];
+        return Some(Ipv4Addr::new(
+            (a >> 8) as u8,
+            (a & 0xff) as u8,
+            (b >> 8) as u8,
+            (b & 0xff) as u8,
+        ));
+    }
+    // 2002::/16 — 6to4 carries the v4 address in segments 1-2.
+    if segments[0] == 0x2002 {
+        let [a, b] = [segments[1], segments[2]];
+        return Some(Ipv4Addr::new(
+            (a >> 8) as u8,
+            (a & 0xff) as u8,
+            (b >> 8) as u8,
+            (b & 0xff) as u8,
+        ));
+    }
+    // 2001:0::/32 — Teredo carries the client's v4 address, bit-inverted, in
+    // the last two segments.
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        let [a, b] = [!segments[6], !segments[7]];
+        return Some(Ipv4Addr::new(
+            (a >> 8) as u8,
+            (a & 0xff) as u8,
+            (b >> 8) as u8,
+            (b & 0xff) as u8,
+        ));
+    }
+    None
+}
+
+/// The gate every outbound connection passes: is `ip` an address that `host`
+/// is allowed to have resolved to?
+///
+/// Three cases, and the distinction between them is the whole security
+/// property:
+///
+/// * **`host` is a literal IP.** The destination is written in the URL bar;
+///   there is no name-to-address indirection for anyone to lie about, so the
+///   user's own choice stands — including a LAN or loopback address, which is
+///   how local development works. The resolved address must equal the literal;
+///   a resolver that "resolves" a literal to something else is not answering
+///   the question that was asked.
+/// * **`host` is a loopback name** (`localhost`, `*.localhost`). RFC 6761
+///   reserves these for the loopback interface, so nothing else is acceptable
+///   — and these are exactly the names that receive the insecure-dev TLS
+///   bypass, which must never be applied to a connection leaving the machine.
+/// * **`host` is any other name.** It must resolve to a publicly-routable
+///   address. This is the DNS-rebinding block: a name the rest of the system
+///   has already classified as remote — and granted remote-origin treatment
+///   on that basis — cannot be pointed at loopback, the LAN, or a cloud
+///   metadata endpoint by whoever controls its DNS records.
+///
+/// # Errors
+///
+/// [`MizuError::SecurityViolation`] naming both the host and the address, so
+/// the rejection is diagnosable without having to reproduce the DNS answer.
+pub fn authorize_resolved_address(host: &str, ip: IpAddr) -> Result<(), MizuError> {
+    if let Some(literal) = parse_host_literal(host) {
+        return if literal == ip {
+            Ok(())
+        } else {
+            Err(MizuError::SecurityViolation(format!(
+                "address literal `{host}` resolved to a different address ({ip})"
+            )))
+        };
+    }
+
+    if is_local_host(host) {
+        return if ip.is_loopback() {
+            Ok(())
+        } else {
+            Err(MizuError::SecurityViolation(format!(
+                "loopback name `{host}` resolved to non-loopback address {ip}"
+            )))
+        };
+    }
+
+    if is_publicly_routable(ip) {
+        Ok(())
+    } else {
+        Err(MizuError::SecurityViolation(format!(
+            "DNS rebinding blocked: public name `{host}` resolved to \
+             non-routable address {ip}"
+        )))
+    }
 }
 
 // Kani harnesses for `is_local_host` — see `SECURITY-INVARIANTS.md` §8.
@@ -81,8 +290,10 @@ mod kani_proofs {
     const HOSTS: &[&str] = &[
         "",
         "localhost",
+        "LOCALHOST",
         ".localhost",
         "a.localhost",
+        "A.LocalHost",
         "a.b.localhost",
         "notlocalhost",
         "localhost.evil.com",
@@ -138,8 +349,8 @@ mod kani_proofs {
         let parsed = any_parse_result();
 
         for host in HOSTS {
-            let expected = *host == "localhost"
-                || host.ends_with(".localhost")
+            let expected = host.eq_ignore_ascii_case("localhost")
+                || ends_with_ignore_ascii_case(host, ".localhost")
                 || parsed.is_some_and(|addr| addr.is_loopback());
 
             assert_eq!(is_local_host_with(host, |_| parsed), expected);
@@ -156,13 +367,75 @@ mod kani_proofs {
         assert_eq!(is_local_host_with(host, |_| Some(addr)), addr.is_loopback());
     }
 
+    /// No address a public name resolves to may be one the public internet
+    /// cannot address, over the whole 2^32 IPv4 space.
+    ///
+    /// Stated over `is_publicly_routable` directly rather than through
+    /// `authorize_resolved_address`, because the host argument would have to
+    /// be symbolic to say anything more, and a symbolic `&str` is what makes
+    /// these harnesses stop terminating (see `HOSTS` above).
+    #[kani::proof]
+    fn no_reserved_ipv4_is_publicly_routable() {
+        let addr = Ipv4Addr::new(kani::any(), kani::any(), kani::any(), kani::any());
+        if is_publicly_routable(IpAddr::V4(addr)) {
+            assert!(!addr.is_loopback());
+            assert!(!addr.is_private());
+            assert!(!addr.is_link_local());
+            assert!(!addr.is_multicast());
+            assert!(!addr.is_broadcast());
+            assert!(!addr.is_documentation());
+            assert!(!addr.is_unspecified());
+            assert!(addr.octets()[0] < 240);
+        }
+    }
+
+    /// An IPv6 address carrying a blocked IPv4 address inside it is blocked.
+    /// Covers the mapped, compatible, 6to4 and Teredo encodings at once by
+    /// checking that whenever an embedded address exists, the verdict is
+    /// exactly that address's own verdict.
+    #[kani::proof]
+    fn embedded_ipv4_decides_the_ipv6_verdict() {
+        let v6 = Ipv6Addr::new(
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+        if let Some(v4) = embedded_ipv4(v6) {
+            assert_eq!(
+                is_publicly_routable(IpAddr::V6(v6)),
+                is_publicly_routable(IpAddr::V4(v4))
+            );
+        }
+    }
+
+    /// A loopback name may only ever authorize a loopback address, whatever
+    /// the resolver answered.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn loopback_names_authorize_only_loopback() {
+        let addr = any_ip();
+        for host in ["localhost", "LOCALHOST", "api.localhost", "API.LocalHost"] {
+            assert_eq!(
+                authorize_resolved_address(host, addr).is_ok(),
+                addr.is_loopback()
+            );
+        }
+    }
+
     /// End-to-end through the real parser, on the cases that matter: the
     /// harnesses above inject the parse result, so these pin the wiring.
     #[kani::proof]
     #[kani::unwind(30)]
     fn concrete_hosts_classify_correctly() {
         assert!(is_local_host("localhost"));
+        assert!(is_local_host("LOCALHOST"));
         assert!(is_local_host("api.localhost"));
+        assert!(is_local_host("API.LocalHost"));
         assert!(is_local_host("a.b.localhost"));
         assert!(is_local_host("127.0.0.1"));
         assert!(is_local_host("127.255.255.254"));
@@ -179,5 +452,194 @@ mod kani_proofs {
         assert!(!is_local_host("10.0.0.1"));
         assert!(!is_local_host("printer.local"));
         assert!(!is_local_host("2001:db8::1"));
+    }
+}
+
+#[cfg(all(test, not(kani)))]
+mod tests {
+    // The crate denies these so production paths surface their failures as
+    // `MizuError`; in a test a panic on a malformed fixture *is* the report.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test address must parse")
+    }
+
+    #[test]
+    fn loopback_and_private_space_is_not_publicly_routable() {
+        for s in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            // The cloud instance-metadata endpoint: the single most valuable
+            // SSRF target on a hosted machine.
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !is_publicly_routable(ip(s)),
+                "{s} must not be publicly routable"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_public_addresses_are_routable() {
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "9.9.9.9",
+            "172.15.255.255",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "2606:4700::1111",
+            "2001:4860:4860::8888",
+            // 6to4 and Teredo wrapping *public* IPv4 addresses stay routable —
+            // the unwrapping must not become a blanket ban on the prefixes.
+            "2002:0808:0808::1",
+            "2001:0:1234:5678:9abc:def0:f7f7:f7f7",
+        ] {
+            assert!(is_publicly_routable(ip(s)), "{s} must be publicly routable");
+        }
+    }
+
+    /// Every way of spelling a blocked IPv4 address inside an IPv6 one.
+    #[test]
+    fn embedded_ipv4_forms_do_not_launder_blocked_addresses() {
+        for s in [
+            // IPv4-mapped.
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+            // IPv4-compatible (deprecated but still parseable).
+            "::127.0.0.1",
+            "::192.168.0.1",
+            // 6to4: 2002:7f00:0001::/48 wraps 127.0.0.1.
+            "2002:7f00:1::1",
+            // Teredo: the client address is the bit-inverted final 32 bits;
+            // !0x8080 == 0x7f7f -> 127.127, !0xffff == 0.0 -> 127.127.0.0.
+            "2001:0:1234:5678:9abc:def0:8080:ffff",
+        ] {
+            assert!(
+                !is_publicly_routable(ip(s)),
+                "{s} embeds a blocked IPv4 address and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn public_name_resolving_inward_is_rejected() {
+        for s in ["127.0.0.1", "169.254.169.254", "10.1.2.3", "::1", "fd00::1"] {
+            let err = authorize_resolved_address("evil.com", ip(s))
+                .expect_err("a public name must not authorize an inward address");
+            assert!(
+                matches!(err, MizuError::SecurityViolation(_)),
+                "expected a SecurityViolation for evil.com -> {s}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_name_resolving_publicly_is_accepted() {
+        assert!(authorize_resolved_address("example.com", ip("93.184.216.34")).is_ok());
+        assert!(authorize_resolved_address("example.com", ip("2606:4700::1111")).is_ok());
+    }
+
+    #[test]
+    fn loopback_names_require_a_loopback_address() {
+        assert!(authorize_resolved_address("localhost", ip("127.0.0.1")).is_ok());
+        assert!(authorize_resolved_address("api.localhost", ip("::1")).is_ok());
+        assert!(authorize_resolved_address("api.localhost", ip("93.184.216.34")).is_err());
+        assert!(authorize_resolved_address("localhost", ip("10.0.0.1")).is_err());
+    }
+
+    /// A literal in the URL bar is the user's own explicit choice, and every
+    /// spelling of one has to be recognised as a literal — otherwise
+    /// `0x7f.0.0.1` would be treated as a name and judged by the rebinding
+    /// rule instead of the equality rule.
+    #[test]
+    fn address_literals_authorize_themselves_in_every_spelling() {
+        for (host, expected) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("2130706433", "127.0.0.1"),
+            ("0x7f.0.0.1", "127.0.0.1"),
+            ("0177.0.0.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+            ("192.168.1.5", "192.168.1.5"),
+            ("93.184.216.34", "93.184.216.34"),
+        ] {
+            assert!(
+                authorize_resolved_address(host, ip(expected)).is_ok(),
+                "literal `{host}` must authorize {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_literal_may_not_resolve_to_a_different_address() {
+        let err = authorize_resolved_address("127.0.0.1", ip("93.184.216.34"))
+            .expect_err("a literal must only authorize itself");
+        assert!(matches!(err, MizuError::SecurityViolation(_)));
+    }
+
+    /// `mizu://` hosts are not case-normalised by the URL parser, so the two
+    /// halves of this module have to agree about `LOCALHOST` on their own.
+    /// Getting this wrong is not cosmetic: the name reaches loopback either
+    /// way, and a case-sensitive check would hand that connection the remote
+    /// storage quota while withholding the loopback TLS treatment.
+    #[test]
+    fn loopback_names_are_recognised_regardless_of_case() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "LocalHost",
+            "api.LOCALHOST",
+            "API.LocalHost",
+        ] {
+            assert!(is_local_host(host), "{host} must classify as local");
+            assert!(
+                authorize_resolved_address(host, ip("127.0.0.1")).is_ok(),
+                "{host} must authorize loopback"
+            );
+            assert!(
+                authorize_resolved_address(host, ip("93.184.216.34")).is_err(),
+                "{host} must not authorize a public address"
+            );
+        }
+    }
+
+    /// The suffix rule must not be satisfied by a name that merely *contains*
+    /// `localhost`, which would otherwise hand a remote name loopback
+    /// treatment.
+    #[test]
+    fn localhost_lookalikes_are_judged_as_public_names() {
+        for host in ["localhost.evil.com", "notlocalhost", "evil-localhost.com"] {
+            assert!(!is_local_host(host));
+            assert!(authorize_resolved_address(host, ip("127.0.0.1")).is_err());
+        }
     }
 }

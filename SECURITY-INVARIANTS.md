@@ -47,6 +47,26 @@ navigation path.
 (construction in `src/render/window/manager.rs`).
 *Enforcement:* **Runtime** — navigation choke point.
 
+**N6 — Resolution honesty:** Every outbound connection's destination address
+is authorized against the *name* it was resolved from, before any socket is
+opened. A name that the rest of the system classifies as remote may only
+resolve to a publicly-routable address; `localhost` and `*.localhost` may only
+resolve to loopback; an address literal may only resolve to itself.
+*Source constructs:* DNS answers for any `mizu://` host.
+*Rationale:* `is_local_host` classifies a *spelling*, and that classification
+selects the storage quota tier and the insecure-dev TLS treatment. Without N6
+the classification is only as honest as whoever controls the name's DNS
+records: `evil.com` is textually remote, is therefore given remote-origin
+treatment, and an `A` record of `127.0.0.1` then points that connection at a
+loopback service — the classic DNS-rebinding path to SSRF. Classifying the
+name is not the same as constraining the connection.
+*Enforcement:* **Runtime** — `authorize_resolved_address` in
+`crates/core/src/security/network.rs`, called from `resolve_domain` in
+`src/network/opennic.rs`, which is the only function that turns a host into a
+socket address and therefore the only place the two can be compared. Answers
+are additionally filtered during selection, so a name publishing one routable
+and one non-routable address still connects, to the routable one.
+
 ---
 
 ## 2. Layout Invariants
@@ -336,6 +356,7 @@ gate is a compile error.
 | N3 | User gesture for cross-origin | Runtime | `check_navigation` |
 | N4 | Scheme allowlist | Runtime | `check_navigation` |
 | N5 | Uniform lifecycle | Runtime | `src/render/window/navigate.rs` |
+| N6 | Resolved address matches the name's class | Runtime | `authorize_resolved_address` in `crates/core/src/security/network.rs`, enforced in `resolve_domain` |
 | L1 | Layout budget | Runtime + Parse-time | `src/render/layout_bridge.rs`, `crates/core/src/parser/layout.rs` |
 | E1 | Bounded evaluator recursion | Runtime + stack-size margin | `core/types/eval.rs` (`eval_depth`), `parser/logic_worker.rs` (`STACK_SIZE_BYTES`) — both under `crates/core/src/` |
 | E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
@@ -403,6 +424,7 @@ changed:
 | Target | Invariant | Kani status |
 |---|---|---|
 | `is_local_host` | quota tier / SSRF block / TLS bypass gate | **Harnessed** — `security/network.rs` |
+| `is_publicly_routable` / `authorize_resolved_address` | N6 | **Harnessed** — `security/network.rs` (whole IPv4 space; embedded-IPv4 IPv6 forms; loopback-name rule) |
 | `normalize_path_components` + containment check | file sandbox | **Harnessed** — `security/sandbox.rs` |
 | `check_storage_write` | S-quota, L1-style bounded counter | **Harnessed** — `security/quota.rs` |
 | `check_type` (3 harnesses) | T4 down payment | **Verified** — `parser/logic/eval.rs` |
