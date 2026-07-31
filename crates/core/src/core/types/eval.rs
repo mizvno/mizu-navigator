@@ -134,7 +134,8 @@ impl Evaluator {
 
     /// Returns the global binding of `sym`, or [`Value::Null`] if unset.
     pub fn get_global(&self, sym: Symbol) -> &Value {
-        self.global_store.get(&sym).unwrap_or(&Value::Null)
+        static NULL: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        self.global_store.get(&sym).unwrap_or(NULL.get_or_init(|| Value::Null))
     }
 
     /// Resolves a local symbol value in O(1) average time using the reverse index.
@@ -219,11 +220,10 @@ impl Evaluator {
                         const MAX_RECORD_DEPTH: usize = 64;
                         let mut parts = var_name.splitn(MAX_RECORD_DEPTH, '.');
                         let root = parts.next().unwrap_or("");
-                        let segments: Vec<&str> = parts.collect();
 
                         let handled = if let Some(root_val) = overlay.and_then(|map| map.get(root))
                         {
-                            if let Some(leaf) = resolve_dot_path(root_val, &segments) {
+                            if let Some(leaf) = resolve_dot_path(root_val, parts.clone()) {
                                 let _ = write!(buffer, "{}", leaf);
                                 true
                             } else {
@@ -238,7 +238,7 @@ impl Evaluator {
                                 None => {
                                     let _ = write!(buffer, "{{{}}}", var_name);
                                 }
-                                Some(root_val) => match resolve_dot_path(root_val, &segments) {
+                                Some(root_val) => match resolve_dot_path(root_val, parts) {
                                     Some(leaf) => {
                                         let _ = write!(buffer, "{}", leaf);
                                     }
@@ -371,7 +371,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let node_id = match val {
-                            Value::String(s) => s.to_string(),
+                            Value::String(ref s) => s.to_string(),
                             _ => {
                                 return Err(MizuError::ExecutionError(
                                     "copy_to_clipboard argument must be a node id string"
@@ -439,7 +439,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let key_str = match key_val {
-                            Value::String(s) => s.to_string(),
+                            Value::String(ref s) => s.to_string(),
                             _ => {
                                 return Err(MizuError::ExecutionError(
                                     "store_local key must be a string".to_string(),
@@ -495,7 +495,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let list = match list_val {
-                            Value::List(l) => l,
+                            Value::List(ref l) => l.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("list".to_string()),
@@ -504,7 +504,7 @@ impl Evaluator {
                             }
                         };
                         let field = match field_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -513,7 +513,7 @@ impl Evaluator {
                             }
                         };
                         let op = match op_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -558,32 +558,36 @@ impl Evaluator {
                             }
                         };
                         let mut ic = self.instruction_count;
-                        let filtered: Vec<Value> = list
-                            .iter()
-                            .filter(|item| {
-                                let Some(field_v) = item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()) else {
-                                    return false;
-                                };
-                                match &binop {
-                                    Some(op) => apply_binop(
-                                        op,
-                                        field_v.clone(),
-                                        target.clone(),
-                                        &mut ic,
-                                        self.max_instructions,
-                                    )
-                                    .map(|v| matches!(v, Value::Bool(true)))
-                                    .unwrap_or(false),
+                        let mut filtered = Vec::new();
+                        for item in list.iter() {
+                            if let Some(field_v) = item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()) {
+                                let include = match &binop {
+                                    Some(op) => {
+                                        match apply_binop(
+                                            op,
+                                            field_v.clone(),
+                                            target.clone(),
+                                            &mut ic,
+                                            self.max_instructions,
+                                        ) {
+                                            Ok(Value::Bool(b)) => b,
+                                            Ok(_) => false,
+                                            Err(MizuError::TypeError { .. }) => false,
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
                                     None => match (field_v, &target) {
                                         (Value::String(h), Value::String(n)) => {
                                             h.contains(n.as_ref())
                                         }
                                         _ => false,
-                                    },
+                                    }
+                                };
+                                if include {
+                                    filtered.push(item.clone());
                                 }
-                            })
-                            .cloned()
-                            .collect();
+                            }
+                        }
                         self.instruction_count = ic;
                         return Ok(Value::List(Arc::new(filtered)));
                     }
@@ -610,7 +614,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let list = match list_val {
-                            Value::List(l) => l,
+                            Value::List(ref l) => l.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("list".to_string()),
@@ -624,7 +628,7 @@ impl Evaluator {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -632,15 +636,15 @@ impl Evaluator {
                                 });
                             }
                         };
-                        let n = list
-                            .iter()
-                            .filter(|item| {
-                                item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref())
-                                    .map(|v| v == &target)
-                                    .unwrap_or(false)
-                            })
-                            .count();
-                        return Ok(Value::Int(n as i64));
+                        let mut n = 0;
+                        for item in list.iter() {
+                            if let Some(v) = item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()) {
+                                if v.budget_eq(&target, &mut self.instruction_count, self.max_instructions)? {
+                                    n += 1;
+                                }
+                            }
+                        }
+                        return Ok(Value::Decimal(n as i64));
                     }
                     "download" if args.len() == 1 => {
                         // arg[0] must be a bare alias identifier (Expr::Variable);
@@ -687,7 +691,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let list = match list_val {
-                            Value::List(l) => l,
+                            Value::List(ref l) => l.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("list".to_string()),
@@ -708,7 +712,7 @@ impl Evaluator {
                             return Err(MizuError::Timeout);
                         }
                         let field = match field_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -717,7 +721,7 @@ impl Evaluator {
                             }
                         };
                         let direction = match direction_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -730,17 +734,28 @@ impl Evaluator {
                                 "sort: direction must be `asc` or `desc`, got `{direction}`"
                             )));
                         }
-                        let mut items: Vec<Value> = (*list).clone();
-                        items.sort_by(|a, b| {
-                            let ord =
-                                compare_values(field_value(a, &field), field_value(b, &field));
+                        let items: Vec<Value> = (*list).clone();
+                        let mut paired = Vec::with_capacity(items.len());
+                        for item in items.into_iter() {
+                            let key = field_value(&item, &field).cloned();
+                            match key {
+                                Some(Value::Null) | Some(Value::Bool(_)) | Some(Value::Decimal(_)) | Some(Value::String(_)) | None => {},
+                                _ => return Err(MizuError::ExecutionError(
+                                    "sort: cannot sort on complex nested fields (List/Record)".to_string(),
+                                )),
+                            }
+                            paired.push((key, item));
+                        }
+                        paired.sort_by(|(ka, _), (kb, _)| {
+                            let ord = compare_values(ka.as_ref(), kb.as_ref());
                             if direction.as_ref() == "desc" {
                                 ord.reverse()
                             } else {
                                 ord
                             }
                         });
-                        return Ok(Value::List(Arc::new(items)));
+                        let sorted_items = paired.into_iter().map(|(_, v)| v).collect();
+                        return Ok(Value::List(Arc::new(sorted_items)));
                     }
                     "length" if args.len() == 1 => {
                         let value = self.evaluate(
@@ -752,7 +767,7 @@ impl Evaluator {
                         )?;
                         let n = match value {
                             // O(1): Arc<Vec<Value>>'s length is already tracked.
-                            Value::List(l) => l.len() as i64,
+                            Value::List(ref l) => l.len() as i64,
                             // O(n): char count, not byte count — this is a
                             // user-facing text length for a document-rendering
                             // language, not a security byte-budget (those are
@@ -769,7 +784,7 @@ impl Evaluator {
                             // scan cost before Timeout could ever fire, letting
                             // a single length() call do MAX_INSTRUCTIONS-times
                             // more work than the budget allows.
-                            Value::String(s) => {
+                            Value::String(ref s) => {
                                 let max_possible_chars = s.len() as u64;
                                 if self.instruction_count.saturating_add(max_possible_chars)
                                     > self.max_instructions
@@ -788,7 +803,7 @@ impl Evaluator {
                                 });
                             }
                         };
-                        return Ok(Value::Int(
+                        return Ok(Value::Decimal(
                             n.saturating_mul(crate::core::types::DECIMAL_SCALE),
                         ));
                     }
@@ -808,7 +823,7 @@ impl Evaluator {
                         // textual form, and guessing one invites confusing
                         // output over a clear rejection.
                         match &value {
-                            Value::Int(_) | Value::Bool(_) => {
+                            Value::Decimal(_) | Value::Bool(_) => {
                                 return Ok(Value::String(Arc::from(value.to_string())));
                             }
                             other => {
@@ -835,7 +850,7 @@ impl Evaluator {
                             arena,
                         )?;
                         let haystack = match haystack_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -844,7 +859,7 @@ impl Evaluator {
                             }
                         };
                         let needle = match needle_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -884,7 +899,7 @@ impl Evaluator {
                             });
                         }
                         let name = match name_val {
-                            Value::String(s) => s,
+                            Value::String(ref s) => s.clone(),
                             other => {
                                 return Err(MizuError::TypeError {
                                     expected: Box::new("string".to_string()),
@@ -1026,11 +1041,15 @@ pub(super) fn field_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value>
 }
 
 /// Navigates a dot-separated path through nested `Value::Record` values,
-/// returning a reference to the leaf without cloning any intermediate value.
-fn resolve_dot_path<'a>(root: &'a Value, segments: &[&str]) -> Option<&'a Value> {
+/// returning a reference to the leaf.
+fn resolve_dot_path<'a, I>(root: &'a Value, segments: I) -> Option<&'a Value>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
     let mut current = root;
     for segment in segments {
-        current = current.get_field(crate::core::types::hash_field(segment), segment)?;
+        current = current.get_field(crate::core::types::hash_field(segment.as_ref()), segment.as_ref())?;
     }
     Some(current)
 }
@@ -1048,6 +1067,7 @@ pub(super) fn variant_weight(v: &Value) -> u8 {
         Value::Null => 1,
         Value::Bool(_) => 2,
         Value::Int(_) => 3,
+        Value::Decimal(_) => 3,
         Value::String(_) => 4,
         Value::List(_) => 5,
         Value::Record(_) => 6,
@@ -1088,7 +1108,7 @@ pub(super) fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::
 
         (Some(Value::Null), Some(Value::Null)) => Ordering::Equal,
         (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
-        (Some(Value::Int(x)), Some(Value::Int(y))) => x.cmp(y),
+        (Some(Value::Decimal(x)), Some(Value::Decimal(y))) => x.cmp(y),
         (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
 
         (Some(Value::List(x)), Some(Value::List(y))) => {

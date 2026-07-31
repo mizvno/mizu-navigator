@@ -29,4 +29,4 @@ pub use eval::{Evaluator, MAX_EVAL_DEPTH};
 use eval::{compare_values, field_value, variant_weight};
 pub use interner::{FrozenInterner, StringInterner, Symbol};
 pub use store::VariableStore;
-pub use value::{DECIMAL_SCALE, FileHandleData, Value, RecordField, hash_field, from_json, to_json};
+pub use value::{DECIMAL_SCALE, FileHandleData, Value, RecordField, from_json_str, from_json_slice, to_json, hash_field};

@@ -22,6 +22,7 @@ pub fn estimate_value_bytes(value: &Value) -> usize {
     match value {
         Value::String(s) => s.len(),
         Value::Int(_) => 8,
+        Value::Decimal(_) => 8,
         Value::Bool(_) => 1,
         Value::Null => 4,
         Value::List(items) => items.iter().map(estimate_value_bytes).sum(),
@@ -222,7 +223,7 @@ pub fn execute_capability_action(
                         tab_id,
                         UiEvent::UpdateVariable {
                             name: name.to_string(),
-                            value: Value::Int(time_ms),
+                            value: Value::Decimal(time_ms),
                         },
                     )) {
                         tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
@@ -641,9 +642,8 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(method, "POST");
-                assert_eq!(
-                    sent,
-                    Some(payload),
+                assert!(
+                    sent.as_ref().is_some_and(|v| v.budget_eq(&payload, &mut u64::MAX, u64::MAX).unwrap_or(false)),
                     "POST payload must survive the ResolvedCall → Fetch dispatch"
                 );
                 assert_eq!(

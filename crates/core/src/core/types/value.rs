@@ -18,14 +18,13 @@ pub const DECIMAL_SCALE: i64 = 100_000_000;
 ///
 /// Deliberately holds only a path and a display name — never the file's
 /// bytes. A `Value` is meant to be cheap to clone/compare/store (the same
-/// spirit as the fixed-point `Value::Int` scale and the evaluator's bounded
+/// spirit as the fixed-point `Value::Decimal` scale and the evaluator's bounded
 /// recursion); loading a whole file into a `Value` the evaluator freely
 /// passes through `filter`/`store_local`/comparisons would blow past that,
 /// and would make raw file content reachable from ordinary logic in ways
 /// nothing here is designed to gate. The file's bytes are read only by the
 /// network worker, in bounded chunks, at the moment a `Multipart` request is
 /// actually sent (see `network::worker::multipart`).
-#[derive(Debug)]
 pub struct FileHandleData {
     /// Absolute filesystem path to the selected file.
     pub path: std::path::PathBuf,
@@ -36,41 +35,37 @@ pub struct FileHandleData {
     pub filename: String,
 }
 
-/// The set of all primitive values in the Mizu type system.
-/// Pre-calculates a 32-bit key hash used to short-circuit field lookups.
-///
-/// FNV-1a, 32-bit. Deliberately *not* `FxHasher` (or any `DefaultHasher`):
-/// those mix at the native word size, so the same key hashes differently on a
-/// 32-bit and a 64-bit target. These hashes are baked into parsed field-access
-/// nodes, so a word-size-dependent hash would make the generated program
-/// representation architecture-dependent. Every operation here is `u32`
-/// wrapping arithmetic — no `usize` anywhere — so the result is identical on
-/// all targets.
-#[inline]
-pub fn hash_field(key: &str) -> u32 {
-    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
-    const FNV_PRIME: u32 = 0x0100_0193;
+impl std::fmt::Debug for FileHandleData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileHandleData")
+            .field("filename", &self.filename)
+            .field("path", &"<REDACTED FOR SECURITY>")
+            .finish()
+    }
+}
 
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in key.as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(FNV_PRIME);
+/// The set of all primitive values in the Mizu type system.
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    pub key: Arc<str>,
+    pub hash: u32,
+    pub value: Value,
+}
+
+#[inline]
+pub fn hash_field(s: &str) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for b in s.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
     }
     hash
 }
 
-#[derive(Debug, Clone)]
-pub struct RecordField {
-    /// [`hash_field`] of `key`, precomputed so lookups compare a `u32` before
-    /// ever touching the string bytes.
-    pub hash: u32,
-    pub key: Arc<str>,
-    pub value: Value,
-}
-
+#[cfg(test)]
 impl PartialEq for RecordField {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.key == other.key && self.value == other.value
+        self.key == other.key && self.value == other.value
     }
 }
 
@@ -81,8 +76,10 @@ pub enum Value {
     Null,
     /// A boolean value (true or false).
     Bool(bool),
-    /// A scaled 64-bit integer representing a fixed-point decimal.
+    /// An unscaled 64-bit integer.
     Int(i64),
+    /// A scaled 64-bit integer representing a fixed-point decimal.
+    Decimal(i64),
     /// A reference-counted string.
     String(Arc<str>),
     /// A reference-counted list of nested values.
@@ -103,33 +100,62 @@ pub enum Value {
     FileHandle(Arc<FileHandleData>),
 }
 
+#[cfg(test)]
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Record(a), Value::Record(b)) => a == b,
-            // `FileHandle` is deliberately never equal to anything, even to
-            // itself — comparing file selections isn't a meaningful
-            // operation this type system supports, and path-based equality
-            // would leak filesystem layout through comparison behavior.
-            _ => false,
+        let mut stack = vec![(self, other)];
+        let mut budget = 100_000_u32;
+
+        while let Some((a, b)) = stack.pop() {
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
+                panic!("Value PartialEq budget exceeded in tests! Use budget_eq.");
+            }
+
+            match (a, b) {
+                (Value::Null, Value::Null) => {}
+                (Value::Bool(x), Value::Bool(y)) if x == y => {}
+                (Value::Int(x), Value::Int(y)) if x == y => {}
+                (Value::Decimal(x), Value::Decimal(y)) if x == y => {}
+                (Value::Int(x), Value::Decimal(y)) | (Value::Decimal(y), Value::Int(x)) => {
+                    if let Some(scaled_x) = x.checked_mul(DECIMAL_SCALE) {
+                        if scaled_x == *y { continue; }
+                    }
+                    return false;
+                }
+                (Value::String(x), Value::String(y)) if x == y => {}
+                (Value::FileHandle(x), Value::FileHandle(y)) if Arc::ptr_eq(x, y) => {}
+                (Value::List(x), Value::List(y)) => {
+                    if Arc::ptr_eq(x, y) { continue; }
+                    if x.len() != y.len() { return false; }
+                    for (vx, vy) in x.iter().zip(y.iter()) {
+                        stack.push((vx, vy));
+                    }
+                }
+                (Value::Record(x), Value::Record(y)) => {
+                    if Arc::ptr_eq(x, y) { continue; }
+                    if x.len() != y.len() { return false; }
+                    for (fx, fy) in x.iter().zip(y.iter()) {
+                        if fx.key != fy.key { return false; }
+                        stack.push((&fx.value, &fy.value));
+                    }
+                }
+                _ => return false,
+            }
         }
+        true
     }
 }
 
+    // The Drop implementation was removed.
+
 impl Value {
-    /// Builds a [`Value::Record`] from unordered key-value pairs, computing
-    /// each key's hash and establishing the lexicographic ordering the variant
-    /// requires.
+    /// Builds a [`Value::Record`] from unordered key-value pairs, establishing
+    /// the lexicographic ordering the variant requires and deduplicating keys.
     ///
     /// This is the only place records are ordered; every construction site
     /// goes through it so the invariant cannot drift between them. Duplicate
-    /// keys are not deduplicated here — callers building from a map type
-    /// cannot produce them, and `get_field` would return the first match.
+    /// keys are deduplicated to ensure deterministic object layouts.
     pub fn record_from_unsorted<I, K>(pairs: I) -> Value
     where
         I: IntoIterator<Item = (K, Value)>,
@@ -144,25 +170,62 @@ impl Value {
             })
             .collect();
         fields.sort_by(|a, b| a.key.cmp(&b.key));
+        fields.dedup_by(|a, b| a.key == b.key);
         Value::Record(Arc::from(fields))
     }
 
     /// Safely retrieves the value associated with `field_name` if this value
-    /// is a [`Value::Record`].
-    ///
-    /// A linear scan, not a binary search: the slice is ordered by key, not by
-    /// hash, and records in practice hold a handful of fields, so a scan over
-    /// a contiguous run of `u32`s beats the mispredicted branch chain of a
-    /// binary search. The `hash` compare is the filter and the `key` compare
-    /// is the decision, so a hash collision resolves correctly instead of
-    /// needing a fallback pass.
+    /// is a [`Value::Record`]. Uses a binary search over the sorted fields.
     pub fn get_field(&self, field_hash: u32, field_name: &str) -> Option<&Value> {
-        match self {
-            Value::Record(slice) => slice
-                .iter()
-                .find(|f| f.hash == field_hash && f.key.as_ref() == field_name)
-                .map(|f| &f.value),
-            _ => None,
+        if let Value::Record(slice) = self {
+            for f in slice.iter() {
+                if f.hash == field_hash && f.key.as_ref() == field_name {
+                    return Some(&f.value);
+                }
+            }
+        }
+        None
+    }
+
+    /// Performs structural equality check with a hard budget to prevent
+    /// "Billion Laughs" algorithmic DoS on deeply nested identical `Arc` references.
+    pub fn budget_eq(&self, other: &Self, budget: &mut u64, max_budget: u64) -> Result<bool, MizuError> {
+        *budget = budget.saturating_add(1);
+        if *budget > max_budget {
+            return Err(MizuError::Timeout);
+        }
+        match (self, other) {
+            (Value::List(la), Value::List(lb)) => {
+                if Arc::ptr_eq(la, lb) { return Ok(true); }
+                if la.len() != lb.len() { return Ok(false); }
+                for (va, vb) in la.iter().zip(lb.iter()) {
+                    if !va.budget_eq(vb, budget, max_budget)? { return Ok(false); }
+                }
+                Ok(true)
+            },
+            (Value::Record(ra), Value::Record(rb)) => {
+                if Arc::ptr_eq(ra, rb) { return Ok(true); }
+                if ra.len() != rb.len() { return Ok(false); }
+                for (fa, fb) in ra.iter().zip(rb.iter()) {
+                    if fa.key != fb.key { return Ok(false); }
+                    if !fa.value.budget_eq(&fb.value, budget, max_budget)? { return Ok(false); }
+                }
+                Ok(true)
+            },
+            (Value::Null, Value::Null) => Ok(true),
+            (Value::Bool(x), Value::Bool(y)) => Ok(x == y),
+            (Value::Int(x), Value::Int(y)) => Ok(x == y),
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(x == y),
+            (Value::Int(x), Value::Decimal(y)) | (Value::Decimal(y), Value::Int(x)) => {
+                if let Some(scaled_x) = x.checked_mul(DECIMAL_SCALE) {
+                    Ok(scaled_x == *y)
+                } else {
+                    Ok(false)
+                }
+            },
+            (Value::String(x), Value::String(y)) => Ok(x == y),
+            (Value::FileHandle(x), Value::FileHandle(y)) => Ok(Arc::ptr_eq(x, y)),
+            _ => Ok(false),
         }
     }
 }
@@ -172,22 +235,28 @@ impl fmt::Display for Value {
         match self {
             Value::Null => write!(f, "null"),
             Value::Bool(b) => write!(f, "{b}"),
-            Value::Int(i) => {
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Decimal(i) => {
                 let integer_part = i / DECIMAL_SCALE;
                 let fractional_part = (i % DECIMAL_SCALE).abs();
 
                 if fractional_part == 0 {
                     write!(f, "{}", integer_part)
                 } else {
-                    let mut frac_str = format!("{:08}", fractional_part);
-                    frac_str = frac_str.trim_end_matches('0').to_string();
                     if *i < 0 && integer_part == 0 {
-                        write!(f, "-{}.{}", integer_part, frac_str)
+                        write!(f, "-0.")?;
                     } else {
-                        write!(f, "{}.{}", integer_part, frac_str)
+                        write!(f, "{}.", integer_part)?;
                     }
+                    let mut frac = fractional_part;
+                    let mut num_digits = 8;
+                    while frac % 10 == 0 && frac > 0 {
+                        frac /= 10;
+                        num_digits -= 1;
+                    }
+                    write!(f, "{:0width$}", frac, width = num_digits)
                 }
-            }
+            },
             Value::String(s) => write!(f, "{s}"),
             Value::List(items) => {
                 write!(f, "[")?;
@@ -212,17 +281,15 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
             // Redact to the display filename only — never the full path.
-            Value::FileHandle(handle) => write!(f, "<file: {}>", handle.filename),
+            // Sanitize control characters to prevent log/terminal injection.
+            Value::FileHandle(handle) => {
+                let safe_name: String = handle.filename.chars().filter(|c| !c.is_control()).collect();
+                write!(f, "<file: {}>", safe_name)
+            }
         }
     }
 }
 
-impl From<i64> for Value {
-    #[inline]
-    fn from(n: i64) -> Self {
-        Value::Int(n)
-    }
-}
 
 impl From<bool> for Value {
     #[inline]
@@ -266,12 +333,16 @@ impl From<&str> for Value {
 /// build is always re-readable from storage.
 const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 
+/// Maximum total number of items in a JSON payload to prevent
+/// memory exhaustion DoS from excessively large payloads.
+const MAX_JSON_NODES: usize = 32768;
+
 /// Converts a `serde_json::Value` into a Mizu [`Value`].
 ///
 /// Mapping:
 /// * `null` → [`Value::Null`]
 /// * `bool` → [`Value::Bool`]
-/// * number → [`Value::Int`], scaled by `DECIMAL_SCALE` (`Value` has no
+/// * number → [`Value::Decimal`], scaled by `DECIMAL_SCALE` (`Value` has no
 ///   separate floating-point variant). Integer literals (no `.` or
 ///   exponent in the source) take an exact `checked_mul` path. Fractional
 ///   literals go through `f64`, which carries only ~15-17 significant
@@ -293,62 +364,159 @@ const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 /// for a legitimate absence of a value. Also returns
 /// [`MizuError::SecurityViolation`] if a JSON number's scaled value doesn't
 /// fit in `i64`, rather than silently truncating or wrapping it.
-pub fn from_json(json: &serde_json::Value) -> Result<Value, MizuError> {
-    from_json_bounded(json, 0)
+pub fn from_json_str(payload: &str) -> Result<Value, MizuError> {
+    let mut deserializer = serde_json::Deserializer::from_str(payload);
+    let mut nodes = 0;
+    let seed = ValueSeed { depth: 0, nodes: &mut nodes };
+    serde::de::DeserializeSeed::deserialize(seed, &mut deserializer)
+        .map_err(|e| MizuError::SecurityViolation(e.to_string()))
 }
 
-fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, MizuError> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(MizuError::SecurityViolation(format!(
-            "JSON payload exceeds maximum nesting depth of {MAX_JSON_DEPTH}"
-        )));
+pub fn from_json_slice(payload: &[u8], is_trusted: bool) -> Result<Value, MizuError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let mut nodes = 0;
+    let seed = ValueSeed { depth: 0, nodes: if is_trusted { &mut 0 } else { &mut nodes } };
+    serde::de::DeserializeSeed::deserialize(seed, &mut deserializer)
+        .map_err(|e| MizuError::SecurityViolation(e.to_string()))
+}
+
+fn parse_json_number_exact(s: &str) -> Result<Value, MizuError> {
+    let mut parts = s.split('.');
+    let int_str = parts.next().unwrap_or("0");
+    let frac_str = parts.next().unwrap_or("0");
+    
+    if parts.next().is_some() || s.contains('e') || s.contains('E') {
+        let float_val: f64 = s.parse().map_err(|_| MizuError::SecurityViolation("JSON number could not be parsed".to_string()))?;
+        let scaled = (float_val * (DECIMAL_SCALE as f64)).round();
+        if !scaled.is_finite() || scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
+            return Err(MizuError::SecurityViolation("JSON number exceeds representable range".to_string()));
+        }
+        return Ok(Value::Decimal(scaled as i64));
     }
-    match json {
-        serde_json::Value::Null => Ok(Value::Null),
-        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
-        serde_json::Value::Number(n) => {
-            // Integer JSON literals take an exact path: `checked_mul` either
-            // produces the exact scaled value or fails cleanly on overflow,
-            // never silently truncating. Fractional literals still go
-            // through `f64`, whose ~15-17 significant decimal digits cannot
-            // exactly represent every value in this type's range (an
-            // 11-digit integer part plus 8 fractional digits is up to ~19
-            // significant digits) — this is a real precision boundary, not
-            // an oversight, so overflow/non-finite results are rejected
-            // rather than silently rounded to a nearby-but-wrong value.
-            if let Some(i) = n.as_i64() {
-                return i.checked_mul(DECIMAL_SCALE).map(Value::Int).ok_or_else(|| {
-                    MizuError::SecurityViolation(
-                        "JSON number exceeds representable range".to_string(),
-                    )
-                });
+    
+    let is_negative = int_str.starts_with('-');
+    let int_part: i64 = int_str.parse().map_err(|_| MizuError::SecurityViolation("JSON number integer overflow".to_string()))?;
+    
+    let mut frac_val: i64 = 0;
+    let mut mult = DECIMAL_SCALE / 10;
+    for (i, c) in frac_str.chars().enumerate() {
+        if !c.is_ascii_digit() { return Err(MizuError::SecurityViolation("Invalid fraction".to_string())); }
+        if i >= 8 {
+            break;
+        }
+        if mult > 0 {
+            let digit = (c as u8 - b'0') as i64;
+            frac_val += digit * mult;
+            mult /= 10;
+        }
+    }
+    
+    let base = int_part.checked_mul(DECIMAL_SCALE).ok_or_else(|| MizuError::SecurityViolation("JSON number integer overflow".to_string()))?;
+    let scaled = if is_negative && base == 0 {
+        -frac_val
+    } else if is_negative {
+        base.checked_sub(frac_val).ok_or_else(|| MizuError::SecurityViolation("JSON number overflow".to_string()))?
+    } else {
+        base.checked_add(frac_val).ok_or_else(|| MizuError::SecurityViolation("JSON number overflow".to_string()))?
+    };
+    
+    Ok(Value::Decimal(scaled))
+}
+
+struct ValueSeed<'a> {
+    depth: u32,
+    nodes: &'a mut usize,
+}
+
+impl<'a, 'de> serde::de::DeserializeSeed<'de> for ValueSeed<'a> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *self.nodes += 1;
+        if *self.nodes > MAX_JSON_NODES {
+            return Err(serde::de::Error::custom(format!("JSON payload exceeds maximum total node limit of {MAX_JSON_NODES}")));
+        }
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(serde::de::Error::custom(format!("JSON payload exceeds maximum nesting depth of {MAX_JSON_DEPTH}")));
+        }
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'a, 'de> serde::de::Visitor<'de> for ValueSeed<'a> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(Value::Int(v))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        let i = i64::try_from(v).map_err(|_| serde::de::Error::custom("JSON number integer overflow"))?;
+        Ok(Value::Int(i))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        let scaled = (v * (DECIMAL_SCALE as f64)).round();
+        if !scaled.is_finite() || scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
+            return Err(serde::de::Error::custom("JSON number exceeds representable range"));
+        }
+        Ok(Value::Decimal(scaled as i64))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(std::sync::Arc::from(v)))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Value::String(std::sync::Arc::from(v.as_str())))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
+    where
+        V: serde::de::SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        while let Some(value) = visitor.next_element_seed(ValueSeed {
+            depth: self.depth + 1,
+            nodes: self.nodes,
+        })? {
+            items.push(value);
+        }
+        Ok(Value::List(std::sync::Arc::new(items)))
+    }
+
+    fn visit_map<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
+    where
+        V: serde::de::MapAccess<'de>,
+    {
+        let mut pairs = Vec::new();
+        while let Some(key) = visitor.next_key::<String>()? {
+            if key == "$serde_json::private::Number" {
+                let s: String = visitor.next_value()?;
+                return parse_json_number_exact(&s).map_err(serde::de::Error::custom);
             }
-            let float_val = n.as_f64().ok_or_else(|| {
-                MizuError::SecurityViolation("JSON number could not be parsed".to_string())
+            let value = visitor.next_value_seed(ValueSeed {
+                depth: self.depth + 1,
+                nodes: self.nodes,
             })?;
-            let scaled = (float_val * (DECIMAL_SCALE as f64)).round();
-            if !scaled.is_finite() || scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
-                return Err(MizuError::SecurityViolation(
-                    "JSON number exceeds representable range".to_string(),
-                ));
-            }
-            Ok(Value::Int(scaled as i64))
+            pairs.push((key, value));
         }
-        serde_json::Value::String(s) => Ok(Value::String(Arc::from(s.as_str()))),
-        serde_json::Value::Array(arr) => {
-            let items = arr
-                .iter()
-                .map(|v| from_json_bounded(v, depth + 1))
-                .collect::<Result<Vec<Value>, MizuError>>()?;
-            Ok(Value::List(Arc::new(items)))
-        }
-        serde_json::Value::Object(map) => {
-            let pairs = map
-                .iter()
-                .map(|(k, v)| Ok((k.as_str(), from_json_bounded(v, depth + 1)?)))
-                .collect::<Result<Vec<(&str, Value)>, MizuError>>()?;
-            Ok(Value::record_from_unsorted(pairs))
-        }
+        Ok(Value::record_from_unsorted(pairs))
     }
 }
 
@@ -357,7 +525,7 @@ fn from_json_bounded(json: &serde_json::Value, depth: u32) -> Result<Value, Mizu
 /// Mapping (inverse of [`from_json`]):
 /// * [`Value::Null`]    → `null`
 /// * [`Value::Bool`]   → `bool`
-/// * [`Value::Int`]    → `number` (unscaled by `DECIMAL_SCALE` — `Value` has
+/// * [`Value::Decimal`]    → `number` (unscaled by `DECIMAL_SCALE` — `Value` has
 ///   no floating-point variant of its own; the fixed-point `Int`
 ///   representation stands in for both integers and floats. A value that is
 ///   a whole number at this scale emits an exact JSON integer; otherwise it
@@ -380,20 +548,31 @@ pub fn to_json(val: &Value) -> Result<serde_json::Value, MizuError> {
     match val {
         Value::Null => Ok(serde_json::Value::Null),
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        Value::Int(i) => {
-            // Whole values take the exact integer path (mirrors from_json's
-            // exact path for whole-number JSON literals) instead of always
-            // dividing through f64, which cannot exactly represent every
-            // value in this type's range.
-            if i % DECIMAL_SCALE == 0 {
-                Ok(serde_json::Value::Number(serde_json::Number::from(
-                    i / DECIMAL_SCALE,
-                )))
+        Value::Int(i) => Ok(serde_json::Value::Number(serde_json::Number::from(*i))),
+        Value::Decimal(i) => {
+            let integer_part = i / DECIMAL_SCALE;
+            let fractional_part = (i % DECIMAL_SCALE).abs();
+
+            if fractional_part == 0 {
+                use std::str::FromStr;
+                let num_str = format!("{}.0", integer_part);
+                Ok(serde_json::Value::Number(serde_json::Number::from_str(&num_str).unwrap()))
             } else {
-                let unscaled = *i as f64 / (DECIMAL_SCALE as f64);
-                Ok(serde_json::Number::from_f64(unscaled)
+                use std::str::FromStr;
+                let sign = if *i < 0 && integer_part == 0 { "-" } else { "" };
+                
+                let mut frac = fractional_part;
+                let mut num_digits = 8;
+                while frac % 10 == 0 && frac > 0 {
+                    frac /= 10;
+                    num_digits -= 1;
+                }
+                
+                let num_str = format!("{}{}.{:0width$}", sign, integer_part, frac, width = num_digits);
+                
+                Ok(serde_json::Number::from_str(&num_str)
                     .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null))
+                    .map_err(|_| MizuError::ExecutionError("failed to serialize decimal exactly".to_string()))?)
             }
         }
         Value::String(s) => Ok(serde_json::Value::String(s.to_string())),

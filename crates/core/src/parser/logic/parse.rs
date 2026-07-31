@@ -170,9 +170,15 @@ pub(super) fn parse_expr(
     }
     // ── Null denotation (prefix / atoms) ────────────────────────────────
     let mut lhs = match cursor.next() {
-        Some(Token::Num(n)) => {
-            let scaled = (*n * (crate::core::types::DECIMAL_SCALE as f64)).round() as i64;
-            Expr::Literal(Value::Int(scaled))
+        Some(Token::Num(num_str)) => {
+            if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
+                let parsed: f64 = num_str.parse().map_err(|_| MizuError::ParseError("Invalid float literal".into()))?;
+                let scaled = (parsed * (crate::core::types::DECIMAL_SCALE as f64)).round() as i64;
+                Expr::Literal(Value::Decimal(scaled))
+            } else {
+                let parsed: i64 = num_str.parse().map_err(|_| MizuError::ParseError("Invalid int literal".into()))?;
+                Expr::Literal(Value::Int(parsed))
+            }
         }
         Some(Token::Bool(b)) => Expr::Literal(Value::Bool(*b)),
         Some(Token::Str(s)) => Expr::Literal(Value::String(std::sync::Arc::from(*s))),
@@ -267,16 +273,21 @@ pub(super) fn parse_expr(
             }
         }
 
-        // Unary minus: `-expr`
         Some(Token::Minus) => {
             let operand = parse_expr(cursor, 30, depth + 1, interner, arena)?; // highest precedence for unary
-            // Fold into a binary `0 - operand` to keep the AST simple.
-            let left = arena.alloc(Expr::Literal(Value::Int(0)));
-            let right = arena.alloc(operand);
-            Expr::BinaryOp {
-                left,
-                op: BinOp::Sub,
-                right,
+            match operand {
+                Expr::Literal(Value::Int(n)) => Expr::Literal(Value::Int(-n)),
+                Expr::Literal(Value::Decimal(n)) => Expr::Literal(Value::Decimal(-n)),
+                _ => {
+                    // Fold into a binary `0 - operand` to keep the AST simple.
+                    let left = arena.alloc(Expr::Literal(Value::Int(0)));
+                    let right = arena.alloc(operand);
+                    Expr::BinaryOp {
+                        left,
+                        op: BinOp::Sub,
+                        right,
+                    }
+                }
             }
         }
 
@@ -314,11 +325,8 @@ pub(super) fn parse_expr(
                 break;
             }
             cursor.next(); // consume `.`
-            let (field, field_hash) = match cursor.next() {
-                Some(Token::Ident(name)) => (
-                    interner.get_or_intern(name),
-                    crate::core::types::hash_field(name)
-                ),
+            let field = match cursor.next() {
+                Some(Token::Ident(name)) => interner.get_or_intern(name),
                 other => {
                     return Err(MizuError::ParseError(format!(
                         "expected field name after `.`, got: {other:?}"
@@ -326,6 +334,7 @@ pub(super) fn parse_expr(
                 }
             };
             let base = arena.alloc(lhs);
+            let field_hash = crate::core::types::hash_field(interner.resolve(field).unwrap_or(""));
             lhs = Expr::FieldAccess { base, field, field_hash };
             continue;
         }

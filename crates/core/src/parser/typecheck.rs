@@ -175,6 +175,7 @@ fn infer(
     match expr {
         Expr::Literal(val) => match val {
             crate::core::types::Value::Int(_) => Ok(Some(ValueType::Num)),
+            crate::core::types::Value::Decimal(_) => Ok(Some(ValueType::Num)),
             crate::core::types::Value::String(_) => Ok(Some(ValueType::Str)),
             crate::core::types::Value::Bool(_) => Ok(Some(ValueType::Bool)),
             crate::core::types::Value::List(_) => Ok(None),
@@ -472,7 +473,7 @@ mod tests {
 // zero-`kani::any()` harness that predates the investigation below — failed
 // to complete even after 3+ minutes in isolation, confirmed with a clean,
 // sequential CBMC run. That includes `infer` on the simplest possible input
-// (`Expr::Literal(Value::Int(n))`) with no symbolic branching over `Expr`'s
+// (`Expr::Literal(Value::Decimal(n))`) with no symbolic branching over `Expr`'s
 // own variants at all, so this isn't the same "self-referential enum"
 // bottleneck diagnosed and worked around in `parser::logic::eval`'s
 // `kani_proofs` module (see that module's doc comment for the full

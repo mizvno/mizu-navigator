@@ -42,7 +42,7 @@ use zeroize::{Zeroize, Zeroizing};
 type HmacSha256 = Hmac<Sha256>;
 
 use crate::core::errors::MizuError;
-use crate::core::types::{Value, from_json, to_json};
+use crate::core::types::{Value, from_json_slice, to_json};
 
 /// The single table definition for redb storage.
 /// Key: Variable name (`&str`)
@@ -460,20 +460,15 @@ impl StorageEngine {
             let blob = v.value();
 
             match decrypt_record(&self.master_key, key_str, blob) {
-                Ok(plaintext) => match serde_json::from_slice::<serde_json::Value>(&plaintext) {
-                    Ok(json) => match from_json(&json) {
-                        Ok(value) => {
-                            map.insert(key_str.to_string(), value);
-                        }
-                        Err(e) => tracing::warn!(
-                            "failed to convert json to Value for storage key '{}': {}",
-                            key_str,
-                            e
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::warn!("failed to decode json for storage key '{}': {}", key_str, e)
+                Ok(plaintext) => match crate::core::types::from_json_slice(&plaintext, true) {
+                    Ok(value) => {
+                        map.insert(key_str.to_string(), value);
                     }
+                    Err(e) => tracing::warn!(
+                        "failed to convert json to Value for storage key '{}': {}",
+                        key_str,
+                        e
+                    ),
                 },
                 Err(e) => tracing::warn!("failed to decrypt storage key '{}': {}", key_str, e),
             }
@@ -768,7 +763,7 @@ mod tests {
 
         let mut data: HashMap<String, Value> = HashMap::new();
         data.insert("hello".to_string(), Value::from("world"));
-        data.insert("answer".to_string(), Value::Int(42));
+        data.insert("answer".to_string(), Value::Decimal(42));
 
         engine
             .write_batch(data.iter().map(|(k, v)| (k.as_str(), v)))
@@ -777,7 +772,7 @@ mod tests {
         let read_data = engine.read_all().expect("read_all");
 
         assert_eq!(read_data.get("hello"), Some(&Value::from("world")));
-        assert_eq!(read_data.get("answer"), Some(&Value::Int(42)));
+        assert_eq!(read_data.get("answer"), Some(&Value::Decimal(42)));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -812,7 +807,7 @@ mod tests {
 
         const N: usize = 50;
         let keys: Vec<String> = (0..N).map(|i| format!("var_{i}")).collect();
-        let values: Vec<Value> = (0..N).map(|i| Value::Int(i as i64)).collect();
+        let values: Vec<Value> = (0..N).map(|i| Value::Decimal(i as i64)).collect();
         let records: Vec<(&str, &Value)> =
             keys.iter().map(String::as_str).zip(values.iter()).collect();
 
@@ -877,7 +872,7 @@ mod tests {
         // don't depth-check on the way in (only `from_json`, on the way out,
         // does), so this reproduces a record that was legitimately persisted
         // but can no longer be decoded back into a `Value`.
-        let mut deep = Value::Int(1);
+        let mut deep = Value::Decimal(1);
         for _ in 0..300 {
             deep = Value::List(std::sync::Arc::new(vec![deep]));
         }

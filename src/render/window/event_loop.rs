@@ -1799,7 +1799,7 @@ fn dispatch_redraw_requested(
     // Expose scroll state to the logic store
     tab.store.set_runtime(
         "root_scroll_y",
-        crate::core::types::Value::Int(
+        crate::core::types::Value::Decimal(
             (tab.root_scroll_offset_y as f64 * crate::core::types::DECIMAL_SCALE as f64).round()
                 as i64,
         ),

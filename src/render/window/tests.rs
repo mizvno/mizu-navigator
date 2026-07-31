@@ -979,9 +979,8 @@ fn cancelling_the_file_dialog_leaves_the_field_null() {
 
     match test_rx.try_recv() {
         Ok((_, crate::network::UiEvent::SubmitForm { fields, .. })) => {
-            assert_eq!(
-                fields.get("avatar"),
-                Some(&crate::core::types::Value::Null),
+            assert!(
+                fields.get("avatar").is_some_and(|v| v.budget_eq(&crate::core::types::Value::Null, &mut u64::MAX, u64::MAX).unwrap_or(false)),
                 "an unselected/cancelled file field must submit Null, not an error"
             );
         }

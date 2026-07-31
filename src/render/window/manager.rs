@@ -945,7 +945,7 @@ impl TabState {
         let ms = match interval {
             TimerInterval::Millis(ms) => *ms,
             TimerInterval::Variable(var_name) => match self.store.get(var_name).ok() {
-                Some(Value::Int(i)) => (*i / crate::core::types::DECIMAL_SCALE) as u64,
+                Some(Value::Decimal(i)) => (*i / crate::core::types::DECIMAL_SCALE) as u64,
                 _ => return None,
             },
         };

@@ -218,7 +218,7 @@ pub(super) async fn encode_multipart(value: &Value, boundary: &str) -> Result<Ve
         )?;
 
         match field_value {
-            Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Null => {
+            Value::Bool(_) | Value::Int(_) | Value::Decimal(_) | Value::String(_) | Value::Null => {
                 let text = match field_value {
                     Value::Null => String::new(),
                     other => other.to_string(),

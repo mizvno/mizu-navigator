@@ -1,6 +1,6 @@
 use super::{
     Evaluator, FileHandleData, StringInterner, Symbol, Value, VariableStore, compare_values,
-    field_value, from_json, to_json, variant_weight,
+    field_value, from_json_str, to_json, variant_weight,
 };
 use crate::core::errors::MizuError;
 use std::collections::HashMap;
@@ -50,14 +50,14 @@ fn list_display_empty() {
 
 #[test]
 fn list_display_single_element() {
-    let v = Value::List(std::sync::Arc::new(vec![Value::Int(super::DECIMAL_SCALE)]));
+    let v = Value::List(std::sync::Arc::new(vec![Value::Decimal(super::DECIMAL_SCALE)]));
     assert_eq!(v.to_string(), "[1]");
 }
 
 #[test]
 fn list_display_multiple_elements() {
     let v = Value::List(std::sync::Arc::new(vec![
-        Value::Int(super::DECIMAL_SCALE),
+        Value::Decimal(super::DECIMAL_SCALE),
         Value::String(std::sync::Arc::from("two")),
         Value::Bool(false),
     ]));
@@ -67,11 +67,11 @@ fn list_display_multiple_elements() {
 #[test]
 fn list_display_nested() {
     let inner = Value::List(std::sync::Arc::new(vec![
-        Value::Int(2 * super::DECIMAL_SCALE),
-        Value::Int(3 * super::DECIMAL_SCALE),
+        Value::Decimal(2 * super::DECIMAL_SCALE),
+        Value::Decimal(3 * super::DECIMAL_SCALE),
     ]));
     let outer = Value::List(std::sync::Arc::new(vec![
-        Value::Int(super::DECIMAL_SCALE),
+        Value::Decimal(super::DECIMAL_SCALE),
         inner,
     ]));
     assert_eq!(outer.to_string(), "[1, [2, 3]]");
@@ -80,11 +80,11 @@ fn list_display_nested() {
 #[test]
 fn store_set_and_get_int_scaled() {
     let mut store = VariableStore::new();
-    store.set("price", Value::Int(99_900));
+    store.set("price", Value::Decimal(99_900));
     let mut store = store.freeze();
     let result = store.get("price");
     assert!(result.is_ok());
-    assert_eq!(*result.unwrap(), Value::Int(99_900));
+    assert_eq!(*result.unwrap(), Value::Decimal(99_900));
 }
 
 #[test]
@@ -110,8 +110,8 @@ fn store_set_and_get_bool() {
 fn store_set_and_get_list() {
     let mut store = VariableStore::new();
     let list = Value::List(std::sync::Arc::new(vec![
-        Value::Int(10_000),
-        Value::Int(20_000),
+        Value::Decimal(10_000),
+        Value::Decimal(20_000),
     ]));
     store.set("items", list.clone());
     let mut store = store.freeze();
@@ -122,7 +122,7 @@ fn store_set_and_get_list() {
 fn store_set_convenience_into() {
     // `set` accepts any `impl Into<Value>`, so raw Rust types work directly.
     let mut store = VariableStore::new();
-    store.set("x", 7_i64);
+    store.set("x", Value::Int(7));
     store.set("greeting", "hi");
     store.set("active", false);
     let mut store = store.freeze();
@@ -137,8 +137,8 @@ fn store_set_convenience_into() {
 #[test]
 fn store_overwrite_binding() {
     let mut store = VariableStore::new();
-    store.set("count", 1_i64);
-    store.set("count", 2_i64);
+    store.set("count", Value::Int(1));
+    store.set("count", Value::Int(2));
     let mut store = store.freeze();
     assert_eq!(*store.get("count").unwrap(), Value::Int(2));
 }
@@ -146,8 +146,8 @@ fn store_overwrite_binding() {
 #[test]
 fn store_scope_chaining() {
     let mut store = VariableStore::new();
-    store.set("x", 10_i64);
-    store.set("y", 20_i64);
+    store.set("x", Value::Int(10));
+    store.set("y", Value::Int(20));
 
     let fp = store.evaluator.local_stack.len();
     let x_sym = store.interner.get_or_intern("x");
@@ -155,11 +155,11 @@ fn store_scope_chaining() {
     let z_sym = store.interner.get_or_intern("z");
     let mut store = store.freeze();
 
-    store.evaluator.push_local(x_sym, Value::from(15_i64));
+    store.evaluator.push_local(x_sym, Value::Int(15_));
 
     assert_eq!(
         *store.evaluator.get_local(x_sym, fp).unwrap(),
-        Value::from(15_i64)
+        Value::Int(15_)
     );
     assert!(store.evaluator.get_local(y_sym, fp).is_none());
     assert!(store.evaluator.get_local(z_sym, fp).is_none());
@@ -172,14 +172,14 @@ fn state_machine_get_local_o1_shadowing() {
     let x = interner.get_or_intern("x");
     let y = interner.get_or_intern("y");
 
-    sm.push_local(x, Value::Int(1));
+    sm.push_local(x, Value::Decimal(1));
     let outer_fp = sm.local_stack.len();
 
-    sm.push_local(x, Value::Int(2));
+    sm.push_local(x, Value::Decimal(2));
 
     assert_eq!(
         sm.get_local(x, outer_fp),
-        Some(&Value::Int(2)),
+        Some(&Value::Decimal(2)),
         "inner binding must shadow outer at frame_pointer={outer_fp}"
     );
     // y is not bound in any frame
@@ -188,7 +188,7 @@ fn state_machine_get_local_o1_shadowing() {
     sm.pop_local();
     assert_eq!(
         sm.get_local(x, 0),
-        Some(&Value::Int(1)),
+        Some(&Value::Decimal(1)),
         "after pop, outer x=1 must be visible from fp=0"
     );
     // But x is no longer visible from inner_fp (the binding index is below inner_fp)
@@ -215,11 +215,11 @@ fn state_machine_truncate_locals_removes_index_entries() {
     let b = interner.get_or_intern("b");
 
     let fp = sm.local_stack.len();
-    sm.push_local(a, Value::Int(10));
-    sm.push_local(b, Value::Int(20));
+    sm.push_local(a, Value::Decimal(10));
+    sm.push_local(b, Value::Decimal(20));
 
-    assert_eq!(sm.get_local(a, fp), Some(&Value::Int(10)));
-    assert_eq!(sm.get_local(b, fp), Some(&Value::Int(20)));
+    assert_eq!(sm.get_local(a, fp), Some(&Value::Decimal(10)));
+    assert_eq!(sm.get_local(b, fp), Some(&Value::Decimal(20)));
 
     sm.truncate_locals(fp);
 
@@ -268,9 +268,9 @@ fn store_new_and_default_are_equivalent() {
 
 #[test]
 fn json_object_becomes_record() {
-    let json: serde_json::Value = serde_json::from_str(r#"{"id":1,"name":"Neko"}"#).unwrap();
-    let val = from_json(&json).unwrap();
-    assert_eq!(val.get_field(crate::core::types::hash_field("id"), "id"), Some(&Value::Int(super::DECIMAL_SCALE)));
+    let json = serde_json::to_string(&serde_json::json!({"id":1,"name":"Neko"})).unwrap();
+    let val = from_json_str(&json).unwrap();
+    assert_eq!(val.get_field(crate::core::types::hash_field("id"), "id"), Some(&Value::Decimal(super::DECIMAL_SCALE)));
     assert_eq!(
         val.get_field(crate::core::types::hash_field("name"), "name"),
         Some(&Value::String(Arc::from("Neko")))
@@ -279,9 +279,9 @@ fn json_object_becomes_record() {
 
 #[test]
 fn json_array_of_objects() {
-    let json: serde_json::Value = serde_json::from_str(r#"[{"id":1},{"id":2}]"#).unwrap();
-    let val = from_json(&json).unwrap();
-    if let Value::List(items) = val {
+    let json = serde_json::to_string(&serde_json::json!([{"id":1},{"id":2}])).unwrap();
+    let val = from_json_str(&json).unwrap();
+    if let Value::List(ref items) = val {
         assert_eq!(items.len(), 2);
         assert!(
             matches!(items[0], Value::Record(_)),
@@ -298,8 +298,8 @@ fn json_array_of_objects() {
 
 #[test]
 fn json_string_passthrough() {
-    let json: serde_json::Value = serde_json::from_str(r#""hello""#).unwrap();
-    let val = from_json(&json).unwrap();
+    let json = serde_json::to_string(&serde_json::json!("hello")).unwrap();
+    let val = from_json_str(&json).unwrap();
     assert_eq!(val, Value::String(Arc::from("hello")));
 }
 
@@ -324,13 +324,13 @@ fn json_bool_becomes_value_bool() {
 #[test]
 fn json_integer_becomes_value_int() {
     let val = from_json(&serde_json::json!(42)).unwrap();
-    assert_eq!(val, Value::Int(42 * super::DECIMAL_SCALE));
+    assert_eq!(val, Value::Decimal(42 * super::DECIMAL_SCALE));
 }
 
 #[test]
 fn json_float_becomes_value_int() {
     let val = from_json(&serde_json::json!(3.14)).unwrap();
-    assert_eq!(val, Value::Int(314_000_000));
+    assert_eq!(val, Value::Decimal(314_000_000));
 }
 
 #[test]
@@ -340,26 +340,23 @@ fn json_integer_exact_path_avoids_float_precision_loss() {
     // not lose precision the way dividing through f64 unconditionally
     // used to.
     let val = from_json(&serde_json::json!(92_233_720_368_i64)).unwrap();
-    assert_eq!(val, Value::Int(92_233_720_368 * super::DECIMAL_SCALE));
+    assert_eq!(val, Value::Decimal(92_233_720_368 * super::DECIMAL_SCALE));
 }
 
 #[test]
-fn json_integer_exceeding_range_is_rejected_not_truncated() {
-    let val = from_json(&serde_json::json!(i64::MAX));
-    assert!(
-        matches!(val, Err(MizuError::SecurityViolation(_))),
-        "expected SecurityViolation for a JSON integer whose scaled value overflows i64, got: {val:?}"
-    );
+fn json_integer_parses_to_true_int_without_overflow() {
+    let val = from_json(&serde_json::json!(i64::MAX)).unwrap();
+    assert_eq!(val, Value::Int(i64::MAX));
 }
 
 #[test]
 fn json_roundtrip_exact_at_top_of_range() {
     // i64::MAX is the largest representable scaled value: exactly
     // 92233720368.54775807. Round-tripping it through to_json/from_json
-    // must recover the exact same Value::Int, pinning the from_json
+    // must recover the exact same Value::Decimal, pinning the from_json
     // exact-integer path and to_json's exact-integer emission against
     // silent precision loss at the top of the new 8-decimal-digit range.
-    let original = Value::Int(i64::MAX);
+    let original = Value::Decimal(i64::MAX);
     let json = to_json(&original).unwrap();
     let roundtripped = from_json(&json).unwrap();
     assert_eq!(roundtripped, original);
@@ -367,8 +364,8 @@ fn json_roundtrip_exact_at_top_of_range() {
 
 #[test]
 fn record_display_contains_fields() {
-    let json: serde_json::Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
-    let val = from_json(&json).unwrap();
+    let json = serde_json::to_string(&serde_json::json!({"x":1})).unwrap();
+    let val = from_json_str(&json).unwrap();
     let display = val.to_string();
     assert!(
         display.contains("x"),
@@ -396,7 +393,7 @@ fn from_json_depth_limit_returns_err() {
     // than silently clamped to Value::Null — a clamp would let a caller
     // mistake a malicious deeply-nested payload for legitimate absent
     // data.
-    let mut json = serde_json::json!(42_i64);
+    let mut json = serde_json::json!(42_);
     for _ in 0..300 {
         json = serde_json::json!([json]);
     }
@@ -430,7 +427,7 @@ fn from_json_shallow_nesting_parses_fully() {
     };
     assert_eq!(
         *leaf,
-        Value::Int(42 * super::DECIMAL_SCALE),
+        Value::Decimal(42 * super::DECIMAL_SCALE),
         "leaf must be Int(42 * DECIMAL_SCALE)"
     );
 }
@@ -438,7 +435,7 @@ fn from_json_shallow_nesting_parses_fully() {
 #[test]
 fn store_interpolate_string() {
     let mut store = VariableStore::new();
-    store.set("count", 42 * super::DECIMAL_SCALE);
+    store.set("count", Value::Decimal(42 * super::DECIMAL_SCALE));
     store.set("name", "Mizu");
     let mut store = store.freeze();
 
@@ -546,7 +543,7 @@ fn eval_field_access_on_non_record() {
 fn interpolate_dot_access() {
     let mut store = VariableStore::new();
     let mut map: Vec<(Arc<str>, Value)> = Vec::new();
-    map.push((Arc::from("age"), Value::Int(3 * super::DECIMAL_SCALE)));
+    map.push((Arc::from("age"), Value::Decimal(3 * super::DECIMAL_SCALE)));
     map.push((Arc::from("name"), Value::String(Arc::from("Neko"))));
     store.set("item", Value::record_from_unsorted(map));
     let mut store = store.freeze();
@@ -643,7 +640,7 @@ fn empty_overlay_is_identical_to_interpolate() {
     // An empty overlay must produce exactly the same result as a direct
     // `interpolate` call (the fast-path and overlay-path must agree).
     let mut store = VariableStore::new();
-    store.set("x", Value::Int(42));
+    store.set("x", Value::Decimal(42));
     let mut store = store.freeze();
 
     let overlay: HashMap<String, Value> = HashMap::new();
@@ -674,7 +671,7 @@ fn make_task_list() -> Value {
             let mut m: Vec<(Arc<str>, Value)> = Vec::new();
             m.push((Arc::from("done"), Value::Bool(*done)));
             m.push((Arc::from("name"), Value::String(Arc::from(*name))));
-            m.push((Arc::from("priority"), Value::Int(*priority)));
+            m.push((Arc::from("priority"), Value::Decimal(*priority)));
             Value::record_from_unsorted(m)
         })
         .collect();
@@ -724,7 +721,7 @@ fn test_filter_by_bool() {
         Expr::Literal(Value::Bool(true)),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 3);
@@ -748,7 +745,7 @@ fn test_filter_by_string() {
         Expr::Literal(Value::String(Arc::from("gamma"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 1);
@@ -770,10 +767,10 @@ fn test_filter_by_num() {
         Expr::Variable(tasks_sym),
         Expr::Literal(Value::String(Arc::from("priority"))),
         Expr::Literal(Value::String(Arc::from("eq"))),
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 3); // beta, delta, epsilon
@@ -791,10 +788,10 @@ fn test_filter_empty_result() {
         Expr::Variable(tasks_sym),
         Expr::Literal(Value::String(Arc::from("priority"))),
         Expr::Literal(Value::String(Arc::from("eq"))),
-        Expr::Literal(Value::Int(99)),
+        Expr::Literal(Value::Decimal(99)),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 0);
@@ -814,7 +811,7 @@ fn test_count_basic() {
         Expr::Literal(Value::Bool(false)),
     ];
     let result = eval_builtin(&mut store, "count", args).unwrap();
-    assert_eq!(result, Value::Int(2));
+    assert_eq!(result, Value::Decimal(2));
 }
 
 #[test]
@@ -831,13 +828,13 @@ fn test_sort_asc() {
         Expr::Literal(Value::String(Arc::from("asc"))),
     ];
     let result = eval_builtin(&mut store, "sort", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     let priorities: Vec<i64> = items
         .iter()
         .map(|item| {
-            if let Some(&Value::Int(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
+            if let Some(&Value::Decimal(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
                 p
             } else {
                 panic!()
@@ -861,13 +858,13 @@ fn test_sort_desc() {
         Expr::Literal(Value::String(Arc::from("desc"))),
     ];
     let result = eval_builtin(&mut store, "sort", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     let priorities: Vec<i64> = items
         .iter()
         .map(|item| {
-            if let Some(&Value::Int(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
+            if let Some(&Value::Decimal(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
                 p
             } else {
                 panic!()
@@ -891,7 +888,7 @@ fn test_sort_string() {
         Expr::Literal(Value::String(Arc::from("asc"))),
     ];
     let result = eval_builtin(&mut store, "sort", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     let names: Vec<String> = items
@@ -922,17 +919,17 @@ fn test_sort_direction_keyword_is_never_shadowed_by_a_real_variable() {
     // A real variable literally named `asc`, bound to a value that is
     // not `"asc"`/`"desc"` at all — if the old bug were still present in
     // spirit, this is the exact scenario it would have mishandled.
-    store.set("asc", Value::Int(999));
+    store.set("asc", Value::Decimal(999));
     let mut store = store.freeze();
 
     let result = eval_parsed(&mut store, r#"sort(tasks, "priority", asc)"#).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     let priorities: Vec<i64> = items
         .iter()
         .map(|item| match item.get_field(crate::core::types::hash_field("priority"), "priority") {
-            Some(&Value::Int(p)) => p,
+            Some(&Value::Decimal(p)) => p,
             _ => panic!(),
         })
         .collect();
@@ -945,7 +942,7 @@ fn test_sort_direction_keyword_is_never_shadowed_by_a_real_variable() {
 
     // The variable itself must still be untouched/unread by this call —
     // sort's third argument never becomes a variable lookup at all.
-    assert_eq!(store.get("asc").unwrap(), &Value::Int(999));
+    assert_eq!(store.get("asc").unwrap(), &Value::Decimal(999));
 }
 
 /// Parses `src` as a standalone expression through the real parser (so
@@ -988,10 +985,10 @@ fn test_filter_op_ne() {
         Expr::Variable(tasks_sym),
         Expr::Literal(Value::String(Arc::from("priority"))),
         Expr::Literal(Value::String(Arc::from("ne"))),
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 2, "alpha (3) and gamma (2) have priority != 1");
@@ -1012,7 +1009,7 @@ fn test_filter_op_lt() {
         Expr::Literal(Value::String(Arc::from("delta"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 2, "alpha, beta < \"delta\" lexicographically");
@@ -1033,7 +1030,7 @@ fn test_filter_op_le() {
         Expr::Literal(Value::String(Arc::from("delta"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 3, "alpha, beta, delta <= \"delta\"");
@@ -1054,7 +1051,7 @@ fn test_filter_op_gt() {
         Expr::Literal(Value::String(Arc::from("delta"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(
@@ -1079,7 +1076,7 @@ fn test_filter_op_ge() {
         Expr::Literal(Value::String(Arc::from("delta"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 3, "delta, gamma, epsilon >= \"delta\"");
@@ -1100,7 +1097,7 @@ fn test_filter_op_contains() {
         Expr::Literal(Value::String(Arc::from("am"))),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 1, "only \"gamma\" contains \"am\"");
@@ -1125,7 +1122,7 @@ fn test_filter_three_argument_form_still_behaves_as_eq() {
     let four_arg = eval_parsed(&mut store, r#"filter(tasks, "done", eq, true)"#).unwrap();
     assert_eq!(three_arg, four_arg);
 
-    let Value::List(items) = three_arg else {
+    let Value::List(ref items) = three_arg else {
         panic!("expected list")
     };
     assert_eq!(items.len(), 3, "alpha, gamma, epsilon have done = true");
@@ -1135,7 +1132,7 @@ fn test_filter_three_argument_form_still_behaves_as_eq() {
 fn test_filter_on_non_list() {
     use crate::parser::logic::Expr;
     let mut store = VariableStore::new();
-    store.set("not_a_list", Value::Int(42));
+    store.set("not_a_list", Value::Decimal(42));
     let sym = store.interner.get_or_intern("not_a_list");
     store.interner.get_or_intern("filter");
     let mut store = store.freeze();
@@ -1154,7 +1151,7 @@ fn make_large_list(n: usize) -> Value {
     let items: Vec<Value> = (0..n)
         .map(|i| {
             let mut m: Vec<(Arc<str>, Value)> = Vec::new();
-            m.push((Arc::from("v"), Value::Int(i as i64)));
+            m.push((Arc::from("v"), Value::Decimal(i as i64)));
             Value::record_from_unsorted(m)
         })
         .collect();
@@ -1173,7 +1170,7 @@ fn test_filter_large_list_triggers_timeout() {
         Expr::Variable(sym),
         Expr::Literal(Value::String(Arc::from("v"))),
         Expr::Literal(Value::String(Arc::from("eq"))),
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
     ];
     let result = eval_builtin(&mut store, "filter", args);
     assert!(
@@ -1193,7 +1190,7 @@ fn test_count_large_list_triggers_timeout() {
     let args = vec![
         Expr::Variable(sym),
         Expr::Literal(Value::String(Arc::from("v"))),
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
     ];
     let result = eval_builtin(&mut store, "count", args);
     assert!(
@@ -1299,7 +1296,7 @@ fn test_filter_small_list_still_works() {
         Expr::Literal(Value::Bool(true)),
     ];
     let result = eval_builtin(&mut store, "filter", args).unwrap();
-    let Value::List(items) = result else {
+    let Value::List(ref items) = result else {
         panic!("expected list")
     };
     assert_eq!(
@@ -1322,7 +1319,7 @@ fn test_length_of_list() {
     store.interner.get_or_intern("length");
     let mut store = store.freeze();
     let result = eval_builtin(&mut store, "length", vec![Expr::Variable(tasks_sym)]).unwrap();
-    assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -1335,7 +1332,7 @@ fn test_length_of_string_counts_chars_not_bytes() {
     // — proves this counts chars, not bytes.
     let args = vec![Expr::Literal(Value::String(Arc::from("héllo")))];
     let result = eval_builtin(&mut store, "length", args).unwrap();
-    assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -1344,7 +1341,7 @@ fn test_length_type_error() {
     let mut store = VariableStore::new();
     store.interner.get_or_intern("length");
     let mut store = store.freeze();
-    let args = vec![Expr::Literal(Value::Int(1))];
+    let args = vec![Expr::Literal(Value::Decimal(1))];
     let result = eval_builtin(&mut store, "length", args);
     assert!(matches!(result, Err(MizuError::TypeError { .. })));
 }
@@ -1372,7 +1369,7 @@ fn test_to_string_int() {
     let mut store = store.freeze();
     // 3.5 in fixed-point representation.
     let n = 3 * crate::core::types::DECIMAL_SCALE + crate::core::types::DECIMAL_SCALE / 2;
-    let args = vec![Expr::Literal(Value::Int(n))];
+    let args = vec![Expr::Literal(Value::Decimal(n))];
     let result = eval_builtin(&mut store, "to_string", args).unwrap();
     assert_eq!(result, Value::String(Arc::from("3.5")));
 }
@@ -1446,7 +1443,7 @@ fn test_contains_type_error() {
     store.interner.get_or_intern("contains");
     let mut store = store.freeze();
     let args = vec![
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
         Expr::Literal(Value::String(Arc::from("x"))),
     ];
     let result = eval_builtin(&mut store, "contains", args);
@@ -1474,7 +1471,7 @@ fn test_contains_large_haystack_triggers_timeout() {
 /// The first record in `make_task_list()`'s underlying list.
 fn first_task_record() -> Value {
     match make_task_list() {
-        Value::List(items) => items[0].clone(),
+        Value::List(ref items) => items[0].clone(),
         _ => panic!("expected list"),
     }
 }
@@ -1514,7 +1511,7 @@ fn test_has_field_type_error() {
     store.interner.get_or_intern("has_field");
     let mut store = store.freeze();
     let args = vec![
-        Expr::Literal(Value::Int(1)),
+        Expr::Literal(Value::Decimal(1)),
         Expr::Literal(Value::String(Arc::from("field"))),
     ];
     let result = eval_builtin(&mut store, "has_field", args);
@@ -1602,13 +1599,13 @@ fn test_strict_weak_ordering_heterogeneous() {
         // score: Int(10)  — variant weight 3
         {
             let mut m: Vec<(Arc<str>, Value)> = Vec::new();
-            m.push((Arc::from("score"), Value::Int(10)));
+            m.push((Arc::from("score"), Value::Decimal(10)));
             Value::record_from_unsorted(m)
         },
         // score: Int(1)  — variant weight 3, lower numeric value
         {
             let mut m: Vec<(Arc<str>, Value)> = Vec::new();
-            m.push((Arc::from("score"), Value::Int(1)));
+            m.push((Arc::from("score"), Value::Decimal(1)));
             Value::record_from_unsorted(m)
         },
     ];
@@ -1623,7 +1620,7 @@ fn test_strict_weak_ordering_heterogeneous() {
         .map(|item| {
             item.get_field(crate::core::types::hash_field("score"), "score")
                 .map(|v| match v {
-                    Value::Int(n) => n.to_string(),
+                    Value::Decimal(n) => n.to_string(),
                     Value::String(s) => s.to_string(),
                     _ => "?".to_string(),
                 })
@@ -1642,8 +1639,8 @@ fn test_strict_weak_ordering_heterogeneous() {
 fn test_variant_weight_ordering() {
     // None < Null < Bool < Int < String < List < Record
     assert!(variant_weight(&Value::Null) < variant_weight(&Value::Bool(true)));
-    assert!(variant_weight(&Value::Bool(true)) < variant_weight(&Value::Int(0)));
-    assert!(variant_weight(&Value::Int(0)) < variant_weight(&Value::String(Arc::from(""))));
+    assert!(variant_weight(&Value::Bool(true)) < variant_weight(&Value::Decimal(0)));
+    assert!(variant_weight(&Value::Decimal(0)) < variant_weight(&Value::String(Arc::from(""))));
     assert!(
         variant_weight(&Value::String(Arc::from("")))
             < variant_weight(&Value::List(Arc::new(vec![])))
@@ -1658,9 +1655,9 @@ fn test_variant_weight_ordering() {
 fn test_none_is_less_than_some() {
     use std::cmp::Ordering;
     assert_eq!(compare_values(None, Some(&Value::Null)), Ordering::Less);
-    assert_eq!(compare_values(None, Some(&Value::Int(0))), Ordering::Less);
+    assert_eq!(compare_values(None, Some(&Value::Decimal(0))), Ordering::Less);
     assert_eq!(
-        compare_values(Some(&Value::Int(0)), None),
+        compare_values(Some(&Value::Decimal(0)), None),
         Ordering::Greater
     );
     assert_eq!(compare_values(None::<&Value>, None), Ordering::Equal);
@@ -1684,10 +1681,10 @@ fn eval_depth_guard() {
             // The parser would reject this before evaluation, so we bypass
             // it to test the evaluator's own depth guard directly.
             let mut arena = ExprArena::new();
-            let mut ast = Expr::Literal(Value::Int(0));
+            let mut ast = Expr::Literal(Value::Decimal(0));
             for _ in 0..300 {
                 let left = arena.alloc(ast);
-                let right = arena.alloc(Expr::Literal(Value::Int(0)));
+                let right = arena.alloc(Expr::Literal(Value::Decimal(0)));
                 ast = Expr::BinaryOp {
                     left,
                     op: BinOp::Add,
@@ -1827,7 +1824,7 @@ fn run_cross_function_composition_scenario(ok_marker: &str) {
     let mut body = Expr::Variable(param);
     for _ in 0..250 {
         let left = body_arena.alloc(body);
-        let right = body_arena.alloc(Expr::Literal(Value::Int(0)));
+        let right = body_arena.alloc(Expr::Literal(Value::Decimal(0)));
         body = Expr::BinaryOp {
             left,
             op: BinOp::Add,
@@ -1851,7 +1848,7 @@ fn run_cross_function_composition_scenario(ok_marker: &str) {
     // MAX_PARSE_DEPTH, but composed at evaluation time they exceed
     // MAX_EVAL_DEPTH (256).
     let mut call_arena = ExprArena::new();
-    let arg0 = call_arena.alloc(Expr::Literal(Value::Int(1)));
+    let arg0 = call_arena.alloc(Expr::Literal(Value::Decimal(1)));
     let (args_start, args_len) = call_arena.push_args(&[arg0]).unwrap();
     let mut call_site = Expr::FunctionCall {
         name: func_sym,
@@ -1860,7 +1857,7 @@ fn run_cross_function_composition_scenario(ok_marker: &str) {
     };
     for _ in 0..20 {
         let left = call_arena.alloc(call_site);
-        let right = call_arena.alloc(Expr::Literal(Value::Int(0)));
+        let right = call_arena.alloc(Expr::Literal(Value::Decimal(0)));
         call_site = Expr::BinaryOp {
             left,
             op: BinOp::Add,
@@ -1998,10 +1995,10 @@ fn run_stack_measurement_child(stack_size: usize, ok_marker: &str) {
         .stack_size(stack_size)
         .spawn(|| {
             let mut arena = ExprArena::new();
-            let mut ast = Expr::Literal(Value::Int(0));
+            let mut ast = Expr::Literal(Value::Decimal(0));
             for _ in 0..300 {
                 let left = arena.alloc(ast);
-                let right = arena.alloc(Expr::Literal(Value::Int(0)));
+                let right = arena.alloc(Expr::Literal(Value::Decimal(0)));
                 ast = Expr::BinaryOp {
                     left,
                     op: BinOp::Add,
@@ -2112,8 +2109,8 @@ fn frozen_clone_resolves_every_symbol_identically() {
 #[test]
 fn compare_lists_equal_content() {
     use std::cmp::Ordering;
-    let a = Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)]));
-    let b = Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)]));
+    let a = Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(2)]));
+    let b = Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(2)]));
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Equal);
 }
 
@@ -2121,8 +2118,8 @@ fn compare_lists_equal_content() {
 fn compare_lists_lexicographic() {
     use std::cmp::Ordering;
     // [1, 3] > [1, 2]
-    let a = Value::List(Arc::new(vec![Value::Int(1), Value::Int(3)]));
-    let b = Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)]));
+    let a = Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(3)]));
+    let b = Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(2)]));
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Greater);
     assert_eq!(compare_values(Some(&b), Some(&a)), Ordering::Less);
 }
@@ -2131,8 +2128,8 @@ fn compare_lists_lexicographic() {
 fn compare_lists_shorter_less_than_longer() {
     use std::cmp::Ordering;
     // [1] < [1, 2] (prefix match, shorter is Less)
-    let shorter = Value::List(Arc::new(vec![Value::Int(1)]));
-    let longer = Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)]));
+    let shorter = Value::List(Arc::new(vec![Value::Decimal(1)]));
+    let longer = Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(2)]));
     assert_eq!(
         compare_values(Some(&shorter), Some(&longer)),
         Ordering::Less
@@ -2155,9 +2152,9 @@ fn compare_empty_lists_equal() {
 fn sort_list_of_lists_is_deterministic() {
     // Sorting [[3], [1,2], [1], []] must produce a stable lexicographic order.
     let mut lists = vec![
-        Value::List(Arc::new(vec![Value::Int(3)])),
-        Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
-        Value::List(Arc::new(vec![Value::Int(1)])),
+        Value::List(Arc::new(vec![Value::Decimal(3)])),
+        Value::List(Arc::new(vec![Value::Decimal(1), Value::Decimal(2)])),
+        Value::List(Arc::new(vec![Value::Decimal(1)])),
         Value::List(Arc::new(vec![])),
     ];
     lists.sort_by(|a, b| compare_values(Some(a), Some(b)));
@@ -2175,7 +2172,7 @@ fn sort_list_of_lists_is_deterministic() {
     assert_eq!(lengths, vec![0, 1, 2, 1]);
     // Verify the last element is [3].
     if let Value::List(last) = lists.last().unwrap() {
-        assert_eq!(last.as_slice(), &[Value::Int(3)]);
+        assert_eq!(last.as_slice(), &[Value::Decimal(3)]);
     } else {
         panic!("last element must be a List");
     }
@@ -2185,9 +2182,9 @@ fn sort_list_of_lists_is_deterministic() {
 fn compare_records_equal_content() {
     use std::cmp::Ordering;
     let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
-    ma.push((Arc::from("x"), Value::Int(1)));
+    ma.push((Arc::from("x"), Value::Decimal(1)));
     let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
-    mb.push((Arc::from("x"), Value::Int(1)));
+    mb.push((Arc::from("x"), Value::Decimal(1)));
     let a = Value::record_from_unsorted(ma);
     let b = Value::record_from_unsorted(mb);
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Equal);
@@ -2198,9 +2195,9 @@ fn compare_records_same_keys() {
     use std::cmp::Ordering;
     // { x: 1 } < { x: 2 }
     let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
-    ma.push((Arc::from("x"), Value::Int(1)));
+    ma.push((Arc::from("x"), Value::Decimal(1)));
     let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
-    mb.push((Arc::from("x"), Value::Int(2)));
+    mb.push((Arc::from("x"), Value::Decimal(2)));
     let a = Value::record_from_unsorted(ma);
     let b = Value::record_from_unsorted(mb);
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
@@ -2212,9 +2209,9 @@ fn compare_records_by_key_name() {
     use std::cmp::Ordering;
     // { a: 1 } < { b: 1 } because "a" < "b"
     let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
-    ma.push((Arc::from("a"), Value::Int(1)));
+    ma.push((Arc::from("a"), Value::Decimal(1)));
     let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
-    mb.push((Arc::from("b"), Value::Int(1)));
+    mb.push((Arc::from("b"), Value::Decimal(1)));
     let a = Value::record_from_unsorted(ma);
     let b = Value::record_from_unsorted(mb);
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
@@ -2225,10 +2222,10 @@ fn compare_records_shorter_less_than_longer() {
     use std::cmp::Ordering;
     // { x: 1 } < { x: 1, y: 2 } (same keys up to len, shorter is Less)
     let mut ma: Vec<(Arc<str>, Value)> = Vec::new();
-    ma.push((Arc::from("x"), Value::Int(1)));
+    ma.push((Arc::from("x"), Value::Decimal(1)));
     let mut mb: Vec<(Arc<str>, Value)> = Vec::new();
-    mb.push((Arc::from("x"), Value::Int(1)));
-    mb.push((Arc::from("y"), Value::Int(2)));
+    mb.push((Arc::from("x"), Value::Decimal(1)));
+    mb.push((Arc::from("y"), Value::Decimal(2)));
     let a = Value::record_from_unsorted(ma);
     let b = Value::record_from_unsorted(mb);
     assert_eq!(compare_values(Some(&a), Some(&b)), Ordering::Less);
@@ -2244,7 +2241,7 @@ fn sort_records_by_single_field_via_compare_values() {
         .rev()
         .map(|i| {
             let mut m: Vec<(Arc<str>, Value)> = Vec::new();
-            m.push((Arc::from("v"), Value::Int(i)));
+            m.push((Arc::from("v"), Value::Decimal(i)));
             Value::record_from_unsorted(m)
         })
         .collect();
@@ -2253,7 +2250,7 @@ fn sort_records_by_single_field_via_compare_values() {
     let vals: Vec<i64> = records
         .iter()
         .map(|r| {
-            if let Some(&Value::Int(n)) = r.get_field(crate::core::types::hash_field("v"), "v") {
+            if let Some(&Value::Decimal(n)) = r.get_field(crate::core::types::hash_field("v"), "v") {
                 n
             } else {
                 panic!()
@@ -2265,6 +2262,11 @@ fn sort_records_by_single_field_via_compare_values() {
         vec![0, 1, 2, 3],
         "records must sort by their 'v' field"
     );
+}
+
+fn from_json(json: &serde_json::Value) -> Result<Value, MizuError> {
+    let s = serde_json::to_string(json).map_err(|e| MizuError::SecurityViolation(e.to_string()))?;
+    from_json_str(&s)
 }
 
 // ------------------------------------------------------------------
@@ -2289,8 +2291,8 @@ fn compare_records_btreemap_zero_alloc_sort() {
     let make = |a: i64, b: i64| {
         let mut m: Vec<(Arc<str>, Value)> = Vec::new();
         // Insert in reverse alphabetical order — BTreeMap must still iterate "alpha" first.
-        m.push((Arc::from("zeta"), Value::Int(b)));
-        m.push((Arc::from("alpha"), Value::Int(a)));
+        m.push((Arc::from("zeta"), Value::Decimal(b)));
+        m.push((Arc::from("alpha"), Value::Decimal(a)));
         m.sort_by(|x, y| x.0.cmp(&y.0));
         Value::record_from_unsorted(m)
     };
@@ -2311,7 +2313,7 @@ fn compare_records_btreemap_zero_alloc_sort() {
     let alpha_vals: Vec<i64> = records
         .iter()
         .map(|r| {
-            if let Some(&Value::Int(n)) = r.get_field(crate::core::types::hash_field("alpha"), "alpha") {
+            if let Some(&Value::Decimal(n)) = r.get_field(crate::core::types::hash_field("alpha"), "alpha") {
                 n
             } else {
                 panic!()
@@ -2349,11 +2351,11 @@ fn interner_clone_symbols_are_identical() {
 #[test]
 fn set_runtime_updates_known_variable() {
     let mut store = VariableStore::new();
-    store.set("price", Value::Int(10));
+    store.set("price", Value::Decimal(10));
     let mut store = store.freeze();
 
-    store.set_runtime("price", Value::Int(99));
-    assert_eq!(*store.get("price").unwrap(), Value::Int(99));
+    store.set_runtime("price", Value::Decimal(99));
+    assert_eq!(*store.get("price").unwrap(), Value::Decimal(99));
 }
 
 /// `set_runtime` silently discards names that are not in the frozen interner,
@@ -2361,12 +2363,12 @@ fn set_runtime_updates_known_variable() {
 #[test]
 fn set_runtime_discards_unknown_names_and_does_not_grow_interner() {
     let mut store = VariableStore::new();
-    store.set("declared", Value::Int(1));
+    store.set("declared", Value::Decimal(1));
     let mut store = store.freeze();
 
     let interned_count = store.interner.vec.len();
 
-    store.set_runtime("undeclared_field", Value::Int(42));
+    store.set_runtime("undeclared_field", Value::Decimal(42));
     store.set_runtime("another_unknown", Value::from("hello"));
 
     // Interner must not have grown.
@@ -2404,7 +2406,7 @@ fn frozen_clone_cannot_diverge_symbol_ids() {
     let mut worker_store = VariableStore::with_interner(worker_interner);
 
     // set_runtime does NOT intern "runtime_var".
-    worker_store.set_runtime("runtime_var", Value::Int(7));
+    worker_store.set_runtime("runtime_var", Value::Decimal(7));
     assert!(worker_store.get("runtime_var").is_err());
 
     // Symbol table size on both sides is still identical.
@@ -2428,16 +2430,11 @@ fn file_handle(filename: &str) -> Value {
 }
 
 #[test]
-fn file_handle_never_equals_anything_including_itself() {
+fn file_handle_pointer_equality() {
     let a = file_handle("avatar.png");
-    // Compare against a fresh clone of the *same* Arc allocation, not
-    // just an equivalent one, to make sure this isn't accidentally
-    // pointer-equality-based.
+    // Pointer equality is used for FileHandle to preserve PartialEq reflexivity
     let a2 = a.clone();
-    assert_ne!(
-        a, a2,
-        "a FileHandle must never compare equal, even to itself"
-    );
+    assert_eq!(a, a2, "Cloned file handles should be equal via pointer equality");
 
     let b = file_handle("avatar.png"); // same filename, distinct handle
     assert_ne!(a, b);

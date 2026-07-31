@@ -57,7 +57,8 @@ pub struct ReloadPayload {
 }
 
 /// A compile-timeâ€“validated HTTP network request produced by `GET(â€¦)` / `POST(â€¦)` / etc.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct NetworkRequest {
     /// Interned symbol (as a raw `u32`) of the endpoint alias to resolve.
     pub endpoint_symbol: u32,
@@ -76,7 +77,8 @@ pub struct NetworkRequest {
 }
 
 /// Declarative runtime actions executed by the Main Thread.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum RuntimeAction {
     /// No-op placeholder (e.g. an unresolved alias, or a discarded action).
     None,

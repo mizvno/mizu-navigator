@@ -10,7 +10,7 @@ use crate::core::types::{Symbol, Value};
 /// and accept any runtime value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
-    /// Corresponds to the `num` keyword — maps to [`Value::Int`] or [`Value::Float`].
+    /// Corresponds to the `num` keyword — maps to [`Value::Int`] or [`Value::Decimal`].
     Num,
     /// Corresponds to the `string` keyword — maps to [`Value::String`].
     Str,
@@ -143,7 +143,8 @@ impl PayloadFormat {
 /// Syntax: `timer <interval> -> <action>`
 ///
 /// Example: `timer 500ms -> count = count + 1`
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct RootTimer {
     /// How often the action fires.
     pub interval: TimerInterval,
@@ -152,7 +153,8 @@ pub struct RootTimer {
 }
 
 /// A timer interval, either a literal millisecond count or a variable name.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum TimerInterval {
     /// A constant interval in milliseconds (e.g. `500ms` → `500`).
     Millis(u64),
@@ -207,7 +209,8 @@ pub struct ExprId(u32);
 /// did not come from *this* arena (e.g. one from a different function's
 /// arena) is a logic error — see [`ExprTree`], which pairs a root `ExprId`
 /// with the arena it belongs to so the two are never separated.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ExprArena {
     nodes: Vec<Expr>,
     /// Shared backing storage for every `FunctionCall`'s argument list in
@@ -298,7 +301,8 @@ impl std::ops::Index<ExprId> for ExprArena {
 /// `Action::Eval`'s payload, `ComputedBinding::expr`, ...) now holds one of
 /// these instead, so the root and its arena travel together and can never
 /// be paired with the wrong arena.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ExprTree {
     /// Every node in this tree.
     pub arena: ExprArena,
@@ -331,7 +335,8 @@ impl ExprTree {
 /// `Vec`/`Box<[ExprId]>` — a per-call collection would otherwise hit the
 /// global allocator once per call with arguments, on top of whatever the
 /// arena itself already amortizes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum Expr {
     /// A compile-time constant literal.
     Literal(Value),
@@ -408,13 +413,14 @@ pub enum Expr {
         base: ExprId,
         /// The field name to look up in the record.
         field: Symbol,
-        /// The precomputed 32-bit hash of the field name for O(log N) lookup.
+        /// Precomputed FNV-1a hash of the field name to accelerate runtime lookups.
         field_hash: u32,
     },
 }
 
 /// An interactive action triggered by an event.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum Action {
     /// An expression evaluated for its effects (e.g., calling a procedure).
     Eval(ExprTree),
@@ -501,9 +507,9 @@ mod tests {
     #[test]
     fn push_args_then_args_round_trips_exactly() {
         let mut arena = ExprArena::new();
-        let a = arena.alloc(Expr::Literal(Value::Int(1)));
-        let b = arena.alloc(Expr::Literal(Value::Int(2)));
-        let c = arena.alloc(Expr::Literal(Value::Int(3)));
+        let a = arena.alloc(Expr::Literal(Value::Decimal(1)));
+        let b = arena.alloc(Expr::Literal(Value::Decimal(2)));
+        let c = arena.alloc(Expr::Literal(Value::Decimal(3)));
         let (start, len) = arena.push_args(&[a, b, c]).unwrap();
         assert_eq!(arena.args(start, len), &[a, b, c]);
     }
@@ -521,8 +527,8 @@ mod tests {
         // each resolve back to exactly their own arguments -- proving the
         // shared pool doesn't let one call's args bleed into another's.
         let mut arena = ExprArena::new();
-        let x = arena.alloc(Expr::Literal(Value::Int(10)));
-        let y = arena.alloc(Expr::Literal(Value::Int(20)));
+        let x = arena.alloc(Expr::Literal(Value::Decimal(10)));
+        let y = arena.alloc(Expr::Literal(Value::Decimal(20)));
         let (start1, len1) = arena.push_args(&[x]).unwrap();
         let (start2, len2) = arena.push_args(&[y, x]).unwrap();
         assert_eq!(arena.args(start1, len1), &[x]);
@@ -535,7 +541,7 @@ mod tests {
         // not its own collection -- resolving it through the arena must
         // recover the exact argument ExprIds that were pushed.
         let mut arena = ExprArena::new();
-        let arg0 = arena.alloc(Expr::Literal(Value::Int(42)));
+        let arg0 = arena.alloc(Expr::Literal(Value::Decimal(42)));
         let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
         let call = Expr::FunctionCall {
             name: Symbol(0),

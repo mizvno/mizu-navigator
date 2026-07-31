@@ -52,7 +52,7 @@ pub(super) struct SerializedRequestBody {
 ///   `Value` → `serde_json::Value` conversion and serialises that
 ///   intermediate representation as YAML instead of JSON.
 /// * `Text` — the payload must be exactly [`Value::String`]; anything else
-///   (including [`Value::Int`]) is rejected rather than implicitly
+///   (including [`Value::Decimal`]) is rejected rather than implicitly
 ///   stringified.
 /// * `Form` — the payload must be a flat [`Value::Record`] of scalar
 ///   (`Bool`/`Int`/`String`/`Null`) fields, percent-encoded via the `url`
@@ -118,7 +118,7 @@ fn serialize_form(value: &Value) -> Result<Vec<u8>, MizuError> {
         let key = &field.key;
         let field_value = &field.value;
         let encoded_value = match field_value {
-            Value::Bool(_) | Value::Int(_) | Value::String(_) => field_value.to_string(),
+            Value::Bool(_) | Value::Int(_) | Value::Decimal(_) | Value::String(_) => field_value.to_string(),
             Value::Null => String::new(),
             Value::List(_) | Value::Record(_) => {
                 return Err(MizuError::ExecutionError(format!(
@@ -168,7 +168,7 @@ mod tests {
                 .await
                 .is_ok()
         );
-        let err = serialize_payload(&Value::Int(100_000_000), PayloadFormat::Text)
+        let err = serialize_payload(&Value::Decimal(100_000_000), PayloadFormat::Text)
             .await
             .unwrap_err();
         assert!(matches!(err, MizuError::ExecutionError(_)));
@@ -178,7 +178,7 @@ mod tests {
     async fn form_encodes_scalars_and_rejects_nested() {
         let value = record(vec![
             ("q", Value::from("a b&c=d".to_string())),
-            ("n", Value::Int(150_000_000)), // 1.5 scaled
+            ("n", Value::Decimal(150_000_000)), // 1.5 scaled
             ("ok", Value::Bool(true)),
         ]);
         let got = serialize_payload(&value, PayloadFormat::Form)
@@ -190,7 +190,7 @@ mod tests {
         assert!(s.contains("ok=true"));
         assert_eq!(got.content_type, "application/x-www-form-urlencoded");
 
-        let nested = record(vec![("bad", Value::List(Arc::new(vec![Value::Int(1)])))]);
+        let nested = record(vec![("bad", Value::List(Arc::new(vec![Value::Decimal(1)])))]);
         let err = serialize_payload(&nested, PayloadFormat::Form)
             .await
             .unwrap_err();
@@ -209,7 +209,7 @@ mod tests {
     async fn yaml_round_trips_through_json_intermediate() {
         let value = record(vec![
             ("name", Value::from("mizu".to_string())),
-            ("count", Value::Int(300_000_000)),
+            ("count", Value::Decimal(300_000_000)),
         ]);
         let got = serialize_payload(&value, PayloadFormat::Yaml)
             .await

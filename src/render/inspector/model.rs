@@ -376,7 +376,7 @@ fn style_rows(src: &InspectorSources<'_>, state: &InspectorState) -> Vec<Row> {
                         0,
                     );
                     let (label, kind) = match result {
-                        Ok(Value::String(s)) => (format!(".{s}"), RowKind::Good),
+                        Ok(Value::String(ref s)) => (format!(".{s}"), RowKind::Good),
                         Ok(_) => ("<non-string result>".to_string(), RowKind::Bad),
                         Err(_) => ("<error>".to_string(), RowKind::Bad),
                     };

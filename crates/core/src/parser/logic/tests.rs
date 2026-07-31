@@ -61,7 +61,7 @@ fn parse_inline_function_no_args() {
     let f = &fns[&pi_sym];
     assert!(f.params.is_empty());
     // 3.14159 * DECIMAL_SCALE, rounded.
-    assert_eq!(*f.body.root(), Expr::Literal(Value::Int(314_159_000)));
+    assert_eq!(*f.body.root(), Expr::Literal(Value::Decimal(314_159_000)));
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn pratt_mul_before_add() {
     )
     .unwrap();
     // 2 + 12 = 14
-    assert_eq!(result, Value::Int(14 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(14 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn pratt_parentheses_override_precedence() {
         &fns,
     )
     .unwrap();
-    assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(20 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn pratt_left_associativity_subtraction() {
         &fns,
     )
     .unwrap();
-    assert_eq!(result, Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn pratt_left_associativity_division() {
         &fns,
     )
     .unwrap();
-    assert_eq!(result, Value::Int(1 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(1 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn pratt_complex_expression() {
         &fns,
     )
     .unwrap();
-    assert_eq!(result, Value::Int(9 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(9 * crate::core::types::DECIMAL_SCALE));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -272,13 +272,13 @@ fn pratt_complex_expression() {
 
 #[test]
 fn evaluate_literal_num() {
-    let expr = Expr::Literal(Value::Int(420_000));
+    let expr = Expr::Literal(Value::Decimal(420_000));
     let arena = ExprArena::new();
     let store = Rc::new(VariableStore::new().freeze());
     let fns = FxHashMap::default();
     assert_eq!(
         evaluate(&expr, &arena, &store, &fns).unwrap(),
-        Value::Int(420_000)
+        Value::Decimal(420_000)
     );
 }
 
@@ -297,7 +297,7 @@ fn evaluate_literal_bool() {
 #[test]
 fn evaluate_variable_lookup() {
     let mut store = VariableStore::new();
-    store.set("x", 70_000_i64);
+    store.set("x", Value::Int(70_000));
     let mut store = store.freeze();
     let x_sym = store.interner.get("x").unwrap();
     let store = Rc::new(store);
@@ -313,8 +313,8 @@ fn evaluate_variable_lookup() {
 #[test]
 fn evaluate_addition() {
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(30_000)));
-    let right = arena.alloc(Expr::Literal(Value::Int(40_000)));
+    let left = arena.alloc(Expr::Literal(Value::Decimal(30_000)));
+    let right = arena.alloc(Expr::Literal(Value::Decimal(40_000)));
     let expr = Expr::BinaryOp {
         left,
         op: BinOp::Add,
@@ -324,15 +324,15 @@ fn evaluate_addition() {
     let fns = FxHashMap::default();
     assert_eq!(
         evaluate(&expr, &arena, &store, &fns).unwrap(),
-        Value::Int(70_000)
+        Value::Decimal(70_000)
     );
 }
 
 #[test]
 fn evaluate_subtraction() {
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(100_000)));
-    let right = arena.alloc(Expr::Literal(Value::Int(35_000)));
+    let left = arena.alloc(Expr::Literal(Value::Decimal(100_000)));
+    let right = arena.alloc(Expr::Literal(Value::Decimal(35_000)));
     let expr = Expr::BinaryOp {
         left,
         op: BinOp::Sub,
@@ -342,7 +342,7 @@ fn evaluate_subtraction() {
     let fns = FxHashMap::default();
     assert_eq!(
         evaluate(&expr, &arena, &store, &fns).unwrap(),
-        Value::Int(65_000)
+        Value::Decimal(65_000)
     );
 }
 
@@ -350,10 +350,10 @@ fn evaluate_subtraction() {
 fn evaluate_multiplication() {
     // 6 * 7 = 42
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(
+    let left = arena.alloc(Expr::Literal(Value::Decimal(
         6 * crate::core::types::DECIMAL_SCALE,
     )));
-    let right = arena.alloc(Expr::Literal(Value::Int(
+    let right = arena.alloc(Expr::Literal(Value::Decimal(
         7 * crate::core::types::DECIMAL_SCALE,
     )));
     let expr = Expr::BinaryOp {
@@ -365,7 +365,7 @@ fn evaluate_multiplication() {
     let fns = FxHashMap::default();
     assert_eq!(
         evaluate(&expr, &arena, &store, &fns).unwrap(),
-        Value::Int(42 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(42 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -373,10 +373,10 @@ fn evaluate_multiplication() {
 fn evaluate_division() {
     // 15 / 3 = 5
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(
+    let left = arena.alloc(Expr::Literal(Value::Decimal(
         15 * crate::core::types::DECIMAL_SCALE,
     )));
-    let right = arena.alloc(Expr::Literal(Value::Int(
+    let right = arena.alloc(Expr::Literal(Value::Decimal(
         3 * crate::core::types::DECIMAL_SCALE,
     )));
     let expr = Expr::BinaryOp {
@@ -388,7 +388,7 @@ fn evaluate_division() {
     let fns = FxHashMap::default();
     assert_eq!(
         evaluate(&expr, &arena, &store, &fns).unwrap(),
-        Value::Int(5 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(5 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -418,10 +418,10 @@ fn evaluate_inline_function_call() {
     let (fns, interner) = single_fn(src).unwrap();
     let vat_sym = interner.get("vat").unwrap();
     let mut store = VariableStore::with_interner(interner.freeze());
-    store.set_runtime("p", 100 * crate::core::types::DECIMAL_SCALE);
+    store.set_runtime("p", Value::Decimal(100 * crate::core::types::DECIMAL_SCALE));
     let store = Rc::new(store);
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(
         100 * crate::core::types::DECIMAL_SCALE,
     )));
     let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
@@ -432,7 +432,7 @@ fn evaluate_inline_function_call() {
     };
     let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
     // 100 * 1.22 = 122
-    assert_eq!(result, Value::Int(122 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(122 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -444,7 +444,7 @@ fn evaluate_function_calling_function() {
     let (fns, interner) = single_fn(src).unwrap();
     let quadruple_sym = interner.get("quadruple").unwrap();
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(
         3 * crate::core::types::DECIMAL_SCALE,
     )));
     let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
@@ -456,7 +456,7 @@ fn evaluate_function_calling_function() {
     let store = Rc::new(VariableStore::with_interner(interner.freeze()));
     let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
     // 3 * 4 = 12
-    assert_eq!(result, Value::Int(12 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(12 * crate::core::types::DECIMAL_SCALE));
 }
 
 #[test]
@@ -469,10 +469,10 @@ fn evaluate_multiline_function_with_let_binding() {
     let (fns, interner) = single_fn(src).unwrap();
     let total_sym = interner.get("total").unwrap();
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(
         10 * crate::core::types::DECIMAL_SCALE,
     )));
-    let arg1 = arena.alloc(Expr::Literal(Value::Int(
+    let arg1 = arena.alloc(Expr::Literal(Value::Decimal(
         3 * crate::core::types::DECIMAL_SCALE,
     )));
     let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
@@ -484,7 +484,7 @@ fn evaluate_multiline_function_with_let_binding() {
     let store = Rc::new(VariableStore::with_interner(interner.freeze()));
     let result = evaluate(&call_expr, &arena, &store, &fns).unwrap();
     // netto = 10 * 3 = 30, result = 30 * 1.22 = 36.6
-    assert_eq!(result, Value::Int(3_660_000_000));
+    assert_eq!(result, Value::Decimal(3_660_000_000));
 }
 
 #[test]
@@ -494,13 +494,13 @@ fn evaluate_function_with_store_variables() {
     let (fns, interner) = single_fn(src).unwrap();
     let area_sym = interner.get("area").unwrap();
     let mut outer_store = VariableStore::with_interner(interner.freeze());
-    outer_store.set_runtime("w", 999 * crate::core::types::DECIMAL_SCALE); // should be ignored inside the function
+    outer_store.set_runtime("w", Value::Decimal(999 * crate::core::types::DECIMAL_SCALE)); // should be ignored inside the function
     let outer_store = Rc::new(outer_store);
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(
         5 * crate::core::types::DECIMAL_SCALE,
     )));
-    let arg1 = arena.alloc(Expr::Literal(Value::Int(
+    let arg1 = arena.alloc(Expr::Literal(Value::Decimal(
         4 * crate::core::types::DECIMAL_SCALE,
     )));
     let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
@@ -511,7 +511,7 @@ fn evaluate_function_with_store_variables() {
     };
     // Function arguments override the outer store inside the function body.
     let result = evaluate(&call_expr, &arena, &outer_store, &fns).unwrap();
-    assert_eq!(result, Value::Int(20 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Decimal(20 * crate::core::types::DECIMAL_SCALE));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -571,7 +571,7 @@ fn dag_accepts_three_level_chain() {
 #[test]
 fn error_num_plus_bool_is_type_error() {
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(1)));
+    let left = arena.alloc(Expr::Literal(Value::Decimal(1)));
     let right = arena.alloc(Expr::Literal(Value::Bool(true)));
     let expr = Expr::BinaryOp {
         left,
@@ -590,7 +590,7 @@ fn error_num_plus_bool_is_type_error() {
 #[test]
 fn error_num_mul_string_is_type_error() {
     let mut arena = ExprArena::new();
-    let left = arena.alloc(Expr::Literal(Value::Int(2)));
+    let left = arena.alloc(Expr::Literal(Value::Decimal(2)));
     let right = arena.alloc(Expr::Literal(Value::String(std::sync::Arc::from("oops"))));
     let expr = Expr::BinaryOp {
         left,
@@ -607,7 +607,7 @@ fn error_num_mul_string_is_type_error() {
 fn error_bool_sub_num_is_type_error() {
     let mut arena = ExprArena::new();
     let left = arena.alloc(Expr::Literal(Value::Bool(true)));
-    let right = arena.alloc(Expr::Literal(Value::Int(1)));
+    let right = arena.alloc(Expr::Literal(Value::Decimal(1)));
     let expr = Expr::BinaryOp {
         left,
         op: BinOp::Sub,
@@ -647,7 +647,7 @@ fn error_wrong_arity_too_few() {
     let (fns, interner) = single_fn(src).unwrap();
     let add_sym = interner.get("add").unwrap();
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(1)));
     let (args_start, args_len) = arena.push_args(&[arg0]).unwrap();
     let call_expr = Expr::FunctionCall {
         name: add_sym,
@@ -668,8 +668,8 @@ fn error_wrong_arity_too_many() {
     let (fns, interner) = single_fn(src).unwrap();
     let inc_sym = interner.get("inc").unwrap();
     let mut arena = ExprArena::new();
-    let arg0 = arena.alloc(Expr::Literal(Value::Int(1)));
-    let arg1 = arena.alloc(Expr::Literal(Value::Int(2)));
+    let arg0 = arena.alloc(Expr::Literal(Value::Decimal(1)));
+    let arg1 = arena.alloc(Expr::Literal(Value::Decimal(2)));
     let (args_start, args_len) = arena.push_args(&[arg0, arg1]).unwrap();
     let call_expr = Expr::FunctionCall {
         name: inc_sym,
@@ -795,7 +795,7 @@ fn test_case_insensitive_types_and_aliases() {
 #[test]
 fn execute_action_assignment_mutates_store() {
     let mut store = VariableStore::new();
-    store.set("count", 10_000_i64);
+    store.set("count", Value::Int(10_000));
     let mut store = store.freeze();
     let mut store = Rc::new(store);
     let functions = FxHashMap::default();
@@ -805,14 +805,14 @@ fn execute_action_assignment_mutates_store() {
     assert!(mutated);
     assert_eq!(
         *store.get("count").unwrap(),
-        Value::Int(10_000 + crate::core::types::DECIMAL_SCALE)
+        Value::Int(10_001)
     );
 }
 
 #[test]
 fn execute_action_pure_expression_no_mutation() {
     let mut store = VariableStore::new();
-    store.set("count", 10_000_i64);
+    store.set("count", Value::Int(10_000));
     let mut store = store.freeze();
     let mut store = Rc::new(store);
     let functions = FxHashMap::default();
@@ -1080,7 +1080,7 @@ fn parse_variable_definition() {
     assert!(f.params.is_empty());
     assert_eq!(
         *f.body.root(),
-        Expr::Literal(Value::Int(10 * crate::core::types::DECIMAL_SCALE))
+        Expr::Literal(Value::Decimal(10 * crate::core::types::DECIMAL_SCALE))
     );
 }
 
@@ -1137,7 +1137,7 @@ fn test_cooperative_checkpointing_timeout() {
 
     let interner = crate::core::types::StringInterner::new().freeze();
     let fns = FxHashMap::default();
-    let expr = Expr::Literal(Value::Int(1));
+    let expr = Expr::Literal(Value::Decimal(1));
     let arena = ExprArena::new();
 
     let res = sm.evaluate(&expr, 0, &fns, &interner, &arena);
@@ -1158,12 +1158,12 @@ fn test_instruction_budget_resets_per_action() {
     let x_sym = interner.get_or_intern("x");
     store.interner = interner;
     let mut store = store.freeze();
-    store.evaluator.set_global(x_sym, Value::Int(0));
+    store.evaluator.set_global(x_sym, Value::Decimal(0));
 
     // First action — must succeed even if counter was near-exhausted from a prior call.
     store.evaluator.instruction_count = crate::core::config::CONFIG.max_instructions - 1;
     let mut arena1 = ExprArena::new();
-    let root1 = arena1.alloc(Expr::Literal(Value::Int(1)));
+    let root1 = arena1.alloc(Expr::Literal(Value::Decimal(1)));
     let action1 = Action::Assign {
         target: "x".to_string(),
         expr: crate::parser::logic::ExprTree {
@@ -1179,7 +1179,7 @@ fn test_instruction_budget_resets_per_action() {
 
     // Second action — counter was reset by execute_action, must also succeed.
     let mut arena2 = ExprArena::new();
-    let root2 = arena2.alloc(Expr::Literal(Value::Int(2)));
+    let root2 = arena2.alloc(Expr::Literal(Value::Decimal(2)));
     let action2 = Action::Assign {
         target: "x".to_string(),
         expr: crate::parser::logic::ExprTree {
@@ -1205,13 +1205,13 @@ fn test_flat_state_machine_scoping() {
     // Set global variables
     let x_sym = interner.get_or_intern("x");
     let y_sym = interner.get_or_intern("y");
-    sm.set_global(x_sym, Value::Int(10));
-    sm.set_global(y_sym, Value::Int(20));
+    sm.set_global(x_sym, Value::Decimal(10));
+    sm.set_global(y_sym, Value::Decimal(20));
 
     // Evaluate an expression shadowing 'x' using Let binding:
     // let x = 15 in x + y
     let mut arena = ExprArena::new();
-    let value = arena.alloc(Expr::Literal(Value::Int(15)));
+    let value = arena.alloc(Expr::Literal(Value::Decimal(15)));
     let left = arena.alloc(Expr::Variable(x_sym));
     let right = arena.alloc(Expr::Variable(y_sym));
     let body = arena.alloc(Expr::BinaryOp {
@@ -1227,7 +1227,7 @@ fn test_flat_state_machine_scoping() {
 
     let interner = interner.freeze();
     let res = sm.evaluate(&expr, 0, &fns, &interner, &arena).unwrap();
-    assert_eq!(res, Value::Int(35));
+    assert_eq!(res, Value::Decimal(35));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1337,7 +1337,7 @@ fn logical_combined_precedence() {
 fn if_then_else_true_branch() {
     assert_eq!(
         eval_src("if true then 1 else 2").unwrap(),
-        Value::Int(1 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(1 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1345,7 +1345,7 @@ fn if_then_else_true_branch() {
 fn if_then_else_false_branch() {
     assert_eq!(
         eval_src("if false then 1 else 2").unwrap(),
-        Value::Int(2 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(2 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1353,11 +1353,11 @@ fn if_then_else_false_branch() {
 fn if_then_else_with_expression_condition() {
     assert_eq!(
         eval_src("if 3 > 2 then 10 else 20").unwrap(),
-        Value::Int(10 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(10 * crate::core::types::DECIMAL_SCALE)
     );
     assert_eq!(
         eval_src("if 1 > 2 then 10 else 20").unwrap(),
-        Value::Int(20 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(20 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1373,7 +1373,7 @@ fn if_then_else_returns_string() {
 fn ternary_true_branch() {
     assert_eq!(
         eval_src("true ? 1 : 2").unwrap(),
-        Value::Int(1 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(1 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1381,7 +1381,7 @@ fn ternary_true_branch() {
 fn ternary_false_branch() {
     assert_eq!(
         eval_src("false ? 1 : 2").unwrap(),
-        Value::Int(2 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(2 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1389,11 +1389,11 @@ fn ternary_false_branch() {
 fn ternary_with_expression_condition() {
     assert_eq!(
         eval_src("5 > 3 ? 100 : 200").unwrap(),
-        Value::Int(100 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(100 * crate::core::types::DECIMAL_SCALE)
     );
     assert_eq!(
         eval_src("1 == 2 ? 100 : 200").unwrap(),
-        Value::Int(200 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(200 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1402,12 +1402,12 @@ fn ternary_right_associative() {
     // `true ? 1 : false ? 2 : 3` → `true ? 1 : (false ? 2 : 3)` → 1
     assert_eq!(
         eval_src("true ? 1 : false ? 2 : 3").unwrap(),
-        Value::Int(1 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(1 * crate::core::types::DECIMAL_SCALE)
     );
     // `false ? 1 : false ? 2 : 3` → `false ? 1 : (false ? 2 : 3)` → 3
     assert_eq!(
         eval_src("false ? 1 : false ? 2 : 3").unwrap(),
-        Value::Int(3 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(3 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -1440,7 +1440,7 @@ absolute_value(n: num) : if n >= 0 then n else 0 - n
     let va_sym = interner.get("absolute_value").unwrap();
     let mut store = VariableStore::with_interner(interner.freeze());
     let pos = fns[&va_sym].body.clone();
-    store.set_runtime("n", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    store.set_runtime("n", Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
     let v = store
         .evaluator
         .evaluate(pos.root(), 0, &fns, &store.interner, &pos.arena)
@@ -2375,7 +2375,7 @@ fn dollar_form_variable_is_valid_assign_target() {
 #[test]
 fn apply_binop_add_overflow() {
     let mut ic = 0u64;
-    let result = super::apply_binop(&BinOp::Add, Value::Int(i64::MAX), Value::Int(1), &mut ic, crate::core::config::CONFIG.max_instructions);
+    let result = super::apply_binop(&BinOp::Add, Value::Decimal(i64::MAX), Value::Decimal(1), &mut ic, crate::core::config::CONFIG.max_instructions);
     assert!(
         matches!(result, Err(MizuError::IntegerOverflow)),
         "expected IntegerOverflow for i64::MAX + 1, got: {result:?}"
@@ -2391,8 +2391,8 @@ fn apply_binop_mul_overflow() {
     let mut ic = 0u64;
     let result = super::apply_binop(
         &BinOp::Mul,
-        Value::Int(i64::MAX),
-        Value::Int(i64::MAX),
+        Value::Decimal(i64::MAX),
+        Value::Decimal(i64::MAX),
         &mut ic,
         crate::core::config::CONFIG.max_instructions,
     );
@@ -2421,8 +2421,8 @@ fn apply_binop_mul_i128_widening_avoids_collapsed_range() {
         l.checked_mul(r).is_none(),
         "premise broken: raw product no longer overflows i64 — pick larger operands"
     );
-    let result = super::apply_binop(&BinOp::Mul, Value::Int(l), Value::Int(r), &mut ic, crate::core::config::CONFIG.max_instructions).unwrap();
-    assert_eq!(result, Value::Int(1_000_000 * scale));
+    let result = super::apply_binop(&BinOp::Mul, Value::Decimal(l), Value::Decimal(r), &mut ic, crate::core::config::CONFIG.max_instructions).unwrap();
+    assert_eq!(result, Value::Decimal(1_000_000 * scale));
 }
 
 #[test]
@@ -2440,14 +2440,14 @@ fn apply_binop_div_i128_widening_avoids_collapsed_range() {
         l.checked_mul(scale).is_none(),
         "premise broken: raw numerator no longer overflows i64 — pick a larger operand"
     );
-    let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic, crate::core::config::CONFIG.max_instructions).unwrap();
-    assert_eq!(result, Value::Int(1_000 * scale));
+    let result = super::apply_binop(&BinOp::Div, Value::Decimal(l), Value::Decimal(r), &mut ic, crate::core::config::CONFIG.max_instructions).unwrap();
+    assert_eq!(result, Value::Decimal(1_000 * scale));
 }
 
 #[test]
 fn apply_binop_sub_underflow() {
     let mut ic = 0u64;
-    let result = super::apply_binop(&BinOp::Sub, Value::Int(i64::MIN), Value::Int(1), &mut ic, crate::core::config::CONFIG.max_instructions);
+    let result = super::apply_binop(&BinOp::Sub, Value::Decimal(i64::MIN), Value::Decimal(1), &mut ic, crate::core::config::CONFIG.max_instructions);
     assert!(
         matches!(result, Err(MizuError::IntegerOverflow)),
         "expected IntegerOverflow for i64::MIN - 1, got: {result:?}"
@@ -2457,7 +2457,7 @@ fn apply_binop_sub_underflow() {
 #[test]
 fn apply_binop_div_overflow() {
     let mut ic = 0u64;
-    let result = super::apply_binop(&BinOp::Div, Value::Int(i64::MIN), Value::Int(-1), &mut ic, crate::core::config::CONFIG.max_instructions);
+    let result = super::apply_binop(&BinOp::Div, Value::Decimal(i64::MIN), Value::Decimal(-1), &mut ic, crate::core::config::CONFIG.max_instructions);
     assert!(
         matches!(result, Err(MizuError::IntegerOverflow)),
         "expected IntegerOverflow for i64::MIN / -1, got: {result:?}"
@@ -2472,7 +2472,7 @@ fn apply_binop_div_numerator_overflow_errors_not_corrupts() {
     // instead of failing — this pins the fail-secure behavior.
     let mut ic = 0u64;
     let l = i64::MAX / crate::core::types::DECIMAL_SCALE + 1;
-    let result = super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(1), &mut ic, crate::core::config::CONFIG.max_instructions);
+    let result = super::apply_binop(&BinOp::Div, Value::Decimal(l), Value::Decimal(1), &mut ic, crate::core::config::CONFIG.max_instructions);
     match result {
         Err(MizuError::IntegerOverflow) => {}
         other => panic!("expected IntegerOverflow for numerator overflow, got: {other:?}"),
@@ -2486,10 +2486,10 @@ fn apply_binop_div_non_terminating_decimal() {
     let l = 5 * crate::core::types::DECIMAL_SCALE;
     let r = 2 * crate::core::types::DECIMAL_SCALE;
     let result =
-        super::apply_binop(&BinOp::Div, Value::Int(l), Value::Int(r), &mut ic, 10_000).unwrap();
+        super::apply_binop(&BinOp::Div, Value::Decimal(l), Value::Decimal(r), &mut ic, 10_000).unwrap();
     assert_eq!(
         result,
-        Value::Int(crate::core::types::DECIMAL_SCALE * 5 / 2)
+        Value::Decimal(crate::core::types::DECIMAL_SCALE * 5 / 2)
     );
 }
 
@@ -2498,8 +2498,8 @@ fn apply_binop_div_by_zero() {
     let mut ic = 0u64;
     let result = super::apply_binop(
         &BinOp::Div,
-        Value::Int(10 * crate::core::types::DECIMAL_SCALE),
-        Value::Int(0),
+        Value::Decimal(10 * crate::core::types::DECIMAL_SCALE),
+        Value::Decimal(0),
         &mut ic,
         10_000,
     );
@@ -2579,7 +2579,7 @@ fn test_comp_assignment_rejected() {
 
     let fns = FxHashMap::default();
     let mut arena = ExprArena::new();
-    let root = arena.alloc(Expr::Literal(Value::Int(99)));
+    let root = arena.alloc(Expr::Literal(Value::Decimal(99)));
     let action = Action::Assign {
         target: "derived".to_string(),
         expr: crate::parser::logic::ExprTree { arena, root },
@@ -2602,7 +2602,7 @@ fn test_comp_initial_value() {
         evaluator: Default::default(),
         interner,
     };
-    store.set("total", Value::Int(5 * crate::core::types::DECIMAL_SCALE));
+    store.set("total", Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
     let mut store = store.freeze();
 
     let fns = FxHashMap::default();
@@ -2612,7 +2612,7 @@ fn test_comp_initial_value() {
     let derived_sym = store.interner.get("derived").unwrap();
     assert_eq!(
         *store.evaluator.get_global(derived_sym),
-        Value::Int(6 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(6 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -2627,7 +2627,7 @@ fn test_comp_evaluated_on_dependency_change() {
         evaluator: Default::default(),
         interner,
     };
-    store.set("x", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
+    store.set("x", Value::Decimal(10 * crate::core::types::DECIMAL_SCALE));
     let mut store = store.freeze();
     let fns = FxHashMap::default();
 
@@ -2636,7 +2636,7 @@ fn test_comp_evaluated_on_dependency_change() {
     let double_sym = store.interner.get("double").unwrap();
     assert_eq!(
         *store.evaluator.get_global(double_sym),
-        Value::Int(20 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(20 * crate::core::types::DECIMAL_SCALE)
     );
 
     // Mutate x and recompute
@@ -2644,13 +2644,13 @@ fn test_comp_evaluated_on_dependency_change() {
     let x_sym = store.interner.get("x").unwrap();
     store
         .evaluator
-        .set_global(x_sym, Value::Int(7 * crate::core::types::DECIMAL_SCALE));
+        .set_global(x_sym, Value::Decimal(7 * crate::core::types::DECIMAL_SCALE));
     let x_sym = store.interner.get("x").unwrap();
     let mutated: FxHashSet<Symbol> = [x_sym].into_iter().collect();
     super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
     assert_eq!(
         *store.evaluator.get_global(double_sym),
-        Value::Int(14 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(14 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -2676,8 +2676,8 @@ fn test_comp_depends_on_globals_read_inside_functions() {
         evaluator: Default::default(),
         interner,
     };
-    store.set("x", Value::Int(1 * crate::core::types::DECIMAL_SCALE));
-    store.set("z", Value::Int(10 * crate::core::types::DECIMAL_SCALE));
+    store.set("x", Value::Decimal(1 * crate::core::types::DECIMAL_SCALE));
+    store.set("z", Value::Decimal(10 * crate::core::types::DECIMAL_SCALE));
     let mut store = store.freeze();
 
     let all_syms: FxHashSet<Symbol> = store.evaluator.global_store.keys().copied().collect();
@@ -2685,7 +2685,7 @@ fn test_comp_depends_on_globals_read_inside_functions() {
     let y_sym = store.interner.get("y").unwrap();
     assert_eq!(
         *store.evaluator.get_global(y_sym),
-        Value::Int(11 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(11 * crate::core::types::DECIMAL_SCALE)
     );
 
     // Mutate ONLY z — y must recompute through the transitive dependency.
@@ -2693,13 +2693,13 @@ fn test_comp_depends_on_globals_read_inside_functions() {
     let z_sym_again = store.interner.get("z").unwrap();
     store.evaluator.set_global(
         z_sym_again,
-        Value::Int(20 * crate::core::types::DECIMAL_SCALE),
+        Value::Decimal(20 * crate::core::types::DECIMAL_SCALE),
     );
     let mutated: FxHashSet<Symbol> = [z_sym].into_iter().collect();
     super::recompute_computed_bindings(&mut store, &computed, &fns, &mutated, &reverse_index);
     assert_eq!(
         *store.evaluator.get_global(y_sym),
-        Value::Int(21 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(21 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -2724,7 +2724,7 @@ fn test_comp_chain() {
         evaluator: Default::default(),
         interner,
     };
-    store.set("x", Value::Int(3 * crate::core::types::DECIMAL_SCALE));
+    store.set("x", Value::Decimal(3 * crate::core::types::DECIMAL_SCALE));
     let mut store = store.freeze();
     let fns = FxHashMap::default();
     let reverse_index = super::build_comp_reverse_index(&computed);
@@ -2736,11 +2736,11 @@ fn test_comp_chain() {
     let b_sym = store.interner.get("b").unwrap();
     assert_eq!(
         *store.evaluator.get_global(a_sym),
-        Value::Int(4 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(4 * crate::core::types::DECIMAL_SCALE)
     );
     assert_eq!(
         *store.evaluator.get_global(b_sym),
-        Value::Int(8 * crate::core::types::DECIMAL_SCALE)
+        Value::Decimal(8 * crate::core::types::DECIMAL_SCALE)
     );
 }
 
@@ -2805,7 +2805,7 @@ fn random_comp_dag(
 
         // expr = (i+1)*100 + dep_0 + dep_1 + ...
         let mut arena = ExprArena::new();
-        let mut expr = Expr::Literal(Value::Int((i as i64 + 1) * 100));
+        let mut expr = Expr::Literal(Value::Decimal((i as i64 + 1) * 100));
         for &d in &deps {
             let left = arena.alloc(expr);
             let right = arena.alloc(Expr::Variable(d));
@@ -2851,7 +2851,7 @@ fn test_recompute_matches_naive_scan_randomized() {
         let mut store_old = VariableStore::with_interner(interner.clone());
         let mut store_new = VariableStore::with_interner(interner.clone());
         for (gi, &sym) in base_syms.iter().enumerate() {
-            let v = Value::Int((gi as i64 + 1) * 10);
+            let v = Value::Decimal((gi as i64 + 1) * 10);
             store_old.evaluator.set_global(sym, v.clone());
             store_new.evaluator.set_global(sym, v);
         }
@@ -2889,7 +2889,7 @@ fn test_recompute_matches_naive_scan_randomized() {
                 mutated.insert(base_syms[rng.next_range(n_base)]);
             }
             for &sym in &mutated {
-                let v = Value::Int((rng.next_u64() % 1000) as i64);
+                let v = Value::Decimal((rng.next_u64() % 1000) as i64);
                 store_old.evaluator.set_global(sym, v.clone());
                 store_new.evaluator.set_global(sym, v);
             }
@@ -2950,7 +2950,7 @@ fn bench_recompute_large_document_small_blast_radius() {
             let name = interner.get_or_intern(&format!("comp{i}"));
             let mut arena = ExprArena::new();
             let left = arena.alloc(Expr::Variable(base_syms[i]));
-            let right = arena.alloc(Expr::Literal(Value::Int(1)));
+            let right = arena.alloc(Expr::Literal(Value::Decimal(1)));
             let root = arena.alloc(Expr::BinaryOp {
                 left,
                 op: BinOp::Add,
@@ -2971,8 +2971,8 @@ fn bench_recompute_large_document_small_blast_radius() {
     let mut store_old = VariableStore::with_interner(interner.clone());
     let mut store_new = VariableStore::with_interner(interner.clone());
     for &sym in &base_syms {
-        store_old.evaluator.set_global(sym, Value::Int(0));
-        store_new.evaluator.set_global(sym, Value::Int(0));
+        store_old.evaluator.set_global(sym, Value::Decimal(0));
+        store_new.evaluator.set_global(sym, Value::Decimal(0));
     }
 
     // Every event mutates the same single variable, which affects
@@ -2982,7 +2982,7 @@ fn bench_recompute_large_document_small_blast_radius() {
 
     let start_old = std::time::Instant::now();
     for n in 0..N_EVENTS {
-        store_old.evaluator.set_global(target, Value::Int(n as i64));
+        store_old.evaluator.set_global(target, Value::Decimal(n as i64));
         let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
         super::recompute_computed_bindings_naive_scan(&mut store_old, &bindings, &fns, &mutated);
     }
@@ -2990,7 +2990,7 @@ fn bench_recompute_large_document_small_blast_radius() {
 
     let start_new = std::time::Instant::now();
     for n in 0..N_EVENTS {
-        store_new.evaluator.set_global(target, Value::Int(n as i64));
+        store_new.evaluator.set_global(target, Value::Decimal(n as i64));
         let mutated: FxHashSet<Symbol> = [target].into_iter().collect();
         super::recompute_computed_bindings(
             &mut store_new,

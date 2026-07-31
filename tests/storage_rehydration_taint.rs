@@ -114,9 +114,8 @@ fn storage_rehydration_taint_end_to_end() {
     // layer forgets, but because nothing wires this back into the evaluator.
     let rehydrated: HashMap<String, Value> =
         read_storage(&domain).expect("read_storage (session 2 rehydration)");
-    assert_eq!(
-        rehydrated.get("saved"),
-        Some(&tainted_value),
+    assert!(
+        rehydrated.get("saved").is_some_and(|v| v.budget_eq(&tainted_value, &mut u64::MAX, u64::MAX).unwrap_or(false)),
         "the storage layer must genuinely round-trip the tainted value \
          across the simulated session boundary — otherwise this test would \
          not be exercising the real risk at all"

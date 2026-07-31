@@ -111,7 +111,7 @@ fn bench_function_call_eval(c: &mut Criterion) {
     // `set_runtime` is available and it drops names the table doesn't know.
     interner.get_or_intern("counter");
     let mut store = VariableStore::with_interner(interner.freeze());
-    store.set_runtime("counter", Value::from(42i64));
+    store.set_runtime("counter", Value::Int(42));
 
     c.bench_function("eval_clamp_call_showcase_mizu", |b| {
         b.iter(|| {

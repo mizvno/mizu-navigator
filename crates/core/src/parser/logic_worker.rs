@@ -336,9 +336,14 @@ fn send_response(
         original_values.entry(sym).or_insert_with(|| val.clone());
     }
     for (sym, old_val) in original_values {
-        let cur_val = tab.store.evaluator.get_global(sym);
-        if old_val != *cur_val {
-            mutated_variables.push((sym, cur_val.clone()));
+        let (_is_eq, cur_val_cloned) = {
+            let cur_val = tab.store.evaluator.get_global(sym);
+            let mut eq_budget = 0;
+            let is_eq = old_val.budget_eq(cur_val, &mut eq_budget, 10_000).unwrap_or(false);
+            (is_eq, if !is_eq { Some(cur_val.clone()) } else { None })
+        };
+        if let Some(val) = cur_val_cloned {
+            mutated_variables.push((sym, val));
         }
     }
     tab.store.evaluator.undo_log.clear();
@@ -632,15 +637,15 @@ mod tests {
 
         let frozen_size = store.interner.vec.len();
 
-        store.set_runtime("products", Value::Int(5));
-        store.set_runtime("unregistered_response_key", Value::Int(99));
+        store.set_runtime("products", Value::Decimal(5));
+        store.set_runtime("unregistered_response_key", Value::Decimal(99));
 
         assert_eq!(
             store.interner.vec.len(),
             frozen_size,
             "interner must not grow via UpdateVariable for unknown names"
         );
-        assert_eq!(*store.get("products").unwrap(), Value::Int(5));
+        assert_eq!(*store.get("products").unwrap(), Value::Decimal(5));
         assert!(store.get("unregistered_response_key").is_err());
     }
 
@@ -812,10 +817,10 @@ mod tests {
         // core::types::tests::eval_depth_guard /
         // cross_function_composition_depth_guard.
         let mut arena = ExprArena::new();
-        let mut expr = Expr::Literal(Value::Int(0));
+        let mut expr = Expr::Literal(Value::Decimal(0));
         for _ in 0..300 {
             let left = arena.alloc(expr);
-            let right = arena.alloc(Expr::Literal(Value::Int(0)));
+            let right = arena.alloc(Expr::Literal(Value::Decimal(0)));
             expr = Expr::BinaryOp {
                 left,
                 op: BinOp::Add,

@@ -7,8 +7,8 @@ use crate::core::errors::MizuError;
 pub(super) enum Token<'a> {
     /// An identifier or keyword.
     Ident(&'a str),
-    /// A numeric literal (already parsed to `f64`).
-    Num(f64),
+    /// A numeric literal (kept as a string slice to preserve integer vs decimal formatting).
+    Num(&'a str),
     /// A string literal (content without surrounding quotes).
     Str(&'a str),
     /// `true` or `false`.
@@ -195,12 +195,7 @@ fn lex_line<'a>(
             let num_str = std::str::from_utf8(&bytes[start..i]).map_err(|_| {
                 MizuError::ParseError(format!("line {line_num}: invalid numeric token"))
             })?;
-            let n: f64 = num_str.parse().map_err(|_| {
-                MizuError::ParseError(format!(
-                    "line {line_num}: cannot parse `{num_str}` as a number"
-                ))
-            })?;
-            out.push(Token::Num(n));
+            out.push(Token::Num(num_str));
             continue;
         }
 

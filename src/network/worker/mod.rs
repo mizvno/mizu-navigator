@@ -415,7 +415,7 @@ pub fn spawn_network_thread(
                                         tracing::trace!("UI channel closed; Navigate redirect dropped");
                                     }
                                 }
-                                Ok((None, crate::core::types::Value::String(source))) => {
+                                Ok((None, crate::core::types::Value::String(ref source))) => {
                                     tracing::debug!("navigation payload fetched");
                                     if tx_clone
                                         .send(NetworkResult::NavigateSuccess { tab,

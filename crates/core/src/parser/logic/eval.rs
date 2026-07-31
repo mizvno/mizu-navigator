@@ -49,7 +49,7 @@ pub fn execute_action(
                     .evaluator
                     .evaluate(url.root(), 0, functions, &store.interner, &url.arena)?;
             let url_str = match eval_url {
-                Value::String(s) => s.to_string(),
+                Value::String(ref s) => s.to_string(),
                 _ => {
                     return Err(MizuError::ExecutionError(
                         "Navigate URL must evaluate to a string".to_string(),
@@ -91,8 +91,8 @@ pub fn execute_action(
                     &pp.arena,
                 )?;
                 let s = match v {
-                    Value::String(s) => s.to_string(),
-                    Value::Int(n) => n.to_string(),
+                    Value::String(ref s) => s.to_string(),
+                    Value::Decimal(n) => n.to_string(),
                     _ => {
                         return Err(MizuError::ExecutionError(
                             "path_param must be a string or number".to_string(),
@@ -177,46 +177,54 @@ pub(crate) fn apply_binop(
     max_instructions: u64,
 ) -> Result<Value, MizuError> {
     match (op, lv, rv) {
-        // Num operations — Int×Int uses checked arithmetic to catch overflow in release builds.
-        (BinOp::Add, Value::Int(l), Value::Int(r)) => l
+        // Int / Int -> Int (integer division)
+        (BinOp::Add, Value::Int(l), Value::Int(r)) => l.checked_add(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
+        (BinOp::Sub, Value::Int(l), Value::Int(r)) => l.checked_sub(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
+        (BinOp::Mul, Value::Int(l), Value::Int(r)) => l.checked_mul(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
+        (BinOp::Div, Value::Int(l), Value::Int(r)) => {
+            let scaled_l = l.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
+            let scaled_r = r.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
+            apply_binop(&BinOp::Div, Value::Decimal(scaled_l), Value::Decimal(scaled_r), instruction_count, max_instructions)
+        }
+
+        // Decimal operations
+        (BinOp::Add, Value::Decimal(l), Value::Decimal(r)) => l
             .checked_add(r)
-            .map(Value::Int)
+            .map(Value::Decimal)
             .ok_or(MizuError::IntegerOverflow),
 
-        (BinOp::Sub, Value::Int(l), Value::Int(r)) => l
+        (BinOp::Sub, Value::Decimal(l), Value::Decimal(r)) => l
             .checked_sub(r)
-            .map(Value::Int)
+            .map(Value::Decimal)
             .ok_or(MizuError::IntegerOverflow),
 
-        // `l` and `r` are already scaled by DECIMAL_SCALE, so their raw
-        // product is scaled by DECIMAL_SCALE^2 and must be divided down by
-        // one factor of DECIMAL_SCALE to get back to a single-scaled result.
-        // Widen to i128 for that intermediate product: `i64 * i64` can never
-        // overflow i128 (i128's range vastly exceeds the square of i64's
-        // range), so no checked_mul is needed at that step. Only the final
-        // narrowing back to i64 can fail, and it fails cleanly (via
-        // checked conversion) exactly when the true result doesn't fit —
-        // not before, the way a pre-divide i64 checked_mul would.
-        (BinOp::Mul, Value::Int(l), Value::Int(r)) => {
+        (BinOp::Mul, Value::Decimal(l), Value::Decimal(r)) => {
             let product = (l as i128) * (r as i128);
             let scaled = product / (crate::core::types::DECIMAL_SCALE as i128);
             i64::try_from(scaled)
-                .map(Value::Int)
+                .map(Value::Decimal)
                 .map_err(|_| MizuError::IntegerOverflow)
         }
 
-        (BinOp::Div, Value::Int(l), Value::Int(r)) => {
+        (BinOp::Div, Value::Decimal(l), Value::Decimal(r)) => {
             if r == 0 {
                 return Err(MizuError::DivisionByZero);
             }
-            // Same i128-widening rationale as Mul: `l` needs one extra
-            // factor of DECIMAL_SCALE before dividing by `r` to preserve
-            // fixed-point precision, and `i64 * i64` can never overflow i128.
             let numerator = (l as i128) * (crate::core::types::DECIMAL_SCALE as i128);
             let quotient = numerator / (r as i128);
             i64::try_from(quotient)
-                .map(Value::Int)
+                .map(Value::Decimal)
                 .map_err(|_| MizuError::IntegerOverflow)
+        }
+
+        // Mixed Int/Decimal operations (promote Int to Decimal)
+        (op, Value::Int(l), Value::Decimal(r)) => {
+            let scaled_l = l.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
+            apply_binop(op, Value::Decimal(scaled_l), Value::Decimal(r), instruction_count, max_instructions)
+        }
+        (op, Value::Decimal(l), Value::Int(r)) => {
+            let scaled_r = r.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
+            apply_binop(op, Value::Decimal(l), Value::Decimal(scaled_r), instruction_count, max_instructions)
         }
 
         // String concatenation via `+`: charge the combined length before
@@ -224,7 +232,7 @@ pub(crate) fn apply_binop(
         // nested `let`s doubling a string bypasses MAX_INSTRUCTIONS entirely
         // (each `+` is one AST node regardless of operand size) while real
         // allocation cost grows exponentially with nesting depth.
-        (BinOp::Add, Value::String(l), Value::String(r)) => {
+        (BinOp::Add, Value::String(ref l), Value::String(ref r)) => {
             let concat_cost = (l.len() as u64).saturating_add(r.len() as u64);
             *instruction_count = instruction_count.saturating_add(concat_cost);
             if *instruction_count > max_instructions {
@@ -238,7 +246,8 @@ pub(crate) fn apply_binop(
 
         // Equality — works across numerics and strings/bools
         (BinOp::Eq, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l == r)),
-        (BinOp::Eq, Value::String(l), Value::String(r)) => Ok(Value::Bool(l == r)),
+        (BinOp::Eq, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l == r)),
+        (BinOp::Eq, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l == r)),
         (BinOp::Eq, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l == r)),
         (BinOp::Eq, Value::Null, Value::Null) => Ok(Value::Bool(true)),
         (BinOp::Eq, Value::Null, _) => Ok(Value::Bool(false)),
@@ -246,27 +255,26 @@ pub(crate) fn apply_binop(
 
         // Inequality — mirrors equality
         (BinOp::Ne, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l != r)),
-        (BinOp::Ne, Value::String(l), Value::String(r)) => Ok(Value::Bool(l != r)),
+        (BinOp::Ne, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l != r)),
+        (BinOp::Ne, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l != r)),
         (BinOp::Ne, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l != r)),
         (BinOp::Ne, Value::Null, Value::Null) => Ok(Value::Bool(false)),
         (BinOp::Ne, Value::Null, _) => Ok(Value::Bool(true)),
         (BinOp::Ne, _, Value::Null) => Ok(Value::Bool(true)),
 
-        // Ordering — numeric types, and strings (lexicographic byte order,
-        // Rust's default `Ord` for `&str`/`String` — the same ordering
-        // `core::types::eval::compare_values` already uses for `sort`'s
-        // String field values, kept consistent here rather than diverging).
-        // No instruction charge: comparison is read-only and doesn't
-        // allocate, matching Eq/Ne's existing (uncharged) String arms above
-        // — only Add charges, because only Add allocates.
+        // Ordering
         (BinOp::Lt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l < r)),
         (BinOp::Gt, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l > r)),
         (BinOp::Le, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l <= r)),
         (BinOp::Ge, Value::Int(l), Value::Int(r)) => Ok(Value::Bool(l >= r)),
-        (BinOp::Lt, Value::String(l), Value::String(r)) => Ok(Value::Bool(l < r)),
-        (BinOp::Gt, Value::String(l), Value::String(r)) => Ok(Value::Bool(l > r)),
-        (BinOp::Le, Value::String(l), Value::String(r)) => Ok(Value::Bool(l <= r)),
-        (BinOp::Ge, Value::String(l), Value::String(r)) => Ok(Value::Bool(l >= r)),
+        (BinOp::Lt, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l < r)),
+        (BinOp::Gt, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l > r)),
+        (BinOp::Le, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l <= r)),
+        (BinOp::Ge, Value::Decimal(l), Value::Decimal(r)) => Ok(Value::Bool(l >= r)),
+        (BinOp::Lt, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l < r)),
+        (BinOp::Gt, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l > r)),
+        (BinOp::Le, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l <= r)),
+        (BinOp::Ge, Value::String(ref l), Value::String(ref r)) => Ok(Value::Bool(l >= r)),
 
         // Logical AND / OR — bool operands only
         (BinOp::And, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l && r)),
@@ -284,6 +292,7 @@ pub(crate) fn apply_binop(
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Int(_) => "num",
+        Value::Decimal(_) => "num",
         Value::String(_) => "string",
         Value::Bool(_) => "bool",
         Value::List(_) => "list",
@@ -301,6 +310,7 @@ pub(crate) fn check_type(
 ) -> Result<(), MizuError> {
     let ok = match (val, expected) {
         (Value::Int(_), ValueType::Num) => true,
+        (Value::Decimal(_), ValueType::Num) => true,
         (Value::String(_), ValueType::Str) => true,
         (Value::Bool(_), ValueType::Bool) => true,
         (Value::List(items), ValueType::List(inner)) => {
@@ -402,7 +412,7 @@ mod kani_proofs {
     #[kani::proof]
     fn check_type_int_matches_num() {
         let n: i64 = kani::any();
-        assert!(check_type(&Value::Int(n), &ValueType::Num, "f", "p").is_ok());
+        assert!(check_type(&Value::Decimal(n), &ValueType::Num, "f", "p").is_ok());
     }
 
     #[kani::proof]

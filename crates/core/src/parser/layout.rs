@@ -76,7 +76,8 @@ impl Primitive {
 }
 
 /// Represents a single node in the Mizu DOM tree.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct MizuNode {
     /// The primitive type of this node.
     pub primitive: Primitive,
@@ -117,7 +118,8 @@ impl MizuNode {
 /// declared exclusively as a root `timer` in the `logic` block, so a
 /// document's entire temporal surface is enumerable without walking the layout
 /// tree (and cannot be multiplied by `each`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum EventBlock {
     /// Triggered on click (e.g. `click -> Redirect("/home")`).
     Click {
@@ -136,7 +138,8 @@ pub enum EventBlock {
 /// Two independent forms share this type because they are declared with the
 /// same `class ...` child-line syntax, but they mean different things at
 /// paint time — see each variant.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum ConditionalClass {
     /// `class <name> if <boolean-expr>` — a fixed class name, toggled on or
     /// off. If `condition` evaluates to `true` on a given paint frame,

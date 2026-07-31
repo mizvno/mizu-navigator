@@ -75,9 +75,8 @@ fn test_client_endpoint() -> Endpoint {
 #[test]
 fn test_parse_body_value_valid_utf8() {
     let val = parse_body_value(b"hello world");
-    assert_eq!(
-        val,
-        crate::core::types::Value::from("hello world".to_string())
+    assert!(
+        val.budget_eq(&crate::core::types::Value::from("hello world".to_string()), &mut u64::MAX, u64::MAX).unwrap_or(false)
     );
 }
 
@@ -86,7 +85,7 @@ fn test_parse_body_value_invalid_utf8_replaced_with_replacement_char() {
     // 0xFF is not valid UTF-8 — must be replaced with U+FFFD, not panic.
     let val = parse_body_value(b"hello \xff world");
     match val {
-        crate::core::types::Value::String(s) => {
+        crate::core::types::Value::String(ref s) => {
             assert!(
                 s.contains('\u{FFFD}'),
                 "invalid bytes must be replaced with U+FFFD, got: {s:?}"
@@ -100,7 +99,7 @@ fn test_parse_body_value_invalid_utf8_replaced_with_replacement_char() {
 #[test]
 fn test_parse_body_value_empty_body() {
     let val = parse_body_value(b"");
-    assert_eq!(val, crate::core::types::Value::from(String::new()));
+    assert!(val.budget_eq(&crate::core::types::Value::from(String::new()), &mut u64::MAX, u64::MAX).unwrap_or(false));
 }
 
 #[test]
@@ -147,7 +146,7 @@ fn test_parse_body_value_multibyte_utf8_preserved() {
     let text = "こんにちは世界";
     let val = parse_body_value(text.as_bytes());
     match val {
-        crate::core::types::Value::String(s) => {
+        crate::core::types::Value::String(ref s) => {
             assert_eq!(s.as_ref(), text, "valid UTF-8 must be preserved exactly");
             assert!(!s.contains('\u{FFFD}'), "no replacement chars expected");
         }
@@ -349,9 +348,8 @@ fn test_storage_store_writes_directly_with_no_delay() {
     .expect("write_record must succeed");
 
     let data = engine.read_all().expect("read_all");
-    assert_eq!(
-        data.get("session_token"),
-        Some(&crate::core::types::Value::from("abc123")),
+    assert!(
+        data.get("session_token").is_some_and(|v| v.budget_eq(&crate::core::types::Value::from("abc123"), &mut u64::MAX, u64::MAX).unwrap_or(false)),
         "value must be readable immediately after write_record returns, with no debounce delay"
     );
 
@@ -408,7 +406,7 @@ async fn storage_debounce_batches_closely_spaced_writes_into_one_transaction() {
             pool.clone(),
             crate::core::storage::ValidatedDomain::from_raw("debounce-batch-test.local"),
             format!("key_{i}"),
-            crate::core::types::Value::Int(i),
+            crate::core::types::Value::Decimal(i),
         );
     }
 
@@ -430,9 +428,8 @@ async fn storage_debounce_batches_closely_spaced_writes_into_one_transaction() {
 
     let data = engine.read_all().expect("read_all");
     for i in 0..5 {
-        assert_eq!(
-            data.get(&format!("key_{i}")),
-            Some(&crate::core::types::Value::Int(i)),
+        assert!(
+            data.get(&format!("key_{i}")).is_some_and(|v| v.budget_eq(&crate::core::types::Value::Decimal(i), &mut u64::MAX, u64::MAX).unwrap_or(false)),
             "key_{i} must be persisted and readable after the batch flush"
         );
     }
@@ -460,7 +457,7 @@ async fn storage_debounce_max_keys_forces_immediate_flush() {
             pool.clone(),
             crate::core::storage::ValidatedDomain::from_raw("debounce-maxkeys-test.local"),
             format!("key_{i}"),
-            crate::core::types::Value::Int(i),
+            crate::core::types::Value::Decimal(i),
         );
     }
 
@@ -502,7 +499,7 @@ async fn storage_debounce_same_key_last_write_wins() {
             pool.clone(),
             crate::core::storage::ValidatedDomain::from_raw("debounce-lastwrite-test.local"),
             "counter".to_string(),
-            crate::core::types::Value::Int(v),
+            crate::core::types::Value::Decimal(v),
         );
     }
 
@@ -510,9 +507,8 @@ async fn storage_debounce_same_key_last_write_wins() {
 
     assert_eq!(engine.write_batch_call_count(), 1);
     let data = engine.read_all().expect("read_all");
-    assert_eq!(
-        data.get("counter"),
-        Some(&crate::core::types::Value::Int(3)),
+    assert!(
+        data.get("counter").is_some_and(|v| v.budget_eq(&crate::core::types::Value::Decimal(3), &mut u64::MAX, u64::MAX).unwrap_or(false)),
         "last write within the window must win"
     );
 
@@ -551,13 +547,11 @@ async fn storage_debounce_batches_per_domain_independently() {
 
     assert_eq!(engine_a.write_batch_call_count(), 1);
     assert_eq!(engine_b.write_batch_call_count(), 1);
-    assert_eq!(
-        engine_a.read_all().unwrap().get("a_key"),
-        Some(&crate::core::types::Value::from("a_value"))
+    assert!(
+        engine_a.read_all().unwrap().get("a_key").is_some_and(|v| v.budget_eq(&crate::core::types::Value::from("a_value"), &mut u64::MAX, u64::MAX).unwrap_or(false))
     );
-    assert_eq!(
-        engine_b.read_all().unwrap().get("b_key"),
-        Some(&crate::core::types::Value::from("b_value"))
+    assert!(
+        engine_b.read_all().unwrap().get("b_key").is_some_and(|v| v.budget_eq(&crate::core::types::Value::from("b_value"), &mut u64::MAX, u64::MAX).unwrap_or(false))
     );
 
     let _ = std::fs::remove_dir_all(&tmp_a);
