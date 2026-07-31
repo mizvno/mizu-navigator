@@ -945,7 +945,12 @@ impl TabState {
         let ms = match interval {
             TimerInterval::Millis(ms) => *ms,
             TimerInterval::Variable(var_name) => match self.store.get(var_name).ok() {
-                Some(Value::Decimal(i)) => (*i / crate::core::types::DECIMAL_SCALE) as u64,
+                // Both numeric variants: `timer_ms = 500` binds a `Value::Int`
+                // (an integer literal), `timer_ms = 500.0` a `Value::Decimal`.
+                // Matching only one of them would make the timer silently never
+                // fire depending on how the interval was written.
+                Some(Value::Int(i)) => (*i).max(0) as u64,
+                Some(Value::Decimal(i)) => (*i / crate::core::types::DECIMAL_SCALE).max(0) as u64,
                 _ => return None,
             },
         };

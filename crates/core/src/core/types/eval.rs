@@ -135,7 +135,9 @@ impl Evaluator {
     /// Returns the global binding of `sym`, or [`Value::Null`] if unset.
     pub fn get_global(&self, sym: Symbol) -> &Value {
         static NULL: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-        self.global_store.get(&sym).unwrap_or(NULL.get_or_init(|| Value::Null))
+        self.global_store
+            .get(&sym)
+            .unwrap_or(NULL.get_or_init(|| Value::Null))
     }
 
     /// Resolves a local symbol value in O(1) average time using the reverse index.
@@ -531,7 +533,12 @@ impl Evaluator {
                         if op.as_ref() == "contains" {
                             let extra: u64 = list
                                 .iter()
-                                .filter_map(|item| item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()))
+                                .filter_map(|item| {
+                                    item.get_field(
+                                        crate::core::types::hash_field(field.as_ref()),
+                                        field.as_ref(),
+                                    )
+                                })
                                 .filter_map(|v| match v {
                                     Value::String(s) => Some(s.len() as u64),
                                     _ => None,
@@ -560,7 +567,10 @@ impl Evaluator {
                         let mut ic = self.instruction_count;
                         let mut filtered = Vec::new();
                         for item in list.iter() {
-                            if let Some(field_v) = item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()) {
+                            if let Some(field_v) = item.get_field(
+                                crate::core::types::hash_field(field.as_ref()),
+                                field.as_ref(),
+                            ) {
                                 let include = match &binop {
                                     Some(op) => {
                                         match apply_binop(
@@ -581,7 +591,7 @@ impl Evaluator {
                                             h.contains(n.as_ref())
                                         }
                                         _ => false,
-                                    }
+                                    },
                                 };
                                 if include {
                                     filtered.push(item.clone());
@@ -636,15 +646,26 @@ impl Evaluator {
                                 });
                             }
                         };
-                        let mut n = 0;
+                        // Hashed once, not once per element: the field name is
+                        // fixed for the whole pass.
+                        let field_hash = crate::core::types::hash_field(field.as_ref());
+                        let mut n: i64 = 0;
                         for item in list.iter() {
-                            if let Some(v) = item.get_field(crate::core::types::hash_field(field.as_ref()), field.as_ref()) {
-                                if v.budget_eq(&target, &mut self.instruction_count, self.max_instructions)? {
-                                    n += 1;
-                                }
+                            if let Some(v) = item.get_field(field_hash, field.as_ref())
+                                && v.budget_eq(
+                                    &target,
+                                    &mut self.instruction_count,
+                                    self.max_instructions,
+                                )?
+                            {
+                                n += 1;
                             }
                         }
-                        return Ok(Value::Decimal(n as i64));
+                        // An element count is a true integer, not a fixed-point
+                        // quantity: `Value::Decimal(n)` would have meant
+                        // `n / DECIMAL_SCALE`, i.e. `count(...)` reporting
+                        // `0.00000003` for three matches.
+                        return Ok(Value::Int(n));
                     }
                     "download" if args.len() == 1 => {
                         // arg[0] must be a bare alias identifier (Expr::Variable);
@@ -736,13 +757,25 @@ impl Evaluator {
                         }
                         let items: Vec<Value> = (*list).clone();
                         let mut paired = Vec::with_capacity(items.len());
+                        // Hashed once for the whole pass, not once per element.
+                        let field_hash = crate::core::types::hash_field(field.as_ref());
                         for item in items.into_iter() {
-                            let key = field_value(&item, &field).cloned();
+                            let key = item.get_field(field_hash, field.as_ref()).cloned();
                             match key {
-                                Some(Value::Null) | Some(Value::Bool(_)) | Some(Value::Decimal(_)) | Some(Value::String(_)) | None => {},
-                                _ => return Err(MizuError::ExecutionError(
-                                    "sort: cannot sort on complex nested fields (List/Record)".to_string(),
-                                )),
+                                Some(
+                                    Value::Null
+                                    | Value::Bool(_)
+                                    | Value::Int(_)
+                                    | Value::Decimal(_)
+                                    | Value::String(_),
+                                )
+                                | None => {}
+                                _ => {
+                                    return Err(MizuError::ExecutionError(
+                                        "sort: cannot sort on complex nested fields (List/Record)"
+                                            .to_string(),
+                                    ));
+                                }
                             }
                             paired.push((key, item));
                         }
@@ -803,9 +836,8 @@ impl Evaluator {
                                 });
                             }
                         };
-                        return Ok(Value::Decimal(
-                            n.saturating_mul(crate::core::types::DECIMAL_SCALE),
-                        ));
+                        // A length is a true integer — see `count` above.
+                        return Ok(Value::Int(n));
                     }
                     "to_string" if args.len() == 1 => {
                         let value = self.evaluate(
@@ -815,15 +847,15 @@ impl Evaluator {
                             interner,
                             arena,
                         )?;
-                        // Int/Bool only: reuses Value's own Display impl (which
-                        // already handles DECIMAL_SCALE fixed-point formatting
-                        // correctly) rather than reimplementing that logic.
-                        // Anything else is a TypeError rather than silently
-                        // stringifying — a list/record has no single canonical
-                        // textual form, and guessing one invites confusing
-                        // output over a clear rejection.
+                        // Numbers and bools only: reuses Value's own Display
+                        // impl (which already handles DECIMAL_SCALE fixed-point
+                        // formatting correctly) rather than reimplementing that
+                        // logic. Anything else is a TypeError rather than
+                        // silently stringifying — a list/record has no single
+                        // canonical textual form, and guessing one invites
+                        // confusing output over a clear rejection.
                         match &value {
-                            Value::Decimal(_) | Value::Bool(_) => {
+                            Value::Int(_) | Value::Decimal(_) | Value::Bool(_) => {
                                 return Ok(Value::String(Arc::from(value.to_string())));
                             }
                             other => {
@@ -912,7 +944,9 @@ impl Evaluator {
                         // behavior; this is for callers who need to branch on
                         // optional/variable-shaped network data before ever
                         // accessing the field, not a replacement for it.
-                        let present = record_val.get_field(crate::core::types::hash_field(name.as_ref()), name.as_ref()).is_some();
+                        let present = record_val
+                            .get_field(crate::core::types::hash_field(name.as_ref()), name.as_ref())
+                            .is_some();
                         return Ok(Value::Bool(present));
                     }
                     _ => {}
@@ -1016,7 +1050,11 @@ impl Evaluator {
                     }),
                 }
             }
-            Expr::FieldAccess { base, field, field_hash } => {
+            Expr::FieldAccess {
+                base,
+                field,
+                field_hash,
+            } => {
                 let base_val =
                     self.evaluate(&arena[*base], frame_pointer, functions, interner, arena)?;
                 if !matches!(base_val, Value::Record(_)) {
@@ -1036,6 +1074,12 @@ impl Evaluator {
 }
 
 /// Returns the value of `field` in `item` if `item` is a `Record`.
+///
+/// Test-only. It hashes `field` on every call, so the production callers that
+/// look one field up across a whole list — `sort`, `count`, `filter` — hoist
+/// [`crate::core::types::hash_field`] out of their loop and call
+/// [`Value::get_field`] directly instead of going through this.
+#[cfg(test)]
 pub(super) fn field_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
     item.get_field(crate::core::types::hash_field(field), field)
 }
@@ -1049,7 +1093,10 @@ where
 {
     let mut current = root;
     for segment in segments {
-        current = current.get_field(crate::core::types::hash_field(segment.as_ref()), segment.as_ref())?;
+        current = current.get_field(
+            crate::core::types::hash_field(segment.as_ref()),
+            segment.as_ref(),
+        )?;
     }
     Some(current)
 }
@@ -1060,7 +1107,13 @@ where
 /// values belong to different variants.  The ordering is arbitrary but fixed,
 /// which is sufficient to satisfy Strict Weak Ordering.
 ///
-/// Weights: Null=1, Bool=2, Int=3, String=4, List=5, Record=6, FileHandle=7.
+/// Weights: Null=1, Bool=2, numeric=3, String=4, List=5, Record=6,
+/// FileHandle=7.
+///
+/// `Int` and `Decimal` deliberately share a weight: they are one surface type
+/// (`num`), so a heterogeneous pair of them must not be ordered by variant.
+/// [`compare_values`] handles every such pair numerically before reaching
+/// here, so the shared weight is never actually the deciding factor.
 #[inline]
 pub(super) fn variant_weight(v: &Value) -> u8 {
     match v {
@@ -1108,7 +1161,21 @@ pub(super) fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::
 
         (Some(Value::Null), Some(Value::Null)) => Ordering::Equal,
         (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+
+        // Numerics compare across the `Int`/`Decimal` split, in `i128` so the
+        // upscale cannot overflow. Without the mixed arms these pairs would
+        // fall through to `variant_weight`, which assigns both variants the
+        // same weight — every comparison would answer `Equal` and `sort`
+        // would silently leave a list of numbers in its original order.
+        (Some(Value::Int(x)), Some(Value::Int(y))) => x.cmp(y),
         (Some(Value::Decimal(x)), Some(Value::Decimal(y))) => x.cmp(y),
+        (Some(Value::Int(x)), Some(Value::Decimal(y))) => {
+            (*x as i128 * super::value::DECIMAL_SCALE as i128).cmp(&(*y as i128))
+        }
+        (Some(Value::Decimal(x)), Some(Value::Int(y))) => {
+            (*x as i128).cmp(&(*y as i128 * super::value::DECIMAL_SCALE as i128))
+        }
+
         (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
 
         (Some(Value::List(x)), Some(Value::List(y))) => {

@@ -24,9 +24,14 @@ mod store;
 mod tests;
 mod value;
 
+#[cfg(test)]
+use eval::field_value;
 pub use eval::{Evaluator, MAX_EVAL_DEPTH};
 #[cfg(test)]
-use eval::{compare_values, field_value, variant_weight};
+use eval::{compare_values, variant_weight};
 pub use interner::{FrozenInterner, StringInterner, Symbol};
 pub use store::VariableStore;
-pub use value::{DECIMAL_SCALE, FileHandleData, Value, RecordField, from_json_str, from_json_slice, to_json, hash_field};
+pub use value::{
+    DECIMAL_SCALE, FileHandleData, RecordField, Value, from_json_slice, from_json_str, hash_field,
+    to_json,
+};

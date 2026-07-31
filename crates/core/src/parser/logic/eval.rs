@@ -177,14 +177,32 @@ pub(crate) fn apply_binop(
     max_instructions: u64,
 ) -> Result<Value, MizuError> {
     match (op, lv, rv) {
-        // Int / Int -> Int (integer division)
-        (BinOp::Add, Value::Int(l), Value::Int(r)) => l.checked_add(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
-        (BinOp::Sub, Value::Int(l), Value::Int(r)) => l.checked_sub(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
-        (BinOp::Mul, Value::Int(l), Value::Int(r)) => l.checked_mul(r).map(Value::Int).ok_or(MizuError::IntegerOverflow),
+        // Int arithmetic stays exact and unscaled.
+        (BinOp::Add, Value::Int(l), Value::Int(r)) => l
+            .checked_add(r)
+            .map(Value::Int)
+            .ok_or(MizuError::IntegerOverflow),
+        (BinOp::Sub, Value::Int(l), Value::Int(r)) => l
+            .checked_sub(r)
+            .map(Value::Int)
+            .ok_or(MizuError::IntegerOverflow),
+        (BinOp::Mul, Value::Int(l), Value::Int(r)) => l
+            .checked_mul(r)
+            .map(Value::Int)
+            .ok_or(MizuError::IntegerOverflow),
+        // Division always yields a `Decimal`, so `7 / 2` is `3.5` and not `3`:
+        // whether an expression truncates must not depend on how its operands
+        // happened to be spelled. Computed directly in `i128` rather than by
+        // upscaling both sides first — `l * DECIMAL_SCALE` would overflow for
+        // any |l| above ~9.2e10, making `1000000000000 / 2` an error.
         (BinOp::Div, Value::Int(l), Value::Int(r)) => {
-            let scaled_l = l.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
-            let scaled_r = r.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
-            apply_binop(&BinOp::Div, Value::Decimal(scaled_l), Value::Decimal(scaled_r), instruction_count, max_instructions)
+            if r == 0 {
+                return Err(MizuError::DivisionByZero);
+            }
+            let quotient = (l as i128 * crate::core::types::DECIMAL_SCALE as i128) / (r as i128);
+            i64::try_from(quotient)
+                .map(Value::Decimal)
+                .map_err(|_| MizuError::IntegerOverflow)
         }
 
         // Decimal operations
@@ -217,14 +235,54 @@ pub(crate) fn apply_binop(
                 .map_err(|_| MizuError::IntegerOverflow)
         }
 
-        // Mixed Int/Decimal operations (promote Int to Decimal)
+        // Mixed Int/Decimal comparison — evaluated in `i128` so that upscaling
+        // cannot overflow. These must precede the arithmetic promotion below:
+        // going through it, comparing an out-of-fixed-point-range integer
+        // (`9223372036854775807 > 1.5`) would raise `IntegerOverflow` instead
+        // of answering the perfectly well-defined question that was asked.
+        (
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
+            Value::Int(l),
+            Value::Decimal(r),
+        ) => {
+            let scale = crate::core::types::DECIMAL_SCALE as i128;
+            Ok(Value::Bool(compare_op(op, (l as i128) * scale, r as i128)))
+        }
+        (
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge,
+            Value::Decimal(l),
+            Value::Int(r),
+        ) => {
+            let scale = crate::core::types::DECIMAL_SCALE as i128;
+            Ok(Value::Bool(compare_op(op, l as i128, (r as i128) * scale)))
+        }
+
+        // Mixed Int/Decimal arithmetic (promote Int to Decimal). Here an
+        // overflow *is* the right answer: the result genuinely has no
+        // fixed-point representation.
         (op, Value::Int(l), Value::Decimal(r)) => {
-            let scaled_l = l.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
-            apply_binop(op, Value::Decimal(scaled_l), Value::Decimal(r), instruction_count, max_instructions)
+            let scaled_l = l
+                .checked_mul(crate::core::types::DECIMAL_SCALE)
+                .ok_or(MizuError::IntegerOverflow)?;
+            apply_binop(
+                op,
+                Value::Decimal(scaled_l),
+                Value::Decimal(r),
+                instruction_count,
+                max_instructions,
+            )
         }
         (op, Value::Decimal(l), Value::Int(r)) => {
-            let scaled_r = r.checked_mul(crate::core::types::DECIMAL_SCALE).ok_or(MizuError::IntegerOverflow)?;
-            apply_binop(op, Value::Decimal(l), Value::Decimal(scaled_r), instruction_count, max_instructions)
+            let scaled_r = r
+                .checked_mul(crate::core::types::DECIMAL_SCALE)
+                .ok_or(MizuError::IntegerOverflow)?;
+            apply_binop(
+                op,
+                Value::Decimal(l),
+                Value::Decimal(scaled_r),
+                instruction_count,
+                max_instructions,
+            )
         }
 
         // String concatenation via `+`: charge the combined length before
@@ -288,6 +346,25 @@ pub(crate) fn apply_binop(
     }
 }
 
+/// Applies one of the six comparison operators to an already-normalised
+/// numeric pair.
+///
+/// Only ever called with a comparison `op` — the arithmetic operators are
+/// matched out before this is reached — so the fallback arm is unreachable
+/// rather than a silent default.
+#[inline]
+fn compare_op(op: &BinOp, l: i128, r: i128) -> bool {
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Ne => l != r,
+        BinOp::Lt => l < r,
+        BinOp::Gt => l > r,
+        BinOp::Le => l <= r,
+        BinOp::Ge => l >= r,
+        _ => false,
+    }
+}
+
 /// Returns the Mizu type-name string for a runtime value.
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
@@ -328,8 +405,7 @@ pub(crate) fn check_type(
             if fields.len() != expected_fields.len() {
                 all_ok = false;
             } else {
-                for (found_field, (exp_name, exp_type)) in
-                    fields.iter().zip(expected_fields.iter())
+                for (found_field, (exp_name, exp_type)) in fields.iter().zip(expected_fields.iter())
                 {
                     if found_field.key.as_ref() != exp_name.as_ref() {
                         all_ok = false;

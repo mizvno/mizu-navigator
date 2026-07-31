@@ -50,7 +50,9 @@ fn list_display_empty() {
 
 #[test]
 fn list_display_single_element() {
-    let v = Value::List(std::sync::Arc::new(vec![Value::Decimal(super::DECIMAL_SCALE)]));
+    let v = Value::List(std::sync::Arc::new(vec![Value::Decimal(
+        super::DECIMAL_SCALE,
+    )]));
     assert_eq!(v.to_string(), "[1]");
 }
 
@@ -270,7 +272,10 @@ fn store_new_and_default_are_equivalent() {
 fn json_object_becomes_record() {
     let json = serde_json::to_string(&serde_json::json!({"id":1,"name":"Neko"})).unwrap();
     let val = from_json_str(&json).unwrap();
-    assert_eq!(val.get_field(crate::core::types::hash_field("id"), "id"), Some(&Value::Decimal(super::DECIMAL_SCALE)));
+    assert_eq!(
+        val.get_field(crate::core::types::hash_field("id"), "id"),
+        Some(&Value::Decimal(super::DECIMAL_SCALE))
+    );
     assert_eq!(
         val.get_field(crate::core::types::hash_field("name"), "name"),
         Some(&Value::String(Arc::from("Neko")))
@@ -726,7 +731,10 @@ fn test_filter_by_bool() {
     };
     assert_eq!(items.len(), 3);
     for item in items.iter() {
-        assert_eq!(item.get_field(crate::core::types::hash_field("done"), "done"), Some(&Value::Bool(true)));
+        assert_eq!(
+            item.get_field(crate::core::types::hash_field("done"), "done"),
+            Some(&Value::Bool(true))
+        );
     }
 }
 
@@ -811,7 +819,8 @@ fn test_count_basic() {
         Expr::Literal(Value::Bool(false)),
     ];
     let result = eval_builtin(&mut store, "count", args).unwrap();
-    assert_eq!(result, Value::Decimal(2));
+    // An element count is an exact integer, not a fixed-point quantity.
+    assert_eq!(result, Value::Int(2));
 }
 
 #[test]
@@ -834,7 +843,9 @@ fn test_sort_asc() {
     let priorities: Vec<i64> = items
         .iter()
         .map(|item| {
-            if let Some(&Value::Decimal(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
+            if let Some(&Value::Decimal(p)) =
+                item.get_field(crate::core::types::hash_field("priority"), "priority")
+            {
                 p
             } else {
                 panic!()
@@ -864,7 +875,9 @@ fn test_sort_desc() {
     let priorities: Vec<i64> = items
         .iter()
         .map(|item| {
-            if let Some(&Value::Decimal(p)) = item.get_field(crate::core::types::hash_field("priority"), "priority") {
+            if let Some(&Value::Decimal(p)) =
+                item.get_field(crate::core::types::hash_field("priority"), "priority")
+            {
                 p
             } else {
                 panic!()
@@ -894,7 +907,9 @@ fn test_sort_string() {
     let names: Vec<String> = items
         .iter()
         .map(|item| {
-            if let Some(Value::String(s)) = item.get_field(crate::core::types::hash_field("name"), "name") {
+            if let Some(Value::String(s)) =
+                item.get_field(crate::core::types::hash_field("name"), "name")
+            {
                 s.to_string()
             } else {
                 panic!()
@@ -928,10 +943,12 @@ fn test_sort_direction_keyword_is_never_shadowed_by_a_real_variable() {
     };
     let priorities: Vec<i64> = items
         .iter()
-        .map(|item| match item.get_field(crate::core::types::hash_field("priority"), "priority") {
-            Some(&Value::Decimal(p)) => p,
-            _ => panic!(),
-        })
+        .map(
+            |item| match item.get_field(crate::core::types::hash_field("priority"), "priority") {
+                Some(&Value::Decimal(p)) => p,
+                _ => panic!(),
+            },
+        )
         .collect();
     assert_eq!(
         priorities,
@@ -1319,7 +1336,7 @@ fn test_length_of_list() {
     store.interner.get_or_intern("length");
     let mut store = store.freeze();
     let result = eval_builtin(&mut store, "length", vec![Expr::Variable(tasks_sym)]).unwrap();
-    assert_eq!(result, Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Int(5));
 }
 
 #[test]
@@ -1332,7 +1349,7 @@ fn test_length_of_string_counts_chars_not_bytes() {
     // — proves this counts chars, not bytes.
     let args = vec![Expr::Literal(Value::String(Arc::from("héllo")))];
     let result = eval_builtin(&mut store, "length", args).unwrap();
-    assert_eq!(result, Value::Decimal(5 * crate::core::types::DECIMAL_SCALE));
+    assert_eq!(result, Value::Int(5));
 }
 
 #[test]
@@ -1655,7 +1672,10 @@ fn test_variant_weight_ordering() {
 fn test_none_is_less_than_some() {
     use std::cmp::Ordering;
     assert_eq!(compare_values(None, Some(&Value::Null)), Ordering::Less);
-    assert_eq!(compare_values(None, Some(&Value::Decimal(0))), Ordering::Less);
+    assert_eq!(
+        compare_values(None, Some(&Value::Decimal(0))),
+        Ordering::Less
+    );
     assert_eq!(
         compare_values(Some(&Value::Decimal(0)), None),
         Ordering::Greater
@@ -2250,7 +2270,8 @@ fn sort_records_by_single_field_via_compare_values() {
     let vals: Vec<i64> = records
         .iter()
         .map(|r| {
-            if let Some(&Value::Decimal(n)) = r.get_field(crate::core::types::hash_field("v"), "v") {
+            if let Some(&Value::Decimal(n)) = r.get_field(crate::core::types::hash_field("v"), "v")
+            {
                 n
             } else {
                 panic!()
@@ -2313,7 +2334,9 @@ fn compare_records_btreemap_zero_alloc_sort() {
     let alpha_vals: Vec<i64> = records
         .iter()
         .map(|r| {
-            if let Some(&Value::Decimal(n)) = r.get_field(crate::core::types::hash_field("alpha"), "alpha") {
+            if let Some(&Value::Decimal(n)) =
+                r.get_field(crate::core::types::hash_field("alpha"), "alpha")
+            {
                 n
             } else {
                 panic!()
@@ -2434,7 +2457,10 @@ fn file_handle_pointer_equality() {
     let a = file_handle("avatar.png");
     // Pointer equality is used for FileHandle to preserve PartialEq reflexivity
     let a2 = a.clone();
-    assert_eq!(a, a2, "Cloned file handles should be equal via pointer equality");
+    assert_eq!(
+        a, a2,
+        "Cloned file handles should be equal via pointer equality"
+    );
 
     let b = file_handle("avatar.png"); // same filename, distinct handle
     assert_ne!(a, b);

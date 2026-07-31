@@ -234,7 +234,7 @@ fn evaluate_conditional_classes(mizu_node: &MizuNode, ctx: &mut PaintContext<'_>
                 sm.evaluate(expr.root(), 0, &empty_fns, interner, &expr.arena)
                     .ok()
                     .and_then(|v| match v {
-                        Value::String(ref s) => Some(s.clone()),
+                        Value::String(s) => Some(s),
                         _ => None,
                     })
             }
@@ -1033,7 +1033,7 @@ fn paint_each(
             .cloned()
             .or_else(|| ctx.store.get(&list_name).ok().cloned());
         match val {
-            Some(Value::List(ref arc)) => arc.clone(),
+            Some(Value::List(arc)) => arc,
             _ => {
                 tracing::warn!("paint_each: `{}` is not a list or not found", list_name);
                 return 0;
@@ -2106,7 +2106,9 @@ mod tests {
         // Global must not have been mutated — the old approach inserted into global_store.
         let global_flag = ctx.store.evaluator.global_store.get(&flag_sym);
         assert!(
-            global_flag.is_some_and(|v| v.budget_eq(&Value::Bool(false), &mut u64::MAX, u64::MAX).unwrap_or(false)),
+            global_flag.is_some_and(|v| v
+                .budget_eq(&Value::Bool(false), &mut u64::MAX, u64::MAX)
+                .unwrap_or(false)),
             "global 'flag' must remain false after conditional-class eval with item_binding override"
         );
 

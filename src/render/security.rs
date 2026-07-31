@@ -223,7 +223,10 @@ pub fn execute_capability_action(
                         tab_id,
                         UiEvent::UpdateVariable {
                             name: name.to_string(),
-                            value: Value::Decimal(time_ms),
+                            // Milliseconds are a whole count, so this is an
+                            // `Int`. As a `Decimal` it would have meant
+                            // `time_ms / DECIMAL_SCALE`.
+                            value: Value::Int(time_ms),
                         },
                     )) {
                         tracing::warn!(error = %e, "logic channel closed; GetSystemTime update dropped");
@@ -643,7 +646,9 @@ mod tests {
             }) => {
                 assert_eq!(method, "POST");
                 assert!(
-                    sent.as_ref().is_some_and(|v| v.budget_eq(&payload, &mut u64::MAX, u64::MAX).unwrap_or(false)),
+                    sent.as_ref().is_some_and(|v| v
+                        .budget_eq(&payload, &mut u64::MAX, u64::MAX)
+                        .unwrap_or(false)),
                     "POST payload must survive the ResolvedCall → Fetch dispatch"
                 );
                 assert_eq!(
