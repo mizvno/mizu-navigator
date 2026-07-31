@@ -58,7 +58,7 @@ pub struct LogicWorkerTabState {
     pub document_domain: String,
     /// Computed (derived) variable bindings in topological order.
     pub computed_vars: Vec<ComputedBinding>,
-    /// Reverse index (symbol â†’ dependent binding indices) over `computed_vars`,
+    /// Reverse index (symbol → dependent binding indices) over `computed_vars`,
     /// rebuilt once whenever `computed_vars` is (re)loaded so
     /// `recompute_computed_bindings` never has to scan every binding per event.
     pub computed_reverse_index: CompReverseIndex,
@@ -103,7 +103,7 @@ pub struct LogicWorker {
 
 impl LogicWorker {
     /// Explicit stack size for the dedicated evaluator thread, overriding the
-    /// platform default (commonly ~1 MiB on Windows, ~2â€“8 MiB on Linux/macOS
+    /// platform default (commonly ~1 MiB on Windows, ~2–8 MiB on Linux/macOS
     /// depending on `ulimit`/pthread defaults).
     ///
     /// `evaluate`/`evaluate_impl` recurse up to `MAX_EVAL_DEPTH` (256) levels
@@ -123,7 +123,7 @@ impl LogicWorker {
     ///
     /// 16 MiB is ~4x the measured debug floor and ~64x the measured release
     /// floor, and matches the value `cross_function_composition_depth_guard`'s
-    /// sibling test (`eval_depth_guard`) already relies on as proven-safe â€”
+    /// sibling test (`eval_depth_guard`) already relies on as proven-safe —
     /// a large margin against interpreter changes, platform stack-frame
     /// layout differences, and future growth of `evaluate_impl`'s frame size.
     ///
@@ -135,7 +135,7 @@ impl LogicWorker {
     /// Spawns a permanent native thread executing the LogicWorker.
     ///
     /// Fails only if the OS refuses the thread/stack allocation (real
-    /// resource exhaustion) â€” propagated as [`MizuError::IoError`] instead of
+    /// resource exhaustion) — propagated as [`MizuError::IoError`] instead of
     /// panicking, so the caller can surface a real error instead of aborting
     /// the process on an opaque message.
     pub fn spawn(
@@ -308,7 +308,7 @@ impl LogicWorker {
                     // other side has no defined meaning here. set_runtime
                     // resolves the name against this worker's own frozen
                     // table and silently drops it if the document never
-                    // declared it â€” the frozen interner is never grown by
+                    // declared it — the frozen interner is never grown by
                     // network-response-driven names.
                     tab.store.set_runtime(&name, value);
                     recompute_after_mutation(tab);
@@ -318,6 +318,15 @@ impl LogicWorker {
         }
     }
 }
+
+/// Node budget for a single old-versus-new variable comparison in
+/// [`send_response`].
+///
+/// Bounds the cost of change detection independently of the evaluator's
+/// instruction budget: this comparison runs once per mutated variable on every
+/// update cycle, over values whose size the document controls, so it needs a
+/// ceiling of its own rather than a share of one the script is also spending.
+const EQ_BUDGET_PER_VARIABLE: u64 = 10_000;
 
 /// Collects this tab's mutations and resolved actions into one response and
 /// sends it back tagged with `tab_id`.
@@ -336,24 +345,45 @@ fn send_response(
         original_values.entry(sym).or_insert_with(|| val.clone());
     }
     for (sym, old_val) in original_values {
-        let (_is_eq, cur_val_cloned) = {
+        let changed = {
             let cur_val = tab.store.evaluator.get_global(sym);
+            // A budget of its own, per variable, rather than a slice of the
+            // evaluator's: change detection is bookkeeping this function does
+            // on its own behalf, and charging it to the document's instruction
+            // budget would let a large-but-legitimate variable starve the
+            // script that produced it.
             let mut eq_budget = 0;
-            let is_eq = old_val.budget_eq(cur_val, &mut eq_budget, 10_000).unwrap_or(false);
-            (is_eq, if !is_eq { Some(cur_val.clone()) } else { None })
+            match old_val.budget_eq(cur_val, &mut eq_budget, EQ_BUDGET_PER_VARIABLE) {
+                Ok(is_eq) => !is_eq,
+                // Undecided within budget. Reporting "changed" is the safe
+                // direction — a spurious update repaints, a missed one leaves
+                // the UI showing a stale value — but it is not free, so say so
+                // rather than letting `unwrap_or(false)` bury a value that will
+                // re-report on every single tick from here on.
+                Err(_) => {
+                    tracing::warn!(
+                        symbol = sym.0,
+                        budget = EQ_BUDGET_PER_VARIABLE,
+                        "variable too large to compare within budget; \
+                         treating it as mutated on every update"
+                    );
+                    true
+                }
+            }
         };
-        if let Some(val) = cur_val_cloned {
-            mutated_variables.push((sym, val));
+        if changed {
+            let cur_val = tab.store.evaluator.get_global(sym).clone();
+            mutated_variables.push((sym, cur_val));
         }
     }
     tab.store.evaluator.undo_log.clear();
-    // Resolve NetworkCall â†’ ResolvedCall and DownloadAlias â†’ DownloadMedia.
+    // Resolve NetworkCall → ResolvedCall and DownloadAlias → DownloadMedia.
     let document_domain = &tab.document_domain;
     let url_registry = &tab.url_registry;
     let raw_actions = std::mem::take(&mut tab.store.evaluator.accumulated_actions);
     let mut runtime_actions: Vec<RuntimeAction> = Vec::with_capacity(raw_actions.len());
     // Unresolved aliases surface a readable error in the call's bound
-    // variable instead of silently dropping the action â€” the user must
+    // variable instead of silently dropping the action — the user must
     // see *why* nothing happened.
     let mut alias_errors: Vec<(String, Value)> = Vec::new();
     for action in raw_actions {
@@ -460,13 +490,13 @@ fn send_response(
 /// * `Media` endpoints: uses `raw_target` as-is (already an absolute `mizu://`
 ///   URL).
 ///
-/// If `path_param` is `Some` and the URL contains a `{â€¦}` placeholder, the
+/// If `path_param` is `Some` and the URL contains a `{…}` placeholder, the
 /// first placeholder is replaced with the percent-encoded param value. Otherwise the
 /// encoded param is appended after a `/`. Note: only the first placeholder is replaced;
-/// a second `{â€¦}` is left literal (this is the intended behavior).
+/// a second `{…}` is left literal (this is the intended behavior).
 ///
 /// `path_param` is re-validated against the same gate as `execute_action` in
-/// `logic.rs` before it is ever substituted into the URL â€” this is the last
+/// `logic.rs` before it is ever substituted into the URL — this is the last
 /// consumption point before the value leaves the process, so it must not be
 /// possible to reach this function with an unvalidated `path_param` via a
 /// different code path.
@@ -506,7 +536,7 @@ pub(crate) fn resolve_endpoint_url(
         }
         let pp = &encoded;
 
-        // Replace the first `{â€¦}` placeholder if present, otherwise append.
+        // Replace the first `{…}` placeholder if present, otherwise append.
         if let Some(open) = base_url.find('{')
             && let Some(rel_close) = base_url[open..].find('}')
         {
@@ -750,10 +780,10 @@ mod tests {
     /// End-to-end regression test for the stack-size fix in
     /// `LogicWorker::spawn`: drives a real `LogicWorker` background thread
     /// (spawned exactly as production does, via `LogicWorker::spawn`) through
-    /// a 300-level-deep expression â€” the same shape used by
+    /// a 300-level-deep expression — the same shape used by
     /// `core::types::tests::eval_depth_guard` and
     /// `cross_function_composition_depth_guard`, deep enough to exceed
-    /// `MAX_EVAL_DEPTH` (256) â€” and asserts the worker returns the controlled
+    /// `MAX_EVAL_DEPTH` (256) — and asserts the worker returns the controlled
     /// "evaluation nesting too deep" error rather than the process crashing
     /// with a native stack overflow.
     ///
@@ -762,7 +792,7 @@ mod tests {
     /// builds (see `STACK_SIZE_BYTES`'s doc comment for the measurement that
     /// proved it). Because a real stack overflow aborts the whole process and
     /// cannot be caught with `catch_unwind`, this test re-execs the test
-    /// binary as a child process and inspects its exit status â€” mirroring
+    /// binary as a child process and inspects its exit status — mirroring
     /// `cross_function_composition_depth_guard` in `core::types`.
     #[test]
     fn logic_worker_thread_survives_max_eval_depth_without_native_crash() {
@@ -866,7 +896,7 @@ mod tests {
                 println!("{ok_marker}");
             }
             // Also acceptable: the instruction budget could in principle be
-            // exhausted first depending on constant tuning â€” still a clean,
+            // exhausted first depending on constant tuning — still a clean,
             // bounded error, not a crash.
             Ok(Err(MizuError::Timeout)) => {
                 println!("{ok_marker}");

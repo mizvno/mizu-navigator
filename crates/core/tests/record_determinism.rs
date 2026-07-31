@@ -5,15 +5,23 @@
 //! surface, since that surface is what a differing architecture or a differing
 //! field insertion order would be observed through.
 
-use mizu_core::core::types::{DECIMAL_SCALE, Value, from_json_str, to_json};
+use mizu_core::core::types::{Value, from_json_str, hash_field, to_json};
 
-/// `Value::Decimal` is fixed-point, so a bare `Value::Int(1)` is 1e-8, not 1.
-/// Tests that assert on serialized text need the scaled representation.
+/// An exact integer. `Value::Int` is unscaled, unlike the fixed-point
+/// `Value::Decimal` — see `Value`'s doc comment for the split.
 fn num(n: i64) -> Value {
     Value::Int(n)
 }
 
-
+/// `budget_eq` with an unbounded budget.
+///
+/// Every value in this file is a handful of nodes built by the test itself, so
+/// there is nothing here for a budget to protect against; the budget exists for
+/// values that arrive from a document or the network.
+fn eq(a: &Value, b: &Value) -> bool {
+    a.budget_eq(b, &mut 0, u64::MAX)
+        .expect("a test-sized value cannot exhaust an unbounded budget")
+}
 
 fn record(pairs: Vec<(&str, Value)>) -> Value {
     Value::record_from_unsorted(pairs)
@@ -54,15 +62,21 @@ fn records_are_equal_regardless_of_insertion_order() {
         ("gamma", Value::from("g")),
         ("alpha", Value::from("a")),
     ]);
-    assert!(a.budget_eq(&b, &mut u64::MAX, u64::MAX).unwrap_or(false));
+    assert!(eq(&a, &b));
     assert_eq!(keys(&a), keys(&b));
 }
 
 #[test]
 fn records_differing_in_one_value_are_not_equal() {
-    let a = record(vec![("alpha", Value::from("x")), ("beta", Value::from("y"))]);
-    let b = record(vec![("alpha", Value::from("x")), ("beta", Value::from("z"))]);
-    assert!(!a.budget_eq(&b, &mut u64::MAX, u64::MAX).unwrap_or(false));
+    let a = record(vec![
+        ("alpha", Value::from("x")),
+        ("beta", Value::from("y")),
+    ]);
+    let b = record(vec![
+        ("alpha", Value::from("x")),
+        ("beta", Value::from("z")),
+    ]);
+    assert!(!eq(&a, &b));
 }
 
 /// Serialized output must be byte-identical for equal records, whatever order
@@ -83,16 +97,19 @@ fn to_json_orders_nested_records_too() {
     assert_eq!(encoded, r#"{"inner_a":{"x":1,"y":2},"outer_z":9}"#);
 }
 
-/// `from_json` must establish the same ordering invariant the in-memory
+/// `from_json_str` must establish the same ordering invariant the in-memory
 /// constructors do, so a record that arrives over the network compares equal
 /// to the identical record built locally.
 #[test]
 fn from_json_orders_keys_and_round_trips_through_to_json() {
-    let parsed = from_json_str(&serde_json::to_string(&serde_json::json!({
-        "zulu": 1,
-        "alpha": 2,
-        "mike": {"delta": 4, "bravo": 3}
-    })).unwrap())
+    let parsed = from_json_str(
+        &serde_json::to_string(&serde_json::json!({
+            "zulu": 1,
+            "alpha": 2,
+            "mike": {"delta": 4, "bravo": 3}
+        }))
+        .unwrap(),
+    )
     .unwrap();
 
     assert_eq!(keys(&parsed), ["alpha", "mike", "zulu"]);
@@ -102,14 +119,18 @@ fn from_json_orders_keys_and_round_trips_through_to_json() {
         re_encoded,
         r#"{"alpha":2,"mike":{"bravo":3,"delta":4},"zulu":1}"#
     );
-    assert!(from_json_str(&serde_json::to_string(&to_json(&parsed).unwrap()).unwrap()).unwrap().budget_eq(&parsed, &mut u64::MAX, u64::MAX).unwrap_or(false));
+    let round_tripped = from_json_str(&re_encoded).unwrap();
+    assert!(eq(&round_tripped, &parsed));
 }
 
 #[test]
 fn from_json_record_equals_locally_built_record() {
-    let parsed = from_json_str(&serde_json::to_string(&serde_json::json!({"b": "two", "a": "one"})).unwrap()).unwrap();
+    let parsed = from_json_str(
+        &serde_json::to_string(&serde_json::json!({"b": "two", "a": "one"})).unwrap(),
+    )
+    .unwrap();
     let built = record(vec![("a", Value::from("one")), ("b", Value::from("two"))]);
-    assert!(parsed.budget_eq(&built, &mut u64::MAX, u64::MAX).unwrap_or(false));
+    assert!(eq(&parsed, &built));
 }
 
 /// `Display` walks the slice in order as well, so it inherits determinism from
@@ -129,19 +150,18 @@ fn get_field_finds_every_key_in_a_record() {
     ]);
     for (key, expected) in [("alpha", 2i64), ("mike", 3), ("zulu", 1)] {
         assert!(
-            val.get_field(mizu_core::core::types::hash_field(key), key).is_some_and(|v| v.budget_eq(&Value::Int(expected as i64), &mut u64::MAX, u64::MAX).unwrap_or(false)),
+            val.get_field(hash_field(key), key)
+                .is_some_and(|v| eq(v, &num(expected))),
             "lookup of {key} failed"
         );
     }
-    assert!(val.get_field(mizu_core::core::types::hash_field("absent"), "absent").is_none());
+    assert!(val.get_field(hash_field("absent"), "absent").is_none());
 }
-
-
 
 #[test]
 fn get_field_on_a_non_record_is_none() {
-    assert!(Value::Int(1).get_field(mizu_core::core::types::hash_field("a"), "a").is_none());
-    assert!(Value::Null.get_field(mizu_core::core::types::hash_field("a"), "a").is_none());
+    assert!(Value::Int(1).get_field(hash_field("a"), "a").is_none());
+    assert!(Value::Null.get_field(hash_field("a"), "a").is_none());
 }
 
 /// Ordering must hold past any small-size threshold, and lookup must stay
@@ -163,7 +183,8 @@ fn ordering_and_lookup_hold_for_larger_records() {
     for i in 0..64i64 {
         let key = format!("key_{i:03}");
         assert!(
-            val.get_field(mizu_core::core::types::hash_field(&key), &key).is_some_and(|v| v.budget_eq(&Value::Int(i as i64), &mut u64::MAX, u64::MAX).unwrap_or(false)),
+            val.get_field(hash_field(&key), &key)
+                .is_some_and(|v| eq(v, &num(i))),
             "lookup of {key} failed"
         );
     }

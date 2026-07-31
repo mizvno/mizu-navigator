@@ -12,7 +12,16 @@ taffy = "0.5"
 ego-tree = "0.10"
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
+# `arbitrary_precision`: numbers arrive as their original token text, which is
+# what lets `Value` keep the integer/decimal distinction and parse each side
+# exactly instead of rounding everything through `f64`.
+# `unbounded_depth`: lets `from_json_*` turn off serde_json's own 128-level
+# recursion cap so `MAX_JSON_DEPTH` is the single depth authority — see the
+# `disable_recursion_limit` call site for why two competing limits was a bug.
+serde_json = { version = "1.0.150", features = [
+    "arbitrary_precision",
+    "unbounded_depth",
+] }
 toml = { version = "0.8", features = ["parse"] }
 aes-gcm = "0.10"
 hex = "0.4"

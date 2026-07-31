@@ -1,4 +1,4 @@
-//! # `storage` â€” Encrypted Local Storage for Mizu Apps
+//! # `storage` — Encrypted Local Storage for Mizu Apps
 //!
 //! Provides AES-256-GCM encrypted persistence under `%APPDATA%\mizu\storage\`.
 //!
@@ -16,7 +16,7 @@
 //! * (RM-10) The domain master key and every derived key are held in
 //!   `Zeroizing<[u8; 32]>`, so they are scrubbed from memory as soon as
 //!   they're dropped instead of lingering (swap, core dumps, debugger
-//!   access) â€” this matters most for `StorageEngine::master_key`, which is
+//!   access) — this matters most for `StorageEngine::master_key`, which is
 //!   cached and kept alive for the life of the process by `StoragePool`.
 //! * `MIZU_MASTER_KEY` (read by [`derive_or_create_key`]) is a headless/
 //!   recovery **break-glass** mechanism, not a supported production
@@ -43,6 +43,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 use crate::core::errors::MizuError;
 use crate::core::types::{Value, from_json_slice, to_json};
+
+/// Storage plaintext is trusted input for [`from_json_slice`]'s node cap: it
+/// is a record this build wrote, encrypted under a key only this build holds
+/// and authenticated on the way back in. Capping it would mean a value the
+/// evaluator was allowed to persist could silently fail to load later.
+const STORAGE_IS_TRUSTED: bool = true;
 
 /// The single table definition for redb storage.
 /// Key: Variable name (`&str`)
@@ -98,7 +104,7 @@ pub(crate) fn fail_if_desync(storage_path: &std::path::Path) -> Result<(), MizuE
     if storage_path.exists() {
         return Err(MizuError::ExecutionError(
             "keyring integrity violation: a storage file exists for this domain but the \
-             corresponding keyring entry is missing â€” environment integrity has been \
+             corresponding keyring entry is missing — environment integrity has been \
              compromised. Restore the OS keyring entry or set MIZU_MASTER_KEY to recover access."
                 .to_owned(),
         ));
@@ -322,24 +328,24 @@ pub fn decrypt_record(
 /// ## Multi-process concurrency (INV-02)
 ///
 /// `mizu-navigator` has no single-instance guard (`main.rs` has no lock
-/// file, PID check, or IPC "activate existing window" mechanism â€” every
+/// file, PID check, or IPC "activate existing window" mechanism — every
 /// `cargo run`/binary launch is an independent OS process with its own
 /// window, exactly like a browser's separate processes). So more than one
 /// process legitimately *can* call `open_db` for the same domain at the
 /// same time (e.g. the user launches the navigator twice, or twice against
 /// documents that happen to share a `mizu://` origin). This is not
-/// prevented, and is not this file's job to prevent â€” redb itself already
+/// prevented, and is not this file's job to prevent — redb itself already
 /// serializes it:
 ///
 /// `redb::Database::create`/`open` (via `FileBackend::new`, `redb` 2.6.3)
 /// takes an OS-level, non-blocking, exclusive advisory lock on the
 /// underlying file the moment it's opened (`flock(fd, LOCK_EX | LOCK_NB)`
-/// on Unix, `LockFile` on Windows â€” see `redb`'s `tree_store/page_store/
+/// on Unix, `LockFile` on Windows — see `redb`'s `tree_store/page_store/
 /// file_backend/{unix,windows}.rs`), held for the lifetime of the
 /// `Database` value and released on `Drop`. A second process (or a second,
 /// independent `File` handle within the same process) trying to open the
 /// same path while the first is still holding it gets
-/// `Err(DatabaseError::DatabaseAlreadyOpen)` immediately â€” never a hang,
+/// `Err(DatabaseError::DatabaseAlreadyOpen)` immediately — never a hang,
 /// never silent corruption, never a torn write. `open_db` below already
 /// propagates that error through the normal `Result` chain like any other
 /// redb failure, so this fails safely (a warning-logged, non-fatal error
@@ -349,7 +355,7 @@ pub fn decrypt_record(
 /// and `walkthrough.md`'s "INV-02" entry for the full investigation.
 ///
 /// **Do not add an application-level file lock (`fd-lock` or similar) on
-/// top of this** â€” it would be redundant with redb's own locking and add
+/// top of this** — it would be redundant with redb's own locking and add
 /// complexity without closing any gap.
 pub fn open_db(domain: &ValidatedDomain) -> Result<redb::Database, MizuError> {
     let path = mizu_storage_path(domain);
@@ -381,8 +387,8 @@ pub struct StorageEngine {
     db: redb::Database,
     /// RM-10: `StoragePool` caches engines for the life of the process (see
     /// `StoragePool`'s doc comment below) rather than reopening them per
-    /// command, so this key would otherwise sit in memory â€” reachable via
-    /// swap, a core dump, or a debugger â€” for the entire process lifetime.
+    /// command, so this key would otherwise sit in memory — reachable via
+    /// swap, a core dump, or a debugger — for the entire process lifetime.
     /// `Zeroizing` scrubs it the moment the engine (and this field) is
     /// dropped instead of leaving it for the allocator to hand out verbatim.
     master_key: Zeroizing<[u8; 32]>,
@@ -460,7 +466,7 @@ impl StorageEngine {
             let blob = v.value();
 
             match decrypt_record(&self.master_key, key_str, blob) {
-                Ok(plaintext) => match crate::core::types::from_json_slice(&plaintext, true) {
+                Ok(plaintext) => match from_json_slice(&plaintext, STORAGE_IS_TRUSTED) {
                     Ok(value) => {
                         map.insert(key_str.to_string(), value);
                     }
@@ -526,7 +532,7 @@ pub fn read_storage(domain: &ValidatedDomain) -> Result<HashMap<String, Value>, 
 /// cached engine can be shared across concurrent blocking tasks via `Arc`.
 ///
 /// This `Mutex` only serialises access *within this process*. Cross-process
-/// concurrent access to the same domain (a legitimate scenario â€” see
+/// concurrent access to the same domain (a legitimate scenario — see
 /// `open_db`'s doc comment, INV-02) is a separate concern, already handled
 /// by `redb`'s own OS-level file locking; nothing extra is needed here.
 #[derive(Clone, Default)]
@@ -557,12 +563,12 @@ impl StoragePool {
 
     /// Encrypts and writes a single record directly against `redb`, in its
     /// own write transaction. The write is durable (via `redb`'s WAL) by the
-    /// time this call returns â€” no write-behind cache, no debounce â€” and
+    /// time this call returns — no write-behind cache, no debounce — and
     /// each record is encrypted with its own HKDF-derived key, so other
     /// records are unaffected by this write.
     ///
     /// RM-12: `network::worker`'s `NetworkCmd::StorageStore` dispatch no
-    /// longer calls this directly for every write â€” it batches closely-spaced
+    /// longer calls this directly for every write — it batches closely-spaced
     /// writes to the same domain via `StorageEngine::write_batch` instead
     /// (see the "Storage dispatch" doc comment in `worker.rs` for the
     /// resulting durability tradeoff). This method remains the immediate,
@@ -628,7 +634,7 @@ mod tests {
 
     /// RM-10 acceptance test: a compile-time proof that every function which
     /// produces key material now returns a type that scrubs itself on drop,
-    /// rather than a runtime memory-inspection test â€” this module is
+    /// rather than a runtime memory-inspection test — this module is
     /// `#![forbid(unsafe_code)]`, and reading freed stack memory to check for
     /// zeroing would itself require unsafe (and be UB besides). `Zeroizing<T>`
     /// implements `zeroize::ZeroizeOnDrop`; a plain `[u8; 32]` does not, so
@@ -845,7 +851,7 @@ mod tests {
 
     /// RM-07: a single record whose stored JSON exceeds `MAX_JSON_DEPTH`
     /// must not abort `read_all` for the whole domain. Before the fix, the
-    /// `from_json(&json)?` in the `Ok` branch propagated the depth-limit
+    /// `from_json_slice(&plaintext)?` in the `Ok` branch propagated the depth-limit
     /// `SecurityViolation` out of `read_all` entirely, so one over-deep
     /// record made every other record in the domain unreadable too.
     #[test]
@@ -869,8 +875,8 @@ mod tests {
         };
 
         // Build a Value nested well beyond MAX_JSON_DEPTH. `to_json`/`write_batch`
-        // don't depth-check on the way in (only `from_json`, on the way out,
-        // does), so this reproduces a record that was legitimately persisted
+        // don't depth-check on the way in (only `from_json_slice`, on the way
+        // out, does), so this reproduces a record that was legitimately persisted
         // but can no longer be decoded back into a `Value`.
         let mut deep = Value::Decimal(1);
         for _ in 0..300 {
@@ -919,7 +925,7 @@ mod tests {
         pool.insert_for_test(&domain, engine.clone());
 
         // A cached domain must return the exact same Arc, never re-opening
-        // the keyring/redb file â€” this is what makes per-write dispatch cheap.
+        // the keyring/redb file — this is what makes per-write dispatch cheap.
         let fetched = pool
             .get_or_open(&domain)
             .expect("cached engine must be returned");
@@ -939,7 +945,7 @@ mod tests {
     }
 
     /// INV-02: two *real, independent OS processes* opening the same redb
-    /// file for the same domain must be serialized safely â€” the second
+    /// file for the same domain must be serialized safely — the second
     /// opener must be rejected (not hang, not corrupt, not silently
     /// succeed), and the lock must be genuinely released (not stuck) once
     /// the first process closes its handle.
@@ -948,7 +954,7 @@ mod tests {
     /// env var, following the same pattern already established by
     /// `core::types::tests::cross_function_composition_depth_guard` /
     /// `measure_stack_usage_at_max_eval_depth` for other process-level
-    /// guarantees in this codebase â€” a genuine second process, not a mock.
+    /// guarantees in this codebase — a genuine second process, not a mock.
     #[test]
     fn concurrent_process_open_is_serialized_by_redb_flock() {
         const CHILD_PATH_ENV: &str = "MIZU_STORAGE_LOCK_CHILD_PATH";
@@ -957,7 +963,7 @@ mod tests {
 
         // Child mode: try to open the redb file at the path given via env
         // var, report the outcome on stdout, then exit. Real process exit,
-        // real OS file lock â€” no simulation.
+        // real OS file lock — no simulation.
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
             match redb::Database::create(path) {
                 Ok(_db) => println!("{CHILD_OPENED}"),
@@ -991,7 +997,7 @@ mod tests {
         let db = redb::Database::create(&path).expect("parent opens db");
 
         // While the parent still holds it, a second, independent process
-        // trying to open the exact same file must be rejected immediately â€”
+        // trying to open the exact same file must be rejected immediately —
         // not hang waiting for the lock, not corrupt the file, not silently
         // proceed as if nothing else had it open.
         let child1 = spawn_child(&exe, &path);
@@ -1005,7 +1011,7 @@ mod tests {
         );
 
         // Release the parent's handle and confirm the lock was genuinely
-        // released (not stuck forever) â€” a subsequent process must now be
+        // released (not stuck forever) — a subsequent process must now be
         // able to open the file cleanly.
         drop(db);
         let child2 = spawn_child(&exe, &path);

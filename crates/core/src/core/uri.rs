@@ -34,7 +34,7 @@ impl MizuUri {
         // *percent-encodes* other C0 controls (e.g. DEL) into the host
         // instead of rejecting them. Both are a sanitize-rather-than-reject
         // behaviour this runtime treats as fail-insecure elsewhere (see
-        // `core::types::from_json`'s depth handling: truncating malicious
+        // `core::types::from_json_str`'s depth handling: truncating malicious
         // input is not an acceptable substitute for rejecting it). A raw
         // control byte is never legitimate in a URI — RFC 3986 requires
         // percent-encoding for any such byte — so it is rejected outright
