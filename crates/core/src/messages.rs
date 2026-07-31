@@ -230,4 +230,25 @@ pub struct WorkerResponse {
     pub state_update: StateUpdate,
     /// Capability actions to execute on the main thread.
     pub runtime_actions: Vec<RuntimeAction>,
+    /// Whether the [`UiEvent`] that produced *these* actions was itself a
+    /// user gesture ([`UiEvent::Click`] or [`UiEvent::SubmitForm`]).
+    ///
+    /// This is gate G1 (`SECURITY-INVARIANTS.md`) as it survives the trip
+    /// through the worker: `parser::flow`'s load-time checker permits a
+    /// tainted value to reach `navigate` only under
+    /// [`crate::parser::flow::ActionContext::UserGesture`], and the runtime
+    /// half of that gate has to answer the same question the checker asked —
+    /// "was *this action* triggered by a gesture?" — not the weaker "has this
+    /// tab seen a gesture recently?".
+    ///
+    /// Carrying the answer on the response is what makes the two agree. An
+    /// ambient per-tab flag set at input-dispatch time and read at
+    /// response-drain time cannot: the worker's responses are drained FIFO
+    /// with no correlation to the events that produced them, so a
+    /// [`UiEvent::RootTimer`] response already queued when the user clicks is
+    /// processed while the flag is set and inherits agency it was never
+    /// granted (timers may fire every 16 ms, so this is not a narrow race).
+    /// Deriving the flag from the event variant inside the worker keeps the
+    /// authorization welded to the action it authorizes.
+    pub gesture: bool,
 }

@@ -104,13 +104,21 @@ const IMAGE_CACHE_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsiz
 /// owns lives here; state the *window* or the *user* owns stays on the
 /// manager.
 ///
-/// Three fields are security-load-bearing and must never be read or written
+/// Two fields are security-load-bearing and must never be read or written
 /// across a tab boundary (invariant **T1**, `SECURITY-INVARIANTS.md`):
-/// `capability_policy` (per-origin storage quota + write rate limit),
-/// `redirect_count` (a per-navigation-chain budget), and `has_user_gesture`
-/// (which gates N3's cross-origin navigation check and the clipboard).
-/// Hoisting any of them back to window level is a security regression, not a
-/// simplification.
+/// `capability_policy` (per-origin storage quota + write rate limit) and
+/// `redirect_count` (a per-navigation-chain budget). Hoisting either back to
+/// window level is a security regression, not a simplification.
+///
+/// User-gesture agency is deliberately *not* a field here. It gates N3's
+/// cross-origin navigation check and the clipboard, and it is carried
+/// per-action-batch on [`crate::network::WorkerResponse::gesture`] instead:
+/// a flag stored on the tab would be set when an input is dispatched and read
+/// when some later, unrelated worker response is drained, letting a timer- or
+/// network-driven batch inherit a gesture it never received. T1 still holds —
+/// a response is routed to the tab that produced it, so one tab's click
+/// cannot authorise another's — but it now holds per action rather than
+/// per tab.
 ///
 /// Holds no `FontContext`, no `LayoutContext`, and no channel endpoints — all
 /// of which are window-level — which is what makes [`TabState::new`] free of
@@ -207,11 +215,6 @@ pub struct TabState {
     pub redirect_count: u32,
     /// Computed (derived) variable bindings in topological order.
     pub computed_bindings: Vec<ComputedBinding>,
-    /// Whether this tab's most recent interaction was a qualifying gesture.
-    /// Cleared after that tab's action batch is processed. **T1:** per-tab so
-    /// a click in one tab can never authorise another tab's clipboard read or
-    /// cross-origin navigation.
-    pub has_user_gesture: bool,
     /// Per-origin capability budget (storage quota + rate limit) for this
     /// tab's current origin. **T1:** per-tab so a low-trust origin cannot
     /// consume — or benefit from — quota attributable to a different origin
@@ -713,7 +716,6 @@ impl TabState {
             each_expansion: EachExpansion::default(),
             redirect_count: 0,
             computed_bindings: Vec::new(),
-            has_user_gesture: false,
             capability_policy: CapabilityPolicy::new(initial_url),
             root_timers: Vec::new(),
             root_timer_queue: BTreeMap::new(),

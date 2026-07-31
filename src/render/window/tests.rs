@@ -559,13 +559,19 @@ fn tab_advances_and_wraps_shift_tab_reverses() {
 }
 
 #[test]
-fn dispatch_click_gesture_sets_gesture_and_emits_single_click() {
+fn dispatch_click_gesture_emits_exactly_one_click_event() {
     // Security regression (MNT ux-1 guardrail): keyboard activation of a
     // focused button must reuse the exact mouse-click gesture sequence —
-    // `has_user_gesture = true` plus exactly one `UiEvent::Click` for that
-    // node, no more, no less. The keyboard Enter/Space handler in
-    // event_loop.rs calls this same `dispatch_click_gesture` helper, so
-    // pinning its behavior here pins keyboard activation as well.
+    // exactly one `UiEvent::Click` for that node, no more, no less. The
+    // keyboard Enter/Space handler in event_loop.rs calls this same
+    // `dispatch_click_gesture` helper, so pinning its behavior here pins
+    // keyboard activation as well.
+    //
+    // The `Click` variant is now the whole of the gesture: the logic worker
+    // stamps `WorkerResponse::gesture` from the event variant, so emitting
+    // this event is exactly what grants agency — and emitting it twice, or
+    // for the wrong node, would grant it twice or to the wrong handler.
+    // There is no separate ambient flag left to assert on.
     let tree = Tree::new(window_node());
     let mut manager = MizuWindowManager::new(
         tree,
@@ -589,17 +595,12 @@ fn dispatch_click_gesture_sets_gesture_and_emits_single_click() {
     // UiEvent can be observed directly.
     let (test_tx, test_rx) = std::sync::mpsc::channel();
     manager.logic_tx = test_tx;
-    manager.active_mut().has_user_gesture = false;
 
     let dispatched = {
         let (t, c) = manager.split_active();
         dispatch_click_gesture(t, c.logic_tx, button_id)
     };
     assert!(dispatched, "dispatch must succeed for a live DOM node");
-    assert!(
-        manager.active_mut().has_user_gesture,
-        "keyboard activation must set has_user_gesture, exactly like a mouse click"
-    );
 
     let events: Vec<_> = test_rx.try_iter().collect();
     assert_eq!(
@@ -1150,15 +1151,14 @@ fn capability_policy_is_per_tab() {
     );
 }
 
-#[test]
-fn gesture_flag_is_per_tab() {
-    let (mut manager, _keepalive) = make_multi_tab_manager(2);
-    manager.tabs[0].has_user_gesture = true;
-    assert!(
-        !manager.tabs[1].has_user_gesture,
-        "a click in one tab must never authorise another tab's clipboard read"
-    );
-}
+// Gesture agency is no longer a per-tab field, so there is no cross-tab flag
+// left to assert on here: it rides on `WorkerResponse::gesture`, and a
+// response is routed to the tab whose id the worker echoed back
+// (`drain_logic_worker_results`), so one tab's click cannot reach another
+// tab's action batch. The per-event property that replaced it — a `RootTimer`
+// batch is never marked as a gesture, even immediately after a `Click` — is
+// pinned in the worker itself by
+// `mizu_core::parser::logic_worker::tests::gesture_is_per_event_not_ambient`.
 
 #[test]
 fn switching_relayouts_a_stale_background_tab() {

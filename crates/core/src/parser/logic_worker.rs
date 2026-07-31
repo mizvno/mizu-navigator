@@ -250,18 +250,27 @@ impl LogicWorker {
                         &tab.computed_reverse_index,
                     );
 
-                    send_response(tab, tx, tab_id);
+                    send_response(tab, tx, tab_id, false);
                 }
 
+                // Gate G1, runtime half: `Click`/`SubmitForm` are emitted only
+                // by `dispatch_click_gesture`/`dispatch_form_submit`, i.e.
+                // only by a real mouse click, keyboard activation, or form
+                // submission — so the event variant *is* the agency, and it
+                // travels back on the response that carries this action's
+                // consequences. Every other variant is document agency:
+                // `RootTimer` fires on a clock, `UpdateVariable` on a network
+                // response, `Reload` on document load. None of them may
+                // inherit a gesture that happened to arrive nearby in time.
                 UiEvent::Click { node_id } => {
                     if let Some(action) = tab.click_actions.get(&node_id).cloned() {
-                        execute_and_respond(tab, tx, tab_id, &action);
+                        execute_and_respond(tab, tx, tab_id, &action, true);
                     }
                 }
 
                 UiEvent::RootTimer { index } => {
                     if let Some(action) = tab.root_timer_actions.get(index as usize).cloned() {
-                        execute_and_respond(tab, tx, tab_id, &action);
+                        execute_and_respond(tab, tx, tab_id, &action, false);
                     }
                 }
 
@@ -296,7 +305,7 @@ impl LogicWorker {
                         tracing::warn!(error = %e, "form submit action failed");
                     }
                     recompute_after_mutation(tab);
-                    send_response(tab, tx, tab_id);
+                    send_response(tab, tx, tab_id, true);
                 }
 
                 UiEvent::UpdateVariable { name, value } => {
@@ -312,7 +321,7 @@ impl LogicWorker {
                     // network-response-driven names.
                     tab.store.set_runtime(&name, value);
                     recompute_after_mutation(tab);
-                    send_response(tab, tx, tab_id);
+                    send_response(tab, tx, tab_id, false);
                 }
             }
         }
@@ -338,6 +347,7 @@ fn send_response(
     tab: &mut LogicWorkerTabState,
     tx: &Sender<(TabId, Result<WorkerResponse, MizuError>)>,
     tab_id: TabId,
+    gesture: bool,
 ) {
     let mut mutated_variables = Vec::new();
     let mut original_values = HashMap::new();
@@ -477,6 +487,7 @@ fn send_response(
         Ok(WorkerResponse {
             state_update: StateUpdate { mutated_variables },
             runtime_actions,
+            gesture,
         }),
     )) {
         tracing::warn!(error = %e, "UI response channel closed; state update dropped");
@@ -579,6 +590,7 @@ fn execute_and_respond(
     tx: &Sender<(TabId, Result<WorkerResponse, MizuError>)>,
     tab_id: TabId,
     action: &Action,
+    gesture: bool,
 ) {
     tab.store.evaluator.undo_log.clear();
     let initial_actions_len = tab.store.evaluator.accumulated_actions.len();
@@ -586,7 +598,7 @@ fn execute_and_respond(
     match execute_action(action, &mut tab.store, &tab.logic_fns) {
         Ok(_) => {
             recompute_after_mutation(tab);
-            send_response(tab, tx, tab_id);
+            send_response(tab, tx, tab_id, gesture);
         }
         Err(e) => {
             for (sym, old_val) in tab.store.evaluator.undo_log.drain(..).rev() {
@@ -614,6 +626,117 @@ mod tests {
         UrlEndpoint {
             kind: EndpointKind::Api,
             raw_target: path.to_owned(),
+        }
+    }
+
+    /// Gate G1 must be a property of the *event*, never of the tab.
+    ///
+    /// The bug this pins: agency used to be an ambient `has_user_gesture`
+    /// boolean, set on the UI thread when an input was dispatched and read on
+    /// the UI thread when a worker response was drained. Because responses are
+    /// drained FIFO with no link to the events that produced them, a
+    /// `RootTimer` batch that merely arrived near a click was labelled
+    /// `NavigationInitiator::UserGesture` and cleared `check_navigation`'s N3
+    /// cross-origin block. Root timers may fire every 16 ms, so a document
+    /// only had to wait for the user to click anything at all.
+    ///
+    /// Here both handlers run the *same* `navigate` action, and both events
+    /// are queued before either response is read — the exact interleaving that
+    /// used to leak agency. The click's batch must carry it; the timer's must
+    /// not, whichever order they are drained in.
+    #[test]
+    fn gesture_is_per_event_not_ambient() {
+        use crate::messages::{ReloadPayload, TabId, UiEvent};
+        use crate::parser::logic::{Expr, ExprArena, ExprTree};
+        use std::sync::mpsc;
+
+        let (tx_in, rx_in) = mpsc::channel::<(TabId, UiEvent)>();
+        let (tx_out, rx_out) = mpsc::channel::<(TabId, Result<WorkerResponse, MizuError>)>();
+        let tab = TabId(0);
+        let _handle = LogicWorker::spawn(rx_in, tx_out).expect("logic worker thread must spawn");
+
+        // One identical cross-origin `navigate` action, reachable both from a
+        // click and from a root timer, so the only difference between the two
+        // responses is the event that triggered them.
+        let navigate = || {
+            let mut arena = ExprArena::new();
+            let root = arena.alloc(Expr::Literal(Value::from("mizu://evil.example/")));
+            Action::Navigate {
+                url: ExprTree { arena, root },
+            }
+        };
+        let mut click_actions = HashMap::new();
+        click_actions.insert(0u32, navigate());
+
+        let mut interner = StringInterner::new();
+        let interner = interner.freeze();
+
+        tx_in
+            .send((
+                tab,
+                UiEvent::Reload(Box::new(ReloadPayload {
+                    logic_fns: FxHashMap::default(),
+                    click_actions,
+                    submit_actions: HashMap::new(),
+                    root_timer_actions: vec![navigate()],
+                    interner,
+                    initial_variables: Vec::new(),
+                    url_registry: FxHashMap::default(),
+                    document_domain: String::new(),
+                    computed_bindings: Vec::new(),
+                })),
+            ))
+            .expect("worker thread must be alive to receive Reload");
+        let reload = rx_out
+            .recv()
+            .expect("worker must respond to Reload")
+            .1
+            .expect("reload must not error");
+        assert!(
+            !reload.gesture,
+            "a document load is document agency, never a user gesture"
+        );
+
+        // Queue both events before reading either response: this is the
+        // interleaving the ambient flag got wrong.
+        tx_in
+            .send((tab, UiEvent::Click { node_id: 0 }))
+            .expect("worker alive");
+        tx_in
+            .send((tab, UiEvent::RootTimer { index: 0 }))
+            .expect("worker alive");
+
+        let click_batch = rx_out
+            .recv()
+            .expect("worker must respond to Click")
+            .1
+            .expect("click action must not error");
+        assert!(
+            click_batch.gesture,
+            "a Click batch carries user agency: gate G1 must let its navigate through"
+        );
+
+        let timer_batch = rx_out
+            .recv()
+            .expect("worker must respond to RootTimer")
+            .1
+            .expect("timer action must not error");
+        assert!(
+            !timer_batch.gesture,
+            "a RootTimer batch must never inherit agency from a click processed \
+             just before it — this is the N3 cross-origin bypass"
+        );
+
+        // Both really did queue the same privileged action, so the assertions
+        // above are about agency and not about one batch being empty.
+        for batch in [&click_batch, &timer_batch] {
+            assert!(
+                batch
+                    .runtime_actions
+                    .iter()
+                    .any(|a| matches!(a, RuntimeAction::Navigate { .. })),
+                "both batches must contain the navigate action under test"
+            );
         }
     }
 

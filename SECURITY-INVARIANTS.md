@@ -80,6 +80,31 @@ budget.  Specifically, layout expansion (`each` nodes) is bounded by
 *Enforcement:* **Runtime** (`layout_bridge.rs` budget counter) and
 **Parse-time** (nested `each` rejection).
 
+**L2 — Bounded interpolated text run:** No single `{var}` substitution, and no
+accumulation of them within one text run, may exceed `MAX_INTERPOLATED_BYTES`
+(64 KiB).
+
+This is L1 applied to the one path where a value crosses out of the budgeted
+evaluator and into the renderer. `Evaluator::interpolate_into_with_overlay`
+runs during layout/paint, not during `evaluate`, so `max_instructions` never
+applies to it; a network response is bounded only by `MAX_RESPONSE_BODY_BYTES`
+(32 MiB) and is a single JSON node, so `MAX_JSON_NODES` does not constrain it
+either. Without L2, one `text "{data}"` node bound to such a response hands
+tens of megabytes to the text shaper on the UI thread on every layout pass.
+
+Every write goes through `CappedBuffer`, which refuses a write *before*
+copying its bytes, so the peak allocation stays bounded no matter how large
+the source value is. Over-budget input is **rejected**
+(`MizuError::SecurityViolation`), never truncated — a clipped prefix of
+attacker-controlled data would be indistinguishable downstream from the whole
+value, the same reject-don't-sanitize rule `from_json_slice` applies to
+over-deep input. All three call sites degrade safely: the renderer paints
+`{error: …}`, the accessibility layer yields an empty name, and
+`copy_to_clipboard` propagates the rejection.
+*Source constructs:* every `{var}` / `{var.path}` placeholder in a layout
+node's text or `content`.
+*Enforcement:* **Runtime** (`crates/core/src/core/types/eval.rs`).
+
 ---
 
 ## 3. Evaluation Invariants
@@ -339,6 +364,27 @@ gate is a compile error.
   static model, actions from `EventBlock::Click` and `EventBlock::Submit` are
   considered gated; actions from `RootTimer` and network-response handlers are
   not.
+
+  The runtime half of G1 must answer the *same* question the static checker
+  asked — "was **this action** triggered by a gesture?" — so agency is a
+  property of the action batch, never of the tab: `LogicWorker` derives
+  `WorkerResponse::gesture` from the `UiEvent` variant that produced the batch
+  (`Click`/`SubmitForm` → yes; `RootTimer`/`UpdateVariable`/`Reload` → no), and
+  `drain_logic_worker_results` reads it from that response when choosing the
+  `NavigationInitiator` and when authorising `copy_to_clipboard`.
+  `dispatch_click_gesture` and `dispatch_form_submit` are the only emitters of
+  the two gesture variants; emitting either from a non-interactive path would
+  forge a gesture.
+
+  **Do not reintroduce an ambient per-tab gesture flag.** One previously
+  existed (`TabState::has_user_gesture`, set at input-dispatch time and read at
+  response-drain time) and was a cross-origin navigation bypass: worker
+  responses are drained FIFO with no link to the events that produced them, so
+  a `RootTimer` batch queued before a click was processed while the flag was
+  still set and inherited the click's authority. Root timers may fire every
+  16 ms, so a hostile document only had to wait for the user to click anything
+  at all. Regression test:
+  `mizu_core::parser::logic_worker::tests::gesture_is_per_event_not_ambient`.
 - **Path parameter validation gate (G2):** The `path_param` runtime A1+A2
   validation (rejecting delimiters and percent-encoding) acts as a gate by
   construction.  Every `path_param` expression is validated at evaluation time;
@@ -353,11 +399,12 @@ gate is a compile error.
 |---|---|---|---|
 | N1 | No fetch→navigation escalation | Runtime | `src/network/worker/` |
 | N2 | Single choke point | Runtime | `src/render/navigation.rs` |
-| N3 | User gesture for cross-origin | Runtime | `check_navigation` |
+| N3 | User gesture for cross-origin | Runtime | `check_navigation`, with agency carried per action batch on `WorkerResponse::gesture` |
 | N4 | Scheme allowlist | Runtime | `check_navigation` |
 | N5 | Uniform lifecycle | Runtime | `src/render/window/navigate.rs` |
 | N6 | Resolved address matches the name's class | Runtime | `authorize_resolved_address` in `crates/core/src/security/network.rs`, enforced in `resolve_domain` |
 | L1 | Layout budget | Runtime + Parse-time | `src/render/layout_bridge.rs`, `crates/core/src/parser/layout.rs` |
+| L2 | Bounded interpolated text run | Runtime | `MAX_INTERPOLATED_BYTES` / `CappedBuffer` in `crates/core/src/core/types/eval.rs` |
 | E1 | Bounded evaluator recursion | Runtime + stack-size margin | `core/types/eval.rs` (`eval_depth`), `parser/logic_worker.rs` (`STACK_SIZE_BYTES`) — both under `crates/core/src/` |
 | E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
 | S1 | Write-only storage | Code boundary | `core/types/eval.rs` (no `read_local`) |

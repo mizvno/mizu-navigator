@@ -1922,14 +1922,23 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
                         tab.layout_stale = true;
                     }
                 }
+                // Gate G1: the agency of *this* batch, decided by the worker
+                // from the event variant that produced it and carried on the
+                // response itself (see `WorkerResponse::gesture`). Never an
+                // ambient per-tab flag: responses are drained FIFO with no
+                // correlation to the events that produced them, so a flag set
+                // at input-dispatch time and read here would let a `RootTimer`
+                // batch that merely arrived near a click inherit the click's
+                // authority.
+                let batch_gesture = response.gesture;
                 for action in response.runtime_actions {
                     if let crate::network::RuntimeAction::Navigate { url } = &action {
                         // N2+N3: Navigate actions go through the choke point;
-                        // capture the current gesture flag so cross-origin
-                        // logic-driven navigation is blocked without a click.
+                        // cross-origin logic-driven navigation is blocked
+                        // unless this batch itself carries a user gesture.
                         tab.chrome_state.loading = true;
                         let url = url.clone();
-                        let initiator = if tab.has_user_gesture {
+                        let initiator = if batch_gesture {
                             NavigationInitiator::UserGesture
                         } else {
                             NavigationInitiator::DocumentLogic
@@ -1947,7 +1956,7 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
                             &tab.local_inputs,
                             &tab.node_id_to_u32,
                             &tab.store,
-                            tab.has_user_gesture,
+                            batch_gesture,
                         ) {
                             Ok(text) => {
                                 if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -1962,9 +1971,6 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
                         execute_tab_capability_action(tab, &ctx, action);
                     }
                 }
-                // User-gesture activation is transitory: consume it after each
-                // action batch so subsequent batches without a click are blocked.
-                tab.has_user_gesture = false;
             }
             Err(e) => {
                 tracing::error!(error = ?e, "logic worker error");

@@ -196,18 +196,24 @@ pub(super) fn dispatch_file_input_click(tab: &mut TabState, node_id: EgoNodeId) 
         .dom
         .get(node_id)
         .and_then(|n| n.value().attributes.get("accept").cloned());
-    tab.has_user_gesture = true;
     let picked = pick_file_path(accept.as_deref());
     apply_file_selection(tab, u32_id, picked);
     true
 }
 
-/// Dispatches a click gesture for `node_id` — the exact user-gesture
-/// sequence the mouse click handler uses (`has_user_gesture = true`, then a
-/// single `UiEvent::Click`). Shared by the mouse click handler and keyboard
-/// activation (Enter/Space) so the two are observationally identical: same
-/// gesture flag, same single event. Returns `true` if dispatched (`node_id`
-/// must have a u32 mapping, which every live DOM node has).
+/// Dispatches a click gesture for `node_id` — a single `UiEvent::Click`.
+/// Shared by the mouse click handler and keyboard activation (Enter/Space) so
+/// the two are observationally identical: the same single event. Returns
+/// `true` if dispatched (`node_id` must have a u32 mapping, which every live
+/// DOM node has).
+///
+/// This function and [`dispatch_form_submit`] are the *only* emitters of
+/// `UiEvent::Click`/`UiEvent::SubmitForm`, which is what lets the logic
+/// worker treat those two variants as user agency and stamp
+/// [`crate::network::WorkerResponse::gesture`] on the resulting batch (gate
+/// G1). Emitting either variant from a non-interactive path would forge a
+/// gesture; route document-driven work through `RootTimer`/`UpdateVariable`
+/// instead.
 pub(super) fn dispatch_click_gesture(
     tab: &mut TabState,
     logic_tx: &std::sync::mpsc::Sender<(TabId, UiEvent)>,
@@ -222,10 +228,10 @@ pub(super) fn dispatch_click_gesture(
             crate::render::inspector::model::node_label(node_ref.value(), None),
         );
     }
-    // Mark user gesture before dispatching — clipboard actions in this
-    // response batch are therefore authorised. Per-tab (invariant T1): a
-    // click here can never authorise another tab's clipboard read.
-    tab.has_user_gesture = true;
+    // The `Click` variant itself carries the agency: the worker stamps
+    // `gesture: true` on exactly the response batch this event produces, so
+    // navigation and clipboard actions in *that* batch — and no other — are
+    // authorised.
     let _ = logic_tx.send((tab.id, UiEvent::Click { node_id: u32_id }));
     true
 }
@@ -252,7 +258,6 @@ pub(super) fn dispatch_form_submit(
         tracing::warn!("submit event outside any form node; ignored");
         return false;
     };
-    tab.has_user_gesture = true;
     tab.inspector_log.push_event(
         crate::render::inspector::log::EventKind::Submit,
         format!("form submit ({} fields)", fields.len()),

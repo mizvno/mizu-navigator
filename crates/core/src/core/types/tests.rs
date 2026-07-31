@@ -457,6 +457,53 @@ fn store_interpolate_string() {
     assert_eq!(escaped_backslash_res.unwrap(), "Test \\42");
 }
 
+/// Interpolation is the one path where a value leaves the budgeted evaluator
+/// and enters the renderer: it runs during layout/paint, so `max_instructions`
+/// never applies. A network response is bounded only by the 32 MiB transfer
+/// cap and is a single JSON node (so `MAX_JSON_NODES` never fires), which made
+/// one `text "{data}"` node enough to hand tens of megabytes to the text
+/// shaper on the UI thread, on every layout pass.
+///
+/// The oversized value must be *rejected*, not truncated: a clipped prefix of
+/// attacker-controlled data would be indistinguishable from the real value to
+/// everything downstream.
+#[test]
+fn interpolation_rejects_oversized_values_instead_of_shaping_them() {
+    use super::eval::MAX_INTERPOLATED_BYTES;
+
+    let mut store = VariableStore::new();
+    store.set("small", "x".repeat(16));
+    store.set("huge", "A".repeat(MAX_INTERPOLATED_BYTES + 1));
+    let store = store.freeze();
+
+    assert_eq!(store.interpolate("v={small}").unwrap(), format!("v={}", "x".repeat(16)));
+
+    let err = store
+        .interpolate("{huge}")
+        .expect_err("an over-budget value must not reach the renderer");
+    assert!(
+        matches!(err, MizuError::SecurityViolation(_)),
+        "expected a SecurityViolation naming the render budget, got {err:?}"
+    );
+
+    // The cap bounds the whole run, not just one substitution: many
+    // individually-legal values must not add up past it either.
+    let mut store = VariableStore::new();
+    store.set("chunk", "y".repeat(MAX_INTERPOLATED_BYTES / 4));
+    let store = store.freeze();
+    assert!(
+        store.interpolate("{chunk}{chunk}").is_ok(),
+        "two quarter-budget values must still render"
+    );
+    assert!(
+        matches!(
+            store.interpolate("{chunk}{chunk}{chunk}{chunk}{chunk}"),
+            Err(MizuError::SecurityViolation(_))
+        ),
+        "values summing past the budget must be rejected"
+    );
+}
+
 #[test]
 fn eval_field_access_on_record() {
     use crate::core::types::Symbol;
