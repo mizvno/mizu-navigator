@@ -76,7 +76,9 @@ fn mizu_domain(url: &str) -> Option<&str> {
 }
 
 /// Returns `true` when `host` is a host token `mizu://` actually admits: no
-/// userinfo, no explicit port.
+/// userinfo, no explicit port, and none of the WHATWG "forbidden host code
+/// points" that `url::Host` (opaque-host parsing, since `mizu` is a
+/// non-special scheme) rejects.
 ///
 /// This mirrors the policy `MizuUri::parse` enforces on the way to the socket
 /// (see `core::uri`), and mirrors it *by hand* rather than by calling that
@@ -92,18 +94,37 @@ fn mizu_domain(url: &str) -> Option<&str> {
 ///
 /// Rejecting here is fail-closed twice over: such a URL could never be fetched
 /// anyway (`MizuUri::parse` refuses it), so the only thing the old behaviour
-/// bought was the chance for `trusted.com@evil.com` to be carried further into
-/// the browser as if it were an origin.
+/// bought was the chance for a spoof-shaped host — `trusted.com@evil.com`, or
+/// `trusted.com\evil.com` (a backslash reads as a path separator to some
+/// consumers and as a plain host character to others) — to be carried further
+/// into the browser as if it were an origin.
 fn is_wellformed_mizu_host(host: &str) -> bool {
-    if host.contains('@') {
+    if host.is_empty() || host.contains('@') {
         return false;
     }
     // An IPv6 literal is bracketed and is full of colons; a colon anywhere
     // else is a port. `[::1]:80` is caught by the trailing-text check.
-    match host.strip_prefix('[') {
-        Some(rest) => matches!(rest.strip_suffix(']'), Some(inner) if !inner.is_empty()),
-        None => !host.contains(':'),
-    }
+    let unbracketed = match host.strip_prefix('[') {
+        Some(rest) => match rest.strip_suffix(']') {
+            Some(inner) if !inner.is_empty() => inner,
+            _ => return false,
+        },
+        None => {
+            if host.contains(':') {
+                return false;
+            }
+            host
+        }
+    };
+    // WHATWG forbidden host code points (opaque-host parsing), minus `:`
+    // which is handled above so a bracketed IPv6 literal's internal colons
+    // are not rejected here.
+    !unbracketed.bytes().any(|b| {
+        matches!(
+            b,
+            0x00..=0x20 | b'#' | b'/' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'|' | 0x7f
+        )
+    })
 }
 
 /// Returns `true` when the root initiator (unwinding `RedirectOf` chains)
@@ -649,6 +670,43 @@ mod tests {
         for host in ["u@h", "h:1", "[::1]:1", "[]", "[::1"] {
             assert!(!is_wellformed_mizu_host(host), "{host} must be rejected");
         }
+    }
+
+    /// Regression guard for the agreement with `MizuUri::parse`: a host
+    /// carrying a WHATWG forbidden host code point must be rejected here too,
+    /// not just by the fetcher, or a spoof-shaped string can be committed as
+    /// an origin that could never actually be fetched.
+    #[test]
+    fn hosts_with_forbidden_code_points_are_rejected() {
+        for host in [
+            "trusted.com\\evil.com",
+            "trusted.com/evil.com",
+            "trusted.com#evil.com",
+            "trusted.com?evil.com",
+            "trusted.com evil.com",
+            "trusted.com<evil.com",
+            "trusted.com>evil.com",
+            "trusted.com^evil.com",
+            "trusted.com|evil.com",
+            "trusted.com\tevil.com",
+            "trusted.com\nevil.com",
+            "",
+        ] {
+            assert!(!is_wellformed_mizu_host(host), "{host:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn a_host_with_a_forbidden_code_point_is_blocked_at_check_navigation() {
+        let v = check_navigation(
+            "mizu://a.com/page",
+            "mizu://trusted.com\\evil.com/page",
+            &NavigationInitiator::UserGesture,
+        );
+        assert_eq!(
+            v,
+            NavigationVerdict::Block("mizu:// URL must not carry credentials or an explicit port"),
+        );
     }
 
     // --- N3: `redirect_of` preserves agency and collapses chains ---
