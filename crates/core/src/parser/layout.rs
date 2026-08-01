@@ -24,6 +24,24 @@ use crate::parser::logic::{
 };
 use crate::parser::urls::{EndpointKind, UrlRegistry};
 
+/// Maximum nesting depth accepted for a `layout` block's indentation
+/// hierarchy (the root `doc` node counts as depth 1).
+///
+/// The parser itself is iterative — an indentation stack, not recursion — so
+/// it has no native depth limit of its own. But the DOM it produces is walked
+/// recursively, once per level, by every downstream consumer that has to
+/// visit every node: `render::layout_bridge::build_taffy_tree`, taffy's own
+/// layout pass, and `render::vello_pipeline::paint_node` all recurse on the
+/// UI thread with no depth counter of their own. A hostile document nested
+/// far enough (attacker-controlled indentation, well within
+/// `MAX_RESPONSE_BODY_BYTES`) would commit successfully and then blow the
+/// main-thread stack on the first layout/paint pass — a full-process crash,
+/// not a per-document failure. Capping depth here, at parse time, rejects
+/// such a document before it ever reaches those walkers. 256 matches
+/// [`crate::core::types::eval::MAX_EVAL_DEPTH`]: far beyond any depth a
+/// legitimate hand-authored or generated document would use.
+const MAX_LAYOUT_DEPTH: usize = 256;
+
 /// The valid structural primitives in Mizu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Primitive {
@@ -1033,6 +1051,12 @@ pub fn parse_layout_with_urls(
         }
 
         stack.push((indent, new_id));
+        if stack.len() > MAX_LAYOUT_DEPTH {
+            return Err(MizuError::ParseError(format!(
+                "line {}: layout nesting too deep (max {MAX_LAYOUT_DEPTH} levels)",
+                line_idx + 1
+            )));
+        }
     }
 
     Ok(tree)
@@ -1045,6 +1069,39 @@ mod tests {
     use crate::core::types::StringInterner;
     use crate::parser::logic::parse_action;
     use crate::parser::urls::UrlRegistry;
+
+    #[test]
+    fn deeply_nested_layout_is_rejected_before_reaching_the_dom() {
+        // Regression: a document nested well beyond MAX_LAYOUT_DEPTH must be
+        // rejected at parse time, before it can reach the recursive DOM
+        // walkers (build_taffy_tree, taffy's layout, paint_node) and overflow
+        // the UI thread's stack.
+        let mut layout = String::from("doc\n");
+        for depth in 0..(super::MAX_LAYOUT_DEPTH + 10) {
+            layout.push_str(&" ".repeat((depth + 1) * 4));
+            layout.push_str("box\n");
+        }
+        let mut interner = StringInterner::new();
+        let result = parse_layout(&layout, &mut interner);
+        assert!(
+            matches!(result, Err(MizuError::ParseError(ref msg)) if msg.contains("nesting too deep")),
+            "over-deep layout must be rejected with a nesting error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn layout_nesting_at_the_limit_is_accepted() {
+        // The boundary itself (exactly MAX_LAYOUT_DEPTH levels, including the
+        // root `doc`) must still parse — the cap must not be off-by-one.
+        let mut layout = String::from("doc\n");
+        for depth in 0..(super::MAX_LAYOUT_DEPTH - 1) {
+            layout.push_str(&" ".repeat((depth + 1) * 4));
+            layout.push_str("box\n");
+        }
+        let mut interner = StringInterner::new();
+        let result = parse_layout(&layout, &mut interner);
+        assert!(result.is_ok(), "layout at the depth limit must parse: {result:?}");
+    }
 
     #[test]
     fn media_guard_rejects_undeclared_image_alias() {
