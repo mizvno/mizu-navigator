@@ -2310,6 +2310,36 @@ fn parse_root_timers_non_timer_lines_are_ignored() {
 }
 
 #[test]
+fn parse_root_timers_at_the_limit_is_accepted() {
+    let src = (0..*crate::parser::logic::MAX_ROOT_TIMERS)
+        .map(|i| format!("timer 100ms -> a = {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut interner = StringInterner::new();
+    let timers = parse_root_timers(&src, &mut interner).expect("exactly the limit must parse");
+    assert_eq!(timers.len(), *crate::parser::logic::MAX_ROOT_TIMERS);
+}
+
+#[test]
+fn parse_root_timers_beyond_the_limit_is_rejected() {
+    // Every timer is an independent, self-rearming event source, so an
+    // unbounded count is an unbounded dispatch rate into the logic worker —
+    // rejected outright rather than silently truncated, so a document never
+    // appears to work while running something other than what it declares.
+    let src = (0..*crate::parser::logic::MAX_ROOT_TIMERS + 1)
+        .map(|i| format!("timer 16ms -> a = {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut interner = StringInterner::new();
+    let err = parse_root_timers(&src, &mut interner)
+        .expect_err("more timers than the limit must be rejected");
+    assert!(
+        matches!(err, MizuError::ParseError(ref msg) if msg.contains("timer")),
+        "expected a ParseError naming the timer limit, got {err:?}"
+    );
+}
+
+#[test]
 fn parse_root_timers_missing_arrow_is_error() {
     let src = "timer 500ms count = count + 1";
     let mut interner = StringInterner::new();

@@ -16,9 +16,14 @@ enforcement mechanism.
 (`Fetch`, `FetchImage`, `NetworkRequest`) must never cause document navigation,
 under any server response.
 *Source constructs:* network worker redirect handling.
-*Enforcement:* **Runtime** — callers of data/media paths never invoke
-`check_navigation`; redirect loops are followed internally with a budget
-(`src/network/worker/` — `mod.rs`/`fetch.rs`).
+*Enforcement:* **Runtime** — every subresource request goes through
+`fetch::handle_fetch_subresource_raw`, which follows *same-origin* redirects
+internally under the `max_redirects` budget and rejects a cross-origin or
+non-`mizu://` `Location` as a `SecurityViolation`. `NetworkResult::
+NavigationRedirect` is therefore reachable only from the `Navigate` handler.
+Enforcing this in one shared function rather than per call site is deliberate:
+the property is "no data/media path can produce a navigation", and a rule each
+caller has to remember to follow is one a later caller will not.
 
 **N2 — Single choke point:** Every top-level navigation passes through one
 policy function (`check_navigation`) before any state change or
@@ -33,6 +38,17 @@ carries a user gesture.  Logic-initiated navigation without a gesture may not
 leave the origin.
 *Source constructs:* `NavigationInitiator` variants.
 *Enforcement:* **Runtime** — navigation choke point (`check_navigation`).
+*Agency is carried, never reconstructed.* Two asynchronous hops separate a
+navigation from its authorising cause, and at each one the initiator travels
+with the message rather than being inferred on arrival: `WorkerResponse::
+gesture` across the logic worker, and `NetworkCmd::Navigate.initiator` →
+`NetworkResult::NavigationRedirect.initiator` across the network worker. A
+redirect re-enters the choke point wrapped by
+`NavigationInitiator::redirect_of`, which preserves the chain's root and
+collapses the nesting. Substituting a plausible-looking initiator at either
+boundary hands the document agency it never had — a server answering a
+same-origin logic fetch with one `Location` header would otherwise obtain a
+gesture-authorised cross-origin navigation.
 
 **N4 — Scheme:** Only `mizu://` is navigable over the network; `file://` only
 under the sandbox rules; `http(s)://` and everything else is refused at the
@@ -43,9 +59,17 @@ choke point.
 **N5 — Uniform lifecycle:** Origin-scoped state (`capability_policy`,
 redirect-chain budget, `url_registry`) is handled identically on every
 navigation path.
-*Source constructs:* `CapabilityPolicy` reset in `src/render/window/navigate.rs`
+*Source constructs:* `CapabilityPolicy` rebuild in `src/render/window/navigate.rs`
 (construction in `src/render/window/manager.rs`).
 *Enforcement:* **Runtime** — navigation choke point.
+*Not everything origin-scoped may be reset by it.* The storage **byte quota**
+is explicitly excluded and lives in the window-level `StorageUsageLedger`,
+keyed by the origin's storage identity. A document can navigate to itself
+without a user gesture (N3 permits same-origin), so any budget the choke point
+zeroes is a budget the document can refill on demand — the quota bounds bytes
+at rest and must outlive both the page load and the tab. What the rebuild does
+reset is the per-second write burst, which genuinely belongs to the running
+document.
 
 **N6 — Resolution honesty:** Every outbound connection's destination address
 is authorized against the *name* it was resolved from, before any socket is
@@ -241,6 +265,24 @@ observability only, not prevention.
 remains the only enforced default; the env override is always available and
 always visible in logs when taken.
 
+**S4 — The storage byte quota is per origin, for the life of the process:**
+The bytes an origin has persisted are accumulated in the window-level
+`StorageUsageLedger` (`crates/core/src/security/quota.rs`), keyed by the same
+identity that names the origin's encrypted store — not on the per-tab, per-page-load
+`CapabilityPolicy`.
+*Rationale:* the quota bounds data at rest, so every way of reaching that data
+must draw on one budget. Two resets would otherwise be free to the document:
+navigating (same-origin navigation needs no user gesture under N3, and the
+choke point rebuilds `capability_policy` on every hop), and opening a second
+tab on the same origin. Either turns a 512 KiB ceiling into 512 KiB per
+iteration.
+*Source constructs:* `CapabilityPolicy::check_storage_write`, built only
+through `render::security::capability_policy_for` so the ledger key is always
+`get_current_domain` — a second, independently-derived notion of "same origin"
+that *split* one origin in two would reopen the bypass.
+*Enforcement:* **Runtime** — check and charge happen under one ledger lock, so
+concurrent tabs on one origin cannot both spend the same remaining budget.
+
 ---
 
 ## 5. Purity Invariants
@@ -385,6 +427,18 @@ gate is a compile error.
   16 ms, so a hostile document only had to wait for the user to click anything
   at all. Regression test:
   `mizu_core::parser::logic_worker::tests::gesture_is_per_event_not_ambient`.
+
+  **Do not synthesise an initiator for a server redirect.** The same mistake in
+  its other shape: `process_network_result` once wrapped every redirect as
+  `RedirectOf(UserGesture)` on the reasoning that a navigation is usually one
+  the user asked for. A document-logic navigation to its own origin is allowed
+  without a gesture, so any server could answer it with `Location:
+  mizu://elsewhere/` and obtain an authorised cross-origin navigation — and,
+  before N1 was enforced centrally, a background data fetch or an `<image>`
+  load could do the same. The initiator now rides on `NetworkCmd::Navigate` and
+  comes back on the redirect result. Regression tests:
+  `render::window::tests::cross_origin_redirect_of_document_logic_navigation_is_blocked`
+  and `redirect_chains_do_not_accumulate_agency`.
 - **Path parameter validation gate (G2):** The `path_param` runtime A1+A2
   validation (rejecting delimiters and percent-encoding) acts as a gate by
   construction.  Every `path_param` expression is validated at evaluation time;
@@ -405,11 +459,13 @@ gate is a compile error.
 | N6 | Resolved address matches the name's class | Runtime | `authorize_resolved_address` in `crates/core/src/security/network.rs`, enforced in `resolve_domain` |
 | L1 | Layout budget | Runtime + Parse-time | `src/render/layout_bridge.rs`, `crates/core/src/parser/layout.rs` |
 | L2 | Bounded interpolated text run | Runtime | `MAX_INTERPOLATED_BYTES` / `CappedBuffer` in `crates/core/src/core/types/eval.rs` |
+| L3 | Bounded timer dispatch rate | Parse-time + Runtime | `MAX_ROOT_TIMERS` in `crates/core/src/parser/logic/parse.rs`, `TabState::may_dispatch_timer_tick` in `src/render/window/manager.rs` |
 | E1 | Bounded evaluator recursion | Runtime + stack-size margin | `core/types/eval.rs` (`eval_depth`), `parser/logic_worker.rs` (`STACK_SIZE_BYTES`) — both under `crates/core/src/` |
 | E2 | Fixed-point numeric scale is not configurable | Compile-time | `core::types::value::DECIMAL_SCALE` |
 | S1 | Write-only storage | Code boundary | `core/types/eval.rs` (no `read_local`) |
 | S2 | Debounced writes are eventually (not immediately) durable | Design boundary | `StorageWriteDebouncer` in `src/network/worker/storage_debounce.rs` |
 | S3 | `MIZU_MASTER_KEY` break-glass path is logged, not silent | Runtime (logged) | `derive_key_from_env_override` in `crates/core/src/core/storage.rs` |
+| S4 | Storage byte quota is per origin, not per page load or tab | Runtime | `StorageUsageLedger` in `crates/core/src/security/quota.rs` |
 | P1 | Purity in observation contexts | Parse-time | `find_side_effect_call` in `crates/core/src/parser/logic/purity.rs` |
 | F1 | Gated information flow | Load-time | `check_information_flow` in `crates/core/src/parser/flow.rs` |
 

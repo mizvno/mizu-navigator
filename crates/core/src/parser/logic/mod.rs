@@ -102,6 +102,7 @@ pub(crate) use eval::{apply_binop, check_type, type_name};
 pub use eval::{evaluate, execute_action};
 pub(crate) use parse::path_param_ok;
 pub use parse::{
-    parse_action, parse_action_with_urls, parse_expr_standalone, parse_logic, parse_root_timers,
+    MAX_ROOT_TIMERS, parse_action, parse_action_with_urls, parse_expr_standalone, parse_logic,
+    parse_root_timers,
 };
 pub use purity::find_side_effect_call;

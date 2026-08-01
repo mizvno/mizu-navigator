@@ -11,7 +11,7 @@
 //!   constants whose own doc comments admit they are unmeasured starting
 //!   guesses, not derived limits (`MAX_COMP_BINDINGS`, `MAX_INSTRUCTIONS`,
 //!   `MAX_SYNTHETIC_LAYOUT_NODES`, `INPUT_MAX_BYTES`, `MAX_PARSE_DEPTH`,
-//!   `MAX_TOKEN_TTL_SECS`). These are overridable only via `MIZU_*`
+//!   `MAX_ROOT_TIMERS`, `MAX_TOKEN_TTL_SECS`). These are overridable only via `MIZU_*`
 //!   environment variables for a single run, deliberately *not* part of
 //!   `config.toml`, so they never look like a supported, persisted setting.
 //!
@@ -47,7 +47,8 @@
 //!
 //! `MIZU_MAX_COMP_BINDINGS`, `MIZU_MAX_INSTRUCTIONS`,
 //! `MIZU_MAX_SYNTHETIC_LAYOUT_NODES`, `MIZU_INPUT_MAX_BYTES`,
-//! `MIZU_MAX_PARSE_DEPTH`, `MIZU_MAX_TOKEN_TTL_SECS` — e.g.
+//! `MIZU_MAX_PARSE_DEPTH`, `MIZU_MAX_ROOT_TIMERS`,
+//! `MIZU_MAX_TOKEN_TTL_SECS` — e.g.
 //! `MIZU_MAX_COMP_BINDINGS=2000 cargo run -- ./big.mizu`. An unset or
 //! unparseable value falls back to the default silently logged via
 //! `tracing::warn!`.

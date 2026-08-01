@@ -678,7 +678,8 @@ fn network_rows(src: &InspectorSources<'_>) -> Vec<Row> {
         1,
         format!(
             "quota: {} / {} bytes",
-            src.capability_policy.bytes_stored, src.capability_policy.quota_bytes
+            src.capability_policy.bytes_stored(),
+            src.capability_policy.quota_bytes
         ),
         RowKind::Normal,
     ));

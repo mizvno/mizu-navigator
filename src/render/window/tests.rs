@@ -7,6 +7,7 @@ use crate::network::TabId;
 use crate::parser::MizuDimension;
 use crate::parser::{MizuNode, Primitive, StyleRules};
 use crate::render::chrome_vello::CHROME_HEIGHT;
+use crate::render::security::StorageUsageLedger;
 use ego_tree::Tree;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -69,6 +70,7 @@ fn make_tab(
     dom: Tree<MizuNode>,
     styles: HashMap<String, StyleRules>,
     url: &str,
+    storage_usage: &StorageUsageLedger,
 ) -> TabState {
     let mut throwaway_cache = lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap());
     TabState::new(
@@ -88,6 +90,7 @@ fn make_tab(
         },
         url,
         &mut throwaway_cache,
+        storage_usage,
     )
     .expect("tab created")
 }
@@ -101,7 +104,9 @@ fn make_manager_with(
     dom: Tree<MizuNode>,
     styles: HashMap<String, StyleRules>,
 ) -> (MizuWindowManager, TestChannelKeepAlive) {
-    MizuWindowManager::new_headless(vec![make_tab(0, dom, styles, TEST_URL)])
+    let storage_usage = StorageUsageLedger::new();
+    let tab = make_tab(0, dom, styles, TEST_URL, &storage_usage);
+    MizuWindowManager::new_headless(vec![tab], storage_usage)
 }
 
 fn window_dom() -> Tree<MizuNode> {
@@ -116,6 +121,27 @@ fn window_dom() -> Tree<MizuNode> {
         iterator_context: None,
         conditional_classes: Vec::new(),
     })
+}
+
+/// Spends the active tab's whole per-second storage write budget.
+///
+/// Used as the sentinel for "was `capability_policy` rebuilt?": the rate
+/// counter is per page load, so a subsequent successful write proves the
+/// navigation choke point ran. (The byte total deliberately survives a
+/// rebuild — see `navigating_does_not_refill_an_exhausted_storage_quota` —
+/// so it cannot serve as that sentinel.)
+fn saturate_write_rate(manager: &mut MizuWindowManager) {
+    let policy = &mut manager.active_mut().capability_policy;
+    while policy.check_storage_write(1).is_ok() {}
+}
+
+/// Whether the active tab may perform a storage write right now.
+fn write_rate_available(manager: &mut MizuWindowManager) -> bool {
+    manager
+        .active_mut()
+        .capability_policy
+        .check_storage_write(1)
+        .is_ok()
 }
 
 fn make_minimal_manager() -> (MizuWindowManager, TestChannelKeepAlive) {
@@ -638,7 +664,7 @@ fn history_back_step_routes_through_navigation_choke_point() {
         });
     assert!(manager.active_mut().history.can_go_back());
 
-    manager.active_mut().capability_policy.bytes_stored = 123_456;
+    saturate_write_rate(&mut manager);
 
     {
         let (t, mut c) = manager.split_active();
@@ -650,12 +676,11 @@ fn history_back_step_routes_through_navigation_choke_point() {
         "mizu://previous.example/page",
         "Back must navigate to the popped history entry"
     );
-    assert_eq!(
-        manager.active_mut().capability_policy.bytes_stored,
-        0,
-        "capability_policy must have been freshly reset by navigate_to_url's \
+    assert!(
+        write_rate_available(&mut manager),
+        "capability_policy must have been freshly rebuilt by navigate_to_url's \
              Allow branch (N5) — a direct URL swap bypassing the choke point \
-             would have left the sentinel value untouched"
+             would have left the exhausted write budget in place"
     );
     assert!(
         !manager.active_mut().history.can_go_back(),
@@ -684,7 +709,7 @@ fn history_forward_step_routes_through_navigation_choke_point() {
     };
     assert!(manager.active_mut().history.can_go_forward());
 
-    manager.active_mut().capability_policy.bytes_stored = 999;
+    saturate_write_rate(&mut manager);
     {
         let (t, mut c) = manager.split_active();
         navigate_forward(t, &mut c)
@@ -694,10 +719,9 @@ fn history_forward_step_routes_through_navigation_choke_point() {
         manager.active_mut().chrome_state.url,
         "mizu://current.example/page"
     );
-    assert_eq!(
-        manager.active_mut().capability_policy.bytes_stored,
-        0,
-        "Forward must also route through the choke point's N5 reset"
+    assert!(
+        write_rate_available(&mut manager),
+        "Forward must also route through the choke point's N5 rebuild"
     );
 }
 
@@ -708,7 +732,7 @@ fn history_back_with_empty_stack_fires_no_navigation() {
     let (mut manager, _keepalive) = make_minimal_manager();
     assert!(!manager.active_mut().history.can_go_back());
     manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
-    manager.active_mut().capability_policy.bytes_stored = 42;
+    saturate_write_rate(&mut manager);
 
     {
         let (t, mut c) = manager.split_active();
@@ -720,9 +744,8 @@ fn history_back_with_empty_stack_fires_no_navigation() {
         "mizu://only-page.example/",
         "URL must be unchanged when back stack is empty"
     );
-    assert_eq!(
-        manager.active_mut().capability_policy.bytes_stored,
-        42,
+    assert!(
+        !write_rate_available(&mut manager),
         "capability_policy must be untouched — no navigation occurred at all"
     );
     assert!(!manager.active_mut().history.can_go_forward());
@@ -733,7 +756,7 @@ fn history_forward_with_empty_stack_fires_no_navigation() {
     let (mut manager, _keepalive) = make_minimal_manager();
     assert!(!manager.active_mut().history.can_go_forward());
     manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
-    manager.active_mut().capability_policy.bytes_stored = 42;
+    saturate_write_rate(&mut manager);
 
     {
         let (t, mut c) = manager.split_active();
@@ -744,7 +767,7 @@ fn history_forward_with_empty_stack_fires_no_navigation() {
         manager.active_mut().chrome_state.url,
         "mizu://only-page.example/"
     );
-    assert_eq!(manager.active_mut().capability_policy.bytes_stored, 42);
+    assert!(!write_rate_available(&mut manager));
 }
 
 #[test]
@@ -795,6 +818,203 @@ fn fresh_navigation_after_back_clears_forward_stack() {
         "a fresh navigation must clear the forward stack"
     );
     assert!(manager.active_mut().history.can_go_back());
+}
+
+// --- Timer dispatch admission (unbounded worker backlog) ---
+
+#[test]
+fn timer_ticks_are_capped_while_the_worker_is_behind() {
+    // The channel to the logic worker is unbounded, so nothing but this gate
+    // stops a document from queueing ticks faster than they can be serviced.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    let tab = manager.active_mut();
+
+    for i in 0..MAX_INFLIGHT_TIMER_TICKS {
+        assert!(
+            tab.may_dispatch_timer_tick(),
+            "tick {i} must be admitted while under the cap"
+        );
+    }
+    assert!(
+        !tab.may_dispatch_timer_tick(),
+        "a tick beyond the cap must be dropped, not queued"
+    );
+    assert_eq!(tab.inflight_timer_ticks, MAX_INFLIGHT_TIMER_TICKS);
+}
+
+#[test]
+fn a_worker_response_frees_timer_capacity() {
+    // Throttling, not disarming: the document must recover as soon as the
+    // worker catches up.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    let tab = manager.active_mut();
+
+    while tab.may_dispatch_timer_tick() {}
+    assert!(!tab.may_dispatch_timer_tick());
+
+    tab.release_timer_tick();
+    assert!(
+        tab.may_dispatch_timer_tick(),
+        "capacity freed by a response must be reusable"
+    );
+}
+
+#[test]
+fn releasing_more_than_was_dispatched_cannot_underflow() {
+    // Responses are not in 1:1 correspondence with ticks (any response for the
+    // tab releases capacity), so over-releasing is expected and must saturate
+    // rather than wrap into an enormous budget.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    let tab = manager.active_mut();
+
+    for _ in 0..8 {
+        tab.release_timer_tick();
+    }
+    assert_eq!(tab.inflight_timer_ticks, 0);
+
+    for _ in 0..MAX_INFLIGHT_TIMER_TICKS {
+        assert!(tab.may_dispatch_timer_tick());
+    }
+    assert!(
+        !tab.may_dispatch_timer_tick(),
+        "the cap must still hold after saturating releases"
+    );
+}
+
+#[test]
+fn reload_clears_outstanding_timer_ticks() {
+    // A tick outstanding against the previous document can never be answered
+    // once the worker rebuilds the tab's state, so it must not permanently
+    // consume capacity.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    let tab = manager.active_mut();
+
+    while tab.may_dispatch_timer_tick() {}
+    tab.reset_timer_ticks();
+
+    assert_eq!(tab.inflight_timer_ticks, 0);
+    assert!(tab.may_dispatch_timer_tick());
+}
+
+#[test]
+fn timer_tick_budget_is_per_tab() {
+    // T1: one document's backlog must not suppress another's timers.
+    let ledger = StorageUsageLedger::new();
+    let (mut manager, _keepalive) = MizuWindowManager::new_headless(
+        vec![
+            make_tab(0, window_dom(), HashMap::new(), TEST_URL, &ledger),
+            make_tab(1, window_dom(), HashMap::new(), TEST_URL, &ledger),
+        ],
+        ledger,
+    );
+
+    while manager.tabs[0].may_dispatch_timer_tick() {}
+    assert!(!manager.tabs[0].may_dispatch_timer_tick());
+    assert!(
+        manager.tabs[1].may_dispatch_timer_tick(),
+        "a saturated tab must not consume another tab's dispatch capacity"
+    );
+}
+
+// --- N3: server redirects may not manufacture user agency ---
+
+/// Drives one `NavigationRedirect` result against the active tab and returns
+/// the URL the tab ended up on.
+fn redirect_to(
+    manager: &mut MizuWindowManager,
+    new_url: &str,
+    initiator: crate::render::navigation::NavigationInitiator,
+) -> String {
+    let tab_id = manager.active().id;
+    {
+        let (t, mut c) = manager.split_active();
+        process_network_result(
+            t,
+            &mut c,
+            crate::network::NetworkResult::NavigationRedirect {
+                tab: tab_id,
+                new_url: new_url.to_string(),
+                initiator,
+            },
+        );
+    }
+    manager.active_mut().chrome_state.url.clone()
+}
+
+#[test]
+fn cross_origin_redirect_of_document_logic_navigation_is_blocked() {
+    // Security regression: a document-logic `navigate` to its OWN origin is
+    // allowed (no gesture needed), and the server answering it with
+    // `Location: mizu://evil.example/` must not thereby obtain a cross-origin
+    // navigation. Before the fix this site hardcoded
+    // `RedirectOf(UserGesture)`, so one header cleared the N3 gate.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+
+    let landed = redirect_to(
+        &mut manager,
+        "mizu://evil.example/trap",
+        crate::render::navigation::NavigationInitiator::DocumentLogic,
+    );
+
+    assert_eq!(
+        landed, "mizu://own.example/",
+        "a redirect of a document-logic navigation must not cross origin"
+    );
+}
+
+#[test]
+fn same_origin_redirect_of_document_logic_navigation_is_allowed() {
+    // The block above must be about the origin hop, not about redirects: a
+    // same-origin redirect of a logic navigation is ordinary and must work.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+
+    let landed = redirect_to(
+        &mut manager,
+        "mizu://own.example/next",
+        crate::render::navigation::NavigationInitiator::DocumentLogic,
+    );
+
+    assert_eq!(landed, "mizu://own.example/next");
+}
+
+#[test]
+fn cross_origin_redirect_of_user_gesture_navigation_is_allowed() {
+    // The mirror image: real user agency still survives the redirect chain,
+    // so the fix does not turn into a blanket ban on cross-origin redirects.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+
+    let landed = redirect_to(
+        &mut manager,
+        "mizu://other.example/page",
+        crate::render::navigation::NavigationInitiator::UserGesture,
+    );
+
+    assert_eq!(landed, "mizu://other.example/page");
+}
+
+#[test]
+fn redirect_chains_do_not_accumulate_agency() {
+    // Hop 2 of a document-logic chain is still document logic: the initiator
+    // arrives already wrapped as `RedirectOf(DocumentLogic)`, and re-wrapping
+    // it must neither promote it nor nest without bound.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+
+    let landed = redirect_to(
+        &mut manager,
+        "mizu://evil.example/trap",
+        crate::render::navigation::NavigationInitiator::RedirectOf(Box::new(
+            crate::render::navigation::NavigationInitiator::DocumentLogic,
+        )),
+    );
+
+    assert_eq!(
+        landed, "mizu://own.example/",
+        "agency must not be gained by adding redirect hops"
+    );
 }
 
 // --- Bidi anti-spoofing (ux-7): programmatic chrome_state.url assignment ---
@@ -981,7 +1201,9 @@ fn cancelling_the_file_dialog_leaves_the_field_null() {
     match test_rx.try_recv() {
         Ok((_, crate::network::UiEvent::SubmitForm { fields, .. })) => {
             assert!(
-                fields.get("avatar").is_some_and(|v| v.budget_eq(&crate::core::types::Value::Null, &mut u64::MAX, u64::MAX).unwrap_or(false)),
+                fields.get("avatar").is_some_and(|v| v
+                    .budget_eq(&crate::core::types::Value::Null, &mut u64::MAX, u64::MAX)
+                    .unwrap_or(false)),
                 "an unselected/cancelled file field must submit Null, not an error"
             );
         }
@@ -1015,10 +1237,11 @@ fn file_input_click_focuses_no_text_caret() {
 fn make_multi_tab_manager(n: u64) -> (MizuWindowManager, TestChannelKeepAlive) {
     let mut styles = HashMap::new();
     styles.insert("window".to_string(), StyleRules::default());
+    let storage_usage = StorageUsageLedger::new();
     let tabs = (0..n)
-        .map(|i| make_tab(i, window_dom(), styles.clone(), TEST_URL))
+        .map(|i| make_tab(i, window_dom(), styles.clone(), TEST_URL, &storage_usage))
         .collect();
-    MizuWindowManager::new_headless(tabs)
+    MizuWindowManager::new_headless(tabs, storage_usage)
 }
 
 #[test]
@@ -1142,12 +1365,110 @@ fn redirect_budget_is_per_tab() {
 }
 
 #[test]
-fn capability_policy_is_per_tab() {
+fn write_rate_limit_is_per_tab() {
+    // The *burst* budget belongs to the running document, so one tab
+    // exhausting it must not stall another's writes.
     let (mut manager, _keepalive) = make_multi_tab_manager(2);
-    manager.tabs[0].capability_policy.bytes_stored = 4096;
+    while manager.tabs[0]
+        .capability_policy
+        .check_storage_write(1)
+        .is_ok()
+    {}
+
+    assert!(
+        manager.tabs[0]
+            .capability_policy
+            .check_storage_write(1)
+            .is_err(),
+        "the first tab's per-second write budget must be exhausted"
+    );
+    assert!(
+        manager.tabs[1]
+            .capability_policy
+            .check_storage_write(1)
+            .is_ok(),
+        "one document's write burst must not consume another's"
+    );
+}
+
+#[test]
+fn storage_byte_quota_is_shared_by_every_tab_on_one_origin() {
+    // The byte quota bounds data at rest, and both tabs write to the same
+    // encrypted store, so they must draw on one budget. Two independent
+    // budgets would mean opening a second tab doubles what an origin can
+    // persist.
+    let (mut manager, _keepalive) = make_multi_tab_manager(2);
+    manager.tabs[0]
+        .capability_policy
+        .check_storage_write(4096)
+        .expect("first write is within quota");
+
     assert_eq!(
-        manager.tabs[1].capability_policy.bytes_stored, 0,
-        "storage quota is per-origin and per-tab; one document must not spend another's"
+        manager.tabs[1].capability_policy.bytes_stored(),
+        4096,
+        "a second tab on the same origin must see the bytes already spent"
+    );
+}
+
+#[test]
+fn storage_byte_quota_is_isolated_between_origins() {
+    let ledger = StorageUsageLedger::new();
+    let mut a = crate::render::security::capability_policy_for("mizu://a.example/x", &ledger);
+    let b = crate::render::security::capability_policy_for("mizu://b.example/x", &ledger);
+
+    a.check_storage_write(4096).expect("within quota");
+
+    assert_eq!(a.bytes_stored(), 4096);
+    assert_eq!(
+        b.bytes_stored(),
+        0,
+        "one origin must never be charged for another's writes"
+    );
+}
+
+#[test]
+fn navigating_does_not_refill_an_exhausted_storage_quota() {
+    // The bypass this closes: a same-origin `navigate` needs no user gesture,
+    // and it rebuilds `capability_policy`. If the byte total lived on the
+    // policy, a document could loop navigate → write-a-full-quota → navigate
+    // and persist without bound.
+    let (mut manager, _keepalive) = make_minimal_manager();
+    let origin = "mizu://greedy.example/index.mizu";
+    manager.active_mut().chrome_state.url = origin.to_string();
+    manager.active_mut().capability_policy =
+        crate::render::security::capability_policy_for(origin, &manager.storage_usage);
+
+    let quota = manager.active().capability_policy.quota_bytes;
+    manager
+        .active_mut()
+        .capability_policy
+        .check_storage_write(quota)
+        .expect("a write of exactly the quota must be accepted");
+
+    // Same-origin navigation: allowed with no gesture, and it rebuilds the
+    // policy through the choke point exactly as production does.
+    {
+        let (t, mut c) = manager.split_active();
+        navigate_to_url(
+            t,
+            &mut c,
+            "mizu://greedy.example/again.mizu".to_string(),
+            crate::render::navigation::NavigationInitiator::DocumentLogic,
+        );
+    }
+
+    assert_eq!(
+        manager.active_mut().capability_policy.bytes_stored(),
+        quota,
+        "navigation must not zero the origin's accumulated byte total"
+    );
+    assert!(
+        manager
+            .active_mut()
+            .capability_policy
+            .check_storage_write(1)
+            .is_err(),
+        "an origin at its quota must stay at its quota across a navigation"
     );
 }
 

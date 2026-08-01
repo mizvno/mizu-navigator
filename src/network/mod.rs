@@ -14,6 +14,7 @@ pub use messages::{
 };
 
 use crate::core::errors::MizuError;
+use crate::render::navigation::NavigationInitiator;
 
 /// Command sent from the UI loop to the networking thread.
 #[derive(Debug)]
@@ -56,6 +57,15 @@ pub enum NetworkCmd {
         tab: TabId,
         /// The target document's URL.
         url: String,
+        /// Who authorised *this* navigation, echoed back on any
+        /// [`NetworkResult::NavigationRedirect`] it produces.
+        ///
+        /// Carried through the worker for the same reason
+        /// [`WorkerResponse::gesture`] is carried through the logic worker: the
+        /// UI thread cannot reconstruct agency from a result that arrives
+        /// asynchronously, and anything it invents instead is agency the
+        /// document never earned. See [`NavigationInitiator::redirect_of`].
+        initiator: NavigationInitiator,
     },
     /// Fetch an image and cache it
     FetchImage {
@@ -143,10 +153,12 @@ pub enum NetworkResult {
     },
     /// A `Navigate` request received a server redirect (3xx).
     ///
-    /// **Provenance**: only emitted by the `Navigate` handler in the network
-    /// worker.  `Fetch`, `FetchImage`, and `NetworkRequest` **never** emit
-    /// this variant — they follow same-origin redirects internally or surface
-    /// failure through `FetchFailed` / `FetchImageFailed` (invariant N1).
+    /// **Provenance (invariant N1)**: only emitted by the `Navigate` handler in
+    /// the network worker.  `Fetch`, `FetchImage`, and `NetworkRequest` never
+    /// emit this variant — they follow same-origin redirects internally and
+    /// surface everything else through `FetchFailed` / `FetchImageFailed` (see
+    /// `worker::fetch::handle_fetch_subresource_raw`, which is what enforces
+    /// this rather than leaving it to each call site's discretion).
     NavigationRedirect {
         /// Tab this result belongs to — the value echoed from the command.
         /// Never resolve it against the *active* tab: the user may have
@@ -155,6 +167,12 @@ pub enum NetworkResult {
         tab: TabId,
         /// The redirect target URL to navigate to next.
         new_url: String,
+        /// The initiator of the navigation being redirected, echoed unchanged
+        /// from [`NetworkCmd::Navigate`]. The UI thread wraps it with
+        /// [`NavigationInitiator::redirect_of`] before re-entering the
+        /// navigation choke point, so a redirect can only ever carry the agency
+        /// the original navigation already had.
+        initiator: NavigationInitiator,
     },
     /// Image fetch succeeded, returning decoded image
     FetchImageSuccess {

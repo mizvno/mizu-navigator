@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 use crate::core::types::Value;
 use crate::render::navigation::{NavigationInitiator, NavigationVerdict, check_navigation};
-use crate::render::security::CapabilityPolicy;
 
 use super::AssetSlot;
 use super::history::{HistoryEntry, VisitRecord};
@@ -376,7 +375,11 @@ pub(super) fn process_network_result(
                 .complete_net(&url, NetOutcome::Ok, Some(source.len()));
             handle_navigate_success(tab, ctx, url, source);
         }
-        NetworkResult::NavigationRedirect { tab: _, new_url } => {
+        NetworkResult::NavigationRedirect {
+            tab: _,
+            new_url,
+            initiator,
+        } => {
             tab.inspector_log
                 .complete_latest_pending(NetOutcome::Redirect);
             if tab.register_redirect() {
@@ -387,22 +390,17 @@ pub(super) fn process_network_result(
                 );
                 // N2+N5: route through the single choke point so scheme,
                 // origin, gesture, and lifecycle checks all apply.
-                // The redirect inherits the initiator of the navigation
-                // chain — a user-gesture navigation that redirects
-                // cross-origin is still user agency.
                 //
-                // TODO: once navigation carries the original initiator
-                // through the redirect chain, wrap it here.  For now,
-                // redirects of top-level navigations always carry
-                // UserGesture because Navigate can only be reached
-                // through navigate_to_url (which is always either
-                // user-initiated or a same-origin logic action).
-                navigate_to_url(
-                    tab,
-                    ctx,
-                    new_url,
-                    NavigationInitiator::RedirectOf(Box::new(NavigationInitiator::UserGesture)),
-                );
+                // N3: the redirect inherits the agency of the navigation it
+                // continues, and nothing more. `initiator` is the value the
+                // originating `navigate_to_url` put on the command and the
+                // worker echoed back untouched, so a user-gesture navigation
+                // that redirects cross-origin stays allowed while a
+                // document-logic one stays blocked. Substituting a synthetic
+                // `UserGesture` here — as this site did before — let any
+                // server convert a same-origin logic fetch into an authorised
+                // cross-origin navigation with one `Location` header.
+                navigate_to_url(tab, ctx, new_url, initiator.redirect_of());
             } else {
                 tracing::error!(
                     limit = *MAX_REDIRECTS,
@@ -600,7 +598,15 @@ pub(super) fn navigate_to_url(
             // sanitized.
             tab.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
             tab.chrome_state.committed_url = target.clone();
-            tab.capability_policy = CapabilityPolicy::new(&target);
+            // Rebuilding the policy re-derives the quota *tier* for the new
+            // origin and resets the per-second write burst. It does not hand
+            // out a fresh byte budget: the running total lives in the
+            // window-level ledger, keyed by origin, so a document navigating
+            // to itself (allowed without a gesture, same origin) cannot use
+            // this line to zero its own accounting and store another quota's
+            // worth on every hop.
+            tab.capability_policy =
+                crate::render::security::capability_policy_for(&target, ctx.storage_usage);
 
             if target.starts_with("file://") {
                 if let Some(path) = target.strip_prefix("file:///")
@@ -613,9 +619,13 @@ pub(super) fn navigate_to_url(
                 tab.inspector_log
                     .push_net_start("NAV", &target, Some(target.clone()));
                 // N2: this is the ONLY site that emits NetworkCmd::Navigate.
+                // The initiator rides along so that a 3xx answer to this
+                // request re-enters this function with the agency it actually
+                // had, instead of one reconstructed after the fact (N3).
                 let _ = ctx.network_tx.send(crate::network::NetworkCmd::Navigate {
                     tab: tab.id,
                     url: target,
+                    initiator,
                 });
             }
         }

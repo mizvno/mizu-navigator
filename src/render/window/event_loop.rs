@@ -1903,6 +1903,11 @@ fn drain_logic_worker_results(manager: &mut MizuWindowManager) -> (bool, Vec<Sym
             continue;
         };
         let is_active = tab_id == active_id;
+        // The worker answered for this tab, so one unit of its dispatch
+        // capacity is free again — recorded before the match so an `Err`
+        // response frees capacity exactly like an `Ok` one, and a document
+        // whose actions keep failing does not throttle itself to a standstill.
+        tab.release_timer_tick();
         match res {
             Ok(response) => {
                 for (sym, val) in response.state_update.mutated_variables {
@@ -2150,14 +2155,26 @@ fn schedule_next_wakeup(
                         Some(rt) => tab.resolve_root_timer_interval(&rt.interval),
                         None => continue,
                     };
-                    let _ = ctx
-                        .logic_tx
-                        .send((tab.id, UiEvent::RootTimer { index: idx as u32 }));
-                    timers_fired = true;
-                    if tab.inspector.open {
-                        tab.inspector_log.push_event(
-                            crate::render::inspector::log::EventKind::Timer,
-                            format!("root timer #{idx}"),
+                    // Admission gate: a tick the worker has no capacity for is
+                    // dropped, never queued. The timer is still re-armed below,
+                    // so it resumes on its own as soon as the worker catches
+                    // up — this throttles, it does not disarm.
+                    if tab.may_dispatch_timer_tick() {
+                        let _ = ctx
+                            .logic_tx
+                            .send((tab.id, UiEvent::RootTimer { index: idx as u32 }));
+                        timers_fired = true;
+                        if tab.inspector.open {
+                            tab.inspector_log.push_event(
+                                crate::render::inspector::log::EventKind::Timer,
+                                format!("root timer #{idx}"),
+                            );
+                        }
+                    } else {
+                        tracing::trace!(
+                            tab = tab.id.0,
+                            timer = idx,
+                            "root timer tick dropped: logic worker backlog at capacity"
                         );
                     }
                     if let Some(interval_ms) = interval {
@@ -2307,10 +2324,22 @@ fn fire_background_timers(
                     Some(rt) => tab.resolve_root_timer_interval(&rt.interval),
                     None => continue,
                 };
-                let _ = ctx
-                    .logic_tx
-                    .send((tab.id, UiEvent::RootTimer { index: idx as u32 }));
-                fired = true;
+                // Same admission gate as the active tab's loop, and per-tab
+                // for the same T1 reason the redirect budget is: a background
+                // document must not be able to spend the foreground one's
+                // capacity.
+                if tab.may_dispatch_timer_tick() {
+                    let _ = ctx
+                        .logic_tx
+                        .send((tab.id, UiEvent::RootTimer { index: idx as u32 }));
+                    fired = true;
+                } else {
+                    tracing::trace!(
+                        tab = tab.id.0,
+                        timer = idx,
+                        "background root timer tick dropped: logic worker backlog at capacity"
+                    );
+                }
                 if let Some(interval_ms) = interval {
                     let throttled = background_timer_period(interval_ms);
                     let next_deadline = now + std::time::Duration::from_millis(throttled);

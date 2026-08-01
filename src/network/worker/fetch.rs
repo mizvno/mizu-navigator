@@ -69,7 +69,15 @@ pub(crate) fn parse_body_value(body: &[u8]) -> crate::core::types::Value {
     crate::core::types::Value::from(String::from_utf8_lossy(body).into_owned())
 }
 
-pub(super) async fn handle_fetch(
+/// Performs a top-level *navigation* request: one hop, with any 3xx surfaced
+/// to the caller rather than followed here.
+///
+/// Navigation redirects deliberately go back out to the UI thread: that is the
+/// only place that owns the navigation choke point (`navigate_to_url`), the
+/// per-tab redirect budget, and the initiator that decides whether a
+/// cross-origin hop is authorised. Following them down here would route around
+/// all three.
+pub(super) async fn handle_navigate(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
     dns: &crate::network::opennic::MizuDnsResolver,
@@ -97,6 +105,143 @@ pub(super) async fn handle_fetch(
         .unwrap_or_default();
     let redirect = parse_http_response(status, &headers, &body, &domain)?;
     Ok((redirect, parse_body_value(&body)))
+}
+
+/// Maximum number of same-origin redirects a *subresource* request follows
+/// inside the worker before giving up.
+///
+/// Shares `max_redirects` with the top-level navigation budget: both answer the
+/// same question (how many hops is a server allowed to make us take), and a
+/// subresource has no reason to be granted more than a navigation.
+fn max_subresource_redirects() -> u32 {
+    crate::core::config::CONFIG.max_redirects
+}
+
+/// Issues a subresource request (a document's `GET`/`POST`/… data call, or an
+/// image fetch) and returns the final response.
+///
+/// **Invariant N1.** A subresource redirect is followed here, or it fails here
+/// — it is never handed back to the UI thread as a navigation. Only two
+/// outcomes are possible:
+///
+/// * **Same-origin 3xx** — followed internally, up to
+///   [`max_subresource_redirects`] hops. This is what a `Location` header on a
+///   data endpoint legitimately means.
+/// * **Cross-origin (or non-`mizu://`) 3xx** — [`MizuError::SecurityViolation`],
+///   surfaced to the document as a failed fetch. A background data call or an
+///   `<image>` load must not be able to retarget another origin behind the
+///   document's back, and — the reason this function exists — must not be able
+///   to become a top-level navigation at all: the redirect result carries no
+///   real navigation initiator, so promoting one forces the UI thread to invent
+///   an agency it was never granted.
+async fn handle_fetch_subresource_raw(
+    endpoint: &Endpoint,
+    pool: &H3ConnectionPool,
+    dns: &crate::network::opennic::MizuDnsResolver,
+    method: &str,
+    url_str: &str,
+    is_remote_origin: bool,
+    request_body: Option<bytes::Bytes>,
+    content_type: Option<String>,
+    custom_headers: &[(String, String)],
+) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
+    let mut current = url_str.to_string();
+    let budget = max_subresource_redirects();
+
+    for _ in 0..=budget {
+        let (status, headers, body) = handle_fetch_raw(
+            endpoint,
+            pool,
+            dns,
+            method,
+            &current,
+            is_remote_origin,
+            // `Bytes::clone` is a refcount bump, so re-sending the payload on
+            // the next hop costs nothing.
+            request_body.clone(),
+            content_type.clone(),
+            custom_headers,
+        )
+        .await?;
+
+        let origin = MizuUri::parse(&current)
+            .map(|u| u.domain)
+            .unwrap_or_default();
+        let Some(next_url) = parse_http_response(status, &headers, &body, &origin)? else {
+            return Ok((status, headers, body));
+        };
+
+        // The redirect target must be a `mizu://` URL on the same host. A
+        // relative `Location` was already re-based onto `origin` by
+        // `parse_http_response`, so it always passes; anything that does not is
+        // a server steering this request somewhere the document did not ask for.
+        let target_origin = MizuUri::parse(&next_url).map(|u| u.domain).ok();
+        if target_origin.as_deref() != Some(origin.as_str()) {
+            return Err(MizuError::SecurityViolation(format!(
+                "cross-origin redirect blocked: subresource request to `{origin}` \
+                 was redirected to `{next_url}`; a subresource may only follow \
+                 same-origin redirects and is never promoted to a navigation"
+            )));
+        }
+        current = next_url;
+    }
+
+    Err(MizuError::Network(format!(
+        "subresource request to {url_str} exceeded the {budget}-redirect limit"
+    )))
+}
+
+/// Subresource data fetch: the decoded response body, with same-origin
+/// redirects already followed. See [`handle_fetch_subresource_raw`].
+pub(super) async fn handle_fetch(
+    endpoint: &Endpoint,
+    pool: &H3ConnectionPool,
+    dns: &crate::network::opennic::MizuDnsResolver,
+    method: &str,
+    url_str: &str,
+    is_remote_origin: bool,
+    request_body: Option<bytes::Bytes>,
+    content_type: Option<String>,
+    custom_headers: &[(String, String)],
+) -> Result<crate::core::types::Value, MizuError> {
+    let (_status, _headers, body) = handle_fetch_subresource_raw(
+        endpoint,
+        pool,
+        dns,
+        method,
+        url_str,
+        is_remote_origin,
+        request_body,
+        content_type,
+        custom_headers,
+    )
+    .await?;
+    Ok(parse_body_value(&body))
+}
+
+/// Subresource binary fetch (images): the raw response bytes, with same-origin
+/// redirects already followed. See [`handle_fetch_subresource_raw`].
+pub(super) async fn handle_fetch_bytes(
+    endpoint: &Endpoint,
+    pool: &H3ConnectionPool,
+    dns: &crate::network::opennic::MizuDnsResolver,
+    method: &str,
+    url_str: &str,
+    is_remote_origin: bool,
+) -> Result<Vec<u8>, MizuError> {
+    let (_status, _headers, body) = handle_fetch_subresource_raw(
+        endpoint,
+        pool,
+        dns,
+        method,
+        url_str,
+        is_remote_origin,
+        None,
+        None,
+        &[],
+    )
+    .await?;
+    Ok(body)
 }
 
 /// Issues an HTTP/3 request over the pool and returns the raw status, response

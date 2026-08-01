@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use quinn::Endpoint;
 
 use crate::core::errors::MizuError;
-use crate::network::uri::MizuUri;
 #[cfg(test)]
 use crate::network::vault::VaultEntry;
 use crate::network::{NetworkCmd, NetworkResult};
@@ -49,8 +48,7 @@ pub(crate) use storage_debounce::StorageWriteDebouncer;
 pub(crate) use tls::INSECURE_DEV_ACTIVE;
 pub(crate) use tls::is_local_host;
 
-use auth::parse_http_response;
-use fetch::{handle_fetch, handle_fetch_file, handle_fetch_raw};
+use fetch::{handle_fetch, handle_fetch_bytes, handle_fetch_file, handle_navigate};
 #[cfg(feature = "insecure-dev")]
 use tls::LocalOrWebPkiVerifier;
 
@@ -341,16 +339,11 @@ pub fn spawn_network_thread(
                             )
                             .await
                             {
-                                Ok((Some(new_url), _)) => {
-                                    if tx_clone
-                                        .send(NetworkResult::NavigationRedirect { tab, new_url })
-                                        .await
-                                        .is_err()
-                                    {
-                                        tracing::trace!("UI channel closed; Fetch redirect result dropped");
-                                    }
-                                }
-                                Ok((None, data)) => {
+                                // N1: a subresource fetch never yields a
+                                // redirect here — `handle_fetch` either
+                                // followed it (same-origin) or turned it into
+                                // the `Err` arm below.
+                                Ok(data) => {
                                     if tx_clone
                                         .send(NetworkResult::Success { tab, target_var, data })
                                         .await
@@ -376,7 +369,7 @@ pub fn spawn_network_thread(
                             }
                         });
                     }
-                    NetworkCmd::Navigate { tab, url } => {
+                    NetworkCmd::Navigate { tab, url, initiator } => {
                         let tx_clone = tx.clone();
                         let endpoint_clone = endpoint.clone();
                         let pool_clone = pool.clone();
@@ -392,7 +385,7 @@ pub fn spawn_network_thread(
                             // Navigate commands are always mizu:// targets — file:// and all
                             // other unsupported schemes are rejected upstream by
                             // resolve_navigate_url (window.rs) and additionally by handle_fetch_raw.
-                            match handle_fetch(
+                            match handle_navigate(
                                 &endpoint_clone,
                                 &pool_clone,
                                 &dns_clone,
@@ -408,7 +401,11 @@ pub fn spawn_network_thread(
                                 Ok((Some(new_url), _)) => {
                                     tracing::debug!(url = %new_url, "navigation redirect");
                                     if tx_clone
-                                        .send(NetworkResult::NavigationRedirect { tab, new_url })
+                                        .send(NetworkResult::NavigationRedirect {
+                                            tab,
+                                            new_url,
+                                            initiator,
+                                        })
                                         .await
                                         .is_err()
                                     {
@@ -547,71 +544,45 @@ pub fn spawn_network_thread(
                             };
                             let _permit = permit;
 
-                            match handle_fetch_raw(
+                            // N1: same-origin redirects are followed inside
+                            // `handle_fetch_bytes`; a cross-origin one is a
+                            // `SecurityViolation`, never a navigation. An
+                            // `<image>` load must not be able to steer the tab.
+                            match handle_fetch_bytes(
                                 &endpoint_clone,
                                 &pool_clone,
                                 &dns_clone,
                                 "GET",
                                 &url,
                                 is_remote_origin,
-                                None,
-                                None,
-                                &[],
                             )
                             .await
                             {
-                                Ok((status, headers, body)) => {
-                                    let domain =
-                                        MizuUri::parse(&url).map(|u| u.domain).unwrap_or_default();
-                                    match parse_http_response(status, &headers, &body, &domain) {
-                                        Ok(Some(new_url)) => {
-                                            if tx_clone
-                                                .send(NetworkResult::NavigationRedirect { tab, new_url })
-                                                .await
-                                                .is_err()
-                                            {
-                                                tracing::trace!("UI channel closed; QUIC image redirect dropped");
-                                            }
+                                Ok(body) => {
+                                    if let Some(animated_img) =
+                                        crate::render::window::decode_image_bytes(&body)
+                                    {
+                                        if tx_clone
+                                            .send(NetworkResult::FetchImageSuccess { tab,
+                                                url,
+                                                image: animated_img,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            tracing::trace!("UI channel closed; FetchImageSuccess dropped");
                                         }
-                                        Ok(None) => {
-                                            if let Some(animated_img) =
-                                                crate::render::window::decode_image_bytes(&body)
-                                            {
-                                                if tx_clone
-                                                    .send(NetworkResult::FetchImageSuccess { tab,
-                                                        url,
-                                                        image: animated_img,
-                                                    })
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    tracing::trace!("UI channel closed; FetchImageSuccess dropped");
-                                                }
-                                            } else if tx_clone
-                                                .send(NetworkResult::FetchImageFailed { tab,
-                                                    url,
-                                                    error: MizuError::Network(
-                                                        "Failed to decode image bytes".to_string(),
-                                                    ),
-                                                })
-                                                .await
-                                                .is_err()
-                                            {
-                                                tracing::trace!("UI channel closed; FetchImageFailed (decode) dropped");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            if tx_clone
-                                                .send(NetworkResult::FetchImageFailed { tab,
-                                                    url,
-                                                    error: e,
-                                                })
-                                                .await
-                                                .is_err()
-                                            {
-                                                tracing::trace!("UI channel closed; FetchImageFailed (headers) dropped");
-                                            }
-                                        }
+                                    } else if tx_clone
+                                        .send(NetworkResult::FetchImageFailed { tab,
+                                            url,
+                                            error: MizuError::Network(
+                                                "Failed to decode image bytes".to_string(),
+                                            ),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::trace!("UI channel closed; FetchImageFailed (decode) dropped");
                                     }
                                 }
                                 Err(e) => {

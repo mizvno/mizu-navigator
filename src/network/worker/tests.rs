@@ -3,6 +3,7 @@ use super::fetch::*;
 use super::h3_pool::*;
 use super::storage_debounce::*;
 use super::*;
+use crate::network::uri::MizuUri;
 
 /// A `rustls` certificate verifier that accepts anything — test-only,
 /// never compiled into production (unlike the `insecure-dev`-gated

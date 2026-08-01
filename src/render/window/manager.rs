@@ -78,6 +78,20 @@ pub(crate) fn lock_spawn_gate() -> std::sync::MutexGuard<'static, ()> {
 pub(super) static MAX_REDIRECTS: LazyLock<u32> =
     LazyLock::new(|| crate::core::config::CONFIG.max_redirects);
 
+/// Maximum root-timer ticks a single tab may have outstanding with the logic
+/// worker at once — see [`TabState::may_dispatch_timer_tick`].
+///
+/// **T1:** counted per tab, so one document's backlog can neither consume nor
+/// suppress another's timers.
+///
+/// Sized to give a healthy worker room to pipeline (a document's timers all
+/// coming due in the same tick must not throttle each other) while keeping the
+/// queue depth a small constant when the worker falls behind. Lower is safer,
+/// not better: too low and legitimate documents lose ticks under momentary
+/// load; the value only has to be small enough that the backlog stays
+/// negligible next to the per-tab state already resident.
+pub const MAX_INFLIGHT_TIMER_TICKS: u32 = 128;
+
 /// Hard cap on concurrently open tabs.
 ///
 /// Each tab holds a whole DOM, taffy tree, `VariableStore`, frozen interner
@@ -218,12 +232,22 @@ pub struct TabState {
     /// Per-origin capability budget (storage quota + rate limit) for this
     /// tab's current origin. **T1:** per-tab so a low-trust origin cannot
     /// consume — or benefit from — quota attributable to a different origin
-    /// open in another tab. Reset on every navigation within this tab.
+    /// open in another tab. Rebuilt on every navigation within this tab.
+    ///
+    /// Rebuilding is a *rate-limit* reset only: the byte quota is accumulated
+    /// per origin in the window's shared `StorageUsageLedger`, precisely so
+    /// that navigating (which a document can do to itself, ungated, whenever
+    /// it likes) cannot hand it a fresh budget. See
+    /// [`mizu_core::security::quota::StorageUsageLedger`].
     pub capability_policy: CapabilityPolicy,
     /// Root-level `timer` declarations from the `logic` block.
     pub root_timers: Vec<RootTimer>,
     /// Priority queue of pending root-timer deadlines.
     pub root_timer_queue: BTreeMap<std::time::Instant, Vec<usize>>,
+    /// Timer ticks dispatched to the logic worker for this tab that have not
+    /// yet been answered — the admission counter behind
+    /// [`Self::may_dispatch_timer_tick`].
+    pub inflight_timer_ticks: u32,
     /// Live inspector UI state for this tab (panel visibility, tab, selection,
     /// scroll). Per-tab, matching how browser devtools are scoped.
     pub inspector: crate::render::inspector::InspectorState,
@@ -313,6 +337,14 @@ pub struct MizuWindowManager {
     pub history_log: HistoryLog,
     /// UI state for the history sidebar panel (visibility, scroll, hover).
     pub history_sidebar: HistorySidebarState,
+    /// Storage bytes charged per origin, for the life of the process.
+    ///
+    /// Window-level rather than per-tab on purpose: the quota bounds bytes at
+    /// rest, and two tabs on one origin write to a single encrypted store, so
+    /// they must draw on a single budget. This is not a T1 exception — no
+    /// origin can read, or spend, another's entry — it is what makes the quota
+    /// per-*origin* rather than per-tab-per-page-load.
+    pub storage_usage: crate::render::security::StorageUsageLedger,
 }
 
 /// A freshly parsed document to replace the currently loaded one, passed to
@@ -396,6 +428,10 @@ pub(super) struct WindowCtx<'a> {
     /// Mutable reference to the window-level persistent history log, so
     /// navigation helpers can push entries without needing a second split.
     pub history_log: &'a mut HistoryLog,
+    /// Window-level per-origin storage byte accounting, so `navigate_to_url`
+    /// can rebuild the tab's `CapabilityPolicy` against the new origin without
+    /// discarding what that origin has already spent.
+    pub storage_usage: &'a crate::render::security::StorageUsageLedger,
 }
 
 impl MizuWindowManager {
@@ -425,6 +461,7 @@ impl MizuWindowManager {
             modifiers,
             start_time,
             history_log,
+            storage_usage,
             ..
         } = self;
         // Direct index, matching `active()`/`active_mut()`: the
@@ -449,6 +486,7 @@ impl MizuWindowManager {
                 modifiers: *modifiers,
                 start_time: *start_time,
                 history_log,
+                storage_usage,
             },
         )
     }
@@ -477,6 +515,7 @@ impl MizuWindowManager {
             modifiers,
             start_time,
             history_log,
+            storage_usage,
             ..
         } = self;
         let active_tab_id = tabs[*active_tab].id;
@@ -497,6 +536,7 @@ impl MizuWindowManager {
                 modifiers: *modifiers,
                 start_time: *start_time,
                 history_log,
+                storage_usage,
             },
         ))
     }
@@ -547,7 +587,14 @@ impl MizuWindowManager {
             },
             color_scheme: self.preferences.color_scheme,
         };
-        let tab = match TabState::new(id, doc, env, url, &mut self.image_cache) {
+        let tab = match TabState::new(
+            id,
+            doc,
+            env,
+            url,
+            &mut self.image_cache,
+            &self.storage_usage,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = ?e, "failed to build new tab");
@@ -654,6 +701,7 @@ impl TabState {
         env: RenderEnvironment,
         initial_url: &str,
         image_cache: &mut lru::LruCache<String, AssetSlot>,
+        storage_usage: &crate::render::security::StorageUsageLedger,
     ) -> Result<Self, MizuError> {
         let TabDocument {
             dom,
@@ -716,9 +764,13 @@ impl TabState {
             each_expansion: EachExpansion::default(),
             redirect_count: 0,
             computed_bindings: Vec::new(),
-            capability_policy: CapabilityPolicy::new(initial_url),
+            capability_policy: crate::render::security::capability_policy_for(
+                initial_url,
+                storage_usage,
+            ),
             root_timers: Vec::new(),
             root_timer_queue: BTreeMap::new(),
+            inflight_timer_ticks: 0,
             inspector: crate::render::inspector::InspectorState::new(),
             inspector_log: crate::render::inspector::log::InspectorLog::new(),
             recent_mutations: FxHashMap::default(),
@@ -782,6 +834,7 @@ impl MizuWindowManager {
         };
         let preferences = UserPreferences::default();
         let mut image_cache = lru::LruCache::new(IMAGE_CACHE_CAPACITY);
+        let storage_usage = crate::render::security::StorageUsageLedger::new();
 
         let tab = TabState::new(
             TabId(0),
@@ -797,6 +850,7 @@ impl MizuWindowManager {
             },
             default_chrome_url,
             &mut image_cache,
+            &storage_usage,
         )?;
 
         let mut manager = Self {
@@ -820,6 +874,7 @@ impl MizuWindowManager {
             preferences,
             history_log: HistoryLog::load_from_disk(),
             history_sidebar: HistorySidebarState::default(),
+            storage_usage,
         };
 
         manager.active().trigger_logic_reload(&manager.logic_tx);
@@ -840,8 +895,14 @@ impl MizuWindowManager {
     ///
     /// Holds the receiving ends of the dummy channels alive so that senders
     /// don't observe a disconnected peer mid-test.
+    /// `storage_usage` must be the same ledger the tabs were built against, or
+    /// a fixture would give the window and its own tabs two different notions
+    /// of what an origin has spent.
     #[cfg(test)]
-    pub(crate) fn new_headless(tabs: Vec<TabState>) -> (Self, TestChannelKeepAlive) {
+    pub(crate) fn new_headless(
+        tabs: Vec<TabState>,
+        storage_usage: crate::render::security::StorageUsageLedger,
+    ) -> (Self, TestChannelKeepAlive) {
         assert!(
             !tabs.is_empty(),
             "a manager must always own at least one tab"
@@ -873,6 +934,7 @@ impl MizuWindowManager {
             preferences: UserPreferences::default(),
             history_log: HistoryLog::default(),
             history_sidebar: HistorySidebarState::default(),
+            storage_usage,
         };
         (
             manager,
@@ -1105,6 +1167,57 @@ impl TabState {
         self.redirect_count <= *MAX_REDIRECTS
     }
 
+    /// Admission gate for a root-timer tick: `true` if one may be dispatched to
+    /// the logic worker now, recording it as in flight.
+    ///
+    /// The channel to the worker is unbounded, and deliberately so — a `Click`,
+    /// a `SubmitForm`, a network `UpdateVariable` or a `Reload` must never be
+    /// dropped, because each carries state the document would otherwise lose.
+    /// Timer ticks are the one event class where dropping is not only safe but
+    /// correct (a tick that could not be serviced is a tick that did not
+    /// happen), and they are also the only class a document controls the rate
+    /// of. So the bound lives here, at the one source that needs it, instead of
+    /// on the channel where it would silently discard the other four.
+    ///
+    /// Without it the producer is decoupled from the consumer: each tick costs
+    /// the worker a full action execution plus a computed-binding recompute,
+    /// so a document that outruns it — trivial, since [`MAX_ROOT_TIMERS`]
+    /// independent timers may each fire every 16 ms — grows the queue without
+    /// limit, and the UI thread then drains an unbounded backlog in a single
+    /// frame. `MAX_INSTRUCTIONS` does not help: it bounds one execution, never
+    /// how many are demanded per second.
+    ///
+    /// [`MAX_ROOT_TIMERS`]: crate::parser::logic::MAX_ROOT_TIMERS
+    pub fn may_dispatch_timer_tick(&mut self) -> bool {
+        if self.inflight_timer_ticks >= MAX_INFLIGHT_TIMER_TICKS {
+            return false;
+        }
+        self.inflight_timer_ticks += 1;
+        true
+    }
+
+    /// Records that the worker answered for this tab, freeing tick capacity.
+    ///
+    /// Called for *every* drained [`WorkerResponse`], not only for ones a timer
+    /// produced. That deliberate imprecision is what makes the counter
+    /// self-healing rather than merely approximate: an event whose response the
+    /// tab never sees (worker-side state not yet created, a response dropped
+    /// with a closed tab) would otherwise pin the counter high forever and
+    /// silently stop the document's timers for good. Miscounting can only ever
+    /// release capacity early — never withhold it — so the failure mode is a
+    /// slightly looser bound, never a wedged document. The counter saturates at
+    /// zero because responses are not in 1:1 correspondence with ticks.
+    pub fn release_timer_tick(&mut self) {
+        self.inflight_timer_ticks = self.inflight_timer_ticks.saturating_sub(1);
+    }
+
+    /// Clears the in-flight tick accounting. Called on document reload, where
+    /// the worker's per-tab state is rebuilt from scratch and any tick still
+    /// outstanding against the *previous* document can never be answered.
+    pub fn reset_timer_ticks(&mut self) {
+        self.inflight_timer_ticks = 0;
+    }
+
     /// Read-only data sources handed to the inspector's row builder.
     ///
     /// Every source here is per-tab, so this needs no window-level borrow at
@@ -1229,6 +1342,9 @@ pub(super) fn reload_tab_document(
 
     tab.trigger_logic_reload(ctx.logic_tx);
 
+    // The worker's per-tab state is rebuilt by the reload above, so any tick
+    // still outstanding against the previous document is never coming back.
+    tab.reset_timer_ticks();
     tab.setup_timers();
     Ok(())
 }

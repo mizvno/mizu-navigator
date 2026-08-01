@@ -6,7 +6,7 @@ use crate::network::{RuntimeAction, UiEvent};
 
 pub use mizu_core::security::quota::{
     CapabilityPolicy, STORAGE_QUOTA_BYTES_LOCAL_FILE, STORAGE_QUOTA_BYTES_LOCALHOST,
-    STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC,
+    STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC, StorageUsageLedger,
 };
 pub(crate) use mizu_core::security::sandbox::file_sandbox_contains;
 #[cfg(test)]
@@ -92,6 +92,24 @@ pub fn get_raw_domain(url: &str) -> String {
         return format!("file_{canonical}");
     }
     "unknown".to_string()
+}
+
+/// Builds the capability policy for a document loaded from `chrome_url`,
+/// charging its storage writes to that origin's entry in `ledger`.
+///
+/// The single place a [`CapabilityPolicy`] is constructed in production, so
+/// that the quota key is always [`get_current_domain`] — the origin's storage
+/// identity, the very value that names its encrypted store and keyring entry.
+/// Deriving the key anywhere else risks a second notion of "same origin" that
+/// disagrees with the first, and any disagreement that *splits* one origin in
+/// two is a quota bypass: the document reaches the same data through both keys
+/// while each carries its own budget.
+pub fn capability_policy_for(chrome_url: &str, ledger: &StorageUsageLedger) -> CapabilityPolicy {
+    CapabilityPolicy::new(
+        chrome_url,
+        get_current_domain(chrome_url).as_str().to_string(),
+        ledger.clone(),
+    )
 }
 
 /// Outcome of a capability dispatch, reported to the caller so the UI (e.g.
@@ -242,12 +260,21 @@ pub fn execute_capability_action(
             CapabilityOutcome::Dispatched
         }
         RuntimeAction::Navigate { url } => {
-            if let Err(e) =
-                network_tx.send(crate::network::NetworkCmd::Navigate { tab: tab_id, url })
-            {
-                tracing::warn!(error = %e, "network channel closed; Navigate command dropped");
-            }
-            CapabilityOutcome::Dispatched
+            // Must be intercepted upstream in `event_loop.rs`, which is the
+            // only place that knows this batch's agency (`WorkerResponse::
+            // gesture`) and owns the navigation choke point `navigate_to_url`.
+            // Reaching here means the intercept was bypassed, and there is no
+            // honest initiator to reconstruct at this point — emitting
+            // `NetworkCmd::Navigate` anyway would mean inventing one. Blocked,
+            // exactly like `CopyToClipboard` below (N2).
+            tracing::warn!(
+                url = %url,
+                "Navigate reached execute_capability_action — should have been \
+                 intercepted upstream by the navigation choke point"
+            );
+            CapabilityOutcome::Blocked(
+                "navigation action bypassed the navigation choke point".to_string(),
+            )
         }
         RuntimeAction::NetworkCall {
             method,
@@ -303,8 +330,8 @@ pub fn execute_capability_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityPolicy, STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC,
-        estimate_value_bytes, get_current_domain,
+        STORAGE_QUOTA_BYTES_REMOTE, STORAGE_RATE_LIMIT_WRITES_PER_SEC, StorageUsageLedger,
+        capability_policy_for, estimate_value_bytes, get_current_domain,
     };
     use crate::core::errors::MizuError;
     use crate::core::types::Value;
@@ -312,7 +339,8 @@ mod tests {
 
     #[test]
     fn test_storage_quota_enforcement() {
-        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+        let mut policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
         assert_eq!(policy.quota_bytes, STORAGE_QUOTA_BYTES_REMOTE);
 
         // Write a value just under the quota — must succeed.
@@ -333,14 +361,17 @@ mod tests {
 
     #[test]
     fn localhost_gets_larger_quota() {
-        let remote = CapabilityPolicy::new("mizu://example.com/index.mizu");
-        let local = CapabilityPolicy::new("mizu://localhost/index.mizu");
+        let remote =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
+        let local =
+            capability_policy_for("mizu://localhost/index.mizu", &StorageUsageLedger::new());
         assert!(local.quota_bytes > remote.quota_bytes);
     }
 
     #[test]
     fn rate_limit_blocks_excess_writes() {
-        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+        let mut policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
         for _ in 0..STORAGE_RATE_LIMIT_WRITES_PER_SEC {
             policy
                 .check_storage_write(1)
@@ -362,9 +393,14 @@ mod tests {
 
     #[test]
     fn file_origin_gets_local_file_quota() {
-        let file_policy = CapabilityPolicy::new("file:///home/user/app/index.mizu");
-        let remote_policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
-        let local_policy = CapabilityPolicy::new("mizu://localhost/index.mizu");
+        let file_policy = capability_policy_for(
+            "file:///home/user/app/index.mizu",
+            &StorageUsageLedger::new(),
+        );
+        let remote_policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
+        let local_policy =
+            capability_policy_for("mizu://localhost/index.mizu", &StorageUsageLedger::new());
         // file:// quota must be strictly larger than remote but smaller than localhost.
         assert!(file_policy.quota_bytes > remote_policy.quota_bytes);
         assert!(file_policy.quota_bytes < local_policy.quota_bytes);
@@ -503,7 +539,10 @@ mod tests {
     fn capability_policy_query_injection_cannot_grant_localhost_quota() {
         // `mizu://evil.com?host=localhost` must receive REMOTE quota, not LOCALHOST.
         // The old `.contains("localhost")` would have granted the larger quota.
-        let policy = super::CapabilityPolicy::new("mizu://evil.com?host=localhost");
+        let policy = super::capability_policy_for(
+            "mizu://evil.com?host=localhost",
+            &StorageUsageLedger::new(),
+        );
         assert_eq!(
             policy.quota_bytes,
             super::STORAGE_QUOTA_BYTES_REMOTE,
@@ -516,7 +555,8 @@ mod tests {
         // `mizu://localhost@evil.com/` — MizuUri rejects '@' in domain, so we
         // fall back to REMOTE. The old `.contains("localhost")` would have granted
         // the larger quota by matching the user-info part of the raw URL string.
-        let policy = super::CapabilityPolicy::new("mizu://localhost@evil.com/");
+        let policy =
+            super::capability_policy_for("mizu://localhost@evil.com/", &StorageUsageLedger::new());
         // MizuUri::parse rejects this → parse fails → fallback to REMOTE.
         assert_eq!(
             policy.quota_bytes,
@@ -527,7 +567,8 @@ mod tests {
 
     #[test]
     fn capability_policy_real_localhost_gets_localhost_quota() {
-        let policy = super::CapabilityPolicy::new("mizu://localhost/app");
+        let policy =
+            super::capability_policy_for("mizu://localhost/app", &StorageUsageLedger::new());
         assert_eq!(
             policy.quota_bytes,
             super::STORAGE_QUOTA_BYTES_LOCALHOST,
@@ -537,7 +578,8 @@ mod tests {
 
     #[test]
     fn capability_policy_ip_127_gets_localhost_quota() {
-        let policy = super::CapabilityPolicy::new("mizu://127.0.0.1/app");
+        let policy =
+            super::capability_policy_for("mizu://127.0.0.1/app", &StorageUsageLedger::new());
         assert_eq!(
             policy.quota_bytes,
             super::STORAGE_QUOTA_BYTES_LOCALHOST,
@@ -548,7 +590,10 @@ mod tests {
     #[test]
     fn capability_policy_file_origin_gets_local_file_quota_regardless_of_path() {
         // Even if the file path contains the word "localhost", it must get LOCAL_FILE quota.
-        let policy = super::CapabilityPolicy::new("file:///home/user/localhost-app/index.mizu");
+        let policy = super::capability_policy_for(
+            "file:///home/user/localhost-app/index.mizu",
+            &StorageUsageLedger::new(),
+        );
         assert_eq!(
             policy.quota_bytes,
             super::STORAGE_QUOTA_BYTES_LOCAL_FILE,
@@ -617,7 +662,8 @@ mod tests {
         let mut store = crate::core::types::VariableStore::new();
         let target_variable = store.interner.get_or_intern("result");
         let mut store = store.freeze();
-        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+        let mut policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
 
         let payload = Value::String(Arc::from(r#"{"who":"mizu"}"#));
         super::execute_capability_action(
@@ -676,7 +722,8 @@ mod tests {
             let mut store = crate::core::types::VariableStore::new();
             let target_variable = store.interner.get_or_intern("result");
             let mut store = store.freeze();
-            let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+            let mut policy =
+                capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
 
             super::execute_capability_action(
                 &mut store,
@@ -724,7 +771,8 @@ mod tests {
         store.interner.get_or_intern("a");
         store.interner.get_or_intern("b");
         let target_variable = store.interner.get_or_intern("weather_report");
-        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+        let mut policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
 
         let mut store = store.freeze();
         super::execute_capability_action(
@@ -766,7 +814,8 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel::<crate::network::NetworkCmd>();
         let (logic_tx, _logic_rx) = std::sync::mpsc::channel();
         let mut store = crate::core::types::VariableStore::new().freeze();
-        let mut policy = CapabilityPolicy::new("mizu://example.com/index.mizu");
+        let mut policy =
+            capability_policy_for("mizu://example.com/index.mizu", &StorageUsageLedger::new());
 
         let outcome = super::execute_capability_action(
             &mut store,

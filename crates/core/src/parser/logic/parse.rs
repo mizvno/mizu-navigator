@@ -882,10 +882,38 @@ pub fn parse_logic(
     Ok(functions)
 }
 
+/// Maximum number of root `timer` declarations a single document may carry.
+///
+/// Every declaration is an independent, self-rearming event source: the window
+/// loop dispatches one `UiEvent::RootTimer` per due timer per tick, each of
+/// which costs the logic worker a full action execution plus a computed-binding
+/// recompute. `MAX_INSTRUCTIONS` bounds one execution; nothing bounds how many
+/// executions a document may demand per second, so without a ceiling here the
+/// document controls that number directly — and the 16 ms interval floor
+/// applies per timer, not in aggregate.
+///
+/// 64 is far beyond any legitimate document (real ones declare a handful:
+/// a clock, a poll, an animation) while keeping the worst-case dispatch rate
+/// bounded by a constant rather than by document length. Exceeding it is a
+/// parse error rather than a silent truncation, matching how every other
+/// over-limit input in this crate is handled — a document whose timers were
+/// quietly dropped would appear to work while behaving differently from what
+/// its author wrote.
+///
+/// An unmeasured starting value, overridable for a single run via
+/// `MIZU_MAX_ROOT_TIMERS` (see the module doc on [`crate::core::config`]).
+pub static MAX_ROOT_TIMERS: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| crate::core::config::env_override("MIZU_MAX_ROOT_TIMERS", 64));
+
 /// Parses all `timer <interval> -> <action>` declarations from a `logic_block`.
 ///
 /// Timer lines are silently skipped by [`parse_logic`]; this function handles
 /// them as a second, independent pass over the same content.
+///
+/// # Errors
+///
+/// Returns [`MizuError::ParseError`] if a declaration is malformed, or if the
+/// document declares more than [`MAX_ROOT_TIMERS`] of them.
 ///
 /// ## Syntax
 ///
@@ -952,6 +980,17 @@ pub fn parse_root_timers(
                 Err(_) => TimerInterval::Variable(interval_str.to_string()),
             }
         };
+
+        // Checked before parsing the action, so an over-long timer block costs
+        // one comparison per extra line rather than a full action parse each.
+        if timers.len() == *MAX_ROOT_TIMERS {
+            return Err(MizuError::ParseError(format!(
+                "document declares more than {} root `timer` declarations; \
+                 each one is an independent event source and the total dispatch \
+                 rate must stay bounded",
+                *MAX_ROOT_TIMERS
+            )));
+        }
 
         let action = parse_action(action_str, interner)?;
         timers.push(RootTimer { interval, action });

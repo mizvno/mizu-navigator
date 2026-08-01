@@ -25,6 +25,34 @@ pub enum NavigationInitiator {
     HistoryStep,
 }
 
+impl NavigationInitiator {
+    /// Wraps `self` as the initiator of a server redirect of the navigation it
+    /// describes.
+    ///
+    /// Redirect chains are *collapsed* rather than nested: the wrapped value is
+    /// always the chain's root initiator, so `RedirectOf` is never more than
+    /// one level deep however many hops a server strings together. This is not
+    /// a cosmetic simplification — [`has_user_agency`] answers by unwinding to
+    /// the root, so collapsing preserves the verdict exactly while keeping the
+    /// recursion depth constant instead of proportional to attacker-chosen hop
+    /// count.
+    ///
+    /// The whole point of carrying the value at all is that the wrapped
+    /// initiator must be the *real* one. Synthesising a
+    /// [`NavigationInitiator::UserGesture`] here — because "a redirect of a
+    /// navigation is probably a navigation the user asked for" — would let any
+    /// server turn a document-logic, same-origin request into a
+    /// gesture-authorised cross-origin navigation with a single `Location`
+    /// header, which is precisely the N3 block this type exists to enforce.
+    #[must_use]
+    pub fn redirect_of(self) -> Self {
+        match self {
+            Self::RedirectOf(inner) => Self::RedirectOf(inner),
+            root => Self::RedirectOf(Box::new(root)),
+        }
+    }
+}
+
 /// The policy verdict on a proposed navigation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationVerdict {
@@ -456,6 +484,56 @@ mod tests {
         assert!(is_same_origin("mizu://a.com/page1", "mizu://a.com/page2"));
         assert!(!is_same_origin("mizu://a.com/page", "mizu://b.com/page"));
         assert!(!is_same_origin("file:///path", "mizu://a.com/page"));
+    }
+
+    // --- N3: `redirect_of` preserves agency and collapses chains ---
+
+    #[test]
+    fn redirect_of_preserves_the_root_verdict() {
+        for root in [
+            NavigationInitiator::UserGesture,
+            NavigationInitiator::DocumentLogic,
+            NavigationInitiator::HistoryStep,
+        ] {
+            let expected = has_user_agency(&root);
+            assert_eq!(
+                has_user_agency(&root.clone().redirect_of()),
+                expected,
+                "wrapping must not change the verdict for {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_of_never_nests_more_than_one_level() {
+        // Hop count is attacker-chosen (a server can emit a `Location` on
+        // every response up to the redirect budget), so the wrapper must not
+        // grow one `Box` per hop — `has_user_agency` recurses through it.
+        let mut initiator = NavigationInitiator::DocumentLogic;
+        for _ in 0..64 {
+            initiator = initiator.redirect_of();
+        }
+        match &initiator {
+            NavigationInitiator::RedirectOf(inner) => assert!(
+                matches!(**inner, NavigationInitiator::DocumentLogic),
+                "the wrapped value must stay the chain's root, got {inner:?}"
+            ),
+            other => panic!("expected RedirectOf, got {other:?}"),
+        }
+        assert!(!has_user_agency(&initiator));
+    }
+
+    #[test]
+    fn redirect_of_a_gesture_chain_keeps_agency() {
+        let mut initiator = NavigationInitiator::UserGesture;
+        for _ in 0..64 {
+            initiator = initiator.redirect_of();
+        }
+        assert!(has_user_agency(&initiator));
+        assert!(matches!(
+            check_navigation("mizu://a.com/p", "mizu://b.com/p", &initiator),
+            NavigationVerdict::Allow(_)
+        ));
     }
 
     #[test]
