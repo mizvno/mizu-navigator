@@ -204,12 +204,19 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 /// Three cases, and the distinction between them is the whole security
 /// property:
 ///
-/// * **`host` is a literal IP.** The destination is written in the URL bar;
+/// * **`host` is a literal IP.** When `allow_private_literal` is set, the
+///   destination is one the user typed or clicked into the URL bar directly —
 ///   there is no name-to-address indirection for anyone to lie about, so the
-///   user's own choice stands — including a LAN or loopback address, which is
-///   how local development works. The resolved address must equal the literal;
-///   a resolver that "resolves" a literal to something else is not answering
-///   the question that was asked.
+///   user's own choice stands, including a LAN or loopback address, which is
+///   how local development works. When it is not set, the literal reached
+///   this call as a *document-supplied* target (an image source, a data-call
+///   URL, a subresource fetch) rather than a navigation the user drove, and
+///   must clear the same public-routability bar as a resolved name — a
+///   `.mizu` document embedding `mizu://169.254.169.254/…` in an `<image>` or
+///   `NetworkCall` is exactly the SSRF this branch exists to block. Either
+///   way, the resolved address must equal the literal; a resolver that
+///   "resolves" a literal to something else is not answering the question
+///   that was asked.
 /// * **`host` is a loopback name** (`localhost`, `*.localhost`). RFC 6761
 ///   reserves these for the loopback interface, so nothing else is acceptable
 ///   — and these are exactly the names that receive the insecure-dev TLS
@@ -224,13 +231,24 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 ///
 /// [`MizuError::SecurityViolation`] naming both the host and the address, so
 /// the rejection is diagnosable without having to reproduce the DNS answer.
-pub fn authorize_resolved_address(host: &str, ip: IpAddr) -> Result<(), MizuError> {
+pub fn authorize_resolved_address(
+    host: &str,
+    ip: IpAddr,
+    allow_private_literal: bool,
+) -> Result<(), MizuError> {
     if let Some(literal) = parse_host_literal(host) {
-        return if literal == ip {
+        if literal != ip {
+            return Err(MizuError::SecurityViolation(format!(
+                "address literal `{host}` resolved to a different address ({ip})"
+            )));
+        }
+        return if allow_private_literal || is_publicly_routable(ip) {
             Ok(())
         } else {
             Err(MizuError::SecurityViolation(format!(
-                "address literal `{host}` resolved to a different address ({ip})"
+                "address literal `{host}` is not publicly routable; a document-\
+                 supplied target may not address a private, loopback, or link-\
+                 local host"
             )))
         };
     }
@@ -421,7 +439,7 @@ mod kani_proofs {
         let addr = any_ip();
         for host in ["localhost", "LOCALHOST", "api.localhost", "API.LocalHost"] {
             assert_eq!(
-                authorize_resolved_address(host, addr).is_ok(),
+                authorize_resolved_address(host, addr, false).is_ok(),
                 addr.is_loopback()
             );
         }
@@ -554,7 +572,7 @@ mod tests {
     #[test]
     fn public_name_resolving_inward_is_rejected() {
         for s in ["127.0.0.1", "169.254.169.254", "10.1.2.3", "::1", "fd00::1"] {
-            let err = authorize_resolved_address("evil.com", ip(s))
+            let err = authorize_resolved_address("evil.com", ip(s), true)
                 .expect_err("a public name must not authorize an inward address");
             assert!(
                 matches!(err, MizuError::SecurityViolation(_)),
@@ -565,16 +583,16 @@ mod tests {
 
     #[test]
     fn public_name_resolving_publicly_is_accepted() {
-        assert!(authorize_resolved_address("example.com", ip("93.184.216.34")).is_ok());
-        assert!(authorize_resolved_address("example.com", ip("2606:4700::1111")).is_ok());
+        assert!(authorize_resolved_address("example.com", ip("93.184.216.34"), true).is_ok());
+        assert!(authorize_resolved_address("example.com", ip("2606:4700::1111"), true).is_ok());
     }
 
     #[test]
     fn loopback_names_require_a_loopback_address() {
-        assert!(authorize_resolved_address("localhost", ip("127.0.0.1")).is_ok());
-        assert!(authorize_resolved_address("api.localhost", ip("::1")).is_ok());
-        assert!(authorize_resolved_address("api.localhost", ip("93.184.216.34")).is_err());
-        assert!(authorize_resolved_address("localhost", ip("10.0.0.1")).is_err());
+        assert!(authorize_resolved_address("localhost", ip("127.0.0.1"), false).is_ok());
+        assert!(authorize_resolved_address("api.localhost", ip("::1"), false).is_ok());
+        assert!(authorize_resolved_address("api.localhost", ip("93.184.216.34"), false).is_err());
+        assert!(authorize_resolved_address("localhost", ip("10.0.0.1"), false).is_err());
     }
 
     /// A literal in the URL bar is the user's own explicit choice, and every
@@ -593,7 +611,7 @@ mod tests {
             ("93.184.216.34", "93.184.216.34"),
         ] {
             assert!(
-                authorize_resolved_address(host, ip(expected)).is_ok(),
+                authorize_resolved_address(host, ip(expected), true).is_ok(),
                 "literal `{host}` must authorize {expected}"
             );
         }
@@ -601,9 +619,37 @@ mod tests {
 
     #[test]
     fn a_literal_may_not_resolve_to_a_different_address() {
-        let err = authorize_resolved_address("127.0.0.1", ip("93.184.216.34"))
+        let err = authorize_resolved_address("127.0.0.1", ip("93.184.216.34"), true)
             .expect_err("a literal must only authorize itself");
         assert!(matches!(err, MizuError::SecurityViolation(_)));
+    }
+
+    /// SSRF regression: a document-supplied target (`allow_private_literal =
+    /// false`) must not be able to self-authorize a private, loopback, or
+    /// link-local literal the way a user-typed address-bar target can — this
+    /// is the check that blocks `mizu://169.254.169.254/…` reaching the
+    /// network from an `<image>` or `NetworkCall` embedded in a `.mizu`
+    /// document.
+    #[test]
+    fn document_supplied_literals_must_be_publicly_routable() {
+        for host in [
+            "127.0.0.1",
+            "192.168.1.5",
+            "10.0.0.1",
+            "169.254.169.254",
+            "[::1]",
+            "[fd00::1]",
+        ] {
+            let literal = host.trim_start_matches('[').trim_end_matches(']');
+            let err = authorize_resolved_address(host, ip(literal), false)
+                .expect_err("a document-supplied private literal must be rejected");
+            assert!(matches!(err, MizuError::SecurityViolation(_)));
+        }
+
+        // A publicly routable literal is still fine without the address-bar
+        // exemption — the rule only tightens the private/loopback/link-local
+        // ranges, it does not ban literal IPs outright.
+        assert!(authorize_resolved_address("93.184.216.34", ip("93.184.216.34"), false).is_ok());
     }
 
     /// `mizu://` hosts are not case-normalised by the URL parser, so the two
@@ -622,11 +668,11 @@ mod tests {
         ] {
             assert!(is_local_host(host), "{host} must classify as local");
             assert!(
-                authorize_resolved_address(host, ip("127.0.0.1")).is_ok(),
+                authorize_resolved_address(host, ip("127.0.0.1"), false).is_ok(),
                 "{host} must authorize loopback"
             );
             assert!(
-                authorize_resolved_address(host, ip("93.184.216.34")).is_err(),
+                authorize_resolved_address(host, ip("93.184.216.34"), false).is_err(),
                 "{host} must not authorize a public address"
             );
         }
@@ -639,7 +685,7 @@ mod tests {
     fn localhost_lookalikes_are_judged_as_public_names() {
         for host in ["localhost.evil.com", "notlocalhost", "evil-localhost.com"] {
             assert!(!is_local_host(host));
-            assert!(authorize_resolved_address(host, ip("127.0.0.1")).is_err());
+            assert!(authorize_resolved_address(host, ip("127.0.0.1"), false).is_err());
         }
     }
 }

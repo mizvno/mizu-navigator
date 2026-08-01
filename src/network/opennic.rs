@@ -292,17 +292,27 @@ fn is_transient_dns_error(_e: &MizuError) -> bool {
 /// [`resolve_ip`]) so that a name publishing both a routable and a
 /// non-routable address still connects, to the routable one; the check here is
 /// the enforcement point that produces the error.
+///
+/// `allow_private_literal` must be `true` only for a connection the user
+/// actually drove (a top-level navigation) and `false` for anything a
+/// document triggered on its own (a subresource fetch: a data call, an
+/// image). It is forwarded verbatim to [`authorize_resolved_address`], which
+/// is where the distinction is enforced — see that function's doc comment.
+/// Getting this backwards turns a `.mizu` document's `<image>` or
+/// `NetworkCall` target into blind SSRF against loopback/LAN/link-local
+/// addresses.
 pub async fn resolve_domain(
     resolver: &MizuDnsResolver,
     domain: &str,
     port: u16,
+    allow_private_literal: bool,
 ) -> Result<SocketAddr, MizuError> {
     let bare = domain.trim_end_matches('.');
 
     // ── Direct IP — skip DNS entirely ────────────────────────────────────────
     if let Some(ip) = mizu_core::security::network::parse_host_literal(bare) {
         let addr = SocketAddr::new(ip, port);
-        authorize_resolved_address(bare, ip)?;
+        authorize_resolved_address(bare, ip, allow_private_literal)?;
         return Ok(addr);
     }
 
@@ -338,7 +348,7 @@ pub async fn resolve_domain(
         }
     }?;
 
-    authorize_resolved_address(bare, addr.ip())?;
+    authorize_resolved_address(bare, addr.ip(), allow_private_literal)?;
     Ok(addr)
 }
 
@@ -688,28 +698,65 @@ mod tests {
     #[tokio::test]
     async fn bare_ip_bypasses_dns() {
         let resolver = build_opennic_resolver();
-        let addr = resolve_domain(&resolver, "1.2.3.4", 7399).await.unwrap();
+        let addr = resolve_domain(&resolver, "1.2.3.4", 7399, true)
+            .await
+            .unwrap();
         assert_eq!(addr.to_string(), "1.2.3.4:7399");
     }
 
     #[tokio::test]
     async fn localhost_maps_to_loopback() {
         let resolver = build_opennic_resolver();
-        let addr = resolve_domain(&resolver, "localhost", 7399).await.unwrap();
+        let addr = resolve_domain(&resolver, "localhost", 7399, true)
+            .await
+            .unwrap();
         assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
     }
 
     #[tokio::test]
     async fn localhost_fqdn_maps_to_loopback() {
         let resolver = build_opennic_resolver();
-        let addr = resolve_domain(&resolver, "localhost.", 7399).await.unwrap();
+        let addr = resolve_domain(&resolver, "localhost.", 7399, true)
+            .await
+            .unwrap();
         assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
     }
 
     #[tokio::test]
     async fn ipv6_loopback_bypasses_dns() {
         let resolver = build_opennic_resolver();
-        let addr = resolve_domain(&resolver, "::1", 443).await.unwrap();
+        let addr = resolve_domain(&resolver, "::1", 443, true).await.unwrap();
         assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443)));
+    }
+
+    /// SSRF regression: a document-supplied target (`allow_private_literal =
+    /// false`, the value every subresource fetch — image/data-call — must
+    /// pass) must not be able to reach a private/loopback literal, even
+    /// though the same literal is allowed for a user-driven navigation.
+    #[tokio::test]
+    async fn document_supplied_private_literal_is_rejected() {
+        let resolver = build_opennic_resolver();
+        let err = resolve_domain(&resolver, "127.0.0.1", 7399, false)
+            .await
+            .expect_err("a document-supplied loopback literal must be rejected");
+        assert!(matches!(err, MizuError::SecurityViolation(_)));
+
+        let err = resolve_domain(&resolver, "192.168.1.5", 7399, false)
+            .await
+            .expect_err("a document-supplied private literal must be rejected");
+        assert!(matches!(err, MizuError::SecurityViolation(_)));
+    }
+
+    /// The `localhost` shortcut is a name, not a literal, so it is untouched
+    /// by `allow_private_literal` — it still maps to loopback either way
+    /// (`authorize_resolved_address`'s loopback-name branch enforces this,
+    /// not the literal branch).
+    #[tokio::test]
+    async fn document_supplied_localhost_name_still_maps_to_loopback() {
+        let resolver = build_opennic_resolver();
+        let addr = resolve_domain(&resolver, "localhost", 7399, false)
+            .await
+            .unwrap();
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
     }
 }

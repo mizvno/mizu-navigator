@@ -275,6 +275,7 @@ async fn test_file_scheme_always_rejected_by_h3_fetch() {
             None,
             None,
             &[],
+            false,
         )
         .await;
         assert!(

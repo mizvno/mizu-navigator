@@ -98,6 +98,10 @@ pub(super) async fn handle_navigate(
         request_body,
         content_type,
         custom_headers,
+        // A top-level navigation is the destination written in the URL bar
+        // (or reached via a same-origin/gesture-authorised hop of one) —
+        // see `handle_fetch_raw`'s `allow_private_literal` doc comment.
+        true,
     )
     .await?;
     let domain = MizuUri::parse(url_str)
@@ -161,6 +165,10 @@ async fn handle_fetch_subresource_raw(
             request_body.clone(),
             content_type.clone(),
             custom_headers,
+            // A subresource fetch (data call or image) is document-triggered,
+            // never user-driven, so a literal-IP target must clear the same
+            // public-routability bar as a resolved name (SSRF guard).
+            false,
         )
         .await?;
 
@@ -253,6 +261,16 @@ pub(super) async fn handle_fetch_bytes(
 /// On a connection-level failure the pool entry is evicted and the request is
 /// retried once on a fresh connection, transparently recovering from stale
 /// connections caused by server restarts or idle-timeout evictions.
+///
+/// `is_navigation` must be `true` only for a top-level navigation
+/// (`handle_navigate`'s call) and `false` for a subresource fetch (a data
+/// call or image, via `handle_fetch_subresource_raw`). It is forwarded to
+/// `resolve_domain` as `allow_private_literal`: a literal-IP `mizu://` host
+/// self-authorizes for a navigation the user drove, but a document-triggered
+/// subresource must clear the public-routability check like any other
+/// target, or an `<image>`/`NetworkCall` embedding
+/// `mizu://169.254.169.254/…` becomes blind SSRF against loopback/LAN/
+/// link-local addresses.
 pub(super) async fn handle_fetch_raw(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
@@ -263,6 +281,7 @@ pub(super) async fn handle_fetch_raw(
     request_body: Option<bytes::Bytes>,
     content_type: Option<String>,
     custom_headers: &[(String, String)],
+    is_navigation: bool,
 ) -> Result<(http::StatusCode, http::HeaderMap, Vec<u8>), MizuError> {
     if url_str.starts_with("file://") {
         return Err(MizuError::SecurityViolation(
@@ -281,6 +300,7 @@ pub(super) async fn handle_fetch_raw(
         dns,
         &uri.domain,
         *crate::network::opennic::MIZU_PORT,
+        is_navigation,
     )
     .await?;
 
