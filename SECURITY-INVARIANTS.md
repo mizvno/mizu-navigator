@@ -62,6 +62,24 @@ navigation path.
 *Source constructs:* `CapabilityPolicy` rebuild in `src/render/window/navigate.rs`
 (construction in `src/render/window/manager.rs`).
 *Enforcement:* **Runtime** — navigation choke point.
+*The origin moves with the document, not with the intent.* The origin of
+record is `ChromeState::committed_url`, and it — together with
+`capability_policy` — is written at exactly one moment: when a document
+commits, in `handle_navigate_success`. Dispatching a navigation deliberately
+changes neither. A `mizu://` navigation is answered asynchronously and may
+never be answered at all (NXDOMAIN, a timeout, a `SecurityViolation`), while
+the previous document keeps running with its DOM, its logic and its root
+timers intact; moving the origin at dispatch time would hand that
+still-running document the *target's* origin, so a local `file://` document
+could shed the `file://`→remote call block — and with it the exfiltration
+guard on every `media` endpoint it declares — by following one link to a host
+that does not resolve. For the same reason no decision may read
+`ChromeState::url`: that is the URL-bar editing buffer, rewritten by every
+keystroke, paste and autocomplete acceptance long before any navigation is
+authorised. Regression tests:
+`render::window::tests::a_dispatched_navigation_does_not_relabel_the_running_documents_origin`,
+`::the_url_bar_buffer_is_not_an_origin`,
+`::a_committed_navigation_does_move_the_origin`.
 *Not everything origin-scoped may be reset by it.* The storage **byte quota**
 is explicitly excluded and lives in the window-level `StorageUsageLedger`,
 keyed by the origin's storage identity. A document can navigate to itself

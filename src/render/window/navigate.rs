@@ -115,7 +115,19 @@ pub(super) fn handle_navigate_success(
     source: String,
 ) {
     tracing::debug!(url = %url, "navigate success");
-    tab.chrome_state.url = url.clone();
+    // N5: this is the single commit point. The origin only changes here —
+    // together with the document it belongs to — so the previous document is
+    // never left running under the next document's origin (see
+    // `ChromeState::committed_url`). `capability_policy` is rebuilt from the
+    // same string in the same breath, so the quota tier and the storage domain
+    // can never describe a different origin than the code that is executing.
+    tab.chrome_state.committed_url = url.clone();
+    tab.capability_policy = crate::render::security::capability_policy_for(&url, ctx.storage_usage);
+    // ux-7: only the *displayed* URL is stripped of bidi override/isolate
+    // controls; `committed_url` keeps the real string every origin comparison
+    // and every fetch is made against.
+    tab.chrome_state
+        .set_displayed_url(crate::render::bidi::strip_bidi_overrides(&url).into_owned());
     tab.chrome_state.loading = false;
     tab.reset_redirect_count();
     tab.store
@@ -265,8 +277,10 @@ pub(super) fn handle_navigate_success(
                             .get("title")
                             .cloned()
                             .unwrap_or_default();
-                        ctx.history_log
-                            .push(VisitRecord::new(tab.chrome_state.url.clone(), title));
+                        ctx.history_log.push(VisitRecord::new(
+                            tab.chrome_state.committed_url.clone(),
+                            title,
+                        ));
                         // ux-4: restore scroll position after a history
                         // (Back/Forward) step. `reload_document` always
                         // resets `root_scroll_offset_y` to 0.0 first, so this
@@ -464,7 +478,7 @@ pub(super) fn rebuild_tab_taffy_after_image(tab: &mut TabState, ctx: &mut Window
             taffy: &mut new_taffy,
             node_to_taffy_id: &mut new_node_map,
             image_cache: ctx.image_cache,
-            chrome_url: &tab.chrome_state.url,
+            chrome_url: &tab.chrome_state.committed_url,
             variants: &tab.style_variants,
             env: &env,
         },
@@ -495,11 +509,25 @@ pub(super) fn rebuild_tab_taffy_after_image(tab: &mut TabState, ctx: &mut Window
 /// the inspector Net panel (`BLOCKED` entry).  No state changes occur.
 ///
 /// On an allowed verdict:
-/// - `chrome_state.url` is updated (N5: single mutation site).
-/// - `capability_policy` is reset for the new origin (N5).
 /// - The redirect chain counter is reset for non-redirect initiators.
 /// - `file://` documents are loaded directly; `mizu://` dispatches
 ///   `NetworkCmd::Navigate` to the network worker.
+///
+/// # The origin does not move here (N5)
+///
+/// Dispatching a navigation deliberately leaves `chrome_state.committed_url`
+/// and `capability_policy` alone: they change only when a document actually
+/// commits, in [`handle_navigate_success`]. A `mizu://` navigation is answered
+/// asynchronously and may never be answered at all (NXDOMAIN, a timeout, a
+/// `SecurityViolation`), while the previous document keeps running with its
+/// DOM, its logic and its root timers intact. Relabelling the origin at
+/// dispatch time would hand that still-running document the *target's* origin:
+/// a local `file://` document could shed the `file://`→remote call block —
+/// and with it the exfiltration guard on every `media` endpoint it
+/// declares — by doing nothing more than following one link to a host that
+/// does not resolve. The current URL read below is the committed one for the
+/// same reason: the URL-bar text is an editing buffer, so anything decided
+/// from it would change under the user's keystrokes.
 pub(super) fn navigate_to_url(
     tab: &mut TabState,
     ctx: &mut WindowCtx<'_>,
@@ -518,16 +546,20 @@ pub(super) fn navigate_to_url(
         return;
     }
 
+    // The origin every check below is made against is the *committed* one —
+    // the document actually loaded in this tab — never the URL-bar text.
+    let current_url = tab.chrome_state.committed_url.clone();
+
     // For file:// origins with relative paths, we still need resolve_navigate_url
     // for sandbox enforcement (it does I/O via canonicalize).  check_navigation
     // handles the pure policy, then we do the I/O-dependent resolution.
-    let resolved_url = if !url.contains("://") && tab.chrome_state.url.starts_with("file://") {
+    let resolved_url = if !url.contains("://") && current_url.starts_with("file://") {
         // check_navigation allows this at the policy level; now enforce sandbox.
-        match resolve_navigate_url(&tab.chrome_state.url, &url) {
+        match resolve_navigate_url(&current_url, &url) {
             Some(u) => u,
             None => {
                 tracing::warn!(
-                    current = %tab.chrome_state.url,
+                    current = %current_url,
                     target = %url,
                     "blocked: relative path escapes file:// sandbox"
                 );
@@ -540,13 +572,13 @@ pub(super) fn navigate_to_url(
                 return;
             }
         }
-    } else if url.starts_with("file://") && tab.chrome_state.url.starts_with("file://") {
+    } else if url.starts_with("file://") && current_url.starts_with("file://") {
         // Absolute file→file: sandbox check via resolve_navigate_url.
-        match resolve_navigate_url(&tab.chrome_state.url, &url) {
+        match resolve_navigate_url(&current_url, &url) {
             Some(u) => u,
             None => {
                 tracing::warn!(
-                    current = %tab.chrome_state.url,
+                    current = %current_url,
                     target = %url,
                     "blocked: file:// target escapes sandbox"
                 );
@@ -564,7 +596,7 @@ pub(super) fn navigate_to_url(
     };
 
     // N2: all navigation decisions go through the policy choke point.
-    match check_navigation(&tab.chrome_state.url, &resolved_url, &initiator) {
+    match check_navigation(&current_url, &resolved_url, &initiator) {
         NavigationVerdict::Allow(target) => {
             // N5: reset redirect chain for non-redirect initiators.
             if !matches!(initiator, NavigationInitiator::RedirectOf(_)) {
@@ -582,32 +614,18 @@ pub(super) fn navigate_to_url(
                 NavigationInitiator::HistoryStep | NavigationInitiator::RedirectOf(_)
             ) {
                 tab.history.record_navigation(HistoryEntry {
-                    url: tab.chrome_state.committed_url.clone(),
+                    url: current_url.clone(),
                     scroll_y: tab.root_scroll_offset_y,
                 });
             }
 
-            // N5: update chrome state and reset capability policy.
-            // ux-7: the *displayed*/current-URL string is sanitized of bidi
-            // override/isolate control characters (docs/design/bidi.md §4)
-            // — a document-driven navigation must not be able to plant one
-            // into the address bar any more than typing one can
-            // (chrome_vello.rs's `insert_text` is the other choke point).
-            // `target` itself (used below for the actual fetch/read) is
-            // left untouched — only what becomes `chrome_state.url` is
-            // sanitized.
-            tab.chrome_state.url = crate::render::bidi::strip_bidi_overrides(&target).into_owned();
-            tab.chrome_state.committed_url = target.clone();
-            // Rebuilding the policy re-derives the quota *tier* for the new
-            // origin and resets the per-second write burst. It does not hand
-            // out a fresh byte budget: the running total lives in the
-            // window-level ledger, keyed by origin, so a document navigating
-            // to itself (allowed without a gesture, same origin) cannot use
-            // this line to zero its own accounting and store another quota's
-            // worth on every hop.
-            tab.capability_policy =
-                crate::render::security::capability_policy_for(&target, ctx.storage_usage);
-
+            // N5: the origin is *not* moved here. `committed_url` and
+            // `capability_policy` are installed by `handle_navigate_success`,
+            // together with the document they describe — see this function's
+            // doc comment. The address bar likewise keeps showing the page the
+            // user is actually looking at until the new one commits, so a
+            // navigation that stalls or fails cannot leave the bar attesting
+            // to a document that was never loaded.
             if target.starts_with("file://") {
                 if let Some(path) = target.strip_prefix("file:///")
                     && let Ok(content) = std::fs::read_to_string(path)
@@ -631,7 +649,7 @@ pub(super) fn navigate_to_url(
         }
         NavigationVerdict::Block(reason) => {
             tracing::warn!(
-                current = %tab.chrome_state.url,
+                current = %current_url,
                 target = %resolved_url,
                 reason = reason,
                 "navigation blocked by policy"
@@ -654,10 +672,12 @@ pub(super) fn navigate_to_url(
 /// (N2) with [`NavigationInitiator::HistoryStep`] — a Back/Forward click is a
 /// real user gesture (N3), but the step must still pass through the single
 /// choke point for scheme/origin/lifecycle handling (N4/N5) rather than
-/// swapping `chrome_state.url` directly.
+/// swapping the tab's URL directly.
 pub(super) fn navigate_back(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
+    // The entry being left is the document actually loaded, not whatever the
+    // user has half-typed into the bar.
     let leaving = HistoryEntry {
-        url: tab.chrome_state.url.clone(),
+        url: tab.chrome_state.committed_url.clone(),
         scroll_y: tab.root_scroll_offset_y,
     };
     let Some(target) = tab.history.go_back(leaving) else {
@@ -672,7 +692,7 @@ pub(super) fn navigate_back(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
 /// stack is empty.
 pub(super) fn navigate_forward(tab: &mut TabState, ctx: &mut WindowCtx<'_>) {
     let leaving = HistoryEntry {
-        url: tab.chrome_state.url.clone(),
+        url: tab.chrome_state.committed_url.clone(),
         scroll_y: tab.root_scroll_offset_y,
     };
     let Some(target) = tab.history.go_forward(leaving) else {

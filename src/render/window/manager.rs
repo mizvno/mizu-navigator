@@ -384,6 +384,24 @@ pub(crate) struct TestChannelKeepAlive {
     _logic_response_tx: std::sync::mpsc::Sender<(TabId, Result<WorkerResponse, MizuError>)>,
 }
 
+#[cfg(test)]
+impl TestChannelKeepAlive {
+    /// Takes every [`crate::network::NetworkCmd`] the manager has dispatched
+    /// since the last drain.
+    ///
+    /// A `mizu://` navigation is asynchronous: the choke point emits a command
+    /// and nothing else changes until a document actually commits. The command
+    /// is therefore the only observable proof that a navigation was authorised,
+    /// which is exactly what the N2/N3 tests need to assert on.
+    pub(crate) fn drain_network_cmds(&mut self) -> Vec<crate::network::NetworkCmd> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = self._network_cmd_rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+}
+
 /// Borrowed window-level state that a per-tab operation may need.
 ///
 /// Exists to solve a borrow-checker problem, not as an abstraction: functions
@@ -725,7 +743,9 @@ impl TabState {
         )?;
 
         let chrome_state = ChromeState {
+            committed_url: initial_url.to_string(),
             url: initial_url.to_string(),
+            cursor: initial_url.len(),
             ..ChromeState::default()
         };
 
@@ -1130,10 +1150,10 @@ impl TabState {
                 // localhost — the only meaningful host during local development
                 // (get_raw_domain would yield a filesystem-derived token that is
                 // not a routable hostname).
-                document_domain: if self.chrome_state.url.starts_with("file://") {
+                document_domain: if self.chrome_state.committed_url.starts_with("file://") {
                     "localhost".to_string()
                 } else {
-                    get_raw_domain(&self.chrome_state.url)
+                    get_raw_domain(&self.chrome_state.committed_url)
                 },
                 computed_bindings: self.computed_bindings.clone(),
             })),
@@ -1280,7 +1300,7 @@ pub(super) fn reload_tab_document(
             taffy: &mut taffy,
             node_to_taffy_id: &mut node_to_taffy_id,
             image_cache: ctx.image_cache,
-            chrome_url: &tab.chrome_state.url,
+            chrome_url: &tab.chrome_state.committed_url,
             variants: &style_variants,
             env: &env,
         },
@@ -1336,8 +1356,10 @@ pub(super) fn reload_tab_document(
         interner,
     }
     .freeze();
-    tab.store
-        .set_runtime("window_url", Value::from(tab.chrome_state.url.clone()));
+    tab.store.set_runtime(
+        "window_url",
+        Value::from(tab.chrome_state.committed_url.clone()),
+    );
     tab.rebuild_dependency_index();
 
     tab.trigger_logic_reload(ctx.logic_tx);
@@ -1408,7 +1430,7 @@ pub(super) fn resize_tab_viewport(
             taffy: &mut new_taffy,
             node_to_taffy_id: &mut new_node_to_taffy_id,
             image_cache: ctx.image_cache,
-            chrome_url: &tab.chrome_state.url,
+            chrome_url: &tab.chrome_state.committed_url,
             variants: &tab.style_variants,
             env: &env,
         },
@@ -1692,7 +1714,9 @@ pub(super) fn execute_tab_capability_action(
         ctx.network_tx,
         ctx.logic_tx,
         tab.id,
-        &tab.chrome_state.url,
+        // The origin of record — never the URL-bar text, which the user may
+        // be editing and which a stalled navigation must not be able to move.
+        &tab.chrome_state.committed_url,
         &mut tab.capability_policy,
         action,
     );

@@ -123,31 +123,78 @@ fn window_dom() -> Tree<MizuNode> {
     })
 }
 
-/// Spends the active tab's whole per-second storage write budget.
-///
-/// Used as the sentinel for "was `capability_policy` rebuilt?": the rate
-/// counter is per page load, so a subsequent successful write proves the
-/// navigation choke point ran. (The byte total deliberately survives a
-/// rebuild — see `navigating_does_not_refill_an_exhausted_storage_quota` —
-/// so it cannot serve as that sentinel.)
-fn saturate_write_rate(manager: &mut MizuWindowManager) {
-    let policy = &mut manager.active_mut().capability_policy;
-    while policy.check_storage_write(1).is_ok() {}
-}
-
-/// Whether the active tab may perform a storage write right now.
-fn write_rate_available(manager: &mut MizuWindowManager) -> bool {
-    manager
-        .active_mut()
-        .capability_policy
-        .check_storage_write(1)
-        .is_ok()
-}
-
 fn make_minimal_manager() -> (MizuWindowManager, TestChannelKeepAlive) {
     let mut styles = HashMap::new();
     styles.insert("window".to_string(), StyleRules::default());
     make_manager_with(window_dom(), styles)
+}
+
+/// Points the active tab at `url` as if a document had committed there.
+///
+/// Tests set the *origin of record*, never the URL-bar buffer: the bar is
+/// display state and no longer feeds any decision (see
+/// `ChromeState::committed_url`), so seeding it would set up nothing at all.
+fn commit_url(manager: &mut MizuWindowManager, url: &str) {
+    let policy = crate::render::security::capability_policy_for(url, &manager.storage_usage);
+    let tab = manager.active_mut();
+    tab.chrome_state.committed_url = url.to_string();
+    tab.chrome_state.set_displayed_url(url.to_string());
+    tab.capability_policy = policy;
+}
+
+/// The URL of the last navigation the choke point dispatched, or `None` if it
+/// dispatched none. Drains the command channel.
+///
+/// `NetworkCmd::Navigate` is emitted from exactly one place
+/// (`navigate_to_url`'s `Allow` branch), so its presence is proof the
+/// navigation was authorised there and nowhere else.
+fn dispatched_navigation(keepalive: &mut TestChannelKeepAlive) -> Option<String> {
+    keepalive
+        .drain_network_cmds()
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            crate::network::NetworkCmd::Navigate { url, .. } => Some(url),
+            _ => None,
+        })
+        .next_back()
+}
+
+/// Delivers the document the network worker would have returned for a
+/// dispatched navigation, committing it.
+fn commit_dispatched_navigation(manager: &mut MizuWindowManager, url: String) {
+    let tab_id = manager.active().id;
+    let (t, mut c) = manager.split_active();
+    process_network_result(
+        t,
+        &mut c,
+        crate::network::NetworkResult::NavigateSuccess {
+            tab: tab_id,
+            url,
+            source: "layout\n  doc\n".to_string(),
+        },
+    );
+}
+
+/// Runs a navigation end to end — through the choke point, then through the
+/// commit — and returns the tab's committed URL afterwards.
+///
+/// A `mizu://` navigation only moves the origin once a document arrives, so a
+/// test that asserts on the destination has to supply that document; one that
+/// stops at the dispatch is asserting on a page that was never loaded.
+fn navigate_and_commit(
+    manager: &mut MizuWindowManager,
+    keepalive: &mut TestChannelKeepAlive,
+    url: &str,
+    initiator: crate::render::navigation::NavigationInitiator,
+) -> String {
+    {
+        let (t, mut c) = manager.split_active();
+        navigate_to_url(t, &mut c, url.to_string(), initiator);
+    }
+    if let Some(dispatched) = dispatched_navigation(keepalive) {
+        commit_dispatched_navigation(manager, dispatched);
+    }
+    manager.active().chrome_state.committed_url.clone()
 }
 
 #[test]
@@ -647,14 +694,12 @@ fn dispatch_click_gesture_emits_exactly_one_click_event() {
 
 #[test]
 fn history_back_step_routes_through_navigation_choke_point() {
-    // Security regression: a Back step must not swap `chrome_state.url`
-    // directly. It must go through `navigate_to_url`'s Allow branch,
-    // which — among other N5 lifecycle resets — always installs a fresh
-    // `CapabilityPolicy`. We plant a sentinel in the current policy and
-    // confirm it is gone after the Back step: that's only possible if
-    // the real choke point ran, not a bypass.
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://current.example/page".to_string();
+    // Security regression: a Back step must not swap the tab's URL directly.
+    // It must go through `navigate_to_url`'s Allow branch — the sole emitter
+    // of `NetworkCmd::Navigate`, so the dispatched command is proof the real
+    // choke point ran rather than a bypass.
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://current.example/page");
     manager
         .active_mut()
         .history
@@ -663,8 +708,7 @@ fn history_back_step_routes_through_navigation_choke_point() {
             scroll_y: 77.0,
         });
     assert!(manager.active_mut().history.can_go_back());
-
-    saturate_write_rate(&mut manager);
+    let _ = keepalive.drain_network_cmds();
 
     {
         let (t, mut c) = manager.split_active();
@@ -672,15 +716,9 @@ fn history_back_step_routes_through_navigation_choke_point() {
     };
 
     assert_eq!(
-        manager.active_mut().chrome_state.url,
-        "mizu://previous.example/page",
-        "Back must navigate to the popped history entry"
-    );
-    assert!(
-        write_rate_available(&mut manager),
-        "capability_policy must have been freshly rebuilt by navigate_to_url's \
-             Allow branch (N5) — a direct URL swap bypassing the choke point \
-             would have left the exhausted write budget in place"
+        dispatched_navigation(&mut keepalive).as_deref(),
+        Some("mizu://previous.example/page"),
+        "Back must dispatch the popped history entry through the choke point"
     );
     assert!(
         !manager.active_mut().history.can_go_back(),
@@ -694,8 +732,8 @@ fn history_back_step_routes_through_navigation_choke_point() {
 
 #[test]
 fn history_forward_step_routes_through_navigation_choke_point() {
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://current.example/page".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://current.example/page");
     manager
         .active_mut()
         .history
@@ -707,21 +745,20 @@ fn history_forward_step_routes_through_navigation_choke_point() {
         let (t, mut c) = manager.split_active();
         navigate_back(t, &mut c)
     };
+    if let Some(url) = dispatched_navigation(&mut keepalive) {
+        commit_dispatched_navigation(&mut manager, url);
+    }
     assert!(manager.active_mut().history.can_go_forward());
 
-    saturate_write_rate(&mut manager);
     {
         let (t, mut c) = manager.split_active();
         navigate_forward(t, &mut c)
     };
 
     assert_eq!(
-        manager.active_mut().chrome_state.url,
-        "mizu://current.example/page"
-    );
-    assert!(
-        write_rate_available(&mut manager),
-        "Forward must also route through the choke point's N5 rebuild"
+        dispatched_navigation(&mut keepalive).as_deref(),
+        Some("mizu://current.example/page"),
+        "Forward must also route through the choke point"
     );
 }
 
@@ -729,10 +766,10 @@ fn history_forward_step_routes_through_navigation_choke_point() {
 fn history_back_with_empty_stack_fires_no_navigation() {
     // Disabled-button behavior: clicking Back with an empty back stack
     // must be a guaranteed no-op, not merely "unlikely to do anything".
-    let (mut manager, _keepalive) = make_minimal_manager();
+    let (mut manager, mut keepalive) = make_minimal_manager();
     assert!(!manager.active_mut().history.can_go_back());
-    manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
-    saturate_write_rate(&mut manager);
+    commit_url(&mut manager, "mizu://only-page.example/");
+    let _ = keepalive.drain_network_cmds();
 
     {
         let (t, mut c) = manager.split_active();
@@ -740,23 +777,23 @@ fn history_back_with_empty_stack_fires_no_navigation() {
     };
 
     assert_eq!(
-        manager.active_mut().chrome_state.url,
+        manager.active().chrome_state.committed_url,
         "mizu://only-page.example/",
-        "URL must be unchanged when back stack is empty"
+        "the origin must be unchanged when the back stack is empty"
     );
     assert!(
-        !write_rate_available(&mut manager),
-        "capability_policy must be untouched — no navigation occurred at all"
+        dispatched_navigation(&mut keepalive).is_none(),
+        "no navigation may be dispatched at all"
     );
     assert!(!manager.active_mut().history.can_go_forward());
 }
 
 #[test]
 fn history_forward_with_empty_stack_fires_no_navigation() {
-    let (mut manager, _keepalive) = make_minimal_manager();
+    let (mut manager, mut keepalive) = make_minimal_manager();
     assert!(!manager.active_mut().history.can_go_forward());
-    manager.active_mut().chrome_state.url = "mizu://only-page.example/".to_string();
-    saturate_write_rate(&mut manager);
+    commit_url(&mut manager, "mizu://only-page.example/");
+    let _ = keepalive.drain_network_cmds();
 
     {
         let (t, mut c) = manager.split_active();
@@ -764,55 +801,50 @@ fn history_forward_with_empty_stack_fires_no_navigation() {
     };
 
     assert_eq!(
-        manager.active_mut().chrome_state.url,
+        manager.active().chrome_state.committed_url,
         "mizu://only-page.example/"
     );
-    assert!(!write_rate_available(&mut manager));
+    assert!(dispatched_navigation(&mut keepalive).is_none());
 }
 
 #[test]
 fn fresh_navigation_after_back_clears_forward_stack() {
     // A -> B -> C, back to B, then a fresh navigation to D from B must
     // clear the forward stack (standard browser semantics).
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://a.example/".to_string();
-    {
-        let (t, mut c) = manager.split_active();
-        navigate_to_url(
-            t,
-            &mut c,
-            "mizu://b.example/".to_string(),
-            crate::render::navigation::NavigationInitiator::UserGesture,
-        );
-    }
-    {
-        let (t, mut c) = manager.split_active();
-        navigate_to_url(
-            t,
-            &mut c,
-            "mizu://c.example/".to_string(),
-            crate::render::navigation::NavigationInitiator::UserGesture,
-        );
-    }
-    assert_eq!(manager.active_mut().chrome_state.url, "mizu://c.example/");
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://a.example/");
+    let _ = keepalive.drain_network_cmds();
+    let gesture = crate::render::navigation::NavigationInitiator::UserGesture;
+
+    navigate_and_commit(
+        &mut manager,
+        &mut keepalive,
+        "mizu://b.example/",
+        gesture.clone(),
+    );
+    let landed = navigate_and_commit(
+        &mut manager,
+        &mut keepalive,
+        "mizu://c.example/",
+        gesture.clone(),
+    );
+    assert_eq!(landed, "mizu://c.example/");
 
     {
         let (t, mut c) = manager.split_active();
         navigate_back(t, &mut c)
     };
-    assert_eq!(manager.active_mut().chrome_state.url, "mizu://b.example/");
+    if let Some(url) = dispatched_navigation(&mut keepalive) {
+        commit_dispatched_navigation(&mut manager, url);
+    }
+    assert_eq!(
+        manager.active().chrome_state.committed_url,
+        "mizu://b.example/"
+    );
     assert!(manager.active_mut().history.can_go_forward());
 
-    {
-        let (t, mut c) = manager.split_active();
-        navigate_to_url(
-            t,
-            &mut c,
-            "mizu://d.example/".to_string(),
-            crate::render::navigation::NavigationInitiator::UserGesture,
-        );
-    }
-    assert_eq!(manager.active_mut().chrome_state.url, "mizu://d.example/");
+    let landed = navigate_and_commit(&mut manager, &mut keepalive, "mizu://d.example/", gesture);
+    assert_eq!(landed, "mizu://d.example/");
     assert!(
         !manager.active_mut().history.can_go_forward(),
         "a fresh navigation must clear the forward stack"
@@ -918,14 +950,17 @@ fn timer_tick_budget_is_per_tab() {
 
 // --- N3: server redirects may not manufacture user agency ---
 
-/// Drives one `NavigationRedirect` result against the active tab and returns
-/// the URL the tab ended up on.
+/// Drives one `NavigationRedirect` result against the active tab, lets any
+/// navigation the choke point authorised run to completion, and returns the
+/// URL the tab ended up committed to.
 fn redirect_to(
     manager: &mut MizuWindowManager,
+    keepalive: &mut TestChannelKeepAlive,
     new_url: &str,
     initiator: crate::render::navigation::NavigationInitiator,
 ) -> String {
     let tab_id = manager.active().id;
+    let _ = keepalive.drain_network_cmds();
     {
         let (t, mut c) = manager.split_active();
         process_network_result(
@@ -938,7 +973,10 @@ fn redirect_to(
             },
         );
     }
-    manager.active_mut().chrome_state.url.clone()
+    if let Some(url) = dispatched_navigation(keepalive) {
+        commit_dispatched_navigation(manager, url);
+    }
+    manager.active().chrome_state.committed_url.clone()
 }
 
 #[test]
@@ -948,11 +986,12 @@ fn cross_origin_redirect_of_document_logic_navigation_is_blocked() {
     // `Location: mizu://evil.example/` must not thereby obtain a cross-origin
     // navigation. Before the fix this site hardcoded
     // `RedirectOf(UserGesture)`, so one header cleared the N3 gate.
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://own.example/");
 
     let landed = redirect_to(
         &mut manager,
+        &mut keepalive,
         "mizu://evil.example/trap",
         crate::render::navigation::NavigationInitiator::DocumentLogic,
     );
@@ -967,11 +1006,12 @@ fn cross_origin_redirect_of_document_logic_navigation_is_blocked() {
 fn same_origin_redirect_of_document_logic_navigation_is_allowed() {
     // The block above must be about the origin hop, not about redirects: a
     // same-origin redirect of a logic navigation is ordinary and must work.
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://own.example/");
 
     let landed = redirect_to(
         &mut manager,
+        &mut keepalive,
         "mizu://own.example/next",
         crate::render::navigation::NavigationInitiator::DocumentLogic,
     );
@@ -983,11 +1023,12 @@ fn same_origin_redirect_of_document_logic_navigation_is_allowed() {
 fn cross_origin_redirect_of_user_gesture_navigation_is_allowed() {
     // The mirror image: real user agency still survives the redirect chain,
     // so the fix does not turn into a blanket ban on cross-origin redirects.
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://own.example/");
 
     let landed = redirect_to(
         &mut manager,
+        &mut keepalive,
         "mizu://other.example/page",
         crate::render::navigation::NavigationInitiator::UserGesture,
     );
@@ -1000,11 +1041,12 @@ fn redirect_chains_do_not_accumulate_agency() {
     // Hop 2 of a document-logic chain is still document logic: the initiator
     // arrives already wrapped as `RedirectOf(DocumentLogic)`, and re-wrapping
     // it must neither promote it nor nest without bound.
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://own.example/".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://own.example/");
 
     let landed = redirect_to(
         &mut manager,
+        &mut keepalive,
         "mizu://evil.example/trap",
         crate::render::navigation::NavigationInitiator::RedirectOf(Box::new(
             crate::render::navigation::NavigationInitiator::DocumentLogic,
@@ -1026,23 +1068,27 @@ fn navigate_to_url_strips_bidi_overrides_from_displayed_url() {
     // override character) must not be able to plant one into the
     // address bar's display any more than typing one can
     // (chrome_vello.rs's insert_text is the other choke point).
-    let (mut manager, _keepalive) = make_minimal_manager();
-    manager.active_mut().chrome_state.url = "mizu://start.example/".to_string();
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "mizu://start.example/");
 
-    {
-        let (t, mut c) = manager.split_active();
-        navigate_to_url(
-            t,
-            &mut c,
-            "mizu://evil\u{202E}gnp.example/".to_string(),
-            crate::render::navigation::NavigationInitiator::UserGesture,
-        );
-    }
+    let target = "mizu://evil\u{202E}gnp.example/";
+    let landed = navigate_and_commit(
+        &mut manager,
+        &mut keepalive,
+        target,
+        crate::render::navigation::NavigationInitiator::UserGesture,
+    );
 
     assert!(
-        !manager.active_mut().chrome_state.url.contains('\u{202E}'),
+        !manager.active().chrome_state.url.contains('\u{202E}'),
         "the displayed URL must never contain an RLO override character, got: {:?}",
-        manager.active_mut().chrome_state.url
+        manager.active().chrome_state.url
+    );
+    assert_eq!(
+        landed, target,
+        "only the display is sanitised — the origin of record keeps the exact \
+         string the document was fetched with, or origin comparisons would be \
+         made against a URL nothing was ever fetched from"
     );
 }
 
@@ -1426,17 +1472,184 @@ fn storage_byte_quota_is_isolated_between_origins() {
     );
 }
 
+// --- N5: the origin moves with the document, not with the intent ---------
+
+/// Dispatches one `ResolvedCall` to `url` through the production capability
+/// path and reports whether it reached the network.
+fn resolved_call_reaches_network(
+    manager: &mut MizuWindowManager,
+    keepalive: &mut TestChannelKeepAlive,
+    url: &str,
+) -> bool {
+    let _ = keepalive.drain_network_cmds();
+    // The call's target variable has to be resolvable in the tab's frozen
+    // interner, or the dispatch would be refused for that reason instead of
+    // the one under test. `a_committed_navigation_does_move_the_origin` is the
+    // positive control that keeps this helper honest.
+    let target_variable = {
+        let mut store = VariableStore::new();
+        let sym = store.interner.get_or_intern("result");
+        manager.active_mut().store = store.freeze();
+        sym
+    };
+    {
+        let (t, c) = manager.split_active();
+        execute_tab_capability_action(
+            t,
+            &c,
+            crate::network::RuntimeAction::ResolvedCall {
+                method: "POST".to_string(),
+                url: url.to_string(),
+                payload: Some(crate::core::types::Value::from("local-secret".to_string())),
+                target_variable,
+                format: crate::parser::logic::PayloadFormat::Json,
+                headers: vec![],
+            },
+        );
+    }
+    keepalive
+        .drain_network_cmds()
+        .iter()
+        .any(|cmd| matches!(cmd, crate::network::NetworkCmd::Fetch { .. }))
+}
+
+#[test]
+fn a_dispatched_navigation_does_not_relabel_the_running_documents_origin() {
+    // Security regression (sandbox escape / exfiltration). A `mizu://`
+    // navigation is answered asynchronously and may never be answered at all,
+    // while the document that requested it keeps running with its DOM, its
+    // logic and its root timers intact. When the origin moved at *dispatch*
+    // time, a local `file://` document could shed the file→remote call block
+    // — the only thing standing between a local document and an
+    // attacker-declared `media mizu://evil.example/…` endpoint — by following
+    // a single link to a host that never resolves. The origin must not move
+    // until a document actually commits.
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    let local_doc = "file:///tmp/mizu-app/index.mizu";
+    commit_url(&mut manager, local_doc);
+
+    assert!(
+        !resolved_call_reaches_network(&mut manager, &mut keepalive, "mizu://evil.example/collect"),
+        "precondition: a file:// document may not call a remote host"
+    );
+
+    // One user gesture is enough to authorise the cross-scheme hop (N3), and
+    // the target is deliberately one that will never answer.
+    {
+        let (t, mut c) = manager.split_active();
+        navigate_to_url(
+            t,
+            &mut c,
+            "mizu://never-resolves.invalid/".to_string(),
+            crate::render::navigation::NavigationInitiator::UserGesture,
+        );
+    }
+    assert_eq!(
+        dispatched_navigation(&mut keepalive).as_deref(),
+        Some("mizu://never-resolves.invalid/"),
+        "the navigation must genuinely have been authorised and dispatched"
+    );
+
+    assert_eq!(
+        manager.active().chrome_state.committed_url,
+        local_doc,
+        "the origin of record must still describe the document that is running"
+    );
+    assert!(
+        !resolved_call_reaches_network(&mut manager, &mut keepalive, "mizu://evil.example/collect"),
+        "the still-running file:// document must not gain remote-call rights \
+         from a navigation that has not committed"
+    );
+
+    // The fetch then fails, so no document ever replaces the local one. The
+    // tab must be exactly where it started.
+    let tab_id = manager.active().id;
+    {
+        let (t, mut c) = manager.split_active();
+        process_network_result(
+            t,
+            &mut c,
+            crate::network::NetworkResult::Error(
+                Some(tab_id),
+                MizuError::Network("no such host".to_string()),
+            ),
+        );
+    }
+    assert_eq!(manager.active().chrome_state.committed_url, local_doc);
+    assert!(
+        !resolved_call_reaches_network(&mut manager, &mut keepalive, "mizu://evil.example/collect"),
+        "a failed navigation must not leave the origin pointing at a document \
+         that was never loaded"
+    );
+}
+
+#[test]
+fn the_url_bar_buffer_is_not_an_origin() {
+    // The URL bar is an editing buffer: typing into it, pasting into it, or
+    // accepting an autocomplete suggestion all rewrite it before any
+    // navigation is authorised. No capability decision may read it, or a
+    // local document would gain remote-call rights from keystrokes.
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    let local_doc = "file:///tmp/mizu-app/index.mizu";
+    commit_url(&mut manager, local_doc);
+
+    manager
+        .active_mut()
+        .chrome_state
+        .set_displayed_url("mizu://evil.example/".to_string());
+
+    assert_eq!(
+        manager.active().chrome_state.committed_url,
+        local_doc,
+        "editing the bar must not touch the origin of record"
+    );
+    assert!(
+        !resolved_call_reaches_network(&mut manager, &mut keepalive, "mizu://evil.example/collect"),
+        "the file:// call block must still hold while the bar shows a mizu:// URL"
+    );
+}
+
+#[test]
+fn a_committed_navigation_does_move_the_origin() {
+    // The mirror image of the two tests above: this is a deferral, not a
+    // refusal. Once a document commits, the new origin is fully in force —
+    // otherwise the fix would just be a different confusion.
+    let (mut manager, mut keepalive) = make_minimal_manager();
+    commit_url(&mut manager, "file:///tmp/mizu-app/index.mizu");
+
+    let landed = navigate_and_commit(
+        &mut manager,
+        &mut keepalive,
+        "mizu://remote.example/page",
+        crate::render::navigation::NavigationInitiator::UserGesture,
+    );
+
+    assert_eq!(landed, "mizu://remote.example/page");
+    assert_eq!(
+        manager.active().chrome_state.url,
+        "mizu://remote.example/page",
+        "the bar must catch up with the document at commit time"
+    );
+    assert!(
+        resolved_call_reaches_network(&mut manager, &mut keepalive, "mizu://remote.example/api/x"),
+        "a committed mizu:// document must be able to call its own origin"
+    );
+    assert_eq!(
+        manager.active().capability_policy.quota_bytes,
+        crate::render::security::STORAGE_QUOTA_BYTES_REMOTE,
+        "the quota tier must be re-derived for the committed origin"
+    );
+}
+
 #[test]
 fn navigating_does_not_refill_an_exhausted_storage_quota() {
     // The bypass this closes: a same-origin `navigate` needs no user gesture,
     // and it rebuilds `capability_policy`. If the byte total lived on the
     // policy, a document could loop navigate → write-a-full-quota → navigate
     // and persist without bound.
-    let (mut manager, _keepalive) = make_minimal_manager();
+    let (mut manager, mut keepalive) = make_minimal_manager();
     let origin = "mizu://greedy.example/index.mizu";
-    manager.active_mut().chrome_state.url = origin.to_string();
-    manager.active_mut().capability_policy =
-        crate::render::security::capability_policy_for(origin, &manager.storage_usage);
+    commit_url(&mut manager, origin);
 
     let quota = manager.active().capability_policy.quota_bytes;
     manager
@@ -1445,17 +1658,14 @@ fn navigating_does_not_refill_an_exhausted_storage_quota() {
         .check_storage_write(quota)
         .expect("a write of exactly the quota must be accepted");
 
-    // Same-origin navigation: allowed with no gesture, and it rebuilds the
-    // policy through the choke point exactly as production does.
-    {
-        let (t, mut c) = manager.split_active();
-        navigate_to_url(
-            t,
-            &mut c,
-            "mizu://greedy.example/again.mizu".to_string(),
-            crate::render::navigation::NavigationInitiator::DocumentLogic,
-        );
-    }
+    // Same-origin navigation: allowed with no gesture, and committing it
+    // rebuilds the policy through the choke point exactly as production does.
+    navigate_and_commit(
+        &mut manager,
+        &mut keepalive,
+        "mizu://greedy.example/again.mizu",
+        crate::render::navigation::NavigationInitiator::DocumentLogic,
+    );
 
     assert_eq!(
         manager.active_mut().capability_policy.bytes_stored(),

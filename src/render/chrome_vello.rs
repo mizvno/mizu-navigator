@@ -78,9 +78,25 @@ const CHROME_FONT_SIZE: f32 = 12.0;
 /// The state for the browser chrome UI element.
 #[derive(Debug, Default)]
 pub struct ChromeState {
-    /// The actual URL of the currently loaded page (the origin of record).
+    /// The URL of the document **currently loaded in this tab** — the origin
+    /// of record, and the only field any security decision may read.
+    ///
+    /// It is written at exactly one moment: when a document commits
+    /// (`window::navigate::handle_navigate_success`). Dispatching a navigation
+    /// does not touch it, so a navigation that is still in flight — or one
+    /// that failed and never replaced anything — cannot relabel the origin of
+    /// the document that is still running. Everything that decides a
+    /// capability from an origin (the `file://`→remote call block, the storage
+    /// domain and quota tier, the image sandbox base, relative-URL
+    /// resolution, and `check_navigation`'s "current origin") reads this
+    /// field; see `SECURITY-INVARIANTS.md` §N5.
     pub committed_url: String,
-    /// Current text in the URL bar.
+    /// Current text in the URL bar: a *display and editing* buffer, freely
+    /// mutated by typing, pasting and autocomplete.
+    ///
+    /// It is therefore attacker- and user-influenced at any instant and is
+    /// never an origin. Use [`Self::committed_url`] for anything but
+    /// rendering the bar.
     pub url: String,
     /// Cursor position as a **byte offset** into `url`.
     pub cursor: usize,
@@ -204,6 +220,25 @@ pub enum ChromeKeyAction {
 // ── ChromeState implementation ────────────────────────────────────────────────
 
 impl ChromeState {
+    /// Replaces the URL-bar text and drops every offset that described the
+    /// previous text.
+    ///
+    /// `cursor` and `selection` are byte offsets into [`Self::url`]; assigning
+    /// the field directly would leave them pointing into a string that no
+    /// longer exists, at an index that may be past the end or inside a
+    /// multi-byte character — the shape that turns a navigation into a panic
+    /// the moment the user next touches the bar. Every caller that swaps the
+    /// displayed URL goes through here so that cannot be forgotten.
+    ///
+    /// This is display state only: it never establishes an origin. See
+    /// [`Self::committed_url`].
+    pub fn set_displayed_url(&mut self, url: String) {
+        self.url = url;
+        self.cursor = self.url.len();
+        self.selection = None;
+        self.inline_completion = None;
+    }
+
     // ── Cursor helpers ────────────────────────────────────────────────────────
 
     /// Returns the normalised `(lo, hi)` selection range, or `None`.

@@ -30,11 +30,15 @@
 //!   are refused *at this choke point*, not per call site.  `about:blank` is a
 //!   no-op handled upstream.
 //!
-//! - **N5 — Uniform lifecycle.** Origin-scoped state (`capability_policy`
-//!   reset, redirect-chain budget, `url_registry` replacement on load) is
-//!   handled identically on every navigation path.  Callers must reset
-//!   `capability_policy` on every `Allow` verdict.  No path may set
-//!   `chrome_state.url` or emit `NetworkCmd::Navigate` around the choke point.
+//! - **N5 — Uniform lifecycle.** Origin-scoped state (`capability_policy`,
+//!   redirect-chain budget, `url_registry` replacement on load) is handled
+//!   identically on every navigation path.  The origin of record
+//!   (`chrome_state.committed_url`) and `capability_policy` change only when a
+//!   document commits — never on an `Allow` verdict alone, which merely
+//!   authorises a navigation that may still fail while the previous document
+//!   keeps running.  No path may set `chrome_state.committed_url` or emit
+//!   `NetworkCmd::Navigate` around the choke point, and no path may decide
+//!   anything from `chrome_state.url`, which is the URL-bar editing buffer.
 
 #![forbid(unsafe_code)]
 

@@ -161,7 +161,11 @@ pub fn run_window_loop(
             "window_url",
             crate::core::types::Value::from(initial_url.clone()),
         );
-        tab.chrome_state.url = initial_url;
+        // Startup commits a document synchronously (it is already parsed and
+        // in the tree), so the origin of record is established here alongside
+        // the displayed URL — see `ChromeState::committed_url`.
+        tab.chrome_state.committed_url = initial_url.clone();
+        tab.chrome_state.set_displayed_url(initial_url);
 
         // Pre-seed the state: evaluate all zero-arity functions and populate the store.
         let logic_fns = tab.logic_fns.clone();
@@ -610,7 +614,9 @@ fn dispatch_chrome_click(
         ChromeHitZone::ReloadButton => {
             tracing::debug!("reload button clicked");
             tab.chrome_state.loading = true;
-            let url = tab.chrome_state.url.clone();
+            // Reload re-fetches the loaded document, not whatever text the URL
+            // bar happens to be showing.
+            let url = tab.chrome_state.committed_url.clone();
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
         ChromeHitZone::UrlBar => {
@@ -651,13 +657,10 @@ fn dispatch_chrome_click(
                 url = format!("mizu://{url}");
             }
 
-            tab.chrome_state.url = url.clone();
-            tab.chrome_state.cursor = tab.chrome_state.url.len();
-            tab.chrome_state.selection = None;
+            tab.chrome_state.set_displayed_url(url.clone());
             tab.chrome_state.focused = false;
             tab.chrome_state.suggestions.clear();
             tab.chrome_state.selected_suggestion = None;
-            tab.chrome_state.inline_completion = None;
 
             tab.chrome_state.loading = true;
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
@@ -966,10 +969,10 @@ fn tab_strip_entries(
                 .get("title")
                 .cloned()
                 .unwrap_or_else(|| {
-                    if t.chrome_state.url.is_empty() {
+                    if t.chrome_state.committed_url.is_empty() {
                         "New Tab".to_string()
                     } else {
-                        t.chrome_state.url.clone()
+                        t.chrome_state.committed_url.clone()
                     }
                 });
             crate::render::chrome_vello::TabStripEntry {
@@ -1156,7 +1159,7 @@ fn handle_chrome_key(
         }
         ChromeKeyAction::Reload => {
             let (tab, mut ctx) = manager.split_active();
-            let url = tab.chrome_state.url.clone();
+            let url = tab.chrome_state.committed_url.clone();
             tab.chrome_state.loading = true;
             navigate_to_url(tab, &mut ctx, url, NavigationInitiator::UserGesture);
         }
@@ -1637,7 +1640,9 @@ fn dispatch_redraw_requested(
 
     let has_animations;
     {
-        let chrome_url_snapshot = tab.chrome_state.url.clone();
+        // Subresource URLs (images, media) resolve against the origin of the
+        // document being painted, never the URL-bar buffer.
+        let chrome_url_snapshot = tab.chrome_state.committed_url.clone();
         let mut ctx = PaintContext {
             tab: tab.id,
             tree: &tab.dom,
