@@ -302,6 +302,21 @@ pub fn execute_capability_action(
             CapabilityOutcome::Dispatched
         }
         RuntimeAction::DownloadMedia { url } => {
+            // Same file:// -> remote-host block as the ResolvedCall arm
+            // above: a `media` alias is a declared, absolute `mizu://` URL,
+            // so without this check a local document could reach an
+            // attacker-controlled host merely by embedding or downloading
+            // an image, bypassing the outbound-call SSRF guard entirely.
+            let target_is_remote_mizu = url.starts_with("mizu://")
+                && crate::network::uri::MizuUri::parse(&url)
+                    .map(|u| !crate::network::worker::is_local_host(&u.domain))
+                    .unwrap_or(true); // parse failure -> fail-secure: treat as remote
+            if chrome_url.starts_with("file://") && target_is_remote_mizu {
+                let reason =
+                    format!("file:// origin blocked from downloading remote media {url}");
+                tracing::warn!(url = %url, "SecurityViolation: {reason}");
+                return CapabilityOutcome::Blocked(reason);
+            }
             tracing::info!(url = %url, "download media requested");
             if let Err(e) = network_tx.send(crate::network::NetworkCmd::FetchImage {
                 tab: tab_id,

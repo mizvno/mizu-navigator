@@ -170,6 +170,19 @@ fn resolve_media_url(path: &str, chrome_url: &str) -> Option<String> {
     let origin_is_file = chrome_url.starts_with("file://");
 
     if path.starts_with("mizu://") {
+        if origin_is_file {
+            // A `file://` document declaring `media logo mizu://evil.com/x.png`
+            // must not be able to reach an attacker-controlled host merely by
+            // rendering or downloading an image — the same SSRF guard the
+            // outbound network-call and download paths already enforce
+            // (`execute_capability_action`'s `ResolvedCall`/`DownloadMedia`
+            // arms). Only a local target is allowed; a parse failure is
+            // treated as remote (fail-secure).
+            let is_local = crate::network::uri::MizuUri::parse(path)
+                .map(|u| crate::network::worker::is_local_host(&u.domain))
+                .unwrap_or(false);
+            return is_local.then(|| path.to_string());
+        }
         return Some(path.to_string());
     }
     if path.starts_with("file://") {
@@ -1194,14 +1207,28 @@ mod tests {
 
     #[test]
     fn resolve_media_url_passes_through_absolute_mizu_urls() {
-        // What a declared `media` alias resolves to, for either origin kind.
+        // A remote mizu:// document may reach any declared media alias.
         assert_eq!(
             resolve_media_url("mizu://other.example/x.png", "mizu://example.mizu/page").as_deref(),
             Some("mizu://other.example/x.png")
         );
+        // A local file:// document reaching a *local* media alias is still
+        // allowed (e.g. a locally-run dev server).
         assert_eq!(
-            resolve_media_url("mizu://other.example/x.png", "file:///C:/docs/page.mizu").as_deref(),
-            Some("mizu://other.example/x.png")
+            resolve_media_url("mizu://localhost/x.png", "file:///C:/docs/page.mizu").as_deref(),
+            Some("mizu://localhost/x.png")
+        );
+    }
+
+    #[test]
+    fn resolve_media_url_refuses_remote_mizu_targets_for_file_documents() {
+        // A `file://` document must not be able to reach an attacker-controlled
+        // remote host merely by declaring `media logo mizu://evil.com/x.png` —
+        // this must be refused here, matching the SSRF guard already enforced
+        // for outbound network calls and downloads.
+        assert_eq!(
+            resolve_media_url("mizu://evil.example/x.png", "file:///C:/docs/page.mizu"),
+            None
         );
     }
 

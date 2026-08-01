@@ -10,6 +10,20 @@ const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 /// untrusted image, enforced via [`image::Limits`].
 const MAX_IMAGE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Maximum total pixels across every frame of an animated image
+/// (`width * height * frame_count`).
+///
+/// `MAX_IMAGE_PIXELS`/`max_alloc` only bound a *single* frame's canvas. An
+/// animation with a modest, under-cap canvas but tens of thousands of frames
+/// still allocates one full canvas-sized RGBA buffer per frame in the loop
+/// below (for compositing and for the frame's own texture), so the
+/// uncapped total is `canvas_pixels * frame_count` — unbounded by any
+/// per-frame check. A small file (well under the network layer's 32 MiB
+/// transfer cap) can therefore still exhaust process memory. Same budget as
+/// a single static image: an animation is not allowed to cost more in total
+/// than the largest static image this codec already accepts.
+const MAX_ANIMATION_TOTAL_PIXELS: u64 = MAX_IMAGE_PIXELS;
+
 /// Builds the [`image::Limits`] applied to every untrusted decode path.
 fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
@@ -104,11 +118,27 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             let _ = decoder.set_limits(decode_limits());
             true
         }
+        && {
+            // Same declared-dimensions check as the WebP branch below: reject
+            // an oversized canvas before any frame is decoded.
+            let (w, h) = decoder.dimensions();
+            if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+                tracing::error!(
+                    width = w,
+                    height = h,
+                    "GIF declared canvas exceeds MAX_IMAGE_PIXELS; rejecting"
+                );
+                false
+            } else {
+                true
+            }
+        }
         && let Ok(frames_iter) = decoder.into_frames().collect::<Result<Vec<_>, _>>()
         && frames_iter.len() > 1
     {
         let mut frames = Vec::new();
         let mut total_duration_ms = 0;
+        let mut total_pixels: u64 = 0;
         let mut canvas: Option<image::RgbaImage> = None;
         for frame in frames_iter {
             let (num, denom) = frame.delay().numer_denom_ms();
@@ -125,6 +155,20 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             };
             let width_px = current_canvas.width();
             let height_px = current_canvas.height();
+
+            // Cumulative budget across every frame decoded so far: a
+            // modest, under-cap canvas repeated over tens of thousands of
+            // frames must not be allowed to allocate unbounded total
+            // memory. See `MAX_ANIMATION_TOTAL_PIXELS`.
+            total_pixels =
+                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
+                tracing::error!(
+                    frames_decoded = frames.len(),
+                    "GIF animation exceeds MAX_ANIMATION_TOTAL_PIXELS; rejecting"
+                );
+                return None;
+            }
 
             let mut duration_ms = if denom > 0 {
                 (num as u64) / (denom as u64)
@@ -207,6 +251,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
     {
         let mut frames = Vec::new();
         let mut total_duration_ms = 0;
+        let mut total_pixels: u64 = 0;
         let mut canvas: Option<image::RgbaImage> = None;
         for frame in frames_iter {
             let (num, denom) = frame.delay().numer_denom_ms();
@@ -223,6 +268,21 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             };
             let width_px = current_canvas.width();
             let height_px = current_canvas.height();
+
+            // Cumulative budget across every frame decoded so far — see
+            // `MAX_ANIMATION_TOTAL_PIXELS`. The per-frame dimension check
+            // above only bounds a single frame; WebP's decoder additionally
+            // never enforces `max_alloc` at all (see the doc comment above),
+            // so this is the only bound on the total for this format.
+            total_pixels =
+                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
+                tracing::error!(
+                    frames_decoded = frames.len(),
+                    "WebP animation exceeds MAX_ANIMATION_TOTAL_PIXELS; rejecting"
+                );
+                return None;
+            }
 
             let mut duration_ms = if denom > 0 {
                 (num as u64) / (denom as u64)
@@ -271,6 +331,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
     {
         let mut frames = Vec::new();
         let mut total_duration_ms = 0;
+        let mut total_pixels: u64 = 0;
         let mut canvas: Option<image::RgbaImage> = None;
         for frame in frames_iter {
             let (num, denom) = frame.delay().numer_denom_ms();
@@ -287,6 +348,20 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             };
             let width_px = current_canvas.width();
             let height_px = current_canvas.height();
+
+            // Cumulative budget across every frame decoded so far — see
+            // `MAX_ANIMATION_TOTAL_PIXELS`. PNG's decoder enforces
+            // `max_alloc` per frame, but nothing bounds the total across an
+            // arbitrarily long APNG frame sequence.
+            total_pixels =
+                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
+                tracing::error!(
+                    frames_decoded = frames.len(),
+                    "APNG animation exceeds MAX_ANIMATION_TOTAL_PIXELS; rejecting"
+                );
+                return None;
+            }
 
             let mut duration_ms = if denom > 0 {
                 (num as u64) / (denom as u64)
