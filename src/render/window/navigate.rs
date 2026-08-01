@@ -133,6 +133,32 @@ pub(super) fn handle_navigate_success(
     tab.store
         .set_runtime("window_url", crate::core::types::Value::from(url.clone()));
 
+    // `Origin::Network` unconditionally, including for the `file://` fast path
+    // in `navigate_to_url` — so a document loaded by *navigating* never gets
+    // `import`/`include`, even when it came off local disk. Deliberate, and
+    // the conservative side of an inconsistency worth naming rather than
+    // quietly living with:
+    //
+    // * Only startup (`main.rs`) passes `Origin::LocalFile`. Imports therefore
+    //   work for the document the browser was launched with and silently stop
+    //   working the moment the user follows a link to a sibling file.
+    // * `current_dir` below is the *process's* working directory. Startup does
+    //   not have that problem — it derives its base from the document's own
+    //   parent directory — but this call site has nothing to do with where the
+    //   document lives, which is precisely why it must not be paired with
+    //   `Origin::LocalFile`. `splitter::process_import` canonicalises the base
+    //   and the resolved file and requires containment, so a wrong base can
+    //   only refuse imports, never widen them; still, "the sandbox root is
+    //   whatever directory the binary was started from" is not a root anyone
+    //   should be relying on.
+    //
+    // Closing the gap properly means threading the *document's* directory in
+    // (from `url` when it is `file://`) and passing `Origin::LocalFile` only
+    // then — not flipping the flag on its own. Until that happens, erring
+    // toward `Network` costs local documents a feature and costs network
+    // documents nothing: an `import` is a local file read, the containment
+    // check is the only thing bounding it, and a document an attacker controls
+    // must not get one at all.
     let current_dir = std::env::current_dir().unwrap_or_default();
     match crate::parser::split_source_with_origin(
         &source,

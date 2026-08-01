@@ -138,18 +138,42 @@ pub struct PaintContext<'a> {
     pub taffy_id_overrides: EachIterationOverrides,
 }
 
-/// Resolves a `background-image`/`image src` path to the absolute URL used
-/// as the image-cache/fetch key.
+/// Resolves a `background-image`/`image src` path to the absolute URL used as
+/// the image-cache/fetch key, or `None` if this document may not reference it.
 ///
-/// An absolute `mizu://` or `file://` path passes through unchanged.
-/// Anything else is resolved relative to the current document's origin: a
-/// `mizu://<domain>` path if the document itself is `mizu://`-hosted, or a
-/// filesystem-relative path against the document's own directory if it's a
-/// `file://` document. Shared by the background-image and inline-`image`
-/// paint paths, which previously duplicated this resolution byte-for-byte.
-fn resolve_media_url(path: &str, chrome_url: &str) -> String {
-    if path.starts_with("mizu://") || path.starts_with("file://") {
-        return path.to_string();
+/// * An absolute `mizu://` path passes through unchanged — that is what a
+///   declared `media` alias resolves to, for local and remote documents alike.
+/// * An absolute `file://` path is accepted **only from a `file://`
+///   document**. A remote document naming a local file is refused here.
+/// * Anything else is resolved relative to the document's own origin: a
+///   `mizu://<domain>` path for a `mizu://`-hosted document, or a path against
+///   the document's own directory for a `file://` one.
+/// * A path that cannot be resolved against either kind of origin is refused
+///   rather than returned verbatim, so it can never be handed to the fetcher
+///   as an unresolved, origin-less string.
+///
+/// # Why the `file://` rule lives here too
+///
+/// Two other guards already stop a remote document from naming a local file:
+/// `parser::layout` rejects `file://` in `image src` for remote origins at
+/// parse time, and the worker's `handle_fetch_file` denies every read when no
+/// sandbox base was supplied (which is the case for a `mizu://` origin). Both
+/// are real, and neither is a reason for *this* function to be fail-open: it
+/// is the one place that turns a document-controlled string into a fetch URL,
+/// and it was previously willing to emit `file:///…` for any origin at all.
+/// A guard that only holds because of what its callers happen to check is one
+/// edit away from not holding.
+///
+/// Shared by the background-image and inline-`image` paint paths, which
+/// previously duplicated this resolution byte-for-byte.
+fn resolve_media_url(path: &str, chrome_url: &str) -> Option<String> {
+    let origin_is_file = chrome_url.starts_with("file://");
+
+    if path.starts_with("mizu://") {
+        return Some(path.to_string());
+    }
+    if path.starts_with("file://") {
+        return origin_is_file.then(|| path.to_string());
     }
     if let Ok(base_uri) = crate::network::uri::MizuUri::parse(chrome_url) {
         let full_path = if path.starts_with('/') {
@@ -157,16 +181,23 @@ fn resolve_media_url(path: &str, chrome_url: &str) -> String {
         } else {
             format!("/{path}")
         };
-        return format!("mizu://{}{}", base_uri.domain, full_path);
+        return Some(format!("mizu://{}{}", base_uri.domain, full_path));
     }
     if let Some(file_path) = chrome_url.strip_prefix("file:///") {
         let base = std::path::Path::new(file_path);
         if let Some(parent) = base.parent() {
+            // Traversal out of the document's directory is still possible in
+            // this string (`../../secret.png`); it is caught at read time by
+            // `handle_fetch_file`'s sandbox check, which resolves symlinks —
+            // something this pure, I/O-free function cannot do.
             let resolved = parent.join(path);
-            return format!("file:///{}", resolved.to_string_lossy().replace('\\', "/"));
+            return Some(format!(
+                "file:///{}",
+                resolved.to_string_lossy().replace('\\', "/")
+            ));
         }
     }
-    path.to_string()
+    None
 }
 
 /// Evaluates every conditional class (`class X if <expr>`) on `mizu_node`
@@ -393,31 +424,44 @@ pub fn paint_node(
 
         // Background Image
         if let Some(img_path) = background_image {
-            let abs_url = resolve_media_url(&img_path, ctx.chrome_url);
-
-            let animated_img = match ctx.image_cache.get(&abs_url) {
-                Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
-                Some(crate::render::window::AssetSlot::Loading) => {
-                    // Already in flight for another tab: join the waiter list
-                    // so this tab is relaid out too when the bytes arrive.
-                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
-                    None
-                }
-                Some(crate::render::window::AssetSlot::Failed) => None,
+            let animated_img = match resolve_media_url(&img_path, ctx.chrome_url) {
                 None => {
-                    ctx.image_cache
-                        .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
-                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
-                    let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
-                        tab: ctx.tab,
-                        url: abs_url.clone(),
-                        is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
-                        sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
-                            ctx.chrome_url,
-                        ),
-                    });
+                    // `debug!`, not `warn!`: paint runs every frame, and a
+                    // document can hold as many refused nodes as it likes —
+                    // an unconditional per-frame warning would be a
+                    // document-controlled log flood at the default level.
+                    tracing::debug!(
+                        path = %img_path,
+                        origin = %ctx.chrome_url,
+                        "background-image refused: not resolvable against this document's origin"
+                    );
                     None
                 }
+                Some(abs_url) => match ctx.image_cache.get(&abs_url) {
+                    Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
+                    Some(crate::render::window::AssetSlot::Loading) => {
+                        // Already in flight for another tab: join the waiter
+                        // list so this tab is relaid out too when the bytes
+                        // arrive.
+                        register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                        None
+                    }
+                    Some(crate::render::window::AssetSlot::Failed) => None,
+                    None => {
+                        ctx.image_cache
+                            .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                        register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                        let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
+                            tab: ctx.tab,
+                            url: abs_url.clone(),
+                            is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
+                            sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
+                                ctx.chrome_url,
+                            ),
+                        });
+                        None
+                    }
+                },
             };
 
             if animated_img.is_none() && background.is_none() {
@@ -781,29 +825,39 @@ pub fn paint_node(
     if mizu_node.primitive == Primitive::Image
         && let Some(src) = mizu_node.attributes.get("src")
     {
-        let abs_url = resolve_media_url(src, ctx.chrome_url);
-
-        let peniko_img = match ctx.image_cache.get(&abs_url) {
-            Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
-            Some(crate::render::window::AssetSlot::Loading) => {
-                register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
-                None
-            }
-            Some(crate::render::window::AssetSlot::Failed) => None,
+        let peniko_img = match resolve_media_url(src, ctx.chrome_url) {
             None => {
-                ctx.image_cache
-                    .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
-                register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
-                let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
-                    tab: ctx.tab,
-                    url: abs_url.clone(),
-                    is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
-                    sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
-                        ctx.chrome_url,
-                    ),
-                });
+                // Per-frame path — see the `background-image` arm above for
+                // why this is `debug!` rather than `warn!`.
+                tracing::debug!(
+                    src = %src,
+                    origin = %ctx.chrome_url,
+                    "image src refused: not resolvable against this document's origin"
+                );
                 None
             }
+            Some(abs_url) => match ctx.image_cache.get(&abs_url) {
+                Some(crate::render::window::AssetSlot::Ready(cached)) => Some(cached.clone()),
+                Some(crate::render::window::AssetSlot::Loading) => {
+                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                    None
+                }
+                Some(crate::render::window::AssetSlot::Failed) => None,
+                None => {
+                    ctx.image_cache
+                        .put(abs_url.clone(), crate::render::window::AssetSlot::Loading);
+                    register_image_waiter(ctx.fetching_images, &abs_url, ctx.tab);
+                    let _ = ctx.network_tx.send(crate::network::NetworkCmd::FetchImage {
+                        tab: ctx.tab,
+                        url: abs_url.clone(),
+                        is_remote_origin: ctx.chrome_url.starts_with("mizu://"),
+                        sandbox_base: crate::render::window::chrome_url_to_file_sandbox_base(
+                            ctx.chrome_url,
+                        ),
+                    });
+                    None
+                }
+            },
         };
 
         if peniko_img.is_none() {
@@ -1139,33 +1193,68 @@ mod tests {
     }
 
     #[test]
-    fn resolve_media_url_passes_through_absolute_schemes() {
+    fn resolve_media_url_passes_through_absolute_mizu_urls() {
+        // What a declared `media` alias resolves to, for either origin kind.
         assert_eq!(
-            resolve_media_url("mizu://other.example/x.png", "mizu://example.mizu/page"),
-            "mizu://other.example/x.png"
+            resolve_media_url("mizu://other.example/x.png", "mizu://example.mizu/page").as_deref(),
+            Some("mizu://other.example/x.png")
         );
         assert_eq!(
-            resolve_media_url("file:///C:/img.png", "mizu://example.mizu/page"),
-            "file:///C:/img.png"
+            resolve_media_url("mizu://other.example/x.png", "file:///C:/docs/page.mizu").as_deref(),
+            Some("mizu://other.example/x.png")
+        );
+    }
+
+    #[test]
+    fn resolve_media_url_refuses_local_files_for_remote_documents() {
+        // A remote document naming a local file is refused *here*, not left to
+        // the parse-time guard and the fetcher's sandbox check alone.
+        for path in [
+            "file:///C:/img.png",
+            "file:///etc/passwd",
+            "file://C:/Users/victim/.ssh/id_rsa",
+        ] {
+            assert_eq!(
+                resolve_media_url(path, "mizu://example.mizu/page"),
+                None,
+                "{path} must not resolve for a mizu:// document"
+            );
+        }
+        // The same path from a local document is the legitimate case, and the
+        // read is still sandboxed at fetch time.
+        assert_eq!(
+            resolve_media_url("file:///C:/docs/img.png", "file:///C:/docs/page.mizu").as_deref(),
+            Some("file:///C:/docs/img.png")
         );
     }
 
     #[test]
     fn resolve_media_url_resolves_relative_to_mizu_origin() {
         assert_eq!(
-            resolve_media_url("img.png", "mizu://example.mizu/page"),
-            "mizu://example.mizu/img.png"
+            resolve_media_url("img.png", "mizu://example.mizu/page").as_deref(),
+            Some("mizu://example.mizu/img.png")
         );
         assert_eq!(
-            resolve_media_url("/assets/img.png", "mizu://example.mizu/page"),
-            "mizu://example.mizu/assets/img.png"
+            resolve_media_url("/assets/img.png", "mizu://example.mizu/page").as_deref(),
+            Some("mizu://example.mizu/assets/img.png")
         );
     }
 
     #[test]
     fn resolve_media_url_resolves_relative_to_file_origin() {
-        let resolved = resolve_media_url("img.png", "file:///C:/docs/page.mizu");
-        assert_eq!(resolved, "file:///C:/docs/img.png");
+        assert_eq!(
+            resolve_media_url("img.png", "file:///C:/docs/page.mizu").as_deref(),
+            Some("file:///C:/docs/img.png")
+        );
+    }
+
+    #[test]
+    fn resolve_media_url_refuses_an_unresolvable_origin() {
+        // Neither a `mizu://` host nor a `file:///` path to resolve against:
+        // returning the raw string here would hand the fetcher an origin-less
+        // path to interpret however it liked.
+        assert_eq!(resolve_media_url("img.png", "about:blank"), None);
+        assert_eq!(resolve_media_url("img.png", ""), None);
     }
 
     #[test]

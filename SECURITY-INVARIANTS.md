@@ -38,6 +38,17 @@ carries a user gesture.  Logic-initiated navigation without a gesture may not
 leave the origin.
 *Source constructs:* `NavigationInitiator` variants.
 *Enforcement:* **Runtime** — navigation choke point (`check_navigation`).
+*One origin, one identity.* Hosts are compared ASCII-case-insensitively, the
+same way `is_local_host` and `ValidatedDomain::from_raw` treat them —
+`mizu://` is a non-special URL scheme, so the `url` crate leaves its host case
+intact, and a case-sensitive check would give one encrypted store, keyring
+entry and quota-ledger entry *two* navigation identities. A host carrying
+userinfo or an explicit port is not an origin at all and is blocked outright:
+`trusted.com@evil.com` reads as one host and resolves to another, and
+`MizuUri::parse` refuses both forms on the way to the socket, so accepting
+them here could only carry a spoofable string further into the browser.
+
+
 *Agency is carried, never reconstructed.* Two asynchronous hops separate a
 navigation from its authorising cause, and at each one the initiator travels
 with the message rather than being inferred on arrival: `WorkerResponse::

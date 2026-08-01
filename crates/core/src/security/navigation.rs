@@ -75,6 +75,37 @@ fn mizu_domain(url: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Returns `true` when `host` is a host token `mizu://` actually admits: no
+/// userinfo, no explicit port.
+///
+/// This mirrors the policy `MizuUri::parse` enforces on the way to the socket
+/// (see `core::uri`), and mirrors it *by hand* rather than by calling that
+/// parser. Two reasons. `check_navigation` is documented as pure and
+/// allocation-free, and is the one policy function `formal/` models; and
+/// `MizuUri::parse` reaches `url::Url::parse`, whose IDNA/`zerovec` codepaths
+/// break Kani's codegen for the whole crate the moment they become reachable
+/// from a harness (`core::uri` documents the incompatibility). What must stay
+/// true is the *agreement*: a token this function accepts must be one
+/// `MizuUri::parse` would also accept, or the choke point and the fetcher
+/// would disagree about what the origin is. Widening either side without the
+/// other is the bug to watch for.
+///
+/// Rejecting here is fail-closed twice over: such a URL could never be fetched
+/// anyway (`MizuUri::parse` refuses it), so the only thing the old behaviour
+/// bought was the chance for `trusted.com@evil.com` to be carried further into
+/// the browser as if it were an origin.
+fn is_wellformed_mizu_host(host: &str) -> bool {
+    if host.contains('@') {
+        return false;
+    }
+    // An IPv6 literal is bracketed and is full of colons; a colon anywhere
+    // else is a port. `[::1]:80` is caught by the trailing-text check.
+    match host.strip_prefix('[') {
+        Some(rest) => matches!(rest.strip_suffix(']'), Some(inner) if !inner.is_empty()),
+        None => !host.contains(':'),
+    }
+}
+
 /// Returns `true` when the root initiator (unwinding `RedirectOf` chains)
 /// is a [`NavigationInitiator::UserGesture`].
 fn has_user_agency(initiator: &NavigationInitiator) -> bool {
@@ -86,11 +117,29 @@ fn has_user_agency(initiator: &NavigationInitiator) -> bool {
     }
 }
 
-/// Returns `true` when `current_url` and `target` are both `mizu://` URLs
-/// with the same domain (case-sensitive).
+/// Returns `true` when `current_url` and `target` are both `mizu://` URLs with
+/// the same domain, compared ASCII-case-insensitively.
+///
+/// # Case
+///
+/// The comparison has to be case-insensitive, and for the same reason
+/// `security::network::is_local_host`'s does: `mizu://` is a non-special URL
+/// scheme, so the `url` crate treats its host as an opaque host and does not
+/// lowercase it. Every *other* part of this runtime already treats the two
+/// spellings as one thing — DNS is case-insensitive, and
+/// `ValidatedDomain::from_raw` lowercases before hashing, so `mizu://Example.com`
+/// and `mizu://example.com` share one encrypted store, one keyring entry and
+/// one quota ledger entry. A case-sensitive check here would call that single
+/// origin two origins: same data, two navigation identities. Agreeing with the
+/// storage identity is what keeps "same origin" one concept.
+///
+/// A malformed host (userinfo or an explicit port) is never same-origin with
+/// anything, including itself — see [`is_wellformed_mizu_host`].
 fn is_same_origin(current_url: &str, target: &str) -> bool {
     match (mizu_domain(current_url), mizu_domain(target)) {
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => {
+            is_wellformed_mizu_host(a) && is_wellformed_mizu_host(b) && a.eq_ignore_ascii_case(b)
+        }
         _ => false,
     }
 }
@@ -111,7 +160,18 @@ fn is_same_origin(current_url: &str, target: &str) -> bool {
 /// | bare hostname (no `://`) | Normalise to `mizu://` and re-check |
 /// | anything else | `Block` |
 ///
+/// # Host rules
+///
+/// | `mizu://` host | Verdict |
+/// |---|---|
+/// | empty (`mizu:///path`) | `Block` |
+/// | carries userinfo or an explicit port | `Block` |
+/// | anything else | Apply the origin rules below |
+///
 /// # Origin rules (N3)
+///
+/// Hosts are compared ASCII-case-insensitively, matching how the storage
+/// identity and DNS already treat them — see [`is_same_origin`].
 ///
 /// | Same origin? | User gesture? | Verdict |
 /// |---|---|---|
@@ -179,8 +239,19 @@ pub fn check_navigation(
     // mizu:// target
     if effective_target.starts_with("mizu://") {
         // Validate that the domain is non-empty.
-        if mizu_domain(effective_target).is_none() {
+        let Some(target_host) = mizu_domain(effective_target) else {
             return NavigationVerdict::Block("mizu:// URL has an empty domain");
+        };
+        // …and that it is a host `mizu://` admits at all. `trusted.com@evil.com`
+        // reads as `trusted.com` to a human and resolves to `evil.com`; an
+        // explicit port is not part of the scheme. Neither could ever be
+        // fetched (`MizuUri::parse` refuses both), so blocking here costs
+        // nothing and keeps a spoofable string from being carried any further
+        // into the browser as if it were an origin.
+        if !is_wellformed_mizu_host(target_host) {
+            return NavigationVerdict::Block(
+                "mizu:// URL must not carry credentials or an explicit port",
+            );
         }
 
         // N3: origin + gesture check.
@@ -484,6 +555,100 @@ mod tests {
         assert!(is_same_origin("mizu://a.com/page1", "mizu://a.com/page2"));
         assert!(!is_same_origin("mizu://a.com/page", "mizu://b.com/page"));
         assert!(!is_same_origin("file:///path", "mizu://a.com/page"));
+    }
+
+    /// The two spellings share an encrypted store, a keyring entry and a quota
+    /// ledger entry (`ValidatedDomain::from_raw` lowercases), and DNS sends
+    /// both to the same server. They must therefore be one navigation origin
+    /// too — otherwise the same data has two identities.
+    #[test]
+    fn origin_comparison_is_case_insensitive() {
+        assert!(is_same_origin(
+            "mizu://Example.com/a",
+            "mizu://example.com/b"
+        ));
+        assert!(is_same_origin(
+            "mizu://EXAMPLE.COM/a",
+            "mizu://example.com/b"
+        ));
+        assert!(is_same_origin(
+            "mizu://a.EXAMPLE.com/",
+            "mizu://A.example.COM/"
+        ));
+        // Case-folding must not reach past the host token.
+        assert!(!is_same_origin(
+            "mizu://example.com/a",
+            "mizu://exemple.com/a"
+        ));
+    }
+
+    #[test]
+    fn a_differently_cased_same_origin_navigation_needs_no_gesture() {
+        // The behaviour the case rule exists for: document logic reaching its
+        // own origin, spelled differently, is not a cross-origin hop.
+        let v = check_navigation(
+            "mizu://Example.com/index.mizu",
+            "mizu://example.com/next.mizu",
+            &NavigationInitiator::DocumentLogic,
+        );
+        assert!(
+            matches!(v, NavigationVerdict::Allow(_)),
+            "a differently-cased same-origin navigation must be allowed: {v:?}"
+        );
+    }
+
+    /// `trusted.com@evil.com` reads as `trusted.com` and resolves to
+    /// `evil.com`. `MizuUri::parse` refuses it on the way to the socket, so it
+    /// could never be fetched — but it must not get as far as being treated
+    /// as an origin, or committed into the address bar, either.
+    #[test]
+    fn hosts_with_credentials_or_a_port_are_blocked() {
+        for target in [
+            "mizu://trusted.com@evil.com/page",
+            "mizu://user:pass@evil.com/page",
+            "mizu://evil.com:8080/page",
+            "mizu://[::1]:8080/page",
+        ] {
+            assert_eq!(
+                check_navigation(
+                    "mizu://a.com/page",
+                    target,
+                    &NavigationInitiator::UserGesture
+                ),
+                NavigationVerdict::Block(
+                    "mizu:// URL must not carry credentials or an explicit port"
+                ),
+                "{target} must be blocked at the choke point"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_host_is_not_same_origin_with_itself() {
+        // Fail-closed: an unparseable origin must not become a way to reach
+        // itself without a gesture.
+        assert!(!is_same_origin(
+            "mizu://a.com@evil.com/one",
+            "mizu://a.com@evil.com/two"
+        ));
+    }
+
+    #[test]
+    fn ordinary_hosts_including_ipv6_literals_stay_wellformed() {
+        // Regression guard: the port check must not reject the colons inside a
+        // bracketed IPv6 literal, which is a legitimate `mizu://` host.
+        for host in [
+            "example.com",
+            "a.b.c.opennic",
+            "127.0.0.1",
+            "[::1]",
+            "[fe80::1]",
+        ] {
+            assert!(is_wellformed_mizu_host(host), "{host} must be accepted");
+        }
+        for host in ["u@h", "h:1", "[::1]:1", "[]", "[::1"] {
+            assert!(!is_wellformed_mizu_host(host), "{host} must be rejected");
+        }
     }
 
     // --- N3: `redirect_of` preserves agency and collapses chains ---
