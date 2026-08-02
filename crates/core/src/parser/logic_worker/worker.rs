@@ -66,6 +66,18 @@ impl LogicWorker {
     /// resident, and events are processed one at a time on this thread.
     pub const STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
+    /// Debug-build stack cost of one `evaluate`/`evaluate_impl` frame pair,
+    /// derived from the measured debug floor documented on
+    /// [`Self::STACK_SIZE_BYTES`]: 4 MiB survived a chain hitting
+    /// `MAX_EVAL_DEPTH` (256), which recurses as 257 `evaluate` + 256
+    /// `evaluate_impl` frames — approximated below as `2 * MAX_EVAL_DEPTH`
+    /// frames for a round, slightly conservative number.
+    ///
+    /// This constant only exists to let the `const _: () = assert!(..)` below
+    /// check the stack-size/depth coupling at compile time; it is not a
+    /// general "bytes per Rust stack frame" fact.
+    const MEASURED_DEBUG_BYTES_PER_FRAME: usize = 8 * 1024;
+
     /// Spawns a permanent native thread executing the LogicWorker.
     ///
     /// Fails only if the OS refuses the thread/stack allocation (real
@@ -261,6 +273,30 @@ impl LogicWorker {
         }
     }
 }
+
+/// Enforces the coupling documented on [`LogicWorker::STACK_SIZE_BYTES`]:
+/// the thread stack must stay at least as large as the measured debug-mode
+/// floor for the *current* [`crate::core::types::MAX_EVAL_DEPTH`], scaled
+/// by [`LogicWorker::MEASURED_DEBUG_BYTES_PER_FRAME`]. Neither constant can
+/// be derived from the other by a real formula — the per-frame cost is an
+/// empirical, compiler/profile-dependent number, not something computable
+/// from first principles (see `core::types::tests::eval::
+/// measure_stack_usage_at_max_eval_depth`) — but once that number has been
+/// measured once, the *relationship* between the two constants is exactly
+/// checkable, so raising `MAX_EVAL_DEPTH` without also raising
+/// `STACK_SIZE_BYTES` (or vice versa, shrinking the stack without shrinking
+/// the depth) fails the build instead of silently reintroducing a
+/// stack-overflow race with the depth guard.
+const _: () = assert!(
+    LogicWorker::STACK_SIZE_BYTES
+        >= (crate::core::types::MAX_EVAL_DEPTH as usize)
+            * 2
+            * LogicWorker::MEASURED_DEBUG_BYTES_PER_FRAME,
+    "LogicWorker::STACK_SIZE_BYTES no longer covers the measured debug-mode \
+     stack floor for MAX_EVAL_DEPTH frame pairs -- if you changed either \
+     constant, re-run core::types::tests::eval::measure_stack_usage_at_max_eval_depth \
+     (see its doc comment) and update both together"
+);
 
 /// Node budget for a single old-versus-new variable comparison in
 /// [`send_response`].
