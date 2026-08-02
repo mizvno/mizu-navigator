@@ -508,14 +508,26 @@ mod kani_proofs {
     ///
     /// Goes through `authorize_resolved_address_with` rather than the public
     /// wrapper so the `url`-backed parser stays unreachable from this harness
-    /// — see that function's doc comment. None of these hosts is an address
-    /// literal, so injecting `|_| None` is the parse result the real parser
-    /// would produce for every one of them.
+    /// — see that function's doc comment. Neither host is an address literal,
+    /// so injecting `|_| None` is the parse result the real parser would
+    /// produce for both.
+    ///
+    /// Two hosts, not four: one matching by exact name and one by the
+    /// `.localhost` suffix, which is one per branch of `is_local_host_with`.
+    /// The case variants that used to be here (`LOCALHOST`, `API.LocalHost`)
+    /// proved nothing this harness is about — whether a *spelling* classifies
+    /// as loopback is `classification_matches_specification`'s job, and it
+    /// covers the case variants across all 13 `HOSTS`, with the unit tests
+    /// exercising them natively on top. What is left to prove here is the
+    /// step after that one: given a loopback name, the verdict is exactly
+    /// `ip.is_loopback()`. Each extra host re-solves that over a fully
+    /// symbolic 128-bit address, so the redundant pair was doubling the
+    /// solver's work for coverage already held elsewhere.
     #[kani::proof]
     #[kani::unwind(12)]
     fn loopback_names_authorize_only_loopback() {
         let addr = any_ip();
-        for host in ["localhost", "LOCALHOST", "api.localhost", "API.LocalHost"] {
+        for host in ["localhost", "api.localhost"] {
             assert_eq!(
                 authorize_resolved_address_with(host, addr, false, |_| None).is_ok(),
                 addr.is_loopback()
