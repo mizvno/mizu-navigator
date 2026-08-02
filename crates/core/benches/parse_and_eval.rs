@@ -69,14 +69,13 @@ fn bench_full_parse(c: &mut Criterion) {
             let mut interner = StringInterner::new();
             let url_registry = parse_urls(&parsed.urls_block, &mut interner).unwrap();
             let logic_fns = parse_logic(&parsed.logic_block, &mut interner).unwrap();
-            let computed =
-                parse_computed_with_functions(
-                    &parsed.logic_block,
-                    &mut interner,
-                    &logic_fns,
-                    mizu_core::core::config::CONFIG.max_comp_bindings,
-                )
-                    .unwrap();
+            let computed = parse_computed_with_functions(
+                &parsed.logic_block,
+                &mut interner,
+                &logic_fns,
+                mizu_core::core::config::CONFIG.max_comp_bindings,
+            )
+            .unwrap();
             let timers = parse_root_timers(&parsed.logic_block, &mut interner).unwrap();
             let (style_rules, style_variants) =
                 parse_style_with_variants(&parsed.style_block).unwrap();

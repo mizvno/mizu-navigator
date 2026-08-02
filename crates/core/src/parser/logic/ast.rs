@@ -1,6 +1,5 @@
 //! AST and function/action type definitions for the Mizu logic block.
 
-
 use crate::core::errors::MizuError;
 use crate::core::types::{Symbol, Value};
 

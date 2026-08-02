@@ -235,7 +235,11 @@ fn infer(
                 Ok(None)
             }
         }
-        Expr::FieldAccess { base, field, field_hash: _ } => {
+        Expr::FieldAccess {
+            base,
+            field,
+            field_hash: _,
+        } => {
             let base_ty = infer(&arena[*base], arena, env, functions, interner)?;
             match base_ty {
                 Some(ValueType::Record(fields)) => {

@@ -100,7 +100,10 @@ mod kani_proofs {
     #[kani::proof]
     #[kani::unwind(12)]
     fn normalize_path_components_drops_curdir() {
-        assert_eq!(normalize_path_components(Path::new("a/./b")), Path::new("a/b"));
+        assert_eq!(
+            normalize_path_components(Path::new("a/./b")),
+            Path::new("a/b")
+        );
     }
 
     /// A `..` that climbs above the root is rejected outright rather than
