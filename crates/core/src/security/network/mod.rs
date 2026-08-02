@@ -45,7 +45,21 @@ pub fn is_local_host(host: &str) -> bool {
 
 /// ASCII case-insensitive `ends_with`, without allocating a lowercased copy of
 /// `haystack`.
+///
+/// Compares as `[u8]` rather than slicing the `str`, which is load-bearing for
+/// two reasons beyond taste. Slicing a `str` has to validate that the split
+/// lands on a UTF-8 boundary, and its failure path (`slice_error_fail`) drags
+/// in `floor_char_boundary` and the panic-formatting machinery — a loop and a
+/// recursion CBMC then unwinds on every call, which is what made the Kani
+/// harnesses here crawl. Byte slicing has neither. It is also strictly safer:
+/// the `str` version can panic when the boundary falls inside a multi-byte
+/// character, while this one simply compares and returns `false`.
+///
+/// The result is identical for every suffix this is called with. Every byte of
+/// an ASCII suffix is `< 0x80`, and no UTF-8 continuation byte is, so a
+/// mid-character split can never spuriously match.
 pub fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    let (haystack, suffix) = (haystack.as_bytes(), suffix.as_bytes());
     haystack.len() >= suffix.len()
         && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
