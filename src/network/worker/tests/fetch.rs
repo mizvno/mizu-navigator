@@ -114,7 +114,7 @@ async fn test_file_scheme_always_rejected_by_h3_fetch() {
     let _ = provider.install_default();
     let endpoint = Endpoint::client(std::net::SocketAddr::from(([0, 0, 0, 0], 0))).unwrap();
     let pool = H3ConnectionPool::new();
-    let dns = crate::network::opennic::build_opennic_resolver();
+    let dns = crate::network::dns::build_dns_resolver();
 
     for is_remote_origin in [false, true] {
         let result = handle_fetch_raw(

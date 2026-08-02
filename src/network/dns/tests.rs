@@ -1,4 +1,4 @@
-//! Tests for the opennic module.
+//! Tests for the dns module.
 
 use super::*;
 
@@ -258,18 +258,18 @@ fn network_variant_is_never_transient_dns() {
 
 // ── Resolver construction ────────────────────────────────────────────────
 
-/// Verifies that [`build_opennic_resolver`] constructs successfully without
+/// Verifies that [`build_dns_resolver`] constructs successfully without
 /// panicking when a Tokio runtime is active.
 #[tokio::test]
 async fn resolver_builds_without_panic() {
-    let _resolver = build_opennic_resolver();
+    let _resolver = build_dns_resolver();
 }
 
 // ── Local shortcut resolution (no network required) ─────────────────────
 
 #[tokio::test]
 async fn bare_ip_bypasses_dns() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "1.2.3.4", 7399, true)
         .await
         .unwrap();
@@ -278,7 +278,7 @@ async fn bare_ip_bypasses_dns() {
 
 #[tokio::test]
 async fn localhost_maps_to_loopback() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "localhost", 7399, true)
         .await
         .unwrap();
@@ -287,7 +287,7 @@ async fn localhost_maps_to_loopback() {
 
 #[tokio::test]
 async fn localhost_fqdn_maps_to_loopback() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "localhost.", 7399, true)
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn localhost_fqdn_maps_to_loopback() {
 
 #[tokio::test]
 async fn ipv6_loopback_bypasses_dns() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "::1", 443, true).await.unwrap();
     assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443)));
 }
@@ -307,7 +307,7 @@ async fn ipv6_loopback_bypasses_dns() {
 /// though the same literal is allowed for a user-driven navigation.
 #[tokio::test]
 async fn document_supplied_private_literal_is_rejected() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let err = resolve_domain(&resolver, "127.0.0.1", 7399, false)
         .await
         .expect_err("a document-supplied loopback literal must be rejected");
@@ -325,7 +325,7 @@ async fn document_supplied_private_literal_is_rejected() {
 /// not the literal branch).
 #[tokio::test]
 async fn document_supplied_localhost_name_still_maps_to_loopback() {
-    let resolver = build_opennic_resolver();
+    let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "localhost", 7399, false)
         .await
         .unwrap();

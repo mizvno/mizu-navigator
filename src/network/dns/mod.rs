@@ -127,7 +127,7 @@ pub enum DnsPool {
 /// # Examples
 ///
 /// ```
-/// use mizu::network::opennic::{select_pool_for_domain, DnsPool};
+/// use mizu::network::dns::{select_pool_for_domain, DnsPool};
 /// assert_eq!(select_pool_for_domain("google.com"), DnsPool::Primary);
 /// assert_eq!(select_pool_for_domain("chat.geek"), DnsPool::OpenNic);
 /// ```
@@ -148,7 +148,7 @@ pub fn select_pool_for_domain(domain: &str) -> DnsPool {
 /// * `opennic` — OpenNIC Tier-2, for alternative TLDs.
 ///
 /// Both pools are cheap to clone (backed by `Arc`).
-/// Construct via [`build_opennic_resolver`].
+/// Construct via [`build_dns_resolver`].
 #[derive(Clone)]
 pub struct MizuDnsResolver {
     primary: TokioAsyncResolver,
@@ -202,7 +202,7 @@ fn build_resolver_from_pool(servers: &[(&str, u16, &str)]) -> TokioAsyncResolver
 ///
 /// The returned resolver is cheap to clone and must be called while a Tokio
 /// runtime is active (required by hickory's connection manager initialisation).
-pub fn build_opennic_resolver() -> MizuDnsResolver {
+pub fn build_dns_resolver() -> MizuDnsResolver {
     MizuDnsResolver {
         primary: build_resolver_from_pool(PRIMARY_DOT_SERVERS),
         opennic: build_resolver_from_pool(OPENNIC_DOT_SERVERS),

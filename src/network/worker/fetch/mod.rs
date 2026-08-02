@@ -80,7 +80,7 @@ pub(crate) fn parse_body_value(body: &[u8]) -> crate::core::types::Value {
 pub(super) async fn handle_navigate(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
-    dns: &crate::network::opennic::MizuDnsResolver,
+    dns: &crate::network::dns::MizuDnsResolver,
     method: &str,
     url_str: &str,
     _is_remote_origin: bool,
@@ -141,7 +141,7 @@ fn max_subresource_redirects() -> u32 {
 async fn handle_fetch_subresource_raw(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
-    dns: &crate::network::opennic::MizuDnsResolver,
+    dns: &crate::network::dns::MizuDnsResolver,
     method: &str,
     url_str: &str,
     is_remote_origin: bool,
@@ -204,7 +204,7 @@ async fn handle_fetch_subresource_raw(
 pub(super) async fn handle_fetch(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
-    dns: &crate::network::opennic::MizuDnsResolver,
+    dns: &crate::network::dns::MizuDnsResolver,
     method: &str,
     url_str: &str,
     is_remote_origin: bool,
@@ -232,7 +232,7 @@ pub(super) async fn handle_fetch(
 pub(super) async fn handle_fetch_bytes(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
-    dns: &crate::network::opennic::MizuDnsResolver,
+    dns: &crate::network::dns::MizuDnsResolver,
     method: &str,
     url_str: &str,
     is_remote_origin: bool,
@@ -274,7 +274,7 @@ pub(super) async fn handle_fetch_bytes(
 pub(super) async fn handle_fetch_raw(
     endpoint: &Endpoint,
     pool: &H3ConnectionPool,
-    dns: &crate::network::opennic::MizuDnsResolver,
+    dns: &crate::network::dns::MizuDnsResolver,
     method: &str,
     url_str: &str,
     _is_remote_origin: bool,
@@ -296,10 +296,10 @@ pub(super) async fn handle_fetch_raw(
     let opt_entry = load_valid_entry(&vault_domain, method)?;
 
     // ── DNS via OpenNIC ──────────────────────────────────────────────────────
-    let addr = crate::network::opennic::resolve_domain(
+    let addr = crate::network::dns::resolve_domain(
         dns,
         &uri.domain,
-        *crate::network::opennic::MIZU_PORT,
+        *crate::network::dns::MIZU_PORT,
         is_navigation,
     )
     .await?;

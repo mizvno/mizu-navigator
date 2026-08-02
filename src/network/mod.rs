@@ -1,7 +1,7 @@
 /// Messages for UI thread isolation communication
 pub use mizu_core::messages;
 /// OpenNIC DNS resolver — forces all domain lookups through OpenNIC servers
-pub mod opennic;
+pub mod dns;
 /// URI parser for `mizu://`
 pub use mizu_core::core::uri;
 /// Zero-Touch Vault for credentials

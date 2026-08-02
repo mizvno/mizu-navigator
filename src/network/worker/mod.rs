@@ -144,7 +144,7 @@ pub fn spawn_network_thread(
             };
 
             // Build the OpenNIC resolver once for the lifetime of the network thread.
-            let dns_resolver = crate::network::opennic::build_opennic_resolver();
+            let dns_resolver = crate::network::dns::build_dns_resolver();
             tracing::debug!("OpenNIC DNS resolver initialised");
 
             #[cfg(feature = "insecure-dev")]
