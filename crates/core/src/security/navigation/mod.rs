@@ -83,14 +83,16 @@ fn mizu_domain(url: &str) -> Option<&str> {
 /// This mirrors the policy `MizuUri::parse` enforces on the way to the socket
 /// (see `core::uri`), and mirrors it *by hand* rather than by calling that
 /// parser. Two reasons. `check_navigation` is documented as pure and
-/// allocation-free, and is the one policy function `formal/` models; and
+/// allocation-free; and
 /// `MizuUri::parse` reaches `url::Url::parse`, whose IDNA/`zerovec` codepaths
 /// break Kani's codegen for the whole crate the moment they become reachable
 /// from a harness (`core::uri` documents the incompatibility). What must stay
 /// true is the *agreement*: a token this function accepts must be one
 /// `MizuUri::parse` would also accept, or the choke point and the fetcher
 /// would disagree about what the origin is. Widening either side without the
-/// other is the bug to watch for.
+/// other is the bug to watch for — and is now checked rather than merely
+/// asserted here, by `accepted_host_is_always_parseable` in this module's
+/// tests, which found two real divergences the first time it ran.
 ///
 /// Rejecting here is fail-closed twice over: such a URL could never be fetched
 /// anyway (`MizuUri::parse` refuses it), so the only thing the old behaviour
