@@ -79,6 +79,13 @@ fn is_local_host_with(host: &str, parse: impl Fn(&str) -> Option<std::net::IpAdd
 /// accepts forms `IpAddr::from_str` rejects — `2130706433`, `0x7f.0.0.1`,
 /// `0177.0.0.1` are all `127.0.0.1` to a browser — and a check that missed
 /// them would classify a loopback literal as a name.
+///
+/// **Never call this from a Kani harness, directly or transitively.** Going
+/// through `url` reaches `idna`/`icu_normalizer`, whose
+/// `zerovec::ZeroSlice<u16>` operations ICE Kani 0.67's codegen and take the
+/// whole crate's verification down with them — see the note at the end of
+/// `core::uri`, and `is_local_host_with`/`authorize_resolved_address_with`,
+/// which exist so harnesses can supply their own parse instead.
 pub fn parse_host_literal(host: &str) -> Option<IpAddr> {
     match url::Host::parse(host) {
         Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
@@ -236,7 +243,24 @@ pub fn authorize_resolved_address(
     ip: IpAddr,
     allow_private_literal: bool,
 ) -> Result<(), MizuError> {
-    if let Some(literal) = parse_host_literal(host) {
+    authorize_resolved_address_with(host, ip, allow_private_literal, parse_host_literal)
+}
+
+/// [`authorize_resolved_address`] with host-literal parsing injected.
+///
+/// Split out for exactly one reason, the same one that produced
+/// [`is_local_host_with`]: the real parser is `url`-backed, and `url`
+/// becoming reachable from *any* harness in this crate breaks Kani's codegen
+/// for the whole crate (see the note at the end of `core::uri`). Production
+/// always goes through the wrapper above; the harness supplies its own parse
+/// so `url` stays out of the reachability graph.
+fn authorize_resolved_address_with(
+    host: &str,
+    ip: IpAddr,
+    allow_private_literal: bool,
+    parse: impl Fn(&str) -> Option<IpAddr> + Copy,
+) -> Result<(), MizuError> {
+    if let Some(literal) = parse(host) {
         if literal != ip {
             return Err(MizuError::SecurityViolation(format!(
                 "address literal `{host}` resolved to a different address ({ip})"
@@ -253,7 +277,7 @@ pub fn authorize_resolved_address(
         };
     }
 
-    if is_local_host(host) {
+    if is_local_host_with(host, parse) {
         return if ip.is_loopback() {
             Ok(())
         } else {
@@ -433,44 +457,44 @@ mod kani_proofs {
 
     /// A loopback name may only ever authorize a loopback address, whatever
     /// the resolver answered.
+    ///
+    /// Goes through `authorize_resolved_address_with` rather than the public
+    /// wrapper so the `url`-backed parser stays unreachable from this harness
+    /// — see that function's doc comment. None of these hosts is an address
+    /// literal, so injecting `|_| None` is the parse result the real parser
+    /// would produce for every one of them.
     #[kani::proof]
     #[kani::unwind(12)]
     fn loopback_names_authorize_only_loopback() {
         let addr = any_ip();
         for host in ["localhost", "LOCALHOST", "api.localhost", "API.LocalHost"] {
             assert_eq!(
-                authorize_resolved_address(host, addr, false).is_ok(),
+                authorize_resolved_address_with(host, addr, false, |_| None).is_ok(),
                 addr.is_loopback()
             );
         }
     }
 
-    /// End-to-end through the real parser, on the cases that matter: the
-    /// harnesses above inject the parse result, so these pin the wiring.
-    #[kani::proof]
-    #[kani::unwind(30)]
-    fn concrete_hosts_classify_correctly() {
-        assert!(is_local_host("localhost"));
-        assert!(is_local_host("LOCALHOST"));
-        assert!(is_local_host("api.localhost"));
-        assert!(is_local_host("API.LocalHost"));
-        assert!(is_local_host("a.b.localhost"));
-        assert!(is_local_host("127.0.0.1"));
-        assert!(is_local_host("127.255.255.254"));
-        assert!(is_local_host("::1"));
-        assert!(is_local_host("[::1]"));
-        assert!(is_local_host("2130706433"));
-        assert!(is_local_host("0x7f.0.0.1"));
-        assert!(is_local_host("0177.0.0.1"));
-
-        assert!(!is_local_host("notlocalhost"));
-        assert!(!is_local_host("localhost.evil.com"));
-        assert!(!is_local_host("evil.com"));
-        assert!(!is_local_host("192.168.1.1"));
-        assert!(!is_local_host("10.0.0.1"));
-        assert!(!is_local_host("printer.local"));
-        assert!(!is_local_host("2001:db8::1"));
-    }
+    // There is deliberately no end-to-end harness calling the real
+    // `is_local_host`/`parse_host_literal` here.
+    //
+    // An earlier revision had one (`concrete_hosts_classify_correctly`),
+    // and it is what broke `cargo kani` for this entire crate: reaching
+    // `parse_host_literal` reaches `url::Host::parse`, and from there
+    // `idna`/`icu_normalizer`, whose `zerovec::ZeroSlice<u16>` operations
+    // hit an internal compiler error in Kani 0.67's MIR-to-goto codegen
+    // (`operand.rs:351`, "entered unreachable code"). That is a static
+    // whole-crate codegen failure, not a branch a bound could avoid — the
+    // identical wall is documented at the end of `core::uri`, which is why
+    // `MizuUri::parse` has no harness either, and why
+    // `security::navigation::check_navigation` mirrors the host policy by
+    // hand rather than calling the parser.
+    //
+    // The concrete spellings that harness asserted on — `2130706433`,
+    // `0x7f.0.0.1`, `0177.0.0.1`, `[::1]`, the case variants, and the
+    // negative cases — are all covered by the unit tests in this module's
+    // `tests.rs`, which run the real parser natively. Nothing was dropped
+    // by removing it; the coverage moved to where it can actually run.
 }
 
 #[cfg(all(test, not(kani)))]
