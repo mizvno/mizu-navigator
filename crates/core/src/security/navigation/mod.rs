@@ -119,10 +119,29 @@ fn is_wellformed_mizu_host(host: &str) -> bool {
     // WHATWG forbidden host code points (opaque-host parsing), minus `:`
     // which is handled above so a bracketed IPv6 literal's internal colons
     // are not rejected here.
+    //
+    // `[` and `]` are in that set and belong here too. The bracket stripping
+    // above only accounts for a *matched* leading/trailing pair, so without
+    // this a stray bracket — `]`, `a[b`, or a doubled `[[::1]]` — reached the
+    // end of the function unexamined and was accepted, while `url` rejects
+    // it. Found by `accepted_host_is_always_parseable`; by the time it runs
+    // here the outer pair is already gone, so a genuine IPv6 literal's inner
+    // text never contains either character.
     !unbracketed.bytes().any(|b| {
         matches!(
             b,
-            0x00..=0x20 | b'#' | b'/' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'|' | 0x7f
+            0x00..=0x20
+                | b'#'
+                | b'/'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'^'
+                | b'|'
+                | 0x7f
         )
     })
 }
@@ -218,6 +237,23 @@ pub fn check_navigation(
     // Empty target is always a block.
     if target.is_empty() {
         return NavigationVerdict::Block("empty navigation target");
+    }
+
+    // A raw ASCII control byte is never legitimate in a URL or a path — RFC
+    // 3986 requires percent-encoding for any such byte — and `MizuUri::parse`
+    // already refuses one anywhere in the input. Refusing it here too keeps
+    // the choke point and the fetcher agreeing about which targets exist:
+    // without this, `mizu://host/a\tb` was allowed by policy and then refused
+    // at fetch time, so a string this function had blessed as a navigable
+    // target could be carried further into the browser while being unfetchable.
+    // The WHATWG parser's own handling is a second reason not to defer: it
+    // silently *strips* tab/CR/LF before parsing rather than rejecting, and
+    // sanitising attacker-controlled input instead of refusing it is treated
+    // as fail-insecure throughout this codebase.
+    //
+    // Found by `allowed_navigation_is_always_parseable`.
+    if target.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return NavigationVerdict::Block("navigation target contains control characters");
     }
 
     // --- Normalise bare hostname/path to mizu:// ---

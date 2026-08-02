@@ -1,6 +1,7 @@
 //! Tests for the navigation module.
 
 use super::*;
+use proptest::prelude::*;
 
 // --- N3: Agency tests ---
 
@@ -176,6 +177,47 @@ fn empty_target_blocked() {
         &NavigationInitiator::UserGesture,
     );
     assert_eq!(v, NavigationVerdict::Block("empty navigation target"));
+}
+
+#[test]
+fn targets_with_control_characters_are_blocked() {
+    // Refused here rather than left to the fetcher, so a target this function
+    // blesses is always one that could actually be fetched. The WHATWG parser
+    // silently strips tab/CR/LF instead of rejecting them, which would turn an
+    // attacker-controlled string into a different, sanitised one.
+    for target in [
+        "mizu://host/a\tb",
+        "mizu://host/a\nb",
+        "mizu://host/a\rb",
+        "mizu://ho\tst/page",
+        "mizu://host/a\u{7f}b",
+    ] {
+        assert_eq!(
+            check_navigation(
+                "mizu://origin.test/",
+                target,
+                &NavigationInitiator::UserGesture
+            ),
+            NavigationVerdict::Block("navigation target contains control characters"),
+            "{target:?} must be blocked"
+        );
+    }
+}
+
+#[test]
+fn stray_brackets_in_a_host_are_blocked() {
+    // `[`/`]` are WHATWG forbidden host code points. The bracket stripping in
+    // `is_wellformed_mizu_host` only accounts for a matched leading/trailing
+    // pair, so a stray one used to reach the end unexamined and be accepted
+    // while `url` rejected it.
+    for host in ["]", "a]b", "a[b", "[[::1]]"] {
+        assert!(
+            !is_wellformed_mizu_host(host),
+            "{host:?} must not be treated as a well-formed mizu:// host"
+        );
+    }
+    // A genuine bracketed IPv6 literal still passes.
+    assert!(is_wellformed_mizu_host("[::1]"));
 }
 
 #[test]
@@ -484,4 +526,133 @@ fn history_step_cross_origin_allowed() {
         matches!(v, NavigationVerdict::Allow(_)),
         "a history step must carry the same cross-origin agency as UserGesture: {v:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agreement between the choke point and the fetcher
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `is_wellformed_mizu_host` deliberately re-implements, by hand, the host
+// policy that `MizuUri::parse` enforces on the way to the socket. It has to:
+// `check_navigation` is documented as pure and allocation-free and is the one
+// policy function `formal/` models, and `MizuUri::parse` reaches
+// `url::Url::parse`, whose IDNA/`zerovec` codepaths break Kani's codegen for
+// the whole crate the moment they become reachable from a harness (see the
+// note at the end of `core::uri`).
+//
+// Two implementations of one rule is a drift hazard, and until now the only
+// thing holding them together was a comment saying so. These are the tests
+// that hold them together: property tests rather than Kani harnesses, because
+// running natively is exactly what lets them call the real `url`-backed parser
+// that no harness may touch.
+//
+// The direction that matters is one-way. `is_wellformed_mizu_host` is allowed
+// to be *stricter* than the parser — that is fail-closed, and it rejects some
+// hosts (an explicit port, say) that `url` itself would happily accept. What
+// must never happen is the reverse: the choke point waving through a host the
+// fetcher cannot parse, because then the two disagree about what the origin
+// is, which is the whole class of bug this pairing exists to prevent.
+
+/// Characters chosen to sit on both sides of every boundary the two
+/// implementations draw: ordinary host bytes, the delimiters that separate URL
+/// components, the WHATWG forbidden host code points, and non-ASCII.
+fn interesting_host_char() -> impl Strategy<Value = char> {
+    prop_oneof![
+        6 => prop::char::range('a', 'z'),
+        3 => prop::char::range('0', '9'),
+        2 => Just('.'),
+        1 => Just('-'),
+        1 => Just(':'),
+        1 => Just('@'),
+        1 => Just('['),
+        1 => Just(']'),
+        1 => Just('%'),
+        1 => Just('\\'),
+        1 => Just('/'),
+        1 => Just('#'),
+        1 => Just('?'),
+        1 => Just('<'),
+        1 => Just('>'),
+        1 => Just('^'),
+        1 => Just('|'),
+        1 => Just(' '),
+        1 => Just('\t'),
+        1 => Just('\0'),
+        1 => Just('\u{7f}'),
+        1 => Just('é'),
+        1 => Just('中'),
+    ]
+}
+
+fn host_string() -> impl Strategy<Value = String> {
+    proptest::collection::vec(interesting_host_char(), 0..12)
+        .prop_map(|cs| cs.into_iter().collect())
+}
+
+proptest! {
+    /// A host token the choke point accepts must be one the fetcher can parse.
+    ///
+    /// Stated over the token `mizu_domain` actually extracts, not over the raw
+    /// generated string, so the property follows the same path
+    /// `check_navigation` does.
+    #[test]
+    fn accepted_host_is_always_parseable(host in host_string()) {
+        let Some(token) = mizu_domain(&format!("mizu://{host}")).map(str::to_owned) else {
+            return Ok(());
+        };
+        if is_wellformed_mizu_host(&token) {
+            // Compare host against host. Rebuilding the URL from the extracted
+            // token rather than reusing the generated string is what keeps this
+            // an honest comparison: `mizu_domain` stops at the first `/`, so a
+            // generated `a/<tab>` yields the perfectly valid token `a`, and
+            // parsing the original string would blame the host for a control
+            // character that lives in the path. Whether the *rest* of a URL
+            // agrees is a separate property — see
+            // `allowed_navigation_is_always_parseable`.
+            let host_only = format!("mizu://{token}");
+            prop_assert!(
+                crate::core::uri::MizuUri::parse(&host_only).is_ok(),
+                "is_wellformed_mizu_host accepted {token:?} but MizuUri::parse \
+                 rejected {host_only:?} — the choke point and the fetcher \
+                 disagree about what this origin is"
+            );
+        }
+    }
+
+    /// The same property one level up, through the real policy entry point:
+    /// nothing `check_navigation` allows may be unfetchable.
+    ///
+    /// A user gesture is used so the origin gate never fires and the verdict
+    /// turns purely on the URL's shape, which is what is under test here.
+    #[test]
+    fn allowed_navigation_is_always_parseable(host in host_string()) {
+        let target = format!("mizu://{host}");
+        let verdict = check_navigation(
+            "mizu://origin.test/",
+            &target,
+            &NavigationInitiator::UserGesture,
+        );
+        if let NavigationVerdict::Allow(allowed) = verdict {
+            prop_assert!(
+                crate::core::uri::MizuUri::parse(&allowed).is_ok(),
+                "check_navigation allowed {allowed:?} but MizuUri::parse \
+                 rejects it, so the navigation could never be fetched"
+            );
+        }
+    }
+
+    /// Neither side may panic, whatever the document supplies.
+    #[test]
+    fn neither_side_panics(host in host_string()) {
+        let url = format!("mizu://{host}");
+        if let Some(token) = mizu_domain(&url) {
+            let _ = is_wellformed_mizu_host(token);
+        }
+        let _ = crate::core::uri::MizuUri::parse(&url);
+        let _ = check_navigation(
+            "mizu://origin.test/",
+            &url,
+            &NavigationInitiator::DocumentLogic,
+        );
+    }
 }

@@ -41,6 +41,12 @@ hickory-resolver = { version = "0.24", default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
+# Property testing for the surfaces Kani cannot reach. The security harnesses
+# must keep `url`/`idna` out of their reachability graph (it ICEs Kani's
+# codegen — see the note at the end of `core::uri`), and CBMC does not scale to
+# the self-referential `Value`/`ValueType`/`Expr` types. Both run fine natively,
+# so the parsers and the URI policy are covered here instead.
+proptest = "1"
 
 [[bench]]
 name = "parse_and_eval"
