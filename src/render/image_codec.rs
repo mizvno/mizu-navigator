@@ -160,8 +160,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             // modest, under-cap canvas repeated over tens of thousands of
             // frames must not be allowed to allocate unbounded total
             // memory. See `MAX_ANIMATION_TOTAL_PIXELS`.
-            total_pixels =
-                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            total_pixels = total_pixels.saturating_add((width_px as u64) * (height_px as u64));
             if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
                 tracing::error!(
                     frames_decoded = frames.len(),
@@ -274,8 +273,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             // above only bounds a single frame; WebP's decoder additionally
             // never enforces `max_alloc` at all (see the doc comment above),
             // so this is the only bound on the total for this format.
-            total_pixels =
-                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            total_pixels = total_pixels.saturating_add((width_px as u64) * (height_px as u64));
             if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
                 tracing::error!(
                     frames_decoded = frames.len(),
@@ -353,8 +351,7 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<AnimatedImage> {
             // `MAX_ANIMATION_TOTAL_PIXELS`. PNG's decoder enforces
             // `max_alloc` per frame, but nothing bounds the total across an
             // arbitrarily long APNG frame sequence.
-            total_pixels =
-                total_pixels.saturating_add((width_px as u64) * (height_px as u64));
+            total_pixels = total_pixels.saturating_add((width_px as u64) * (height_px as u64));
             if total_pixels > MAX_ANIMATION_TOTAL_PIXELS {
                 tracing::error!(
                     frames_decoded = frames.len(),

@@ -118,7 +118,9 @@ fn serialize_form(value: &Value) -> Result<Vec<u8>, MizuError> {
         let key = &field.key;
         let field_value = &field.value;
         let encoded_value = match field_value {
-            Value::Bool(_) | Value::Int(_) | Value::Decimal(_) | Value::String(_) => field_value.to_string(),
+            Value::Bool(_) | Value::Int(_) | Value::Decimal(_) | Value::String(_) => {
+                field_value.to_string()
+            }
             Value::Null => String::new(),
             Value::List(_) | Value::Record(_) => {
                 return Err(MizuError::ExecutionError(format!(
@@ -190,7 +192,10 @@ mod tests {
         assert!(s.contains("ok=true"));
         assert_eq!(got.content_type, "application/x-www-form-urlencoded");
 
-        let nested = record(vec![("bad", Value::List(Arc::new(vec![Value::Decimal(1)])))]);
+        let nested = record(vec![(
+            "bad",
+            Value::List(Arc::new(vec![Value::Decimal(1)])),
+        )]);
         let err = serialize_payload(&nested, PayloadFormat::Form)
             .await
             .unwrap_err();

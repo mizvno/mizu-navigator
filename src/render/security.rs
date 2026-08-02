@@ -312,8 +312,7 @@ pub fn execute_capability_action(
                     .map(|u| !crate::network::worker::is_local_host(&u.domain))
                     .unwrap_or(true); // parse failure -> fail-secure: treat as remote
             if chrome_url.starts_with("file://") && target_is_remote_mizu {
-                let reason =
-                    format!("file:// origin blocked from downloading remote media {url}");
+                let reason = format!("file:// origin blocked from downloading remote media {url}");
                 tracing::warn!(url = %url, "SecurityViolation: {reason}");
                 return CapabilityOutcome::Blocked(reason);
             }
