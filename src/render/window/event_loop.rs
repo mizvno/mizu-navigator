@@ -501,6 +501,32 @@ fn dispatch_cursor_moved(
         return;
     }
 
+    // ── Inspector hover: track the cursor in panel-local coordinates ─
+    // Stored as a point, not a resolved row: the paint pass already computes
+    // the row geometry and resolves the point against it, so the two can
+    // never disagree about which row is lit.
+    if tab.inspector.open {
+        let logical_width = window.inner_size().width as f32 / scale_factor as f32;
+        let left = crate::render::inspector::panel_left(logical_width);
+        let over_panel = mouse.last_logical_x >= left && mouse.last_logical_y >= CHROME_HEIGHT;
+        let hover = over_panel.then(|| {
+            (
+                mouse.last_logical_x - left,
+                mouse.last_logical_y - CHROME_HEIGHT,
+            )
+        });
+        if tab.inspector.hover != hover {
+            tab.inspector.hover = hover;
+            window.request_redraw();
+        }
+        // The panel shrinks the page viewport rather than overlaying it, so
+        // there is no document under these coordinates to hit-test.
+        if over_panel && !tab.inspector.picker {
+            window.set_cursor_icon(winit::window::CursorIcon::Default);
+            return;
+        }
+    }
+
     let mut hit_node_id = None;
     if mouse.last_logical_y >= CHROME_HEIGHT {
         hit_node_id = hit_test(
@@ -702,7 +728,16 @@ fn dispatch_inspector_panel_click(
     };
     let x = mouse.last_logical_x - crate::render::inspector::panel_left(logical_width);
     let y = mouse.last_logical_y - CHROME_HEIGHT;
-    if crate::render::inspector::handle_panel_click(&mut tab.inspector, &rows, x, y) {
+    let panel_height =
+        window.inner_size().height as f32 / window.scale_factor() as f32 - CHROME_HEIGHT;
+    let outcome =
+        crate::render::inspector::handle_panel_click(&mut tab.inspector, &rows, panel_height, x, y);
+    if let Some(text) = outcome.copy
+        && let Ok(mut cb) = arboard::Clipboard::new()
+    {
+        let _ = cb.set_text(text);
+    }
+    if outcome.changed {
         window.request_redraw();
     }
     true
@@ -738,9 +773,11 @@ fn dispatch_picker_click(
         if let Some(idx) = rows.iter().position(|r| r.node == Some(hit_id)) {
             let logical_height = window.inner_size().height as f32 / window.scale_factor() as f32;
             let viewport_h =
-                (logical_height - CHROME_HEIGHT - crate::render::inspector::TAB_BAR_HEIGHT)
-                    .max(0.0);
-            tab.inspector.scroll_to_row(idx, viewport_h);
+                (logical_height - CHROME_HEIGHT - crate::render::inspector::content_top()).max(0.0);
+            // Rows are not uniformly tall, so the target offset comes from the
+            // same layout the panel paints with.
+            let tops = crate::render::inspector::row_tops(&rows);
+            tab.inspector.scroll_to(tops[idx], viewport_h);
         }
     }
     tab.inspector.set_picker(false);
@@ -1382,6 +1419,11 @@ fn handle_escape_fallback(
         tab.inspector.set_picker(false);
         window.set_cursor_icon(winit::window::CursorIcon::Default);
         window.request_redraw();
+    } else if tab.inspector.value_view.is_some() {
+        // Dismissing the value drawer is a smaller Escape than closing the
+        // whole panel, same precedence as the picker above it.
+        tab.inspector.value_view = None;
+        window.request_redraw();
     } else if tab.inspector.open {
         tab.inspector.toggle();
         let physical_size = window.inner_size();
@@ -1472,7 +1514,20 @@ fn dispatch_mouse_wheel(
         if mouse.last_logical_x >= crate::render::inspector::panel_left(logical_width)
             && mouse.last_logical_y >= CHROME_HEIGHT
         {
-            tab.inspector.scroll_by(delta_y * 2.0);
+            let panel_y = mouse.last_logical_y - CHROME_HEIGHT;
+            let panel_height = window.inner_size().height as f32 / scale - CHROME_HEIGHT;
+            // The drawer has its own scroll region; only route the wheel to
+            // the row list when the cursor is above it.
+            let over_drawer = tab.inspector.value_view.is_some()
+                && panel_y >= panel_height - crate::render::inspector::DRAWER_HEIGHT;
+            if over_drawer {
+                if let Some(view) = &mut tab.inspector.value_view {
+                    view.scroll =
+                        (view.scroll + delta_y * 2.0).clamp(0.0, view.max_scroll.max(0.0));
+                }
+            } else {
+                tab.inspector.scroll_by(delta_y * 2.0);
+            }
             window.request_redraw();
             return;
         }

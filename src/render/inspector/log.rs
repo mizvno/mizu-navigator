@@ -13,7 +13,16 @@ use std::time::Instant;
 const LOG_CAPACITY: usize = 256;
 
 /// Maximum characters retained for a logged detail string.
-const DETAIL_MAX_CHARS: usize = 96;
+///
+/// This is a **memory bound, not a display bound**. It is deliberately far
+/// wider than the panel: truncating here is irreversible, so a cap tight
+/// enough to matter visually would destroy the tail of every long URL and
+/// error message before anything had a chance to render it. Fitting text to
+/// the panel is the paint pass's job, and it elides with an ellipsis against
+/// the width actually available.
+///
+/// At 256 entries per ring buffer this bounds each log at ~1 MB worst case.
+const DETAIL_MAX_CHARS: usize = 2048;
 
 /// Truncates `s` to [`DETAIL_MAX_CHARS`] characters, appending `…` when cut.
 pub(crate) fn truncate_detail(s: &str) -> String {
@@ -41,12 +50,15 @@ pub enum EventKind {
 
 impl EventKind {
     /// Short tag shown at the start of a log row.
+    ///
+    /// Unpadded: the row builder pads it into a column, and a tag that
+    /// arrives pre-padded would be padded twice.
     pub fn tag(self) -> &'static str {
         match self {
-            EventKind::Click => "click ",
-            EventKind::Timer => "timer ",
+            EventKind::Click => "click",
+            EventKind::Timer => "timer",
             EventKind::Submit => "submit",
-            EventKind::Mutation => "set   ",
+            EventKind::Mutation => "set",
             EventKind::Layout => "layout",
         }
     }
@@ -80,13 +92,16 @@ pub enum NetOutcome {
 
 impl NetOutcome {
     /// Short status tag shown in the log row.
+    ///
+    /// Words rather than symbols: `…` and `->` are indistinguishable from
+    /// each other at 11 px, and the status is the first thing read on the row.
     pub fn tag(&self) -> &'static str {
         match self {
-            NetOutcome::Pending => "…",
+            NetOutcome::Pending => "pending",
             NetOutcome::Ok => "ok",
-            NetOutcome::Redirect => "->",
-            NetOutcome::Failed(_) => "ERR",
-            NetOutcome::Blocked(_) => "BLOCKED",
+            NetOutcome::Redirect => "redirect",
+            NetOutcome::Failed(_) => "failed",
+            NetOutcome::Blocked(_) => "blocked",
         }
     }
 }
@@ -298,9 +313,20 @@ mod tests {
 
     #[test]
     fn truncate_detail_caps_length() {
-        let long = "x".repeat(500);
+        let long = "x".repeat(DETAIL_MAX_CHARS * 2);
         let out = truncate_detail(&long);
         assert!(out.chars().count() <= DETAIL_MAX_CHARS);
         assert!(out.ends_with('…'));
+    }
+
+    /// The cap exists to bound memory, not to fit the panel. A URL or an
+    /// error message long enough to overflow the panel must still reach the
+    /// paint pass intact, so that eliding it is a rendering decision that can
+    /// be revisited rather than data thrown away at the source.
+    #[test]
+    fn ordinary_long_details_survive_the_log_intact() {
+        let url = format!("mizu://example.test/{}/leaf.json", "segment/".repeat(30));
+        assert!(url.chars().count() > 200, "a realistically long target");
+        assert_eq!(truncate_detail(&url), url);
     }
 }
