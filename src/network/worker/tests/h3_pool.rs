@@ -44,7 +44,7 @@ async fn test_h3_connection_pool_concurrent_safety_and_failed_eviction() {
 
     // Use localhost:1 — no server is running, all connects fail (or, for
     // a non-responsive target, time out) at the QUIC handshake stage.
-    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let addr = crate::network::dns::AuthorizedAddr::for_test("127.0.0.1:1".parse().unwrap());
 
     let mut handles = Vec::new();
     for _ in 0..3 {
@@ -86,7 +86,8 @@ async fn stalled_handshake_releases_permit_within_timeout() {
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("blackhole socket must bind");
-    let blackhole_addr = blackhole.local_addr().unwrap();
+    let blackhole_addr =
+        crate::network::dns::AuthorizedAddr::for_test(blackhole.local_addr().unwrap());
     tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         while blackhole.recv_from(&mut buf).await.is_ok() {

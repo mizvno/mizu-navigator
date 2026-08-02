@@ -273,7 +273,7 @@ async fn bare_ip_bypasses_dns() {
     let addr = resolve_domain(&resolver, "1.2.3.4", 7399, true)
         .await
         .unwrap();
-    assert_eq!(addr.to_string(), "1.2.3.4:7399");
+    assert_eq!(addr.get().to_string(), "1.2.3.4:7399");
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn localhost_maps_to_loopback() {
     let addr = resolve_domain(&resolver, "localhost", 7399, true)
         .await
         .unwrap();
-    assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
+    assert_eq!(addr.get(), SocketAddr::from(([127, 0, 0, 1], 7399)));
 }
 
 #[tokio::test]
@@ -291,14 +291,17 @@ async fn localhost_fqdn_maps_to_loopback() {
     let addr = resolve_domain(&resolver, "localhost.", 7399, true)
         .await
         .unwrap();
-    assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
+    assert_eq!(addr.get(), SocketAddr::from(([127, 0, 0, 1], 7399)));
 }
 
 #[tokio::test]
 async fn ipv6_loopback_bypasses_dns() {
     let resolver = build_dns_resolver();
     let addr = resolve_domain(&resolver, "::1", 443, true).await.unwrap();
-    assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443)));
+    assert_eq!(
+        addr.get(),
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))
+    );
 }
 
 /// SSRF regression: a document-supplied target (`allow_private_literal =
@@ -329,5 +332,5 @@ async fn document_supplied_localhost_name_still_maps_to_loopback() {
     let addr = resolve_domain(&resolver, "localhost", 7399, false)
         .await
         .unwrap();
-    assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 7399)));
+    assert_eq!(addr.get(), SocketAddr::from(([127, 0, 0, 1], 7399)));
 }

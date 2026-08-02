@@ -197,7 +197,7 @@ impl H3ConnectionPool {
     pub(crate) async fn get_or_connect(
         &self,
         endpoint: &Endpoint,
-        addr: std::net::SocketAddr,
+        addr: crate::network::dns::AuthorizedAddr,
         domain: &str,
     ) -> Result<H3Client, MizuError> {
         let mut map = self.connections.lock().await;
@@ -214,7 +214,7 @@ impl H3ConnectionPool {
         // the caller's fetch-concurrency permit) forever.
         let (mut driver, sender) = tokio::time::timeout(self.connect_timeout, async {
             let quinn_conn = endpoint
-                .connect(addr, domain)
+                .connect(addr.get(), domain)
                 .map_err(|e| MizuError::Network(format!("Connect error: {e}")))?
                 .await
                 .map_err(|e| MizuError::Network(format!("Connection failed: {e}")))?;

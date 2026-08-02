@@ -431,7 +431,7 @@ fn build_h3_request(
 pub(super) async fn do_h3_request(
     pool: &H3ConnectionPool,
     endpoint: &Endpoint,
-    addr: std::net::SocketAddr,
+    addr: crate::network::dns::AuthorizedAddr,
     uri: &MizuUri,
     method: &str,
     opt_entry: Option<&VaultEntry>,

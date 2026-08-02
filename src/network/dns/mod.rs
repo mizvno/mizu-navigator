@@ -50,6 +50,12 @@
 //! name that the quota tier and the TLS verifier treat as remote cannot be
 //! pointed at loopback, the LAN, or a cloud metadata endpoint by whoever
 //! controls its DNS records. See [`resolve_domain`].
+//!
+//! That guarantee is carried by the type system rather than by convention:
+//! [`resolve_domain`] hands back an [`AuthorizedAddr`], whose field is private
+//! to this module, and the connection pool accepts nothing else. Connecting to
+//! an address that was never vetted is therefore not a mistake a reviewer has
+//! to catch — it does not compile.
 
 #![forbid(unsafe_code)]
 
@@ -272,6 +278,44 @@ fn is_transient_dns_error(_e: &MizuError) -> bool {
     false
 }
 
+/// A socket address that has passed [`authorize_resolved_address`].
+///
+/// The inner field is private and this module is the only place that can build
+/// one, so the type is a *witness*: holding an `AuthorizedAddr` is evidence
+/// that the SSRF and DNS-rebinding checks ran for that exact address.
+///
+/// This is the structural half of the guarantee, and it closes a gap that no
+/// amount of testing can. Kani proves `authorize_resolved_address` classifies
+/// addresses correctly, and property tests hammer the parsers — but neither
+/// says anything about whether the check is *invoked* on the path to the
+/// socket. A reviewer noticing a missing call is not a mechanism. Making
+/// `get_or_connect` demand this type instead of a bare `SocketAddr` turns
+/// "someone forgot to authorize" from a bug that compiles into one that does
+/// not: the only way to obtain the argument is to have asked.
+///
+/// The remaining surface is this module. A new function *here* could construct
+/// one without authorizing, so that is what to audit — one file, rather than
+/// every call site in the crate.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthorizedAddr(SocketAddr);
+
+impl AuthorizedAddr {
+    /// Unwraps the vetted address, for the one call that opens the socket.
+    pub fn get(self) -> SocketAddr {
+        self.0
+    }
+
+    /// Test-only constructor, for tests that need an address without standing
+    /// up a resolver.
+    ///
+    /// Deliberately `cfg(test)`: it is exactly the bypass this type exists to
+    /// prevent, so it must not exist in a shipped binary.
+    #[cfg(test)]
+    pub fn for_test(addr: SocketAddr) -> Self {
+        Self(addr)
+    }
+}
+
 /// Resolves `domain` via the split-horizon DoT pool and returns a [`SocketAddr`]
 /// for `port`.
 ///
@@ -306,14 +350,13 @@ pub async fn resolve_domain(
     domain: &str,
     port: u16,
     allow_private_literal: bool,
-) -> Result<SocketAddr, MizuError> {
+) -> Result<AuthorizedAddr, MizuError> {
     let bare = domain.trim_end_matches('.');
 
     // ── Direct IP — skip DNS entirely ────────────────────────────────────────
     if let Some(ip) = mizu_core::security::network::parse_host_literal(bare) {
-        let addr = SocketAddr::new(ip, port);
         authorize_resolved_address(bare, ip, allow_private_literal)?;
-        return Ok(addr);
+        return Ok(AuthorizedAddr(SocketAddr::new(ip, port)));
     }
 
     // ── localhost shortcut — always loopback ──────────────────────────────────
@@ -324,7 +367,17 @@ pub async fn resolve_domain(
     // resolver never gets the chance to answer for a name that would then
     // receive loopback treatment elsewhere in the stack.
     if bare.eq_ignore_ascii_case("localhost") || ends_with_ignore_ascii_case(bare, ".localhost") {
-        return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        // Authorized like every other branch even though the verdict is a
+        // foregone conclusion — a loopback name resolving to loopback is
+        // precisely what `authorize_resolved_address` permits. Introducing
+        // `AuthorizedAddr` surfaced this as the one construction site that
+        // skipped the check, and an exemption is worth less than the property
+        // that *every* address handed out of this module has been through it:
+        // an invariant with one carve-out is one nobody can rely on without
+        // first re-reading the code.
+        authorize_resolved_address(bare, ip, allow_private_literal)?;
+        return Ok(AuthorizedAddr(SocketAddr::new(ip, port)));
     }
 
     // Trailing dot → FQDN semantics; suppresses ndots/search-domain expansion.
@@ -349,7 +402,7 @@ pub async fn resolve_domain(
     }?;
 
     authorize_resolved_address(bare, addr.ip(), allow_private_literal)?;
-    Ok(addr)
+    Ok(AuthorizedAddr(addr))
 }
 
 /// Looks up `fqdn` via `resolver` and returns the best [`SocketAddr`] for `port`.
