@@ -433,8 +433,12 @@ mod kani_proofs {
         if kani::any() { Some(any_ip()) } else { None }
     }
 
+    /// Bound is `HOSTS.len() + 1`, not the workspace default of 12: the loop
+    /// over `HOSTS` needs one unwinding per entry plus one to exit, so a
+    /// bound below that fails the unwinding assertion rather than proving
+    /// anything. Grow it alongside `HOSTS`.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(14)]
     fn is_local_host_never_panics() {
         for host in HOSTS {
             let _ = is_local_host_with(host, |_| any_parse_result());
@@ -447,8 +451,11 @@ mod kani_proofs {
     /// Stated as an equality rather than as two branch-specific harnesses
     /// guarded by `kani::assume`, so both branches are covered at once and CBMC
     /// has no assumed-away half of the space to enumerate.
+    ///
+    /// Bound is `HOSTS.len() + 1` for the same reason as
+    /// [`is_local_host_never_panics`]; grow it alongside `HOSTS`.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(14)]
     fn classification_matches_specification() {
         let parsed = any_parse_result();
 
@@ -526,26 +533,26 @@ mod kani_proofs {
     /// so injecting `|_| None` is the parse result the real parser would
     /// produce for both.
     ///
-    /// Two hosts, not four: one matching by exact name and one by the
-    /// `.localhost` suffix, which is one per branch of `is_local_host_with`.
-    /// The case variants that used to be here (`LOCALHOST`, `API.LocalHost`)
-    /// proved nothing this harness is about — whether a *spelling* classifies
-    /// as loopback is `classification_matches_specification`'s job, and it
-    /// covers the case variants across all 13 `HOSTS`, with the unit tests
-    /// exercising them natively on top. What is left to prove here is the
-    /// step after that one: given a loopback name, the verdict is exactly
-    /// `ip.is_loopback()`. Each extra host re-solves that over a fully
-    /// symbolic 128-bit address, so the redundant pair was doubling the
-    /// solver's work for coverage already held elsewhere.
+    /// Both branches of `is_local_host_with` are covered, in both cases:
+    /// exact name and `.localhost` suffix, each lowercase and mixed-case.
+    /// The `mem::forget` is not an optimisation, it is what makes this
+    /// harness terminate. Dropping a [`MizuError`] recurses through
+    /// `MultipleErrors(Vec<MizuError>)` — `drop_in_place::<MizuError>` →
+    /// `Vec<MizuError>` → `[MizuError]` → back again — and CBMC unwinds that
+    /// mutual recursion to the harness bound on every rejecting path. With
+    /// this harness's bound of 12 that alone did not finish in nine minutes,
+    /// all of it spent on a destructor whose result is never read: the only
+    /// thing asserted is `is_ok()`. Leaking one error inside a proof costs
+    /// nothing and changes nothing about what is proved.
     #[kani::proof]
     #[kani::unwind(12)]
     fn loopback_names_authorize_only_loopback() {
         let addr = any_ip();
-        for host in ["localhost", "api.localhost"] {
-            assert_eq!(
-                authorize_resolved_address_with(host, addr, false, |_| None).is_ok(),
-                addr.is_loopback()
-            );
+        for host in ["localhost", "LOCALHOST", "api.localhost", "API.LocalHost"] {
+            let verdict = authorize_resolved_address_with(host, addr, false, |_| None);
+            let authorized = verdict.is_ok();
+            std::mem::forget(verdict);
+            assert_eq!(authorized, addr.is_loopback());
         }
     }
 
