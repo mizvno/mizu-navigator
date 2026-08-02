@@ -262,18 +262,16 @@ fn authorize_resolved_address_with(
 ) -> Result<(), MizuError> {
     if let Some(literal) = parse(host) {
         if literal != ip {
-            return Err(MizuError::SecurityViolation(format!(
-                "address literal `{host}` resolved to a different address ({ip})"
+            return Err(MizuError::SecurityViolation(violation_literal_mismatch(
+                host, ip,
             )));
         }
         return if allow_private_literal || is_publicly_routable(ip) {
             Ok(())
         } else {
-            Err(MizuError::SecurityViolation(format!(
-                "address literal `{host}` is not publicly routable; a document-\
-                 supplied target may not address a private, loopback, or link-\
-                 local host"
-            )))
+            Err(MizuError::SecurityViolation(
+                violation_literal_not_routable(host),
+            ))
         };
     }
 
@@ -281,8 +279,8 @@ fn authorize_resolved_address_with(
         return if ip.is_loopback() {
             Ok(())
         } else {
-            Err(MizuError::SecurityViolation(format!(
-                "loopback name `{host}` resolved to non-loopback address {ip}"
+            Err(MizuError::SecurityViolation(violation_loopback_name(
+                host, ip,
             )))
         };
     }
@@ -290,11 +288,61 @@ fn authorize_resolved_address_with(
     if is_publicly_routable(ip) {
         Ok(())
     } else {
-        Err(MizuError::SecurityViolation(format!(
-            "DNS rebinding blocked: public name `{host}` resolved to \
-             non-routable address {ip}"
-        )))
+        Err(MizuError::SecurityViolation(violation_rebinding(host, ip)))
     }
+}
+
+// The four rejection messages, behind `cfg` so the harnesses never reach
+// `format!`.
+//
+// Formatting a `&str` goes through `Formatter::pad`, which calls
+// `floor_char_boundary` to truncate on a UTF-8 boundary — a loop CBMC has to
+// unwind on every rejection path, for text no proof ever inspects (the
+// harnesses only ever look at `is_ok()`). This mirrors what
+// `security::quota::check_write_budget` already does with its two messages,
+// and for the same reason. Production text is unchanged.
+
+#[cfg(not(kani))]
+fn violation_literal_mismatch(host: &str, ip: IpAddr) -> String {
+    format!("address literal `{host}` resolved to a different address ({ip})")
+}
+#[cfg(kani)]
+fn violation_literal_mismatch(_host: &str, _ip: IpAddr) -> String {
+    String::from("address literal resolved to a different address")
+}
+
+#[cfg(not(kani))]
+fn violation_literal_not_routable(host: &str) -> String {
+    format!(
+        "address literal `{host}` is not publicly routable; a document-\
+         supplied target may not address a private, loopback, or link-\
+         local host"
+    )
+}
+#[cfg(kani)]
+fn violation_literal_not_routable(_host: &str) -> String {
+    String::from("address literal is not publicly routable")
+}
+
+#[cfg(not(kani))]
+fn violation_loopback_name(host: &str, ip: IpAddr) -> String {
+    format!("loopback name `{host}` resolved to non-loopback address {ip}")
+}
+#[cfg(kani)]
+fn violation_loopback_name(_host: &str, _ip: IpAddr) -> String {
+    String::from("loopback name resolved to non-loopback address")
+}
+
+#[cfg(not(kani))]
+fn violation_rebinding(host: &str, ip: IpAddr) -> String {
+    format!(
+        "DNS rebinding blocked: public name `{host}` resolved to \
+         non-routable address {ip}"
+    )
+}
+#[cfg(kani)]
+fn violation_rebinding(_host: &str, _ip: IpAddr) -> String {
+    String::from("DNS rebinding blocked")
 }
 
 // Kani harnesses for `is_local_host` — see `SECURITY-INVARIANTS.md` §8.
