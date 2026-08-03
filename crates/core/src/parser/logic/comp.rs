@@ -121,13 +121,17 @@ pub fn parse_computed_with_functions(
     }
 
     // Reject documents that declare more `comp` bindings than
-    // MAX_COMP_BINDINGS. `recompute_computed_bindings` grants each firing
-    // comp its own fresh MAX_INSTRUCTIONS budget (see that constant's docs
-    // and `formal/MizuFormal/Budget.lean`'s `T1_reaction_bound`), so an
-    // unbounded comp count would let a single event cascade through
-    // arbitrarily many full-budget re-evaluations. Rejecting here, at parse
-    // time, turns that into a clear load-time error instead of a runtime
-    // DoS or an undiagnosable timeout.
+    // MAX_COMP_BINDINGS.
+    //
+    // This limit used to be load-bearing against CPU exhaustion, because
+    // `recompute_computed_bindings` granted each firing comp its own fresh
+    // MAX_INSTRUCTIONS budget: the comp count multiplied the per-event work.
+    // It no longer does — the cascade shares one budget — so the cap is now
+    // about *memory and clarity* rather than time: each binding holds a
+    // parsed `ExprTree` and an entry in the reverse index, and a document
+    // needing hundreds of derived variables is far more likely to be
+    // generated abuse than hand-written. Rejecting at parse time keeps that a
+    // clear load-time error instead of an undiagnosable runtime shrug.
     if bindings.len() > max_comp_bindings {
         return Err(MizuError::ParseError(format!(
             "document declares {} `comp` bindings, exceeding the maximum of {} \
@@ -281,19 +285,45 @@ pub fn recompute_computed_bindings(
         }
     }
 
+    // One budget for the whole cascade, not one per comp.
+    //
+    // Resetting per comp made the worst case a *product*: MAX_COMP_BINDINGS
+    // (500) fully-spent budgets per event, since every firing comp got a fresh
+    // allowance. Measured at ~27.5 ns/instruction that is ~6.9 s of wall time
+    // at a 500k budget, on the single `LogicWorker` thread every tab shares —
+    // one document could freeze all of them. Charging the cascade to one
+    // counter makes the bound `2 * MAX_INSTRUCTIONS` per event (the action,
+    // then all recomputation) regardless of how many comps a document
+    // declares, so the budget constant means what it appears to mean.
+    //
+    // `formal/MizuFormal/Budget.lean`'s `T1_reaction_bound` proves
+    // `work <= (1 + #comps) * B + N`. That still holds — it is now merely
+    // conservative rather than tight, which is the safe direction for a
+    // bound to move.
+    store.evaluator.instruction_count = 0;
     while let Some(i) = candidates.pop_first() {
         let cb = &bindings[i];
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
-        store.evaluator.instruction_count = 0;
-        if let Ok(val) = store.evaluator.evaluate(
+        let evaluated = store.evaluator.evaluate(
             cb.expr.root(),
             0,
             functions,
             &store.interner,
             &cb.expr.arena,
-        ) {
+        );
+        if matches!(evaluated, Err(MizuError::Timeout)) {
+            // Budget gone: every remaining comp would fail the same way, so
+            // stop rather than spin. Warned because a starved cascade leaves
+            // derived state stale, which is otherwise silent.
+            tracing::warn!(
+                budget = store.evaluator.max_instructions,
+                "comp recomputation exhausted its instruction budget;                  remaining computed bindings were not updated"
+            );
+            break;
+        }
+        if let Ok(val) = evaluated {
             store.set_symbol(cb.name, val);
             if changed.insert(cb.name)
                 && let Some(idxs) = reverse_index.get(&cb.name)
@@ -320,18 +350,25 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
         return mutated.clone();
     }
     let mut changed = mutated.clone();
+    // Shares one budget across the cascade, matching `recompute_computed_bindings`
+    // — the equivalence this reference implementation exists to check covers
+    // budget behaviour too, not just which bindings get visited.
+    store.evaluator.instruction_count = 0;
     for cb in bindings {
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
-        store.evaluator.instruction_count = 0;
-        if let Ok(val) = store.evaluator.evaluate(
+        let evaluated = store.evaluator.evaluate(
             cb.expr.root(),
             0,
             functions,
             &store.interner,
             &cb.expr.arena,
-        ) {
+        );
+        if matches!(evaluated, Err(MizuError::Timeout)) {
+            break;
+        }
+        if let Ok(val) = evaluated {
             store.set_symbol(cb.name, val);
             changed.insert(cb.name);
         }

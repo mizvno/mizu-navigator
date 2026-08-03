@@ -563,3 +563,71 @@ fn bench_recompute_large_document_small_blast_radius() {
              document with a small blast radius; naive={old_elapsed:?} indexed={new_elapsed:?}"
     );
 }
+
+#[test]
+fn comp_cascade_shares_one_instruction_budget() {
+    // The budget is per *event*, not per binding. Before this, every firing
+    // comp got a fresh allowance, so the real worst case was
+    // MAX_COMP_BINDINGS (500) full budgets per event — a product the document
+    // controlled by declaring more derived variables, spent on the single
+    // LogicWorker thread every tab shares.
+    //
+    // Asserted on an observable that actually separates the two designs: with
+    // one shared budget a long chain is *cut short*, so the tail never
+    // updates. Per-binding budgets would run the whole chain to completion,
+    // because no individual link is expensive enough to trip its own quota.
+    // (Asserting only on `instruction_count` does not work — with per-binding
+    // resets it reads back as the last link's cost, which is tiny either way.)
+    let n_comps = 40;
+    let mut src = String::from(
+        "    comp c0 = base + 1
+",
+    );
+    for i in 1..n_comps {
+        src.push_str(&format!(
+            "    comp c{i} = c{} + 1
+",
+            i - 1
+        ));
+    }
+
+    let mut interner = StringInterner::new();
+    let base = interner.get_or_intern("base");
+    let last = interner.get_or_intern(&format!("c{}", n_comps - 1));
+    let bindings = super::super::parse_computed(&src, &mut interner).expect("comps parse");
+    assert_eq!(bindings.len(), n_comps, "every comp should have parsed");
+    let reverse_index = super::super::build_comp_reverse_index(&bindings);
+
+    let interner = interner.freeze();
+    let mut store = VariableStore::with_interner(interner);
+    store.evaluator.set_global(base, Value::Decimal(0));
+
+    // Enough for a handful of links, nowhere near all forty.
+    let budget = 20;
+    store.evaluator.max_instructions = budget;
+
+    let mutated: FxHashSet<Symbol> = std::iter::once(base).collect();
+    let fns = FxHashMap::default();
+    let changed = super::super::recompute_computed_bindings(
+        &mut store,
+        &bindings,
+        &fns,
+        &mutated,
+        &reverse_index,
+    );
+
+    assert!(
+        !changed.contains(&last),
+        "the whole {n_comps}-link cascade completed under a budget of {budget}, so each          binding is being granted its own allowance instead of sharing one per event"
+    );
+    assert!(
+        changed.len() < n_comps,
+        "expected the cascade to be cut short, but {} of {n_comps} bindings updated",
+        changed.len().saturating_sub(1)
+    );
+    assert!(
+        store.evaluator.instruction_count <= budget + 1,
+        "spent {} instructions against a budget of {budget}",
+        store.evaluator.instruction_count
+    );
+}

@@ -21,8 +21,15 @@ impl Evaluator {
     /// Budget enforcement is pure-integer: each recursive call increments
     /// `self.instruction_count` and the method returns `Err(MizuError::Timeout)`
     /// once the count exceeds [`MAX_INSTRUCTIONS`].  No hardware clock is read
-    /// inside the hot loop — callers must reset `instruction_count` to `0`
-    /// before each top-level invocation.
+    /// inside the hot loop.
+    ///
+    /// Callers reset `instruction_count` to `0` once per *unit of work they
+    /// are willing to pay a full budget for* — which is not the same as once
+    /// per call. A `comp` cascade resets once for the whole cascade, not once
+    /// per binding, so a document cannot multiply its allowance by declaring
+    /// more computed variables; see `parser::logic::comp`. Resetting more
+    /// eagerly than that silently turns the budget into a per-step quota with
+    /// no total.
     ///
     /// `eval_depth` guards against native stack overflow on deeply-nested ASTs.
     /// It is incremented on entry and decremented before every return so it is
