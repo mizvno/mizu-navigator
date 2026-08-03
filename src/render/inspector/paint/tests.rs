@@ -121,7 +121,7 @@ fn tones_that_already_pass_are_left_alone() {
 /// platform offers, so these assertions are phrased to hold for any font.
 fn text_ctx(metrics: &mut TextMetrics) -> (parley::FontContext, parley::LayoutContext<Color>) {
     let _ = metrics;
-    (parley::FontContext::new(), parley::LayoutContext::new())
+    (crate::render::embedded_fonts::new_font_context(), parley::LayoutContext::new())
 }
 
 macro_rules! with_text {
@@ -323,7 +323,7 @@ fn sample_rows() -> Vec<Row> {
 /// a resize drag.
 #[test]
 fn painting_survives_hostile_content_and_geometry() {
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let palette = ChromePalette::for_preferences(&UserPreferences::default());
     let rows = sample_rows();
@@ -368,7 +368,7 @@ fn painting_survives_hostile_content_and_geometry() {
 /// geometry as the row list, including a panel too short to fit it.
 #[test]
 fn the_drawer_survives_hostile_content_and_geometry() {
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let palette = ChromePalette::for_preferences(&UserPreferences::default());
     let rows = sample_rows();
@@ -408,7 +408,7 @@ fn the_drawer_survives_hostile_content_and_geometry() {
 
 #[test]
 fn copy_button_flashes_copied_then_reverts() {
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let mut metrics = TextMetrics::default();
     let mut text = TextCtx {
@@ -457,7 +457,7 @@ fn copy_button_flashes_copied_then_reverts() {
 
 #[test]
 fn the_drawer_clamps_its_own_scroll_independent_of_the_row_list() {
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let palette = ChromePalette::for_preferences(&UserPreferences::default());
     let rows = sample_rows();
@@ -491,7 +491,7 @@ fn the_drawer_clamps_its_own_scroll_independent_of_the_row_list() {
 
 #[test]
 fn the_measurement_cache_stays_bounded() {
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let mut metrics = TextMetrics::default();
     // UI-face strings miss the monospace fast path, so they are exactly

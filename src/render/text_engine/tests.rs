@@ -6,9 +6,15 @@ use rustc_hash::FxHashMap;
 /// The "No Tofu" coverage bar (ux-3, modeled on Noto's own coverage
 /// benchmark): every script here must shape without a single `.notdef`
 /// (glyph id 0) glyph through the real `calculate_node_text` path — the
-/// same generic-family resolution + fontique system fallback documented
-/// in the module doc's determinism note. Table-driven so a regression in
-/// fallback for any single script fails loudly and by name.
+/// same generic-family resolution + embedded-font script fallback
+/// documented in the module doc's determinism note (superseded from
+/// system-only to embedded-only). Table-driven so a regression in fallback
+/// for any single script fails loudly and by name.
+///
+/// Scoped to exactly the 11 scripts `embedded_fonts::new_font_context`
+/// bundles. Bengali and emoji were part of the old system-only coverage
+/// bar (OS fonts covered them) but IBM Plex ships neither — they are a
+/// known, accepted gap, not tested here (see module doc).
 const COVERAGE_BAR: &[(&str, &str)] = &[
     ("Latin", "Hello world"),
     ("Cyrillic", "Привет мир"),
@@ -20,9 +26,7 @@ const COVERAGE_BAR: &[(&str, &str)] = &[
     ("Japanese", "こんにちは世界"),
     ("Korean", "안녕하세요 세계"),
     ("Devanagari", "नमस्ते दुनिया"),
-    ("Bengali", "ওহে বিশ্ব"),
     ("Thai", "สวัสดีชาวโลก"),
-    ("Emoji", "😀🎉🔥"),
 ];
 
 fn text_node(content: &str) -> MizuNode {
@@ -39,8 +43,7 @@ fn text_node(content: &str) -> MizuNode {
 
 #[test]
 fn script_coverage_bar_renders_without_tofu() {
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let style_rules: HashMap<String, StyleRules> = HashMap::new();
     let store = VariableStore::new().freeze();
@@ -107,8 +110,7 @@ fn script_coverage_bar_renders_without_tofu() {
 fn font_family_generic_resolves_per_author_choice() {
     // Regression: font-family must actually be read (it wasn't, before
     // ux-3 — the old hardcoded list ignored StyleRules entirely).
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -197,8 +199,7 @@ fn color_scheme_variant_reaches_calculate_node_text() {
     let tree = Tree::new(node);
     let node_id = tree.root().id();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -306,8 +307,7 @@ fn lang_reaches_calculate_node_text_via_dom_attribute_inheritance() {
         .append(text_node_with_lang("こんにちは", None))
         .id();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -344,8 +344,7 @@ fn absent_lang_does_not_prevent_a_layout() {
     let tree = Tree::new(text_node_with_lang("Hello", None));
     let node_id = tree.root().id();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -420,8 +419,7 @@ fn mixed_bidi_line_shapes_into_multiple_runs_without_error() {
     let tree = Tree::new(node);
     let node_id = tree.root().id();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -487,8 +485,7 @@ fn explicit_dir_reaches_calculate_node_text_via_dom_attribute_inheritance() {
         ))
         .id();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();
@@ -528,8 +525,7 @@ fn text_align_start_resolves_opposite_edges_under_ltr_and_rtl() {
     rules.text_align = Some(crate::parser::MizuTextAlign::Start);
     style_rules.insert("label".to_string(), rules);
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx: parley::LayoutContext<vello::peniko::Color> = parley::LayoutContext::new();
     let store = VariableStore::new().freeze();
     let local_inputs = rustc_hash::FxHashMap::default();

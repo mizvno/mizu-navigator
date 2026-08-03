@@ -31,7 +31,7 @@ winit = "0.29"
 accesskit = "0.13"
 accesskit_winit = "0.19"
 vello = "0.1.0"
-parley = { version = "0.10.0", features = ["complex-scripts"] }
+parley = { version = "0.10.0", default-features = false, features = ["std", "complex-scripts"] }
 pollster = "0.3"
 wgpu = "0.19"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time", "net", "macros", "fs"] }

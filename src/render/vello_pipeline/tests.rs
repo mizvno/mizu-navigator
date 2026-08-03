@@ -177,8 +177,7 @@ fn test_paint_node_with_text() {
         .unwrap();
 
     // Parley contexts
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let mut store = VariableStore::new().freeze();
     let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
@@ -344,8 +343,7 @@ fn test_paint_each_node_iterates_list() {
         )
         .unwrap();
 
-    let mut font_cx = parley::FontContext::new();
-    font_cx.collection.load_system_fonts();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
     let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
@@ -747,7 +745,7 @@ fn conditional_class_evaluation_leaves_local_stack_clean() {
     let mut style_rules: HashMap<String, StyleRules> = HashMap::new();
     style_rules.insert("active-style".to_string(), StyleRules::default());
 
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
     let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
@@ -868,7 +866,7 @@ fn ternary_conditional_class_resolves_to_the_evaluated_branch_style() {
     store.set("flag", Value::Bool(true));
     let mut store = store.freeze();
 
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
     let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());
@@ -987,7 +985,7 @@ fn conditional_class_item_binding_shadows_global() {
         },
     );
 
-    let mut font_cx = parley::FontContext::new();
+    let mut font_cx = crate::render::embedded_fonts::new_font_context();
     let mut layout_cx = parley::LayoutContext::new();
     let scroll_offsets: HashMap<EgoNodeId, f32> = HashMap::new();
     let mut image_cache = lru::LruCache::new(std::num::NonZeroUsize::new(200).unwrap());

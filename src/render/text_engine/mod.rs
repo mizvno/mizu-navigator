@@ -1,44 +1,48 @@
 //! # `text_engine` — Parley text layout for Mizu DOM nodes
 //!
-//! ## Font resolution & the determinism decision (ux-3 Part B)
+//! ## Font resolution & the determinism decision (ux-3 Part B, superseded)
 //!
 //! An author's `font-family` choice — one of the fixed generics
 //! `sans-serif` / `serif` / `monospace`, see
 //! [`crate::parser::style::MizuFontFamily`] — resolves to a single
 //! `parley::GenericFamily` entry. Actual glyph coverage per script comes from
-//! **fontique's system font fallback**: parley's shaping pass
+//! **fontique's script/locale fallback map**: parley's shaping pass
 //! (`FontSelector` in `parley::shape`) consults
 //! `fontique::Query::set_fallbacks(FallbackKey::new(script, locale))` for
 //! every text run, independent of which family was requested, and picks the
-//! font that actually covers that run's codepoints. A single generic entry
-//! therefore gets full per-script coverage while still respecting the
-//! author's serif/sans/mono choice — which a hand-picked list of concrete
-//! font names could never do, since nothing before this change looked at
-//! `font-family` at all.
+//! font registered for that run's script. A single generic entry therefore
+//! gets full per-script coverage while still respecting the author's
+//! serif/sans/mono choice.
 //!
-//! This module makes an explicit **System-only** determinism choice (the
-//! alternative being a hybrid bundled-Noto safety net), not a default left
-//! unexamined:
+//! This module originally made an explicit **System-only** determinism
+//! choice (relying on OS-installed fonts via fontique's system backend,
+//! never bundling anything). That has since been superseded by
+//! [`crate::render::embedded_fonts`]: the font stack is now
+//! **embedded-only** — `render::window::manager::construct` builds the
+//! `FontContext` via `embedded_fonts::new_font_context`, which constructs
+//! fontique's `Collection` with `system_fonts: false` and registers 11
+//! IBM Plex faces (Regular+Bold) directly, covering Latin, Cyrillic, Greek,
+//! Arabic, Hebrew, Devanagari, Thai, Japanese, Simplified Chinese,
+//! Traditional Chinese, and Korean.
 //!
-//! * **Measured, not assumed:** on the primary target (Windows), the
-//!   documented coverage bar — Latin, Cyrillic, Greek, Arabic, Hebrew, Han
-//!   (Simplified + Traditional), Japanese, Korean, Devanagari, Bengali,
-//!   Thai, plus emoji — is verified empirically by
-//!   `tests::script_coverage_bar_renders_without_tofu` to render without
-//!   `.notdef` glyphs using only OS-installed fonts (Segoe UI, Nirmala UI,
-//!   Microsoft YaHei/SimSun, Malgun Gothic, Yu Gothic, Segoe UI Emoji) and
-//!   zero bundled bytes.
-//! * **Why not bundle a Noto safety net?** Bundling means embedding real
-//!   font binaries (Noto Sans/Serif/Mono plus CJK, Arabic, Indic, Thai,
-//!   Hebrew faces) and registering them into fontique's `Collection`.
-//!   Sourcing, license-verifying (Noto is OFL 1.1), and vetting binary font
-//!   assets is a materially larger, separable piece of work — left as an
-//!   explicit follow-up rather than folded into this change.
-//! * **Consequence accepted:** rendering is non-deterministic across
-//!   machines — a document can render a script as tofu on a system missing
-//!   that script's font/language pack (a minimal Windows install, or the
-//!   untested Linux/macOS targets). This is a stated tradeoff, not a
-//!   silently-deferred gap.
+//! * **Why the change:** the system backend (fontique's DirectWrite/
+//!   CoreText/fontconfig FFI, gated behind parley's `system` Cargo feature)
+//!   was the only unsafe code anywhere in the parley/fontique/skrifa/
+//!   read-fonts stack — everything else in that stack is
+//!   `#![forbid(unsafe_code)]` or measured at zero unsafe blocks. Embedding
+//!   fonts and disabling the `system` feature entirely (see this crate's
+//!   `Cargo.toml`) removes that FFI surface from the compiled binary, not
+//!   just from the runtime code path.
+//! * **Consequence accepted:** coverage is now a *fixed, audited* list
+//!   instead of "whatever the OS has installed" — deterministic across
+//!   machines, but narrower. Two scripts the old system-only coverage bar
+//!   exercised are **not** in the embedded set and now render as tofu:
+//!   **Bengali** and **emoji** (IBM Plex ships neither). Extending coverage
+//!   means sourcing and embedding additional faces the same way the current
+//!   11 were — not a config flag.
+//! * **Verified:** `tests::script_coverage_bar_renders_without_tofu` runs
+//!   the real `calculate_node_text` path against `embedded_fonts::new_font_context`
+//!   for exactly the 11 embedded scripts and asserts zero `.notdef` glyphs.
 
 #![forbid(unsafe_code)]
 
