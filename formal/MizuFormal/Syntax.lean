@@ -118,6 +118,16 @@ the model (`Semantics.compDeps`) rather than stored, mirroring what
 structure CompDef where
   name : Symbol
   expr : Expr
+  /-- Whether this binding's value may derive from an untrusted source.
+  Mirrors `ComputedBinding::tainted` (`parser/logic/ast.rs`), which
+  `check_information_flow` fills in at load time from its taint fixpoint.
+
+  Carried on the binding rather than looked up through `taintOf` because
+  that is what the runtime does, and because the recomputation semantics
+  (`Semantics.lean`) needs it while `taintOf` is only defined later, in
+  `Flow.lean`. `NonInterference.lean` states the agreement between the two
+  as an explicit hypothesis (`CompsMarked`) rather than assuming it. -/
+  tainted : Bool
   deriving Repr, Inhabited
 
 /-- The builtins implemented by the evaluator dispatch

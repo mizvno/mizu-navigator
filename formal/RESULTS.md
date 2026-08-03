@@ -11,7 +11,7 @@ A sibling follow-up using Kani/Creusot will prove the **code**: that the shipped
 
 ### T1 — Bounded reaction (The honest termination result)
 * **Status**: Proved (`eval_out`, `eval_nf`, `reaction_work_le` in `MizuFormal/Budget.lean`)
-* **Prose**: For every well-formed reaction and every input, evaluation reaches a value, a defined error, or a `BudgetExceeded` result within the instrumented budget. The total resource consumption (expression steps and synthetic layout nodes) is `≤ MAX_INSTRUCTIONS + MAX_SYNTHETIC_LAYOUT_NODES`, which is a data-independent bound that relies on the document's structure rather than the size of any remote data.
+* **Prose**: For every well-formed reaction and every input, evaluation reaches a value, a defined error, or a `BudgetExceeded` result within the instrumented budget. The total resource consumption (expression steps and synthetic layout nodes) is `≤ 3 · MAX_INSTRUCTIONS + MAX_SYNTHETIC_LAYOUT_NODES` — one budget for the action and two for the comp cascade, one per taint class — which is a data-independent bound that relies on the document's structure rather than the size of any remote data.
 * **Dependency**: This proof explicitly rests on the `MAX_INSTRUCTIONS` and `MAX_SYNTHETIC_LAYOUT_NODES` budgets. A cost-free structural termination result would be misleading, as `each` amplifications can cause unbounded layout blowup while remaining acyclic.
 * **Mapping**: Discharges the "it can't freeze" manifesto property.
 

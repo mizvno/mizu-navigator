@@ -516,9 +516,34 @@ theorem recomputeStep_writes_opt (B : Nat) (D : Doc) (acc : RecompRes) (c : Comp
   unfold recomputeStep
   split
   · split
-    · exact ⟨Or.inr ⟨_, rfl⟩, Or.inr rfl⟩
-    · exact ⟨Or.inl rfl, Or.inl rfl⟩
+    · split
+      · exact ⟨Or.inr ⟨_, rfl⟩, Or.inr rfl⟩
+      · exact ⟨Or.inl rfl, Or.inl rfl⟩
+    · split
+      · exact ⟨Or.inr ⟨_, rfl⟩, Or.inr rfl⟩
+      · exact ⟨Or.inl rfl, Or.inl rfl⟩
   · exact ⟨Or.inl rfl, Or.inl rfl⟩
+
+/-- Every comp carries the taint verdict the fixpoint assigns to its name.
+
+This is what `check_information_flow` establishes at load time when it writes
+`ComputedBinding::tainted` (`parser/flow/check.rs`), and it is stated as a
+hypothesis rather than assumed silently: the two-pool split is only
+information-flow-safe if the pool a binding draws on really is decided by
+its taint. A document whose marks disagreed with the fixpoint could put an
+untainted comp on the tainted pool, where a hostile response could starve
+it — which is the very channel the split removes. -/
+def CompsMarked (D : Doc) (T : Taint) : Prop :=
+  ∀ c ∈ D.comps, c.tainted = T.vars.contains c.name
+
+/-- A tainted binding never touches the untainted pool. -/
+theorem recomputeStep_workU_tainted (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef)
+    (ht : c.tainted = true) : (recomputeStep B D acc c).workU = acc.workU := by
+  unfold recomputeStep
+  by_cases htr : (compDeps D c).any (fun d => acc.changed.contains d) = true
+  · rw [if_pos htr, if_pos ht]
+    split <;> rfl
+  · rw [if_neg htr]
 
 /-- **Recomputation agreement**, one comp at a time.  Two cases:
 
@@ -535,69 +560,96 @@ theorem recomputeStep_writes_opt (B : Nat) (D : Doc) (acc : RecompRes) (c : Comp
   equality of the evaluation outcome, so both runs write the same value (or
   fail identically) and the `changed` lists stay in lockstep. -/
 theorem recomputeStep_agree (B : Nat) (D : Doc) (T : Taint) (hfc : FnClosure D T)
-    (hst : Taint.stable D T = true) {c : CompDef} (hmem : c ∈ D.comps)
+    (hst : Taint.stable D T = true) (hcm : CompsMarked D T)
+    {c : CompDef} (hmem : c ∈ D.comps)
     {acc1 acc2 : RecompRes}
-    (hlow : lowEq T acc1.σ acc2.σ) (hch : chAgree T acc1.changed acc2.changed) :
+    (hlow : lowEq T acc1.σ acc2.σ) (hch : chAgree T acc1.changed acc2.changed)
+    (hwu : acc1.workU = acc2.workU) :
     lowEq T (recomputeStep B D acc1 c).σ (recomputeStep B D acc2 c).σ ∧
-    chAgree T (recomputeStep B D acc1 c).changed (recomputeStep B D acc2 c).changed := by
+    chAgree T (recomputeStep B D acc1 c).changed (recomputeStep B D acc2 c).changed ∧
+    (recomputeStep B D acc1 c).workU = (recomputeStep B D acc2 c).workU := by
+  have hmark : c.tainted = T.vars.contains c.name := hcm c hmem
   by_cases htc : T.vars.contains c.name = true
-  · obtain ⟨hw1, hc1⟩ := recomputeStep_writes_opt B D acc1 c
+  · -- Tainted: writes are confined to a tainted symbol, and the untainted
+    -- pool is untouched on both sides, so all three components survive.
+    have ht : c.tainted = true := by rw [hmark]; exact htc
+    obtain ⟨hw1, hc1⟩ := recomputeStep_writes_opt B D acc1 c
     obtain ⟨hw2, hc2⟩ := recomputeStep_writes_opt B D acc2 c
-    exact ⟨lowEq_write_opt hlow htc hw1 hw2, chAgree_write_opt hch htc hc1 hc2⟩
+    refine ⟨lowEq_write_opt hlow htc hw1 hw2, chAgree_write_opt hch htc hc1 hc2, ?_⟩
+    rw [recomputeStep_workU_tainted B D acc1 c ht,
+        recomputeStep_workU_tainted B D acc2 c ht]
+    exact hwu
   · have htc' : T.vars.contains c.name = false := by
       cases h : T.vars.contains c.name
       · rfl
       · exact absurd h htc
+    have hf : c.tainted = false := by rw [hmark]; exact htc'
     have hexpr : isTaintedE T c.expr = false := stable_comp hst hmem htc'
     have hdeps : ∀ d ∈ compDeps D c, T.vars.contains d = false :=
       collectReads_unt hfc _ c.expr hexpr
     have htrig : (compDeps D c).any (fun d => acc1.changed.contains d)
         = (compDeps D c).any (fun d => acc2.changed.contains d) :=
       any_contains_agree (fun d hd => hch d (hdeps d hd))
-    have hev := eval_agree B D T hfc (B + 2) acc1.σ acc2.σ hlow [] c.expr .init hexpr
+    -- The untainted pool is what this binding spends from, and `hwu` makes
+    -- that budget *identical* in the two runs — which is precisely why the
+    -- split preserves T2 where one shared pool would not: with a shared pool
+    -- the budget here would carry the tainted spend, and a hostile response
+    -- could decide whether this binding runs at all.
+    have hev := eval_agree (B - acc1.workU) D T hfc (B - acc1.workU + 2) acc1.σ acc2.σ
+      hlow [] c.expr .init hexpr
     unfold recomputeStep
-    rw [htrig]
-    split
-    · rw [hev]
+    by_cases htr : (compDeps D c).any (fun d => acc1.changed.contains d) = true
+    · have htr2 : (compDeps D c).any (fun d => acc2.changed.contains d) = true := by
+        rw [← htrig]; exact htr
+      rw [if_pos htr, if_pos htr2, if_neg (by simp [hf]), if_neg (by simp [hf]), ← hwu, hev]
       split
       · rename_i v _ _
-        exact ⟨lowEq_setVar_same hlow c.name v, chAgree_cons_same hch c.name⟩
-      · exact ⟨hlow, hch⟩
-    · exact ⟨hlow, hch⟩
+        exact ⟨lowEq_setVar_same hlow c.name v, chAgree_cons_same hch c.name, rfl⟩
+      · exact ⟨hlow, hch, rfl⟩
+    · have htr2 : (compDeps D c).any (fun d => acc2.changed.contains d) = false := by
+        rw [← htrig]; simpa using htr
+      rw [if_neg htr, if_neg (by rw [htr2]; simp)]
+      exact ⟨hlow, hch, hwu⟩
 
 /-- **Fold-level recomputation agreement**, generalised over any prefix of
 comps (not just `D.comps`) so induction goes through directly on
 `List.foldl`. -/
 theorem foldl_recompute_agree (B : Nat) (D : Doc) (T : Taint) (hfc : FnClosure D T)
-    (hst : Taint.stable D T = true) :
+    (hst : Taint.stable D T = true) (hcm : CompsMarked D T) :
     ∀ (l : List CompDef), (∀ c ∈ l, c ∈ D.comps) →
       ∀ {acc1 acc2 : RecompRes}, lowEq T acc1.σ acc2.σ → chAgree T acc1.changed acc2.changed →
+        acc1.workU = acc2.workU →
         lowEq T (l.foldl (recomputeStep B D) acc1).σ (l.foldl (recomputeStep B D) acc2).σ ∧
         chAgree T (l.foldl (recomputeStep B D) acc1).changed
-          (l.foldl (recomputeStep B D) acc2).changed := by
+          (l.foldl (recomputeStep B D) acc2).changed ∧
+        (l.foldl (recomputeStep B D) acc1).workU = (l.foldl (recomputeStep B D) acc2).workU := by
   intro l
   induction l with
   | nil =>
-    intro _ acc1 acc2 hlow hch
-    exact ⟨hlow, hch⟩
+    intro _ acc1 acc2 hlow hch hwu
+    exact ⟨hlow, hch, hwu⟩
   | cons c rest ih =>
-    intro hmem acc1 acc2 hlow hch
+    intro hmem acc1 acc2 hlow hch hwu
     have hmemc : c ∈ D.comps := hmem c (List.mem_cons_self ..)
     have hmemrest : ∀ c' ∈ rest, c' ∈ D.comps :=
       fun c' hc' => hmem c' (List.mem_cons_of_mem _ hc')
-    obtain ⟨hlow1, hch1⟩ := recomputeStep_agree B D T hfc hst hmemc hlow hch
+    obtain ⟨hlow1, hch1, hwu1⟩ := recomputeStep_agree B D T hfc hst hcm hmemc hlow hch hwu
     simp only [List.foldl_cons]
-    exact ih hmemrest hlow1 hch1
+    exact ih hmemrest hlow1 hch1 hwu1
 
 /-- **Recomputation agreement** over a whole document's `comps`, in parsed
 order — the model's `recompute`. -/
 theorem recompute_agree (B : Nat) (D : Doc) (T : Taint) (hfc : FnClosure D T)
-    (hst : Taint.stable D T = true) {σ1 σ2 : Store} (hlow : lowEq T σ1 σ2)
+    (hst : Taint.stable D T = true) (hcm : CompsMarked D T)
+    {σ1 σ2 : Store} (hlow : lowEq T σ1 σ2)
     {ch1 ch2 : List Symbol} (hch : chAgree T ch1 ch2) :
     lowEq T (recompute B D σ1 ch1).σ (recompute B D σ2 ch2).σ ∧
     chAgree T (recompute B D σ1 ch1).changed (recompute B D σ2 ch2).changed := by
   unfold recompute
-  exact foldl_recompute_agree B D T hfc hst D.comps (fun _ h => h) hlow hch
+  obtain ⟨h1, h2, _⟩ :=
+    foldl_recompute_agree (acc1 := ⟨σ1, [], 0, 0, ch1, []⟩) (acc2 := ⟨σ2, [], 0, 0, ch2, []⟩)
+      B D T hfc hst hcm D.comps (fun _ h => h) hlow hch rfl
+  exact ⟨h1, h2⟩
 
 /-! ## Action agreement
 
@@ -911,7 +963,7 @@ untouched — the base case that anchors `recompute_tainted_ch_lowEq_self`. -/
 theorem recompute_changed_nil (B : Nat) (D : Doc) (σ : Store) :
     (recompute B D σ []).σ = σ := by
   unfold recompute
-  exact foldl_recompute_nil_id B D D.comps ⟨σ, [], 0, [], []⟩ rfl
+  exact foldl_recompute_nil_id B D D.comps ⟨σ, [], 0, 0, [], []⟩ rfl
 
 /-- **Recomputation started from an all-tainted trigger list never disturbs
 low-equivalence with its own input.**  Intuitively: an all-tainted `changed`
@@ -919,9 +971,9 @@ can never satisfy an untainted comp's (all-untainted, by `collectReads_unt`)
 trigger condition, so recomputation can only ever cascade through *other*
 tainted comps — every write stays confined to tainted symbols. -/
 theorem recompute_tainted_ch_lowEq_self (B : Nat) (D : Doc) (T : Taint) (hfc : FnClosure D T)
-    (hst : Taint.stable D T = true) {σ : Store} {ch : List Symbol}
+    (hst : Taint.stable D T = true) (hcm : CompsMarked D T) {σ : Store} {ch : List Symbol}
     (h : ∀ s ∈ ch, T.vars.contains s = true) : lowEq T σ (recompute B D σ ch).σ := by
-  have hra := (recompute_agree B D T hfc hst (lowEq.refl T σ) (chAgree_all_tainted_nil h)).1
+  have hra := (recompute_agree B D T hfc hst hcm (lowEq.refl T σ) (chAgree_all_tainted_nil h)).1
   rw [recompute_changed_nil] at hra
   exact hra.symm
 
@@ -1021,6 +1073,7 @@ identifying the failing side's (unchanged) store with the succeeding side's
 `chAgree` forces the successful side's `changed` to be all-tainted, since the
 failing side's is `[]`) never disturbs low-equivalence. -/
 theorem fireTx_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {c : Ctx} {a : Action} (hmem : (c, a) ∈ allActions D)
     {σ1 σ2 : Store} (hlow : lowEq (taintOf D) σ1 σ2) :
     lowEq (taintOf D) (fireTx B D σ1 c a).σ (fireTx B D σ2 c a).σ := by
@@ -1045,7 +1098,7 @@ theorem fireTx_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
     | none =>
       have htn : ∀ s ∈ ch2, (taintOf D).vars.contains s = true := by
         rw [hch1eq] at hchA; exact chAgree_nil_all_tainted hchA
-      have hself := recompute_tainted_ch_lowEq_self B D (taintOf D) hfc hst (σ := σ2') (ch := ch2) htn
+      have hself := recompute_tainted_ch_lowEq_self B D (taintOf D) hfc hst hcm (σ := σ2') (ch := ch2) htn
       rw [hσ1eq] at hlowA
       exact hlowA.trans hself
   | none =>
@@ -1058,18 +1111,19 @@ theorem fireTx_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
         have h := execAction_err_changed_nil B D σ2 a h2ne; rw [hE2] at h; simpa using h
       have htn : ∀ s ∈ ch1, (taintOf D).vars.contains s = true := by
         rw [hch2eq] at hchA; exact chAgree_nil_all_tainted hchA.symm
-      have hself := recompute_tainted_ch_lowEq_self B D (taintOf D) hfc hst (σ := σ1') (ch := ch1) htn
+      have hself := recompute_tainted_ch_lowEq_self B D (taintOf D) hfc hst hcm (σ := σ1') (ch := ch1) htn
       rw [hσ2eq] at hlowA
       exact (hself.symm.trans hlowA)
-    | none => exact (recompute_agree B D (taintOf D) hfc hst hlowA hchA).1
+    | none => exact (recompute_agree B D (taintOf D) hfc hst hcm hlowA hchA).1
 
 /-- **`fireTx` agreement**, combining the store and trace halves. -/
 theorem fireTx_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {c : Ctx} {a : Action} (hmem : (c, a) ∈ allActions D)
     {σ1 σ2 : Store} (hlow : lowEq (taintOf D) σ1 σ2) :
     lowEq (taintOf D) (fireTx B D σ1 c a).σ (fireTx B D σ2 c a).σ ∧
     ungatedNavs (fireTx B D σ1 c a).trace = ungatedNavs (fireTx B D σ2 c a).trace := by
-  refine ⟨fireTx_lowEq_agree B D hacc hmem hlow, ?_⟩
+  refine ⟨fireTx_lowEq_agree B D hacc hcm hmem hlow, ?_⟩
   cases c with
   | gesture =>
     rw [fireTx_gesture_ungatedNavs_nil B D σ1 a, fireTx_gesture_ungatedNavs_nil B D σ2 a]
@@ -1093,6 +1147,7 @@ failing side's own `[]` after substitution), and prepending the same
 `formSym` (`chAgree_cons_same`) keeps them in lockstep for `recompute_agree`
 directly. -/
 theorem fireSubmit_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {a : Action} (hmem : (Ctx.gesture, a) ∈ allActions D) (formSym : Symbol)
     {σ0_1 σ0_2 : Store} (hlow : lowEq (taintOf D) σ0_1 σ0_2) :
     lowEq (taintOf D) (fireSubmit B D σ0_1 formSym a).σ (fireSubmit B D σ0_2 formSym a).σ := by
@@ -1112,14 +1167,14 @@ theorem fireSubmit_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
       have h := execAction_err_changed_nil B D σ0_1 a h1ne; rw [hE1] at h; simpa using h
     cases err2 with
     | some e2 =>
-      exact (recompute_agree B D (taintOf D) hfc hst hlow (chAgree.refl (taintOf D) [formSym])).1
+      exact (recompute_agree B D (taintOf D) hfc hst hcm hlow (chAgree.refl (taintOf D) [formSym])).1
     | none =>
       have hσ1eq : σ1' = σ0_1 := by
         have h := execAction_err_no_write B D σ0_1 a h1ne; rw [hE1] at h; simpa using h
       rw [hσ1eq] at hlowA
       have hch2 : chAgree (taintOf D) [formSym] (formSym :: ch2) := by
         rw [hch1eq] at hchA; exact chAgree_cons_same hchA formSym
-      exact (recompute_agree B D (taintOf D) hfc hst hlowA hch2).1
+      exact (recompute_agree B D (taintOf D) hfc hst hcm hlowA hch2).1
   | none =>
     cases err2 with
     | some e2 =>
@@ -1131,19 +1186,20 @@ theorem fireSubmit_lowEq_agree (B : Nat) (D : Doc) (hacc : accept D = true)
       rw [hσ2eq] at hlowA
       have hch1 : chAgree (taintOf D) (formSym :: ch1) [formSym] := by
         rw [hch2eq] at hchA; exact chAgree_cons_same hchA formSym
-      exact (recompute_agree B D (taintOf D) hfc hst hlowA hch1).1
+      exact (recompute_agree B D (taintOf D) hfc hst hcm hlowA hch1).1
     | none =>
-      exact (recompute_agree B D (taintOf D) hfc hst hlowA (chAgree_cons_same hchA formSym)).1
+      exact (recompute_agree B D (taintOf D) hfc hst hcm hlowA (chAgree_cons_same hchA formSym)).1
 
 /-- **`fireSubmit` agreement**, combining the store and (trivial) trace
 halves. -/
 theorem fireSubmit_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {a : Action} (hmem : (Ctx.gesture, a) ∈ allActions D) (formSym : Symbol)
     {σ0_1 σ0_2 : Store} (hlow : lowEq (taintOf D) σ0_1 σ0_2) :
     lowEq (taintOf D) (fireSubmit B D σ0_1 formSym a).σ (fireSubmit B D σ0_2 formSym a).σ ∧
     ungatedNavs (fireSubmit B D σ0_1 formSym a).trace
       = ungatedNavs (fireSubmit B D σ0_2 formSym a).trace := by
-  refine ⟨fireSubmit_lowEq_agree B D hacc hmem formSym hlow, ?_⟩
+  refine ⟨fireSubmit_lowEq_agree B D hacc hcm hmem formSym hlow, ?_⟩
   rw [fireSubmit_ungatedNavs_nil B D σ0_1 formSym a, fireSubmit_ungatedNavs_nil B D σ0_2 formSym a]
 
 /-! ## Reaction and run agreement — T2 -/
@@ -1191,6 +1247,7 @@ inductive EventsAgree (D : Doc) : List Event → List Event → Prop
 out — composing `fireTx_agree`/`fireSubmit_agree`/`recompute_agree` per
 `Event` constructor. -/
 theorem reaction_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {e1 e2 : Event} (he : EventAgree D e1 e2)
     {σ1 σ2 : Store} (hlow : lowEq (taintOf D) σ1 σ2) :
     lowEq (taintOf D) (reaction B D σ1 e1).σ (reaction B D σ2 e2).σ ∧
@@ -1203,31 +1260,31 @@ theorem reaction_agree (B : Nat) (D : Doc) (hacc : accept D = true)
     split
     · exact ⟨hlow, rfl⟩
     · rename_i a heq
-      exact fireTx_agree B D hacc (click_mem_allActions heq) hlow
+      exact fireTx_agree B D hacc hcm (click_mem_allActions heq) hlow
   | timer i =>
     simp only [reaction]
     split
     · exact ⟨hlow, rfl⟩
     · rename_i a heq
-      exact fireTx_agree B D hacc (timer_mem_allActions heq) hlow
+      exact fireTx_agree B D hacc hcm (timer_mem_allActions heq) hlow
   | submit i f1 f2 =>
     simp only [reaction]
     have hff : lowEq (taintOf D) (setVar σ1 D.formSym (Val.record f1))
         (setVar σ2 D.formSym (Val.record f2)) :=
       lowEq_write_opt hlow (formSym_tainted D) (Or.inr ⟨_, rfl⟩) (Or.inr ⟨_, rfl⟩)
     split
-    · have hr := recompute_agree B D (taintOf D) hfc hst hff (chAgree.refl (taintOf D) [D.formSym])
+    · have hr := recompute_agree B D (taintOf D) hfc hst hcm hff (chAgree.refl (taintOf D) [D.formSym])
       refine ⟨hr.1, ?_⟩
       rw [ungatedNavs_tag_gesture, ungatedNavs_tag_gesture]
     · rename_i a heq
-      exact fireSubmit_agree B D hacc (submit_mem_allActions heq) D.formSym hff
+      exact fireSubmit_agree B D hacc hcm (submit_mem_allActions heq) D.formSym hff
   | netResponse t ht v1 v2 =>
     simp only [reaction]
     have htt : (taintOf D).vars.contains t = true := netTarget_tainted ht
     split
     · have hσ : lowEq (taintOf D) (setVar σ1 t v1) (setVar σ2 t v2) :=
         lowEq_write_opt hlow htt (Or.inr ⟨_, rfl⟩) (Or.inr ⟨_, rfl⟩)
-      have hr := recompute_agree B D (taintOf D) hfc hst hσ (chAgree.refl (taintOf D) [t])
+      have hr := recompute_agree B D (taintOf D) hfc hst hcm hσ (chAgree.refl (taintOf D) [t])
       refine ⟨hr.1, ?_⟩
       rw [ungatedNavs_tag_nonInteractive, ungatedNavs_tag_nonInteractive,
           navsOfEffects_navFree (recompute_navFree B D (setVar σ1 t v1) [t]),
@@ -1237,7 +1294,8 @@ theorem reaction_agree (B : Nat) (D : Doc) (hacc : accept D = true)
 /-- **Run agreement**: folding `reaction_agree` over the whole event
 sequence, combining the store half by transitivity and the trace half via
 `ungatedNavs_append`. -/
-theorem run_agree (B : Nat) (D : Doc) (hacc : accept D = true) :
+theorem run_agree (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D)) :
     ∀ {evs1 evs2 : List Event}, EventsAgree D evs1 evs2 →
       ∀ {σ1 σ2 : Store}, lowEq (taintOf D) σ1 σ2 →
         lowEq (taintOf D) (run B D σ1 evs1).1 (run B D σ2 evs2).1 ∧
@@ -1249,7 +1307,7 @@ theorem run_agree (B : Nat) (D : Doc) (hacc : accept D = true) :
     exact ⟨hlow, rfl⟩
   | cons he _ ih =>
     intro σ1 σ2 hlow
-    obtain ⟨hlowR, hnavR⟩ := reaction_agree B D hacc he hlow
+    obtain ⟨hlowR, hnavR⟩ := reaction_agree B D hacc hcm he hlow
     obtain ⟨hlowRest, hnavRest⟩ := ih hlowR
     simp only [run]
     refine ⟨hlowRest, ?_⟩
@@ -1298,12 +1356,22 @@ header comment, which this theorem composes end to end:**
   `run_agree` (a whole event trace) → this theorem (restating `run_agree`
   under the name the security invariant is known by). Every step is a
   genuine Lean proof term; there is no `sorry`/`axiom` anywhere in the
-  chain. -/
+  chain.
+
+  `hcm` is new, and it is not bookkeeping: it says every comp carries the
+  taint verdict the fixpoint assigns to its name, which is what
+  `check_information_flow` writes into `ComputedBinding::tainted` at load
+  time. The two-pool budget is only information-flow-safe if the pool a
+  binding draws on really is decided by its taint — a document whose marks
+  disagreed with the fixpoint could put an untainted comp on the tainted
+  pool, where a hostile response could starve it. Stating it as a hypothesis
+  keeps that dependency visible instead of silently assumed. -/
 theorem T2_non_interference (B : Nat) (D : Doc) (hacc : accept D = true)
+    (hcm : CompsMarked D (taintOf D))
     {evs1 evs2 : List Event} (hevs : EventsAgree D evs1 evs2)
     {σ1 σ2 : Store} (hlow : lowEq (taintOf D) σ1 σ2) :
     lowEq (taintOf D) (run B D σ1 evs1).1 (run B D σ2 evs2).1 ∧
     ungatedNavs (run B D σ1 evs1).2 = ungatedNavs (run B D σ2 evs2).2 :=
-  run_agree B D hacc hevs hlow
+  run_agree B D hacc hcm hevs hlow
 
 end Mizu

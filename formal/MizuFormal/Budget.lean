@@ -1138,46 +1138,92 @@ theorem execAction_nf (B : Nat) (D : Doc) (σ : Store) (a : Action) :
 
 /-! ### Recomputation -/
 
-theorem recomputeStep_work (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef) :
-    (recomputeStep B D acc c).work ≤ acc.work + B := by
-  unfold recomputeStep
+/-- The two-pool invariant carried across a cascade: the untainted spend is
+part of the total, and neither pool has run past `B`. -/
+def PoolInv (B : Nat) (r : RecompRes) : Prop :=
+  r.workU ≤ r.work ∧ r.workU ≤ B ∧ r.work - r.workU ≤ B
+
+theorem recomputeStep_pool (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef)
+    (h : PoolInv B acc) : PoolInv B (recomputeStep B D acc c) := by
+  obtain ⟨hle, hu, ht⟩ := h
+  unfold recomputeStep PoolInv
   split
   · split
-    · rename_i v s heq
-      have o : Out B EvalSt.init ((Except.ok v, s) : Res Val) :=
-        heq ▸ eval_out B D acc.σ (B + 2) [] c.expr EvalSt.init inv_init
-      have hw : s.work ≤ B := o.wb
-      show acc.work + s.work ≤ acc.work + B
-      omega
-    · rename_i er s heq
-      have o : Out B EvalSt.init ((Except.error er, s) : Res Val) :=
-        heq ▸ eval_out B D acc.σ (B + 2) [] c.expr EvalSt.init inv_init
-      have hw : s.work ≤ B := o.wb
-      show acc.work + s.work ≤ acc.work + B
-      omega
-  · exact Nat.le_add_right _ _
+    · -- tainted binding: spends from `B - (work - workU)`, leaves `workU` alone
+      split
+      · rename_i v s heq
+        have o : Out (B - (acc.work - acc.workU)) EvalSt.init ((Except.ok v, s) : Res Val) :=
+          heq ▸ eval_out (B - (acc.work - acc.workU)) D acc.σ
+            (B - (acc.work - acc.workU) + 2) [] c.expr EvalSt.init inv_init
+        have hw : s.work ≤ B - (acc.work - acc.workU) := o.wb
+        refine ⟨?_, ?_, ?_⟩
+        · show acc.workU ≤ acc.work + s.work
+          omega
+        · show acc.workU ≤ B
+          omega
+        · show acc.work + s.work - acc.workU ≤ B
+          omega
+      · rename_i er s heq
+        have o : Out (B - (acc.work - acc.workU)) EvalSt.init ((Except.error er, s) : Res Val) :=
+          heq ▸ eval_out (B - (acc.work - acc.workU)) D acc.σ
+            (B - (acc.work - acc.workU) + 2) [] c.expr EvalSt.init inv_init
+        have hw : s.work ≤ B - (acc.work - acc.workU) := o.wb
+        refine ⟨?_, ?_, ?_⟩
+        · show acc.workU ≤ acc.work + s.work
+          omega
+        · show acc.workU ≤ B
+          omega
+        · show acc.work + s.work - acc.workU ≤ B
+          omega
+    · -- untainted binding: spends from `B - workU`, and banks into `workU`
+      split
+      · rename_i v s heq
+        have o : Out (B - acc.workU) EvalSt.init ((Except.ok v, s) : Res Val) :=
+          heq ▸ eval_out (B - acc.workU) D acc.σ (B - acc.workU + 2) [] c.expr
+            EvalSt.init inv_init
+        have hw : s.work ≤ B - acc.workU := o.wb
+        refine ⟨?_, ?_, ?_⟩
+        · show acc.workU + s.work ≤ acc.work + s.work
+          omega
+        · show acc.workU + s.work ≤ B
+          omega
+        · show acc.work + s.work - (acc.workU + s.work) ≤ B
+          omega
+      · rename_i er s heq
+        have o : Out (B - acc.workU) EvalSt.init ((Except.error er, s) : Res Val) :=
+          heq ▸ eval_out (B - acc.workU) D acc.σ (B - acc.workU + 2) [] c.expr
+            EvalSt.init inv_init
+        have hw : s.work ≤ B - acc.workU := o.wb
+        refine ⟨?_, ?_, ?_⟩
+        · show acc.workU + s.work ≤ acc.work + s.work
+          omega
+        · show acc.workU + s.work ≤ B
+          omega
+        · show acc.work + s.work - (acc.workU + s.work) ≤ B
+          omega
+  · exact ⟨hle, hu, ht⟩
 
-theorem foldl_recompute_work (B : Nat) (D : Doc) :
+theorem foldl_recompute_pool (B : Nat) (D : Doc) :
     ∀ (l : List CompDef) (acc : RecompRes),
-      (l.foldl (recomputeStep B D) acc).work ≤ acc.work + l.length * B := by
+      PoolInv B acc → PoolInv B (l.foldl (recomputeStep B D) acc) := by
   intro l
   induction l with
-  | nil =>
-    intro acc
-    simp
+  | nil => intro acc h; simpa using h
   | cons c rest ih =>
-    intro acc
-    have h1 := recomputeStep_work B D acc c
-    have h2 := ih (recomputeStep B D acc c)
-    simp only [List.foldl, List.length_cons]
-    rw [Nat.succ_mul]
-    omega
+    intro acc h
+    simp only [List.foldl]
+    exact ih (recomputeStep B D acc c) (recomputeStep_pool B D acc c h)
 
+/-- **A whole cascade costs at most two budgets**, one per taint class —
+never `#comps · B`.  The document's comp count has left the bound entirely,
+so a document cannot buy more work by declaring more derived variables. -/
 theorem recompute_work (B : Nat) (D : Doc) (σ : Store) (ch : List Symbol) :
-    (recompute B D σ ch).work ≤ D.comps.length * B := by
-  have h := foldl_recompute_work B D D.comps ⟨σ, [], 0, ch, []⟩
+    (recompute B D σ ch).work ≤ 2 * B := by
+  have h := foldl_recompute_pool B D D.comps ⟨σ, [], 0, 0, ch, []⟩
+    ⟨Nat.le_refl 0, Nat.zero_le B, Nat.zero_le B⟩
   unfold recompute
-  simpa using h
+  obtain ⟨hle, hu, ht⟩ := h
+  omega
 
 theorem recomputeStep_nf (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef)
     (h : ∀ er ∈ acc.errs, er ≠ Err.fuel) :
@@ -1185,18 +1231,34 @@ theorem recomputeStep_nf (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef)
   unfold recomputeStep
   split
   · split
-    · rename_i v s heq
-      exact h
-    · rename_i er s heq
-      intro x hx
-      have hne : er ≠ Err.fuel :=
-        nf_err (eval_nf B D acc.σ (B + 2) [] c.expr EvalSt.init inv_init
-          (Nat.zero_le B) (by omega)) heq
-      rcases List.mem_append.mp hx with h1 | h1
-      · exact h x h1
-      · simp at h1
-        subst h1
-        exact hne
+    ·
+      split
+      · rename_i v s heq
+        exact h
+      · rename_i er s heq
+        intro x hx
+        have hne : er ≠ Err.fuel :=
+          nf_err (eval_nf (B - (acc.work - acc.workU)) D acc.σ ((B - (acc.work - acc.workU)) + 2) [] c.expr EvalSt.init inv_init
+            (Nat.zero_le _) (by omega)) heq
+        rcases List.mem_append.mp hx with h1 | h1
+        · exact h x h1
+        · simp at h1
+          subst h1
+          exact hne
+    ·
+      split
+      · rename_i v s heq
+        exact h
+      · rename_i er s heq
+        intro x hx
+        have hne : er ≠ Err.fuel :=
+          nf_err (eval_nf (B - acc.workU) D acc.σ ((B - acc.workU) + 2) [] c.expr EvalSt.init inv_init
+            (Nat.zero_le _) (by omega)) heq
+        rcases List.mem_append.mp hx with h1 | h1
+        · exact h x h1
+        · simp at h1
+          subst h1
+          exact hne
   · exact h
 
 theorem foldl_recompute_nf (B : Nat) (D : Doc) :
@@ -1223,22 +1285,42 @@ theorem recomputeStep_navFree (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef
   unfold recomputeStep
   split
   · split
-    · rename_i v s heq
-      have o : Out B EvalSt.init ((Except.ok v, s) : Res Val) :=
-        heq ▸ eval_out B D acc.σ (B + 2) [] c.expr EvalSt.init inv_init
-      obtain ⟨d, e, n⟩ := o.eff
-      have e' : s.effects = d := by simpa [EvalSt.init] using e
-      show navFree (acc.effects ++ s.effects)
-      rw [e']
-      exact navFree_append h n
-    · rename_i er s heq
-      have o : Out B EvalSt.init ((Except.error er, s) : Res Val) :=
-        heq ▸ eval_out B D acc.σ (B + 2) [] c.expr EvalSt.init inv_init
-      obtain ⟨d, e, n⟩ := o.eff
-      have e' : s.effects = d := by simpa [EvalSt.init] using e
-      show navFree (acc.effects ++ s.effects)
-      rw [e']
-      exact navFree_append h n
+    ·
+      split
+      · rename_i v s heq
+        have o : Out (B - (acc.work - acc.workU)) EvalSt.init ((Except.ok v, s) : Res Val) :=
+          heq ▸ eval_out (B - (acc.work - acc.workU)) D acc.σ ((B - (acc.work - acc.workU)) + 2) [] c.expr EvalSt.init inv_init
+        obtain ⟨d, e, n⟩ := o.eff
+        have e' : s.effects = d := by simpa [EvalSt.init] using e
+        show navFree (acc.effects ++ s.effects)
+        rw [e']
+        exact navFree_append h n
+      · rename_i er s heq
+        have o : Out (B - (acc.work - acc.workU)) EvalSt.init ((Except.error er, s) : Res Val) :=
+          heq ▸ eval_out (B - (acc.work - acc.workU)) D acc.σ ((B - (acc.work - acc.workU)) + 2) [] c.expr EvalSt.init inv_init
+        obtain ⟨d, e, n⟩ := o.eff
+        have e' : s.effects = d := by simpa [EvalSt.init] using e
+        show navFree (acc.effects ++ s.effects)
+        rw [e']
+        exact navFree_append h n
+    ·
+      split
+      · rename_i v s heq
+        have o : Out (B - acc.workU) EvalSt.init ((Except.ok v, s) : Res Val) :=
+          heq ▸ eval_out (B - acc.workU) D acc.σ ((B - acc.workU) + 2) [] c.expr EvalSt.init inv_init
+        obtain ⟨d, e, n⟩ := o.eff
+        have e' : s.effects = d := by simpa [EvalSt.init] using e
+        show navFree (acc.effects ++ s.effects)
+        rw [e']
+        exact navFree_append h n
+      · rename_i er s heq
+        have o : Out (B - acc.workU) EvalSt.init ((Except.error er, s) : Res Val) :=
+          heq ▸ eval_out (B - acc.workU) D acc.σ ((B - acc.workU) + 2) [] c.expr EvalSt.init inv_init
+        obtain ⟨d, e, n⟩ := o.eff
+        have e' : s.effects = d := by simpa [EvalSt.init] using e
+        show navFree (acc.effects ++ s.effects)
+        rw [e']
+        exact navFree_append h n
   · exact h
 
 theorem foldl_recompute_navFree (B : Nat) (D : Doc) :
@@ -1259,7 +1341,7 @@ theorem recompute_navFree (B : Nat) (D : Doc) (σ : Store) (ch : List Symbol) :
 /-! ### Reactions and T1 -/
 
 theorem fireTx_work (B : Nat) (D : Doc) (σ : Store) (c : Ctx) (a : Action) :
-    (fireTx B D σ c a).work ≤ (1 + D.comps.length) * B := by
+    (fireTx B D σ c a).work ≤ 3 * B := by
   unfold fireTx
   split
   · rename_i x1 x2 x3 w x5 heq
@@ -1267,8 +1349,7 @@ theorem fireTx_work (B : Nat) (D : Doc) (σ : Store) (c : Ctx) (a : Action) :
       have h := execAction_work B D σ a
       rw [heq] at h
       exact h
-    show w ≤ (1 + D.comps.length) * B
-    rw [Nat.add_mul, Nat.one_mul]
+    show w ≤ 3 * B
     omega
   · rename_i σ' effs w ch heq
     have hw : w ≤ B := by
@@ -1276,12 +1357,11 @@ theorem fireTx_work (B : Nat) (D : Doc) (σ : Store) (c : Ctx) (a : Action) :
       rw [heq] at h
       exact h
     have hr := recompute_work B D σ' ch
-    show w + (recompute B D σ' ch).work ≤ (1 + D.comps.length) * B
-    rw [Nat.add_mul, Nat.one_mul]
+    show w + (recompute B D σ' ch).work ≤ 3 * B
     omega
 
 theorem fireSubmit_work (B : Nat) (D : Doc) (σ0 : Store) (formSym : Symbol) (a : Action) :
-    (fireSubmit B D σ0 formSym a).work ≤ (1 + D.comps.length) * B := by
+    (fireSubmit B D σ0 formSym a).work ≤ 3 * B := by
   unfold fireSubmit
   split
   · rename_i x1 x2 effs w x5 heq
@@ -1290,8 +1370,7 @@ theorem fireSubmit_work (B : Nat) (D : Doc) (σ0 : Store) (formSym : Symbol) (a 
       rw [heq] at h
       exact h
     have hr := recompute_work B D σ0 [formSym]
-    show w + (recompute B D σ0 [formSym]).work ≤ (1 + D.comps.length) * B
-    rw [Nat.add_mul, Nat.one_mul]
+    show w + (recompute B D σ0 [formSym]).work ≤ 3 * B
     omega
   · rename_i σ' effs w ch heq
     have hw : w ≤ B := by
@@ -1299,16 +1378,17 @@ theorem fireSubmit_work (B : Nat) (D : Doc) (σ0 : Store) (formSym : Symbol) (a 
       rw [heq] at h
       exact h
     have hr := recompute_work B D σ' (formSym :: ch)
-    show w + (recompute B D σ' (formSym :: ch)).work ≤ (1 + D.comps.length) * B
-    rw [Nat.add_mul, Nat.one_mul]
+    show w + (recompute B D σ' (formSym :: ch)).work ≤ 3 * B
     omega
 
-/-- **Expression-work bound for a whole reaction**: at most
-`(1 + #comps) · B` — one fresh budget for the action, one per comp binding.
-The factor is a static property of the *document*; no input datum enlarges
-it. -/
+/-- **Expression-work bound for a whole reaction**: at most `3 · B` — one
+budget for the action, and two for the comp cascade (one per taint class).
+
+The bound used to be `(1 + #comps) · B`, because every firing comp received
+its own fresh budget. It is now a constant: neither an input datum nor the
+document's own comp count enlarges it. -/
 theorem reaction_work_le (B : Nat) (D : Doc) (σ : Store) (ev : Event) :
-    (reaction B D σ ev).work ≤ (1 + D.comps.length) * B := by
+    (reaction B D σ ev).work ≤ 3 * B := by
   cases ev with
   | click i =>
     rw [reaction]
@@ -1327,8 +1407,7 @@ theorem reaction_work_le (B : Nat) (D : Doc) (σ : Store) (ev : Event) :
     split
     · have h := recompute_work B D (setVar σ D.formSym (.record fields)) [D.formSym]
       show (recompute B D (setVar σ D.formSym (.record fields)) [D.formSym]).work
-        ≤ (1 + D.comps.length) * B
-      rw [Nat.add_mul, Nat.one_mul]
+        ≤ 3 * B
       omega
     · rename_i a heq
       exact fireSubmit_work B D (setVar σ D.formSym (.record fields)) D.formSym a
@@ -1336,8 +1415,7 @@ theorem reaction_work_le (B : Nat) (D : Doc) (σ : Store) (ev : Event) :
     rw [reaction]
     split
     · have h := recompute_work B D (setVar σ t v) [t]
-      show (recompute B D (setVar σ t v) [t]).work ≤ (1 + D.comps.length) * B
-      rw [Nat.add_mul, Nat.one_mul]
+      show (recompute B D (setVar σ t v) [t]).work ≤ 3 * B
       omega
     · exact Nat.zero_le _
 
@@ -1350,64 +1428,48 @@ budgets: strip `charge` from the semantics and `each`-amplification gives
 unbounded acyclic work. -/
 theorem T1_reaction_bound (B N : Nat) (D : Doc) (σ : Store) (ev : Event) :
     (reaction B D σ ev).work + expandLayout N D (reaction B D σ ev).σ
-      ≤ (1 + D.comps.length) * B + N :=
+      ≤ 3 * B + N :=
   Nat.add_le_add (reaction_work_le B D σ ev) (expandLayout_le N D _)
 
-/-- The shipped budgets (`types.rs::MAX_INSTRUCTIONS`,
-`layout_bridge.rs::MAX_SYNTHETIC_LAYOUT_NODES`). -/
-def MAX_INSTRUCTIONS : Nat := 20000
+/-- The shipped budgets.  Mirrored by hand from the Rust defaults in
+`core::config::MizuConfig::default` (`max_instructions`,
+`max_synthetic_layout_nodes`); changing one side without the other is the
+drift this pairing exists to make visible. -/
+def MAX_INSTRUCTIONS : Nat := 500000
 
-def MAX_SYNTHETIC_LAYOUT_NODES : Nat := 20000
+def MAX_SYNTHETIC_LAYOUT_NODES : Nat := 50000
 
-/-- T1 at the shipped constants. -/
+/-- T1 at the shipped constants.
+
+Stated over the constants rather than their literals, so the bound cannot
+drift from the definitions above the way a repeated numeral can. -/
 theorem T1_shipped (D : Doc) (σ : Store) (ev : Event) :
     (reaction MAX_INSTRUCTIONS D σ ev).work
       + expandLayout MAX_SYNTHETIC_LAYOUT_NODES D (reaction MAX_INSTRUCTIONS D σ ev).σ
-      ≤ (1 + D.comps.length) * 20000 + 20000 :=
+      ≤ 3 * MAX_INSTRUCTIONS + MAX_SYNTHETIC_LAYOUT_NODES :=
   T1_reaction_bound MAX_INSTRUCTIONS MAX_SYNTHETIC_LAYOUT_NODES D σ ev
 
-/-! ## RM-08 — the comp-count cap
+/-! ## RM-08 — the comp-count cap, and why T1 no longer needs it
 
-`T1_shipped` bounds one reaction by `(1 + D.comps.length) * 20000 + 20000` —
-an honest bound, but still a function of the *document*: nothing in the
-model up to this point stops `D.comps.length` from being arbitrarily large,
-so the bound above is not by itself a fixed number. A document declaring,
-say, 5000 `comp` bindings that all transitively depend on one mutable
-variable is priced correctly by `T1_shipped` (`(1 + 5000) * 20000`
-instructions), but that price is a very different number from what
-`MAX_INSTRUCTIONS = 20000` suggests in isolation, and is a practical DoS
-vector for a document loaded from an untrusted origin.
+This section used to carry a second theorem, `T1_shipped_capped`.  It existed
+because `T1_shipped` bounded a reaction by `(1 + D.comps.length) * B + N` —
+honest, but a function of the *document*: nothing stopped `D.comps.length`
+from being large, so the promise was not a fixed number.  A document
+declaring 5000 `comp` bindings that all depended on one mutable variable was
+priced at `(1 + 5000) * B`, a very different quantity from what
+`MAX_INSTRUCTIONS` suggested in isolation, and a practical DoS vector for a
+document from an untrusted origin.  `MAX_COMP_BINDINGS` capped the factor at
+parse time, and the capped theorem composed the two into a concrete number.
 
-`MAX_COMP_BINDINGS` mirrors the cap enforced on the Rust side, at parse time,
-in `parser::logic::parse_computed_with_functions` (`src/core/types.rs`): a
-document declaring more `comp` bindings than this is rejected with a
-`ParseError` before it ever reaches the evaluator, so every `Doc` that
-*successfully loads* satisfies `D.comps.length ≤ MAX_COMP_BINDINGS`.
-`T1_shipped_capped` composes that load-time invariant with `T1_shipped` to
-produce a bound that depends on nothing but the three shipped constants —
-the fully concrete number `MAX_INSTRUCTIONS = 20000` alone was always
-implicitly promising. -/
+`recomputeStep` now charges the cascade to two pools — one per taint class —
+instead of granting each comp a fresh budget, matching the Rust.
+`reaction_work_le` is therefore `3 * B` outright, `T1_shipped` is already a
+concrete number, and the capped variant would state nothing further, so it is
+gone rather than kept as a tautology.
 
-/-- The comp-count cap enforced at parse time (`types.rs::MAX_COMP_BINDINGS`).
-Kept in sync manually with the Rust constant; see `RM-08` in `walkthrough.md`
-at the repository root. -/
-def MAX_COMP_BINDINGS : Nat := 500
-
-set_option maxRecDepth 65536
-
-/-- **T1, capped.** For any document that passed the `MAX_COMP_BINDINGS`
-load-time check (i.e. any document the Rust parser actually accepts), one
-reaction's expression work plus one frame's layout expansion is bounded by a
-single concrete number depending only on the three shipped budget constants
-— never on the document, and never on the size of any remote datum. This is
-the corollary the comp-count cap exists to establish. -/
-theorem T1_shipped_capped (D : Doc) (σ : Store) (ev : Event)
-    (hcap : D.comps.length ≤ MAX_COMP_BINDINGS) :
-    (reaction MAX_INSTRUCTIONS D σ ev).work
-      + expandLayout MAX_SYNTHETIC_LAYOUT_NODES D (reaction MAX_INSTRUCTIONS D σ ev).σ
-      ≤ (1 + MAX_COMP_BINDINGS) * 20000 + 20000 := by
-  have h := T1_shipped D σ ev
-  have hcap' : D.comps.length ≤ 500 := hcap
-  omega
+`MAX_COMP_BINDINGS` still exists on the Rust side, but its justification
+moved with the proof: it now bounds *memory* (a parsed expression tree and a
+reverse-index entry per binding), not time.  It is deliberately not modelled
+here, because no theorem depends on it any more. -/
 
 end Mizu

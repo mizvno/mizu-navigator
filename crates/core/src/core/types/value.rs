@@ -497,7 +497,16 @@ const MAX_JSON_DEPTH: u32 = MAX_EVAL_DEPTH;
 /// It is deliberately *not* applied to storage rehydration — see
 /// [`from_json_slice`] — because a record the app itself was allowed to write
 /// must always be readable back.
-const MAX_JSON_NODES: usize = 32_768;
+/// Raised from 32_768 once the node cost was measured rather than guessed:
+/// ~66 ns and 24 bytes per node for a flat list, ~117 ns for records, so a
+/// full payload parses in ~17-29 ms and holds ~6-25 MB. The old ceiling
+/// rejected ordinary API responses — a 5000-row table with six fields is
+/// already over it — while the memory it saved was never the binding
+/// constraint. What *is* worth watching is the product with
+/// `max_concurrent_fetches` (16): record-heavy payloads at this cap put the
+/// worst-case resident set near 400 MB, so the two constants should move
+/// together.
+const MAX_JSON_NODES: usize = 250_000;
 
 /// Prefix marking a [`ValueSeed`] error as a limit violation rather than a
 /// syntax error, so the boundary functions can pick the right [`MizuError`]

@@ -108,7 +108,7 @@ impl Default for MizuConfig {
             storage_batch_max_keys: 64,
             max_redirects: 10,
             mizu_port: 7399,
-            max_instructions: 10_000,
+            max_instructions: 500_000,
             max_comp_bindings: 500,
             max_synthetic_layout_nodes: 50_000,
             input_max_bytes: 1024 * 1024,

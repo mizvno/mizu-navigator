@@ -15,36 +15,9 @@ number — see the convention note at the end of `Syntax.lean`):
   (`parser/logic/comp.rs::recompute_computed_bindings`)
   — error-skipping, cascade through `changed`.
 
-  **The model lags the implementation here, deliberately and temporarily.**
-  `recomputeStep` below still gives every comp a fresh budget `B`, which is
-  what the Rust did until the budget rework. The Rust now keeps *two* pools
-  for a whole cascade — one for tainted comps, one for untainted — so the
-  per-event bound is `2·B` rather than `#comps·B`, and the cost of a comp fed
-  by a network response can no longer starve an untainted one.
-
-  Two things have to change together to close this, and neither is hard so
-  much as fiddly:
-
-  1. `RecompRes` needs the spend split per taint class (a `workU` field beside
-     `work`), and `recomputeStep` needs to branch on
-     `(taintOf D).vars.contains c.name`, charging `B - acc.workU` or
-     `B - (acc.work - acc.workU)`. `Budget.lean`'s `recomputeStep_work`,
-     `_nf` and `_navFree` each gain the extra branch, `recompute_work`
-     becomes `≤ 2 * B`, and T1 becomes `3 * B + N`.
-  2. `NonInterference.lean`'s `recomputeStep_agree` needs `acc1.workU =
-     acc2.workU` as an extra conjunct, threaded through
-     `foldl_recompute_agree`. That conjunct is what makes an untainted comp's
-     budget identical in both runs, which is precisely why the two-pool split
-     preserves T2 where a single shared pool would not — a single pool makes
-     a tainted comp's cost observable through whether an untainted comp got
-     to run.
-
-  Until then the theorems below are proved about a model that grants more
-  budget than the implementation does. That direction is sound for T1 (the
-  proved bound is looser than reality) but it does **not** re-establish T2
-  for the shipped code: T2's proof relies on the per-comp reset this model
-  still has. Treat T2 as proved for the model, not for the current runtime,
-  until step 2 lands.
+  Tainted and untainted comps draw on separate instruction pools, so a whole
+  cascade costs at most `2 · B` and neither class can starve the other; see
+  `recomputeStep`.
 * `parser::logic_worker::LogicWorker::run_loop` / `execute_and_respond`
   (`logic_worker.rs::LogicWorker::run_loop`,
   `logic_worker.rs::LogicWorker::execute_and_respond`) — the reaction
@@ -707,28 +680,57 @@ def compDeps (D : Doc) (c : CompDef) : List Symbol :=
 structure RecompRes where
   σ       : Store
   effects : List Effect
+  /-- Total work performed by the cascade so far, both taint classes. -/
   work    : Nat
+  /-- The part of `work` spent by *untainted* comps.
+  Tainted spend is therefore `work - workU`, and the two are budgeted
+  separately; see `recomputeStep`. -/
+  workU   : Nat
   changed : List Symbol
   errs    : List Err
   deriving Repr
 
 /-- One binding of `recompute_computed_bindings`
-(`logic.rs::recompute_computed_bindings`): trigger if any static dep
-changed; fresh instruction budget per comp;
-on error the value write is skipped but queued effects survive (the Rust
-loop never truncates `accumulated_actions`). -/
+(`parser/logic/comp.rs::recompute_computed_bindings`): trigger if any static
+dep changed; on error the value write is skipped but queued effects survive
+(the Rust loop never truncates `accumulated_actions`).
+
+**Two pools, one per taint class.**  A binding spends from the pool of its
+own class — untainted comps from `B - acc.workU`, tainted ones from
+`B - (acc.work - acc.workU)` — so a whole cascade costs at most `2 · B`
+however many comps fire, and neither class can exhaust the other's
+allowance.
+
+Both halves of that matter, and for different theorems.  Sharing *one* pool
+across the cascade would still bound the work (T1), but it would let a
+tainted comp's cost decide whether an untainted comp gets evaluated at all —
+an untainted value would then depend on untrusted input, which is exactly
+what T2 denies.  Giving each comp its own fresh `B`, as this model did
+before, avoids that channel but makes the per-event bound `#comps · B`, a
+factor the document chooses.  Splitting by class is what buys both. -/
 def recomputeStep (B : Nat) (D : Doc) (acc : RecompRes) (c : CompDef) : RecompRes :=
   if (compDeps D c).any (fun d => acc.changed.contains d) then
-    match evalE B D acc.σ (B + 2) [] c.expr .init with
-    | (.ok v, s) =>
-      ⟨setVar acc.σ c.name v, acc.effects ++ s.effects, acc.work + s.work,
-       c.name :: acc.changed, acc.errs⟩
-    | (.error er, s) =>
-      ⟨acc.σ, acc.effects ++ s.effects, acc.work + s.work, acc.changed, acc.errs ++ [er]⟩
+    if c.tainted then
+      match evalE (B - (acc.work - acc.workU)) D acc.σ (B - (acc.work - acc.workU) + 2) []
+          c.expr .init with
+      | (.ok v, s) =>
+        ⟨setVar acc.σ c.name v, acc.effects ++ s.effects, acc.work + s.work, acc.workU,
+         c.name :: acc.changed, acc.errs⟩
+      | (.error er, s) =>
+        ⟨acc.σ, acc.effects ++ s.effects, acc.work + s.work, acc.workU, acc.changed,
+         acc.errs ++ [er]⟩
+    else
+      match evalE (B - acc.workU) D acc.σ (B - acc.workU + 2) [] c.expr .init with
+      | (.ok v, s) =>
+        ⟨setVar acc.σ c.name v, acc.effects ++ s.effects, acc.work + s.work,
+         acc.workU + s.work, c.name :: acc.changed, acc.errs⟩
+      | (.error er, s) =>
+        ⟨acc.σ, acc.effects ++ s.effects, acc.work + s.work, acc.workU + s.work,
+         acc.changed, acc.errs ++ [er]⟩
   else acc
 
 def recompute (B : Nat) (D : Doc) (σ : Store) (changed : List Symbol) : RecompRes :=
-  D.comps.foldl (recomputeStep B D) ⟨σ, [], 0, changed, []⟩
+  D.comps.foldl (recomputeStep B D) ⟨σ, [], 0, 0, changed, []⟩
 
 /-! ## Reactions -/
 
