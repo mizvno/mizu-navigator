@@ -18,6 +18,8 @@ pub mod chrome_vello;
 pub mod history_sidebar;
 /// Spatial hit-testing for input events.
 pub mod hit_test;
+/// Embedded IBM Plex font data (OTF, Regular+Bold only).
+pub mod embedded_fonts;
 /// Image and animation decoders.
 pub mod image_codec;
 /// In-window developer inspector panel (F12).

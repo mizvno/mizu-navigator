@@ -173,8 +173,10 @@ impl MizuWindowManager {
             crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx)?;
         }
 
-        let mut font_cx = parley::FontContext::new();
-        font_cx.collection.load_system_fonts();
+        let font_cx = parley::FontContext::new();
+        // System font fallback disabled: using embedded IBM Plex fonts only
+        // (eliminates 66 unsafe FFI calls in fontique backend).
+        // font_cx.collection.load_system_fonts();
 
         let default_chrome_url = "mizu://localhost/index.mizu";
         // Placeholder viewport: the real window doesn't exist yet at this
