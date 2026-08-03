@@ -1,111 +1,124 @@
-//! Embedded IBM Plex font data (OTF, Regular+Bold only).
+//! Embedded IBM Plex font data (OTF, Regular+Bold only, DEFLATE-compressed).
 //!
 //! Hardcoded font bytes eliminate the system font fallback mechanism
 //! (fontique FFI backend with 66 unsafe calls) in favor of skrifa/read-fonts
 //! (0 unsafe). Supports 11 scripts: Latin, Cyrillic, Greek, Arabic, Hebrew,
 //! Devanagari, Thai, Japanese, Simplified Chinese, Traditional Chinese, Korean.
+//!
+//! Bytes are stored DEFLATE-compressed (via `examples/compress_fonts.rs`,
+//! ~20% smaller — OTF/CFF outline data is already fairly dense, so this
+//! isn't the 40-60% a text-like asset would see) and inflated once at
+//! startup in [`new_font_context`]. `miniz_oxide` + its `adler2` dependency
+//! are both `#![forbid(unsafe_code)]` (verified: 0 unsafe blocks in either
+//! crate's source), so this adds zero unsafe surface to the font stack.
 
 #![forbid(unsafe_code)]
 
-/// Embedded OTF font bytes by family and weight.
-pub struct EmbeddedFonts;
+/// Embedded DEFLATE-compressed OTF font bytes by family and weight.
+struct EmbeddedFonts;
 
 impl EmbeddedFonts {
     /// IBM Plex Mono Regular (400)
-    pub const MONO_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-mono/fonts/complete/otf/IBMPlexMono-Regular.otf");
+    const MONO_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexMono-Regular.otf.deflate");
 
     /// IBM Plex Mono Bold (700)
-    pub const MONO_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-mono/fonts/complete/otf/IBMPlexMono-Bold.otf");
+    const MONO_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexMono-Bold.otf.deflate");
 
     /// IBM Plex Sans Regular (400)
-    pub const SANS_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans/fonts/complete/otf/IBMPlexSans-Regular.otf");
+    const SANS_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSans-Regular.otf.deflate");
 
     /// IBM Plex Sans Bold (700)
-    pub const SANS_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans/fonts/complete/otf/IBMPlexSans-Bold.otf");
+    const SANS_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSans-Bold.otf.deflate");
 
     /// IBM Plex Serif Regular (400)
-    pub const SERIF_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-serif/fonts/complete/otf/IBMPlexSerif-Regular.otf");
+    const SERIF_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSerif-Regular.otf.deflate");
 
     /// IBM Plex Serif Bold (700)
-    pub const SERIF_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-serif/fonts/complete/otf/IBMPlexSerif-Bold.otf");
+    const SERIF_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSerif-Bold.otf.deflate");
 
     /// IBM Plex Sans Arabic Regular (400)
-    pub const ARABIC_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-arabic/fonts/complete/otf/IBMPlexSansArabic-Regular.otf");
+    const ARABIC_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansArabic-Regular.otf.deflate");
 
     /// IBM Plex Sans Arabic Bold (700)
-    pub const ARABIC_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-arabic/fonts/complete/otf/IBMPlexSansArabic-Bold.otf");
+    const ARABIC_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansArabic-Bold.otf.deflate");
 
     /// IBM Plex Sans Hebrew Regular (400)
-    pub const HEBREW_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-hebrew/fonts/complete/otf/IBMPlexSansHebrew-Regular.otf");
+    const HEBREW_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansHebrew-Regular.otf.deflate");
 
     /// IBM Plex Sans Hebrew Bold (700)
-    pub const HEBREW_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-hebrew/fonts/complete/otf/IBMPlexSansHebrew-Bold.otf");
+    const HEBREW_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansHebrew-Bold.otf.deflate");
 
     /// IBM Plex Sans Devanagari Regular (400)
-    pub const DEVANAGARI_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-devanagari/fonts/complete/otf/IBMPlexSansDevanagari-Regular.otf");
+    const DEVANAGARI_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansDevanagari-Regular.otf.deflate");
 
     /// IBM Plex Sans Devanagari Bold (700)
-    pub const DEVANAGARI_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-devanagari/fonts/complete/otf/IBMPlexSansDevanagari-Bold.otf");
+    const DEVANAGARI_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansDevanagari-Bold.otf.deflate");
 
     /// IBM Plex Sans Thai Regular (400)
-    pub const THAI_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-thai/fonts/complete/otf/IBMPlexSansThai-Regular.otf");
+    const THAI_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansThai-Regular.otf.deflate");
 
     /// IBM Plex Sans Thai Bold (700)
-    pub const THAI_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-thai/fonts/complete/otf/IBMPlexSansThai-Bold.otf");
+    const THAI_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansThai-Bold.otf.deflate");
 
     /// IBM Plex Sans JP Regular (400)
-    pub const JP_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-jp/fonts/complete/otf/unhinted/IBMPlexSansJP-Regular.otf");
+    const JP_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansJP-Regular.otf.deflate");
 
     /// IBM Plex Sans JP Bold (700)
-    pub const JP_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-jp/fonts/complete/otf/unhinted/IBMPlexSansJP-Bold.otf");
+    const JP_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansJP-Bold.otf.deflate");
 
     /// IBM Plex Sans SC (Simplified Chinese) Regular (400)
-    pub const SC_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-sc/fonts/complete/otf/unhinted/IBMPlexSansSC-Regular.otf");
+    const SC_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansSC-Regular.otf.deflate");
 
     /// IBM Plex Sans SC (Simplified Chinese) Bold (700)
-    pub const SC_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-sc/fonts/complete/otf/unhinted/IBMPlexSansSC-Bold.otf");
+    const SC_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansSC-Bold.otf.deflate");
 
     /// IBM Plex Sans TC (Traditional Chinese) Regular (400)
-    pub const TC_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-tc/fonts/complete/otf/unhinted/IBMPlexSansTC-Regular.otf");
+    const TC_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansTC-Regular.otf.deflate");
 
     /// IBM Plex Sans TC (Traditional Chinese) Bold (700)
-    pub const TC_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-tc/fonts/complete/otf/unhinted/IBMPlexSansTC-Bold.otf");
+    const TC_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansTC-Bold.otf.deflate");
 
     /// IBM Plex Sans KR (Korean) Regular (400)
-    pub const KR_REGULAR: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-kr/fonts/complete/otf/IBMPlexSansKR-Regular.otf");
+    const KR_REGULAR: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansKR-Regular.otf.deflate");
 
     /// IBM Plex Sans KR (Korean) Bold (700)
-    pub const KR_BOLD: &'static [u8] =
-        include_bytes!("../../assets/fonts/ibm-plex-sans-kr/fonts/complete/otf/IBMPlexSansKR-Bold.otf");
-
+    const KR_BOLD: &'static [u8] =
+        include_bytes!("../../assets/fonts_compressed/IBMPlexSansKR-Bold.otf.deflate");
 }
 
-/// Registers a font blob and returns the [`FamilyId`] fontique assigned it
-/// (derived from the font's own `name` table, so Regular+Bold of the same
-/// family collapse into one `FamilyId` across two calls).
-fn register(collection: &mut parley::fontique::Collection, bytes: &'static [u8]) -> parley::fontique::FamilyId {
-    let blob = parley::fontique::Blob::new(std::sync::Arc::new(bytes));
+/// Inflates a compressed font blob and registers it, returning the
+/// [`FamilyId`] fontique assigned it (derived from the font's own `name`
+/// table, so Regular+Bold of the same family collapse into one `FamilyId`
+/// across two calls).
+fn register(
+    collection: &mut parley::fontique::Collection,
+    compressed: &'static [u8],
+) -> parley::fontique::FamilyId {
+    let data = miniz_oxide::inflate::decompress_to_vec(compressed)
+        .expect("embedded font data is compressed at build time by compress_fonts and verified \
+                 to round-trip there; corruption here means the checked-in .deflate is stale/bad");
+    let blob = parley::fontique::Blob::new(std::sync::Arc::new(data));
     let registered = collection.register_fonts(blob, None);
     registered
         .first()
@@ -133,8 +146,7 @@ fn register(collection: &mut parley::fontique::Collection, bytes: &'static [u8])
 /// confirm Cyrillic + monotonic Greek coverage in Sans/Serif/Mono, so no
 /// separate script fallback is needed for those three scripts). Script
 /// fallback is registered explicitly for the other 8 documented scripts —
-/// see `docs/design/text_engine.md` determinism note and
-/// `text_engine::tests::script_coverage_bar_renders_without_tofu`.
+/// see `text_engine::tests::script_coverage_bar_renders_without_tofu`.
 pub fn new_font_context() -> parley::FontContext {
     let mut collection = parley::fontique::Collection::new(parley::fontique::CollectionOptions {
         shared: false,
@@ -143,15 +155,24 @@ pub fn new_font_context() -> parley::FontContext {
 
     let mono_regular = register(&mut collection, EmbeddedFonts::MONO_REGULAR);
     register(&mut collection, EmbeddedFonts::MONO_BOLD);
-    collection.set_generic_families(parley::fontique::GenericFamily::Monospace, [mono_regular].into_iter());
+    collection.set_generic_families(
+        parley::fontique::GenericFamily::Monospace,
+        [mono_regular].into_iter(),
+    );
 
     let sans_regular = register(&mut collection, EmbeddedFonts::SANS_REGULAR);
     register(&mut collection, EmbeddedFonts::SANS_BOLD);
-    collection.set_generic_families(parley::fontique::GenericFamily::SansSerif, [sans_regular].into_iter());
+    collection.set_generic_families(
+        parley::fontique::GenericFamily::SansSerif,
+        [sans_regular].into_iter(),
+    );
 
     let serif_regular = register(&mut collection, EmbeddedFonts::SERIF_REGULAR);
     register(&mut collection, EmbeddedFonts::SERIF_BOLD);
-    collection.set_generic_families(parley::fontique::GenericFamily::Serif, [serif_regular].into_iter());
+    collection.set_generic_families(
+        parley::fontique::GenericFamily::Serif,
+        [serif_regular].into_iter(),
+    );
 
     // Script-based fallback (used by parley's per-run shaping regardless of
     // the requested generic family — see text_engine::mod's determinism

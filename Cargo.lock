@@ -2619,6 +2619,7 @@ dependencies = [
  "image",
  "keyring",
  "lru",
+ "miniz_oxide",
  "mizu-core",
  "multer",
  "nom",
