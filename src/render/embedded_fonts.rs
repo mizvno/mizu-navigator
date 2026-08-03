@@ -99,32 +99,134 @@ impl EmbeddedFonts {
     pub const KR_BOLD: &'static [u8] =
         include_bytes!("../../assets/fonts/ibm-plex-sans-kr/fonts/complete/otf/IBMPlexSansKR-Bold.otf");
 
-    /// Return all embedded fonts as byte slices.
-    /// Order: Mono, Sans, Serif, Arabic, Hebrew, Devanagari, Thai, JP, SC, TC, KR.
-    pub fn all() -> &'static [&'static [u8]] {
-        &[
-            Self::MONO_REGULAR,
-            Self::MONO_BOLD,
-            Self::SANS_REGULAR,
-            Self::SANS_BOLD,
-            Self::SERIF_REGULAR,
-            Self::SERIF_BOLD,
-            Self::ARABIC_REGULAR,
-            Self::ARABIC_BOLD,
-            Self::HEBREW_REGULAR,
-            Self::HEBREW_BOLD,
-            Self::DEVANAGARI_REGULAR,
-            Self::DEVANAGARI_BOLD,
-            Self::THAI_REGULAR,
-            Self::THAI_BOLD,
-            Self::JP_REGULAR,
-            Self::JP_BOLD,
-            Self::SC_REGULAR,
-            Self::SC_BOLD,
-            Self::TC_REGULAR,
-            Self::TC_BOLD,
-            Self::KR_REGULAR,
-            Self::KR_BOLD,
-        ]
+}
+
+/// Registers a font blob and returns the [`FamilyId`] fontique assigned it
+/// (derived from the font's own `name` table, so Regular+Bold of the same
+/// family collapse into one `FamilyId` across two calls).
+fn register(collection: &mut parley::fontique::Collection, bytes: &'static [u8]) -> parley::fontique::FamilyId {
+    let blob = parley::fontique::Blob::new(std::sync::Arc::new(bytes));
+    let registered = collection.register_fonts(blob, None);
+    registered
+        .first()
+        .map(|(family_id, _)| *family_id)
+        .expect("embedded font bytes must contain at least one valid font")
+}
+
+/// Builds a [`parley::FontContext`] backed *only* by the embedded IBM Plex
+/// fonts — no OS font-directory access.
+///
+/// This matters beyond disk footprint: `parley::fontique::Collection::default()`
+/// (what `parley::FontContext::new()` calls) eagerly runs
+/// `CollectionOptions::default().system_fonts = true`, which constructs a
+/// platform `SystemFonts` backend (DirectWrite on Windows, CoreText on
+/// macOS, fontconfig on Linux) — the *only* place unsafe code exists in the
+/// parley/fontique/skrifa stack (66 unsafe blocks, all FFI). Merely omitting
+/// a later `load_system_fonts()` call does not avoid this: that method is a
+/// no-op once `Collection::new` has already installed a `System`. The only
+/// way to skip the FFI backend entirely is to construct the `Collection`
+/// with `system_fonts: false` from the start, which is what this function
+/// does.
+///
+/// Generic families (`sans-serif`/`serif`/`monospace`) resolve to the
+/// bundled Latin/Cyrillic/Greek-covering IBM Plex faces (release notes
+/// confirm Cyrillic + monotonic Greek coverage in Sans/Serif/Mono, so no
+/// separate script fallback is needed for those three scripts). Script
+/// fallback is registered explicitly for the other 8 documented scripts —
+/// see `docs/design/text_engine.md` determinism note and
+/// `text_engine::tests::script_coverage_bar_renders_without_tofu`.
+pub fn new_font_context() -> parley::FontContext {
+    let mut collection = parley::fontique::Collection::new(parley::fontique::CollectionOptions {
+        shared: false,
+        system_fonts: false,
+    });
+
+    let mono_regular = register(&mut collection, EmbeddedFonts::MONO_REGULAR);
+    register(&mut collection, EmbeddedFonts::MONO_BOLD);
+    collection.set_generic_families(parley::fontique::GenericFamily::Monospace, [mono_regular].into_iter());
+
+    let sans_regular = register(&mut collection, EmbeddedFonts::SANS_REGULAR);
+    register(&mut collection, EmbeddedFonts::SANS_BOLD);
+    collection.set_generic_families(parley::fontique::GenericFamily::SansSerif, [sans_regular].into_iter());
+
+    let serif_regular = register(&mut collection, EmbeddedFonts::SERIF_REGULAR);
+    register(&mut collection, EmbeddedFonts::SERIF_BOLD);
+    collection.set_generic_families(parley::fontique::GenericFamily::Serif, [serif_regular].into_iter());
+
+    // Script-based fallback (used by parley's per-run shaping regardless of
+    // the requested generic family — see text_engine::mod's determinism
+    // note). `FallbackKey::from(Script)` with no locale hits fontique's
+    // "default" bucket for that script, which is what a run gets when the
+    // ancestor `lang` attribute is absent *or* set to that script's primary
+    // language (fontique's own canonical-locale table maps e.g. lang="ar"
+    // to the same default bucket as no lang at all).
+    let arabic_regular = register(&mut collection, EmbeddedFonts::ARABIC_REGULAR);
+    register(&mut collection, EmbeddedFonts::ARABIC_BOLD);
+    collection.set_fallbacks(
+        parley::fontique::Script::from_bytes(*b"Arab"),
+        [arabic_regular].into_iter(),
+    );
+
+    let hebrew_regular = register(&mut collection, EmbeddedFonts::HEBREW_REGULAR);
+    register(&mut collection, EmbeddedFonts::HEBREW_BOLD);
+    collection.set_fallbacks(
+        parley::fontique::Script::from_bytes(*b"Hebr"),
+        [hebrew_regular].into_iter(),
+    );
+
+    let devanagari_regular = register(&mut collection, EmbeddedFonts::DEVANAGARI_REGULAR);
+    register(&mut collection, EmbeddedFonts::DEVANAGARI_BOLD);
+    collection.set_fallbacks(
+        parley::fontique::Script::from_bytes(*b"Deva"),
+        [devanagari_regular].into_iter(),
+    );
+
+    let thai_regular = register(&mut collection, EmbeddedFonts::THAI_REGULAR);
+    register(&mut collection, EmbeddedFonts::THAI_BOLD);
+    collection.set_fallbacks(
+        parley::fontique::Script::from_bytes(*b"Thai"),
+        [thai_regular].into_iter(),
+    );
+
+    // Han unification: one script, four disjoint glyph sets. fontique's own
+    // canonical-locale table (fallback.rs) routes lang="zh" (no region) to
+    // the "default" bucket, lang="ja"/"ko" and lang="zh" with a TW/HK/MO
+    // region to separate locale-keyed buckets — so each must be registered
+    // against the exact `(Script, &str)` pair fontique canonicalizes to.
+    let jp_regular = register(&mut collection, EmbeddedFonts::JP_REGULAR);
+    register(&mut collection, EmbeddedFonts::JP_BOLD);
+    let sc_regular = register(&mut collection, EmbeddedFonts::SC_REGULAR);
+    register(&mut collection, EmbeddedFonts::SC_BOLD);
+    let tc_regular = register(&mut collection, EmbeddedFonts::TC_REGULAR);
+    register(&mut collection, EmbeddedFonts::TC_BOLD);
+    let kr_regular = register(&mut collection, EmbeddedFonts::KR_REGULAR);
+    register(&mut collection, EmbeddedFonts::KR_BOLD);
+
+    let han = parley::fontique::Script::from_bytes(*b"Hani");
+    // No lang, or lang="zh" with no region: IBM's own fallback table already
+    // documents "default to simplified Chinese" for this bucket.
+    collection.set_fallbacks(han, [sc_regular].into_iter());
+    collection.set_fallbacks((han, "ja"), [jp_regular].into_iter());
+    collection.set_fallbacks((han, "ko"), [kr_regular].into_iter());
+    collection.set_fallbacks((han, "zh-TW"), [tc_regular].into_iter());
+    collection.set_fallbacks((han, "zh-HK"), [tc_regular].into_iter());
+    collection.set_fallbacks((han, "zh-MO"), [tc_regular].into_iter());
+
+    // Korean text is written in Hangul syllables — script "Hang", a
+    // *different* ISO 15924 code from "Hani" (Han/CJK ideographs). Han
+    // unification (the fallback map above) only covers Korean text that
+    // uses Chinese-derived Hanja; plain Hangul needs its own script
+    // fallback entry, or every Korean run shapes to tofu regardless of the
+    // `lang="ko"` Hani bucket above (caught by manually running the app —
+    // see script_coverage_bar_renders_without_tofu, which exercises real
+    // Hangul text and would have failed silently otherwise).
+    collection.set_fallbacks(
+        parley::fontique::Script::from_bytes(*b"Hang"),
+        [kr_regular].into_iter(),
+    );
+
+    parley::FontContext {
+        collection,
+        source_cache: parley::fontique::SourceCache::default(),
     }
 }
