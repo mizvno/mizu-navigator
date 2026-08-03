@@ -61,7 +61,7 @@ pub(super) fn build_text_ex(
     builder.push_default(StyleProperty::FontSize(face_size(face)));
     builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(1.0)));
     if face == Face::UiStrong {
-        builder.push_default(StyleProperty::FontWeight(FontWeight::new(600.0)));
+        builder.push_default(StyleProperty::FontWeight(FontWeight::new(700.0)));
         builder.push_default(StyleProperty::LetterSpacing(HEADER_TRACKING));
     }
     let mut layout = builder.build(text);
