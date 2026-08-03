@@ -69,7 +69,7 @@ fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), mizu::core::errors
     let mut interner = StringInterner::new();
     let urls = parse_urls(&blocks.urls_block, &mut interner).unwrap_or_default();
     let functions = parse_logic(&blocks.logic_block, &mut interner).unwrap_or_default();
-    let comps = parse_computed_with_functions(
+    let mut comps = parse_computed_with_functions(
         &blocks.logic_block,
         &mut interner,
         &functions,
@@ -86,7 +86,7 @@ fn check_flow_doc(src: &str) -> Result<(usize, usize, usize), mizu::core::errors
     )
     .expect("parse_layout_with_urls");
 
-    check_information_flow(&dom, &timers, &functions, &comps, &urls, &interner)
+    check_information_flow(&dom, &timers, &functions, &mut comps, &urls, &interner)
 }
 
 #[test]

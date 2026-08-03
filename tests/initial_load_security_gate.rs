@@ -48,7 +48,7 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
     };
 
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
-    let computed_bindings = parse_computed_with_functions(
+    let mut computed_bindings = parse_computed_with_functions(
         &parsed.logic_block,
         &mut interner,
         &logic_fns,
@@ -77,7 +77,7 @@ fn load_document_like_main(source: &str) -> Result<(), MizuError> {
         &dom_tree,
         &root_timers,
         &logic_fns,
-        &computed_bindings,
+        &mut computed_bindings,
         &url_registry,
         &interner,
     )?;

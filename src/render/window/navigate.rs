@@ -178,7 +178,7 @@ pub(super) fn handle_navigate_success(
             } else {
                 FxHashMap::default()
             };
-            let new_computed = if !blocks.logic_block.trim().is_empty() {
+            let mut new_computed = if !blocks.logic_block.trim().is_empty() {
                 match crate::parser::logic::parse_computed_with_functions(
                     &blocks.logic_block,
                     &mut new_interner,
@@ -255,7 +255,7 @@ pub(super) fn handle_navigate_success(
                         &dom,
                         &new_root_timers,
                         &logic_fns,
-                        &new_computed,
+                        &mut new_computed,
                         &new_url_registry,
                         &new_interner,
                     ) {

@@ -23,7 +23,7 @@ pub fn check_information_flow(
     dom: &ego_tree::Tree<MizuNode>,
     timers: &[crate::parser::logic::RootTimer],
     functions: &FxHashMap<Symbol, MizuFunction>,
-    comps: &[ComputedBinding],
+    comps: &mut [ComputedBinding],
     _urls: &UrlRegistry,
     interner: &crate::core::types::StringInterner,
 ) -> Result<(usize, usize, usize), MizuError> {
@@ -167,7 +167,7 @@ pub fn check_information_flow(
         }
     }
 
-    for comp in comps {
+    for comp in comps.iter() {
         let mut deps = FxHashSet::default();
         extract_deps(comp.expr.root(), &comp.expr.arena, gst_sym, &mut deps);
         for dep in deps {
@@ -261,7 +261,7 @@ pub fn check_information_flow(
                 &mut gst_targets,
             );
         }
-        for comp in comps {
+        for comp in comps.iter() {
             collect_get_system_time_targets(
                 comp.expr.root(),
                 &comp.expr.arena,
@@ -291,6 +291,17 @@ pub fn check_information_flow(
     }
 
     // ── Check sinks ─────────────────────────────────────────────────────────
+
+    // Record, on each binding, whether the fixpoint classified it as tainted.
+    // `recompute_computed_bindings` spends tainted and untainted comps from
+    // separate instruction pools, so that computation driven by a network
+    // response cannot exhaust the budget an untainted binding needs. Without
+    // the split, a hostile server could change an untainted value simply by
+    // making its own response expensive — a starvation channel around the very
+    // non-interference guarantee this checker establishes.
+    for cb in comps.iter_mut() {
+        cb.tainted = tainted_vars.contains(&cb.name);
+    }
 
     let mut num_sinks = 0;
     for (ctx, action) in &actions {

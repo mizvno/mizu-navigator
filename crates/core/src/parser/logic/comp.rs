@@ -117,6 +117,8 @@ pub fn parse_computed_with_functions(
             name: name_sym,
             expr,
             depends_on: dep_set.into_iter().collect(),
+            // Set by `check_information_flow` once the taint fixpoint is known.
+            tainted: false,
         });
     }
 
@@ -126,7 +128,8 @@ pub fn parse_computed_with_functions(
     // This limit used to be load-bearing against CPU exhaustion, because
     // `recompute_computed_bindings` granted each firing comp its own fresh
     // MAX_INSTRUCTIONS budget: the comp count multiplied the per-event work.
-    // It no longer does — the cascade shares one budget — so the cap is now
+    // It no longer does — the cascade shares two budgets, one per taint class,
+    // neither scaled by the comp count — so the cap is now
     // about *memory and clarity* rather than time: each binding holds a
     // parsed `ExprTree` and an entry in the reverse index, and a document
     // needing hundreds of derived variables is far more likely to be
@@ -143,6 +146,21 @@ pub fn parse_computed_with_functions(
     }
 
     topo_sort_computed(bindings)
+}
+
+/// Whether the instruction pool a binding of this taint class draws on is
+/// already spent.
+///
+/// Tainted and untainted comps have separate pools so that computation driven
+/// by untrusted input cannot exhaust the allowance an untainted binding needs
+/// — see `ComputedBinding::tainted`.
+fn pool_exhausted(tainted: bool, spent_tainted: u64, spent_untainted: u64, budget: u64) -> bool {
+    let spent = if tainted {
+        spent_tainted
+    } else {
+        spent_untainted
+    };
+    spent > budget
 }
 
 /// Applies Kahn's algorithm to sort `bindings` topologically and detect cycles.
@@ -285,7 +303,7 @@ pub fn recompute_computed_bindings(
         }
     }
 
-    // One budget for the whole cascade, not one per comp.
+    // Two budgets for the cascade: one for tainted comps, one for untainted.
     //
     // Resetting per comp made the worst case a *product*: MAX_COMP_BINDINGS
     // (500) fully-spent budgets per event, since every firing comp got a fresh
@@ -300,12 +318,24 @@ pub fn recompute_computed_bindings(
     // `work <= (1 + #comps) * B + N`. That still holds — it is now merely
     // conservative rather than tight, which is the safe direction for a
     // bound to move.
-    store.evaluator.instruction_count = 0;
+    let budget = store.evaluator.max_instructions;
+    let (mut spent_tainted, mut spent_untainted) = (0u64, 0u64);
     while let Some(i) = candidates.pop_first() {
         let cb = &bindings[i];
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
+        // Spend from this binding's own pool, then bank what it used. The
+        // evaluator carries a single counter, so the pools are swapped in and
+        // out around each evaluation.
+        if pool_exhausted(cb.tainted, spent_tainted, spent_untainted, budget) {
+            continue;
+        }
+        store.evaluator.instruction_count = if cb.tainted {
+            spent_tainted
+        } else {
+            spent_untainted
+        };
         let evaluated = store.evaluator.evaluate(
             cb.expr.root(),
             0,
@@ -313,15 +343,21 @@ pub fn recompute_computed_bindings(
             &store.interner,
             &cb.expr.arena,
         );
+        if cb.tainted {
+            spent_tainted = store.evaluator.instruction_count;
+        } else {
+            spent_untainted = store.evaluator.instruction_count;
+        }
         if matches!(evaluated, Err(MizuError::Timeout)) {
-            // Budget gone: every remaining comp would fail the same way, so
-            // stop rather than spin. Warned because a starved cascade leaves
-            // derived state stale, which is otherwise silent.
+            // This pool is spent. Keep going: the *other* pool may still have
+            // room, and skipping its bindings because of this one is exactly
+            // the starvation the split exists to prevent.
             tracing::warn!(
-                budget = store.evaluator.max_instructions,
-                "comp recomputation exhausted its instruction budget;                  remaining computed bindings were not updated"
+                tainted = cb.tainted,
+                budget,
+                "comp recomputation exhausted an instruction pool; remaining                  bindings of that taint class were not updated"
             );
-            break;
+            continue;
         }
         if let Ok(val) = evaluated {
             store.set_symbol(cb.name, val);
@@ -353,11 +389,23 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
     // Shares one budget across the cascade, matching `recompute_computed_bindings`
     // — the equivalence this reference implementation exists to check covers
     // budget behaviour too, not just which bindings get visited.
-    store.evaluator.instruction_count = 0;
+    let budget = store.evaluator.max_instructions;
+    let (mut spent_tainted, mut spent_untainted) = (0u64, 0u64);
     for cb in bindings {
         if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
+        // Spend from this binding's own pool, then bank what it used. The
+        // evaluator carries a single counter, so the pools are swapped in and
+        // out around each evaluation.
+        if pool_exhausted(cb.tainted, spent_tainted, spent_untainted, budget) {
+            continue;
+        }
+        store.evaluator.instruction_count = if cb.tainted {
+            spent_tainted
+        } else {
+            spent_untainted
+        };
         let evaluated = store.evaluator.evaluate(
             cb.expr.root(),
             0,
@@ -365,8 +413,13 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
             &store.interner,
             &cb.expr.arena,
         );
+        if cb.tainted {
+            spent_tainted = store.evaluator.instruction_count;
+        } else {
+            spent_untainted = store.evaluator.instruction_count;
+        }
         if matches!(evaluated, Err(MizuError::Timeout)) {
-            break;
+            continue;
         }
         if let Ok(val) = evaluated {
             store.set_symbol(cb.name, val);

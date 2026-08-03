@@ -121,7 +121,7 @@ fn run() -> Result<(), MizuError> {
 
     // Phase 4: Compile logic
     let logic_fns = parse_logic(&parsed.logic_block, &mut interner)?;
-    let computed_bindings = parse_computed_with_functions(
+    let mut computed_bindings = parse_computed_with_functions(
         &parsed.logic_block,
         &mut interner,
         &logic_fns,
@@ -161,7 +161,7 @@ fn run() -> Result<(), MizuError> {
         &dom_tree,
         &root_timers,
         &logic_fns,
-        &computed_bindings,
+        &mut computed_bindings,
         &url_registry,
         &interner,
     )?;

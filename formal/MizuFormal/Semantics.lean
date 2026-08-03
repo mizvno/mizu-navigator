@@ -11,8 +11,40 @@ number — see the convention note at the end of `Syntax.lean`):
 * `parser::logic::execute_action` (`logic.rs::execute_action`)
   — per-action budget reset, the `path_param` A1+A2 gate (G2) via
   `parser::logic::path_param_ok` (`logic.rs::path_param_ok`);
-* `parser::logic::recompute_computed_bindings` (`logic.rs::recompute_computed_bindings`)
-  — per-comp budget reset, error-skipping, cascade through `changed`;
+* `parser::logic::recompute_computed_bindings`
+  (`parser/logic/comp.rs::recompute_computed_bindings`)
+  — error-skipping, cascade through `changed`.
+
+  **The model lags the implementation here, deliberately and temporarily.**
+  `recomputeStep` below still gives every comp a fresh budget `B`, which is
+  what the Rust did until the budget rework. The Rust now keeps *two* pools
+  for a whole cascade — one for tainted comps, one for untainted — so the
+  per-event bound is `2·B` rather than `#comps·B`, and the cost of a comp fed
+  by a network response can no longer starve an untainted one.
+
+  Two things have to change together to close this, and neither is hard so
+  much as fiddly:
+
+  1. `RecompRes` needs the spend split per taint class (a `workU` field beside
+     `work`), and `recomputeStep` needs to branch on
+     `(taintOf D).vars.contains c.name`, charging `B - acc.workU` or
+     `B - (acc.work - acc.workU)`. `Budget.lean`'s `recomputeStep_work`,
+     `_nf` and `_navFree` each gain the extra branch, `recompute_work`
+     becomes `≤ 2 * B`, and T1 becomes `3 * B + N`.
+  2. `NonInterference.lean`'s `recomputeStep_agree` needs `acc1.workU =
+     acc2.workU` as an extra conjunct, threaded through
+     `foldl_recompute_agree`. That conjunct is what makes an untainted comp's
+     budget identical in both runs, which is precisely why the two-pool split
+     preserves T2 where a single shared pool would not — a single pool makes
+     a tainted comp's cost observable through whether an untainted comp got
+     to run.
+
+  Until then the theorems below are proved about a model that grants more
+  budget than the implementation does. That direction is sound for T1 (the
+  proved bound is looser than reality) but it does **not** re-establish T2
+  for the shipped code: T2's proof relies on the per-comp reset this model
+  still has. Treat T2 as proved for the model, not for the current runtime,
+  until step 2 lands.
 * `parser::logic_worker::LogicWorker::run_loop` / `execute_and_respond`
   (`logic_worker.rs::LogicWorker::run_loop`,
   `logic_worker.rs::LogicWorker::execute_and_respond`) — the reaction

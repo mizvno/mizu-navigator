@@ -497,6 +497,22 @@ pub struct ComputedBinding {
     /// [`parse_computed_with_functions`] — the globals read transitively inside
     /// any called logic function.  May include other comp vars.
     pub depends_on: Vec<Symbol>,
+    /// Whether this binding's value may derive from an untrusted source
+    /// (a network response or a submitted form field).
+    ///
+    /// Filled in by `parser::flow::check_information_flow` at load time, and
+    /// read by `recompute_computed_bindings` to decide which instruction pool
+    /// the binding spends from. Tainted and untainted comps draw on separate
+    /// budgets so the cost of computation driven by attacker-supplied data can
+    /// never starve a binding the flow checker certified as untainted —
+    /// starving one would let a hostile server change an untainted value by
+    /// making its own response expensive, which is precisely the
+    /// non-interference property (T2) the flow checker exists to provide.
+    ///
+    /// Defaults to `false`; a document that never ran the flow checker
+    /// therefore spends everything from the untainted pool, which is the
+    /// conservative direction (one shared budget, no starvation channel).
+    pub tainted: bool,
 }
 
 #[cfg(test)]

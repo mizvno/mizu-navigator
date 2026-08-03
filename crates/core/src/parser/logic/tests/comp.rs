@@ -352,6 +352,7 @@ fn random_comp_dag(
             name,
             expr: crate::parser::logic::ExprTree { arena, root },
             depends_on: deps,
+            tainted: false,
         });
     }
     (base_syms, bindings)
@@ -491,6 +492,7 @@ fn bench_recompute_large_document_small_blast_radius() {
                 name,
                 expr: crate::parser::logic::ExprTree { arena, root },
                 depends_on: vec![base_syms[i]],
+                tainted: false,
             }
         })
         .collect();
@@ -629,5 +631,55 @@ fn comp_cascade_shares_one_instruction_budget() {
         store.evaluator.instruction_count <= budget + 1,
         "spent {} instructions against a budget of {budget}",
         store.evaluator.instruction_count
+    );
+}
+
+#[test]
+fn tainted_comps_cannot_starve_untainted_ones() {
+    // The property the flow checker exists to provide (T2): what an untainted
+    // binding computes must not depend on untrusted input. A single shared
+    // instruction budget quietly broke that — a comp fed by a network response
+    // could burn the whole allowance and leave an untainted comp unevaluated,
+    // so a hostile server could change an untainted value just by making its
+    // response expensive. Separate pools remove the channel.
+    let n_tainted = 30;
+    let mut src = String::new();
+    for i in 0..n_tainted {
+        src.push_str(&format!("    comp t{i} = base + {i}\n"));
+    }
+    src.push_str("    comp safe = base + 1\n");
+
+    let mut interner = StringInterner::new();
+    let base = interner.get_or_intern("base");
+    let safe = interner.get_or_intern("safe");
+    let mut bindings = super::super::parse_computed(&src, &mut interner).expect("comps parse");
+    // Mark everything but `safe` as tainted, the way `check_information_flow`
+    // would for comps reachable from a network response.
+    for cb in bindings.iter_mut() {
+        cb.tainted = cb.name != safe;
+    }
+    let reverse_index = super::super::build_comp_reverse_index(&bindings);
+
+    let interner = interner.freeze();
+    let mut store = VariableStore::with_interner(interner);
+    store.evaluator.set_global(base, Value::Decimal(0));
+    // Small enough that the tainted class exhausts its pool well before the
+    // cascade reaches `safe`.
+    store.evaluator.max_instructions = 20;
+
+    let mutated: FxHashSet<Symbol> = std::iter::once(base).collect();
+    let fns = FxHashMap::default();
+    let changed = super::super::recompute_computed_bindings(
+        &mut store,
+        &bindings,
+        &fns,
+        &mutated,
+        &reverse_index,
+    );
+
+    assert!(
+        changed.contains(&safe),
+        "the untainted binding was starved by {n_tainted} tainted ones, so tainted \
+         computation is still spending the untainted budget"
     );
 }
