@@ -107,10 +107,19 @@ pub fn parse_computed_with_functions(
             &function_names,
             &mut dep_set,
         );
-        // Function names are code references, not data dependencies.
-        for fname in &function_names {
-            dep_set.remove(fname);
-        }
+        // `collect_vars`/`collect_reachable_function_reads` only ever insert
+        // symbols that are read as *values* (call arguments, operands,
+        // `Let`/param-free references) — neither one ever inserts a callee's
+        // own name, since both skip the `name` field of `Expr::FunctionCall`.
+        // There is therefore nothing here to filter as "a function name, not
+        // a data dependency": a blanket `dep_set.remove` over every known
+        // function name used to sit here, but a bare `name = expr` top-level
+        // declaration is itself parsed as a zero-parameter function (see
+        // `parse_logic`), so *every* plain global doubles as a "function
+        // name" — the blanket removal therefore stripped the dependency on
+        // any global passed as a call argument (`comp y = f(counter)` lost
+        // `counter` whenever nothing else referenced it), which is the
+        // common case for a `comp` calling a helper function.
         dep_set.remove(&name_sym);
 
         bindings.push(ComputedBinding {
@@ -472,6 +481,65 @@ fn collect_vars(expr: &Expr, arena: &ExprArena, out: &mut FxHashSet<Symbol>) {
     }
 }
 
+/// Like [`collect_vars`], but only collects *free* variable references —
+/// skips any [`Expr::Variable`] whose symbol is in `bound` (a function's own
+/// parameters, seeded by the caller, plus any name locally bound by an
+/// enclosing [`Expr::Let`] walked so far).
+///
+/// Used by [`collect_reachable_function_reads`] to find the globals a called
+/// function's body actually reads. Without this, walking `double(x: num) :
+/// x * 2`'s body with plain `collect_vars` would report `x` — the
+/// function's own parameter, not a global — as a data dependency of every
+/// `comp` that calls `double`.
+fn collect_free_vars(
+    expr: &Expr,
+    arena: &ExprArena,
+    bound: &mut FxHashSet<Symbol>,
+    out: &mut FxHashSet<Symbol>,
+) {
+    match expr {
+        Expr::Variable(sym) => {
+            if !bound.contains(sym) {
+                out.insert(*sym);
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_free_vars(&arena[*left], arena, bound, out);
+            collect_free_vars(&arena[*right], arena, bound, out);
+        }
+        Expr::FunctionCall {
+            args_start,
+            args_len,
+            ..
+        } => {
+            for &arg in arena.args(*args_start, *args_len) {
+                collect_free_vars(&arena[arg], arena, bound, out);
+            }
+        }
+        Expr::Let { name, value, body } => {
+            // `name` is not in scope while evaluating its own initializer.
+            collect_free_vars(&arena[*value], arena, bound, out);
+            let newly_bound = bound.insert(*name);
+            collect_free_vars(&arena[*body], arena, bound, out);
+            if newly_bound {
+                bound.remove(name);
+            }
+        }
+        Expr::Not(inner) => collect_free_vars(&arena[*inner], arena, bound, out),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_free_vars(&arena[*condition], arena, bound, out);
+            collect_free_vars(&arena[*then_expr], arena, bound, out);
+            collect_free_vars(&arena[*else_expr], arena, bound, out);
+        }
+        Expr::FieldAccess { base, .. } => collect_free_vars(&arena[*base], arena, bound, out),
+    }
+}
+
 /// Collects all `FunctionCall` and variable reference symbols that match defined functions.
 pub(super) fn collect_calls(
     expr: &Expr,
@@ -545,7 +613,15 @@ fn collect_reachable_function_reads(
         let Some(func) = functions.get(&sym) else {
             continue;
         };
-        collect_vars(func.body.root(), &func.body.arena, out);
+        // Free variables only: `double(x: num) : x * 2` reads `x`, but `x`
+        // is `double`'s own parameter, not a global the caller depends on.
+        // Plain `collect_vars` doesn't know that — it would add `x` (and,
+        // for a function with a `let`-local like `clamp`'s `limited`, that
+        // too) to `out` as if it were a global read by every comp that
+        // calls `double`, which is wrong regardless of the blanket-removal
+        // issue fixed at this function's call site.
+        let mut bound: FxHashSet<Symbol> = func.params.iter().map(|(p, _)| *p).collect();
+        collect_free_vars(func.body.root(), &func.body.arena, &mut bound, out);
         let mut nested_calls: FxHashSet<Symbol> = FxHashSet::default();
         collect_calls(
             func.body.root(),
