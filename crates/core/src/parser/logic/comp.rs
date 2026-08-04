@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::core::errors::MizuError;
-use crate::core::types::{StringInterner, Symbol, VariableStore};
+use crate::core::types::{StringInterner, Symbol, Value, VariableStore};
 
 use super::ast::{ComputedBinding, Expr, ExprArena, MizuFunction};
 use super::lexer::{Cursor, assert_cursor_empty, leading_spaces, lex};
@@ -311,6 +311,22 @@ pub fn recompute_computed_bindings(
             candidates.extend(idxs.iter().copied());
         }
     }
+    // A binding with an empty `depends_on` (e.g. `comp greeting =
+    // greet("Mizu")` — every argument a literal, no variable read) never
+    // appears in `reverse_index` under any symbol, since that index is
+    // built entirely from `depends_on` sets. It would therefore never be
+    // reachable from `mutated` through the loop above, on the very first
+    // call (the "treat every global as mutated" initial pass) or any
+    // later one — nothing ever mutates *for* it, because it has nothing
+    // to depend on. Its value is truly constant once computed, so this
+    // only needs to add it once: `Value::Null` is otherwise unreachable
+    // for a bound comp (every non-error evaluation result is stored via
+    // `set_symbol` below), so it doubles as "not yet evaluated" here.
+    for (i, cb) in bindings.iter().enumerate() {
+        if cb.depends_on.is_empty() && matches!(store.evaluator.get_global(cb.name), Value::Null) {
+            candidates.insert(i);
+        }
+    }
 
     // Two budgets for the cascade: one for tainted comps, one for untainted.
     //
@@ -331,7 +347,11 @@ pub fn recompute_computed_bindings(
     let (mut spent_tainted, mut spent_untainted) = (0u64, 0u64);
     while let Some(i) = candidates.pop_first() {
         let cb = &bindings[i];
-        if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
+        // A binding with no dependencies has nothing to intersect `changed`
+        // with — `.any()` on an empty `depends_on` is vacuously `false`,
+        // which would otherwise skip it forever despite it being a
+        // deliberate candidate (see the zero-dependency seeding above).
+        if !cb.depends_on.is_empty() && !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
         // Spend from this binding's own pool, then bank what it used. The
@@ -401,7 +421,13 @@ pub(crate) fn recompute_computed_bindings_naive_scan(
     let budget = store.evaluator.max_instructions;
     let (mut spent_tainted, mut spent_untainted) = (0u64, 0u64);
     for cb in bindings {
-        if !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
+        // See the matching comment in `recompute_computed_bindings`: a
+        // no-dependency binding must still get a chance to run once (its
+        // `.any()` on an empty `depends_on` is vacuously `false`), gated
+        // the same way there — on it not having been evaluated yet.
+        let no_deps_pending = cb.depends_on.is_empty()
+            && matches!(store.evaluator.get_global(cb.name), Value::Null);
+        if !no_deps_pending && !cb.depends_on.iter().any(|dep| changed.contains(dep)) {
             continue;
         }
         // Spend from this binding's own pool, then bank what it used. The
