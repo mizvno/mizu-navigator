@@ -4,8 +4,9 @@
 //!
 //! All DNS queries are transmitted exclusively over TLS (RFC 7858, port 853).
 //! Plain UDP/TCP port-53 queries are **categorically forbidden**: every
-//! [`NameServerConfig`] in every pool uses [`Protocol::Tls`].  No cleartext
-//! DNS traffic can leak, preventing ISP NXDOMAIN hijacking and traffic analysis.
+//! [`NameServerConfig`] in every pool is built via `NameServerConfig::tls`,
+//! whose single connection is DNS-over-TLS. No cleartext DNS traffic can
+//! leak, preventing ISP NXDOMAIN hijacking and traffic analysis.
 //!
 //! ## Two-pool split-horizon routing
 //!
@@ -21,7 +22,7 @@
 //!
 //! ## Resilience within each pool
 //!
-//! Each pool's [`TokioAsyncResolver`] is built with all servers for that pool.
+//! Each pool's [`TokioResolver`] is built with all servers for that pool.
 //! Hickory's built-in connection manager queries servers in parallel (fastest-
 //! response strategy), handles per-server TLS reconnection, retry back-off, and
 //! failure isolation automatically — providing round-robin–style load distribution
@@ -32,9 +33,9 @@
 //! The `webpki-roots` Cargo feature is enabled on `hickory-resolver`.  Every TLS
 //! handshake is verified against the WebPKI root store embedded in the crate.  A
 //! DoT endpoint whose certificate chain is not trusted by a WebPKI root is
-//! rejected before any DNS payload is exchanged.  The per-entry `tls_dns_name`
-//! field carries the SNI hostname used for both the TLS `ClientHello` extension
-//! and certificate identity verification.
+//! rejected before any DNS payload is exchanged.  The per-entry SNI hostname
+//! passed to `NameServerConfig::tls` is used for both the TLS `ClientHello`
+//! extension and certificate identity verification.
 //!
 //! ## Special cases
 //!
@@ -63,8 +64,9 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 
 use hickory_resolver::{
-    TokioAsyncResolver,
-    config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts},
+    Resolver, TokioResolver,
+    config::{NameServerConfig, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
 };
 
 use crate::core::errors::MizuError;
@@ -149,7 +151,7 @@ pub fn select_pool_for_domain(domain: &str) -> DnsPool {
 
 /// Split-horizon DoT resolver for Mizu.
 ///
-/// Internally maintains two [`TokioAsyncResolver`] pools:
+/// Internally maintains two [`TokioResolver`] pools:
 /// * `primary` — Quad9 + Cloudflare, for ICANN domains.
 /// * `opennic` — OpenNIC Tier-2, for alternative TLDs.
 ///
@@ -157,8 +159,8 @@ pub fn select_pool_for_domain(domain: &str) -> DnsPool {
 /// Construct via [`build_dns_resolver`].
 #[derive(Clone)]
 pub struct MizuDnsResolver {
-    primary: TokioAsyncResolver,
-    opennic: TokioAsyncResolver,
+    primary: TokioResolver,
+    opennic: TokioResolver,
 }
 
 /// Mizu protocol port used on every `mizu://` server.
@@ -167,9 +169,11 @@ pub static MIZU_PORT: std::sync::LazyLock<u16> =
 
 /// Builds [`NameServerConfig`] entries for the given server list.
 ///
-/// Every entry uses [`Protocol::Tls`] and an explicit SNI hostname.
-/// The `tls_config` field is left `None` so hickory's internal `CLIENT_CONFIG`
-/// (populated from `webpki-roots`) provides certificate chain validation.
+/// Every entry is built via `NameServerConfig::tls` with an explicit SNI
+/// hostname, so its single connection is DNS-over-TLS. No explicit
+/// `rustls::ClientConfig` is supplied to the resolver builder, so hickory's
+/// default TLS config (populated from `webpki-roots`) provides certificate
+/// chain validation.
 ///
 /// Exposed as `pub(crate)` so tests can inspect the produced configs without
 /// constructing a full resolver.
@@ -178,17 +182,24 @@ pub(crate) fn build_nameserver_configs(servers: &[(&str, u16, &str)]) -> Vec<Nam
         .iter()
         .filter_map(|(ip_str, port, sni)| {
             let ip: IpAddr = ip_str.parse().ok()?;
-            let mut cfg = NameServerConfig::new(SocketAddr::new(ip, *port), Protocol::Tls);
-            cfg.tls_dns_name = Some((*sni).to_string());
+            let mut cfg = NameServerConfig::tls(ip, std::sync::Arc::from(*sni));
+            // `NameServerConfig::tls` defaults the connection to DoT's
+            // standard port 853, which is what every entry in
+            // `PRIMARY_DOT_SERVERS`/`OPENNIC_DOT_SERVERS` already uses — set
+            // explicitly rather than relied upon, so a future non-853 entry
+            // in that data doesn't silently resolve to the wrong port.
+            cfg.connections[0].port = *port;
             Some(cfg)
         })
         .collect()
 }
 
-fn build_resolver_from_pool(servers: &[(&str, u16, &str)]) -> TokioAsyncResolver {
-    let configs = build_nameserver_configs(servers);
-    let group = NameServerConfigGroup::from(configs);
-    let config = ResolverConfig::from_parts(None, vec![], group);
+fn build_resolver_from_pool(servers: &[(&str, u16, &str)]) -> TokioResolver {
+    // `ResolverConfig` is `#[non_exhaustive]`: no struct-literal construction
+    // from outside hickory-resolver, even with `..Default::default()`. Build
+    // the default (empty name server list) and mutate the public field.
+    let mut config = ResolverConfig::default();
+    config.name_servers = build_nameserver_configs(servers);
 
     let mut opts = ResolverOpts::default();
     // Per-server query timeout; hickory's parallel-query strategy returns as
@@ -201,7 +212,14 @@ fn build_resolver_from_pool(servers: &[(&str, u16, &str)]) -> TokioAsyncResolver
     // Never apply OS ndots / search-domain logic to `mizu://` host names.
     opts.ndots = 0;
 
-    TokioAsyncResolver::tokio(config, opts)
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .expect(
+            "TLS config for a static, hardcoded DoT server list (see PRIMARY_DOT_SERVERS/\
+             OPENNIC_DOT_SERVERS) — a build failure here is a startup-time configuration \
+             bug, not a runtime network condition",
+        )
 }
 
 /// Constructs the split-horizon [`MizuDnsResolver`] with both DoT pools.
@@ -245,22 +263,23 @@ pub(crate) async fn resolve_with_pool_fallback(
 /// Returns `false` for DNS-level errors (NXDOMAIN, SERVFAIL, etc.) — those are
 /// authoritative responses and must not trigger a pool retry.
 ///
-/// Matches on the strongly-typed [`hickory_resolver::error::ResolveErrorKind`]
-/// variants so the classification is immune to upstream changes in error message
+/// Matches on the strongly-typed [`hickory_resolver::net::NetError`] variants
+/// so the classification is immune to upstream changes in error message
 /// formatting.  Only `Timeout` and `Io` errors (connection-refused, network-
-/// unreachable, etc.) are transient; all other variants (including
-/// `NoRecordsFound`, `Message`, `Proto`) are authoritative.
+/// unreachable, etc.) are transient; every other variant — including
+/// `Dns` (NXDOMAIN, SERVFAIL, and other semantic DNS responses) and `Proto`
+/// — is authoritative.
 #[cfg(not(kani))]
 fn is_transient_dns_error(e: &MizuError) -> bool {
-    use hickory_resolver::error::ResolveErrorKind;
+    use hickory_resolver::net::NetError;
     use std::io::ErrorKind as IOKind;
 
     let MizuError::DnsError(re) = e else {
         return false;
     };
-    match re.kind() {
-        ResolveErrorKind::Timeout => true,
-        ResolveErrorKind::Io(io_err) => matches!(
+    match re.as_ref() {
+        NetError::Timeout => true,
+        NetError::Io(io_err) => matches!(
             io_err.kind(),
             IOKind::TimedOut
                 | IOKind::ConnectionRefused
@@ -418,11 +437,11 @@ pub async fn resolve_domain(
 /// [`resolve_domain`] re-checks the winner.
 ///
 /// Resolution errors are propagated as [`MizuError::DnsError`] (preserving the
-/// strongly-typed [`hickory_resolver::error::ResolveError`]) so that
+/// strongly-typed [`hickory_resolver::net::NetError`]) so that
 /// [`is_transient_dns_error`] can classify them by variant rather than by
 /// scraping formatted strings.
 async fn resolve_ip(
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     fqdn: String,
     port: u16,
 ) -> Result<SocketAddr, MizuError> {
@@ -430,7 +449,7 @@ async fn resolve_ip(
     let lookup = resolver.lookup_ip(fqdn.as_str()).await.map_err(|e| {
         tracing::debug!(domain = %bare, error = %e, "DoT lookup failed");
         #[cfg(not(kani))]
-        return MizuError::DnsError(e);
+        return MizuError::DnsError(Box::new(e));
         #[cfg(kani)]
         return MizuError::Network(e.to_string());
     })?;

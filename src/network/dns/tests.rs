@@ -62,13 +62,17 @@ fn all_opennic_servers_have_non_empty_sni() {
 
 // ── Required test: DoT-enforcement scan ─────────────────────────────────
 
-/// Scans every [`NameServerConfig`] in both pools and asserts that no entry
-/// uses [`Protocol::Udp`], [`Protocol::Tcp`], or port 53 (cleartext DNS).
+/// Scans every [`NameServerConfig`] in both pools and asserts that every one
+/// of its connections is DNS-over-TLS on a non-53 port with an SNI hostname
+/// set — no [`ProtocolConfig::Udp`], no [`ProtocolConfig::Tcp`], no port 53
+/// (cleartext DNS), no missing SNI.
 ///
 /// This test would catch any accidental introduction of a cleartext server
 /// into the server lists, regardless of how the list is constructed.
 #[test]
 fn test_strict_dot_enforcement() {
+    use hickory_resolver::config::ProtocolConfig;
+
     let all_configs: Vec<NameServerConfig> = build_nameserver_configs(PRIMARY_DOT_SERVERS)
         .into_iter()
         .chain(build_nameserver_configs(OPENNIC_DOT_SERVERS))
@@ -81,30 +85,36 @@ fn test_strict_dot_enforcement() {
 
     for cfg in &all_configs {
         assert!(
-            !matches!(cfg.protocol, Protocol::Udp | Protocol::Tcp),
-            "SECURITY VIOLATION: server {} uses cleartext DNS protocol {:?} \
-             — only Protocol::Tls is permitted",
-            cfg.socket_addr,
-            cfg.protocol
+            !cfg.connections.is_empty(),
+            "server {} has no connections configured",
+            cfg.ip
         );
-        assert_eq!(
-            cfg.protocol,
-            Protocol::Tls,
-            "server {} must use Protocol::Tls for DNS-over-TLS",
-            cfg.socket_addr
-        );
-        assert_ne!(
-            cfg.socket_addr.port(),
-            53,
-            "SECURITY VIOLATION: server {} is on port 53 (cleartext DNS) \
-             — DoT port 853 is required",
-            cfg.socket_addr
-        );
-        assert!(
-            cfg.tls_dns_name.is_some(),
-            "server {} has no SNI hostname; TLS certificate identity cannot be verified",
-            cfg.socket_addr
-        );
+        for conn in &cfg.connections {
+            assert!(
+                !matches!(conn.protocol, ProtocolConfig::Udp | ProtocolConfig::Tcp),
+                "SECURITY VIOLATION: server {} uses cleartext DNS protocol {:?} \
+                 — only ProtocolConfig::Tls is permitted",
+                cfg.ip,
+                conn.protocol
+            );
+            let ProtocolConfig::Tls { server_name } = &conn.protocol else {
+                panic!(
+                    "server {} must use ProtocolConfig::Tls for DNS-over-TLS, got {:?}",
+                    cfg.ip, conn.protocol
+                );
+            };
+            assert_ne!(
+                conn.port, 53,
+                "SECURITY VIOLATION: server {} is on port 53 (cleartext DNS) \
+                 — DoT port 853 is required",
+                cfg.ip
+            );
+            assert!(
+                !server_name.is_empty(),
+                "server {} has an empty SNI hostname; TLS certificate identity cannot be verified",
+                cfg.ip
+            );
+        }
     }
 }
 
@@ -150,16 +160,18 @@ fn test_dns_routing_by_tld() {
 /// secondary pool and returns the secondary pool's result without
 /// propagating an error to the caller.
 ///
-/// Uses synchronous mock futures and strongly-typed `ResolveError` values
+/// Uses synchronous mock futures and strongly-typed `NetError` values
 /// to avoid requiring live DNS infrastructure and to validate the typed
 /// error-classification path (no string scraping).
 #[tokio::test]
 async fn test_dns_resolver_failover() {
-    use hickory_resolver::error::{ResolveError, ResolveErrorKind};
+    use hickory_resolver::net::NetError;
 
     // Primary pool: simulate a connection timeout via the strongly-typed variant.
-    let timeout_err = ResolveError::from(ResolveErrorKind::Timeout);
-    let primary_fails = std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(timeout_err)));
+    let primary_fails =
+        std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(Box::new(
+            NetError::Timeout,
+        ))));
 
     // Secondary pool: returns a canned address immediately.
     let secondary_succeeds = std::future::ready(Ok::<SocketAddr, _>(SocketAddr::from((
@@ -184,14 +196,17 @@ async fn test_dns_resolver_failover() {
 /// a pool fallback — they are authoritative responses, not network failures.
 #[tokio::test]
 async fn test_nxdomain_is_not_retried() {
-    use hickory_resolver::error::{ResolveError, ResolveErrorKind};
+    use hickory_resolver::net::NetError;
 
     // Use a Message error to represent a non-transient DNS failure.
     // NoRecordsFound would be more precise but requires constructing a
     // hickory_proto Query struct; Message correctly exercises the "not
     // Timeout / not Io → no retry" gate.
-    let dns_err = ResolveError::from(ResolveErrorKind::Message("no records found (NXDOMAIN)"));
-    let primary_nxdomain = std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(dns_err)));
+    let dns_err = NetError::Message("no records found (NXDOMAIN)");
+    let primary_nxdomain =
+        std::future::ready(Err::<SocketAddr, _>(MizuError::DnsError(Box::new(
+            dns_err,
+        ))));
     let secondary_would_succeed = std::future::ready(Ok::<SocketAddr, _>(SocketAddr::from((
         [1, 1, 1, 1],
         *MIZU_PORT,
@@ -208,39 +223,37 @@ async fn test_nxdomain_is_not_retried() {
 
 // ── Task 3: is_transient_dns_error typed-matching unit tests ────────────
 
-/// `ResolveErrorKind::Timeout` must be classified as transient.
+/// `NetError::Timeout` must be classified as transient.
 #[test]
 fn is_transient_for_timeout_error() {
-    use hickory_resolver::error::{ResolveError, ResolveErrorKind};
-    let e = MizuError::DnsError(ResolveError::from(ResolveErrorKind::Timeout));
+    use hickory_resolver::net::NetError;
+    let e = MizuError::DnsError(Box::new(NetError::Timeout));
     assert!(
         is_transient_dns_error(&e),
-        "ResolveErrorKind::Timeout must be classified as transient"
+        "NetError::Timeout must be classified as transient"
     );
 }
 
-/// `ResolveErrorKind::Io(ConnectionRefused)` must be classified as transient.
+/// `NetError::Io(ConnectionRefused)` must be classified as transient.
 #[test]
 fn is_transient_for_io_connection_refused() {
-    use hickory_resolver::error::{ResolveError, ResolveErrorKind};
+    use hickory_resolver::net::NetError;
     let io_err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-    let e = MizuError::DnsError(ResolveError::from(ResolveErrorKind::Io(io_err)));
+    let e = MizuError::DnsError(Box::new(NetError::Io(std::sync::Arc::new(io_err))));
     assert!(
         is_transient_dns_error(&e),
         "Io(ConnectionRefused) must be classified as transient"
     );
 }
 
-/// `ResolveErrorKind::Message` (non-transient protocol error) must return false.
+/// `NetError::Message` (non-transient protocol error) must return false.
 #[test]
 fn is_not_transient_for_protocol_message_error() {
-    use hickory_resolver::error::{ResolveError, ResolveErrorKind};
-    let e = MizuError::DnsError(ResolveError::from(ResolveErrorKind::Message(
-        "no records found",
-    )));
+    use hickory_resolver::net::NetError;
+    let e = MizuError::DnsError(Box::new(NetError::Message("no records found")));
     assert!(
         !is_transient_dns_error(&e),
-        "ResolveErrorKind::Message must not be classified as transient"
+        "NetError::Message must not be classified as transient"
     );
 }
 

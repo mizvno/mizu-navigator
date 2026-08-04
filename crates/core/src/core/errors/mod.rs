@@ -108,14 +108,18 @@ pub enum MizuError {
     /// A DNS resolution error propagated from the DoT resolver.
     ///
     /// Unlike the generic [`Network`](Self::Network) variant, this carries the
-    /// strongly-typed [`hickory_resolver::error::ResolveError`] so that callers
-    /// can match on concrete [`hickory_resolver::error::ResolveErrorKind`] variants
-    /// instead of scraping formatted error strings.  The `#[from]` attribute
-    /// auto-generates `From<ResolveError> for MizuError`, enabling `?` propagation
-    /// in async DNS call sites without losing type information.
+    /// strongly-typed [`hickory_resolver::net::NetError`] so that callers
+    /// can match on concrete `NetError` variants instead of scraping
+    /// formatted error strings.  The `#[from]` attribute auto-generates
+    /// `From<NetError> for MizuError`, enabling `?` propagation in async DNS
+    /// call sites without losing type information. Boxed for the same reason
+    /// as `TypeError::expected` below: `NetError` (unlike the old
+    /// `ResolveError`) is a flat enum with several multi-word variants, and
+    /// this type must stay within the 32-byte bound asserted at the bottom
+    /// of this file.
     #[cfg(not(kani))]
     #[error("DNS error: {0}")]
-    DnsError(#[from] hickory_resolver::error::ResolveError),
+    DnsError(#[from] Box<hickory_resolver::net::NetError>),
 
     /// A runtime execution error (e.g. an invalid action evaluation).
     #[error("execution error: {0}")]

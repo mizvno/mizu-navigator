@@ -37,7 +37,7 @@ rand_chacha = "0.3"
 http = "1"
 
 [target.'cfg(not(kani))'.dependencies]
-hickory-resolver = { version = "0.24", default-features = false }
+hickory-resolver = { version = "0.26", default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
