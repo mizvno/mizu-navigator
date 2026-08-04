@@ -388,15 +388,16 @@ pub fn paint_node(
             let mut builder = ctx
                 .layout_cx
                 .ranged_builder(ctx.font_cx, &text_to_draw, 1.0, true);
-            let fallbacks = vec![
-                parley::style::FontFamilyName::named("Segoe UI"),
-                parley::style::FontFamilyName::named("Arial"),
-                parley::style::FontFamilyName::named("Meiryo"),
-                parley::style::FontFamilyName::named("Yu Gothic"),
-                parley::style::FontFamilyName::named("Hiragino Sans"),
+            // Embedded-only (see `render::embedded_fonts`): `SansSerif`
+            // always resolves to IBM Plex Sans, and per-script fallback
+            // (Han/Hangul/Arabic/...) is registered collection-wide there
+            // too, independent of which family was explicitly requested —
+            // so a named-font chain probing for OS-installed Latin/CJK
+            // faces (Segoe UI/Meiryo/Yu Gothic/Hiragino Sans) would never
+            // match anything and is unnecessary either way.
+            let font_family = parley::style::FontFamily::Single(
                 parley::style::FontFamilyName::Generic(parley::style::GenericFamily::SansSerif),
-            ];
-            let font_family = parley::style::FontFamily::List(std::borrow::Cow::Owned(fallbacks));
+            );
             builder.push_default(parley::style::StyleProperty::FontFamily(font_family));
             builder.push_default(StyleProperty::FontSize(font_size));
             builder.push_default(StyleProperty::Brush(text_color));

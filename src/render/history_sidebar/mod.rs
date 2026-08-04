@@ -566,23 +566,18 @@ fn build_text(
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<Color>,
 ) -> parley::Layout<Color> {
-    let fallbacks = if mono {
-        vec![
-            FontFamilyName::named("Consolas"),
-            FontFamilyName::named("Cascadia Code"),
-            FontFamilyName::named("Courier New"),
-            FontFamilyName::Generic(GenericFamily::Monospace),
-        ]
+    // Embedded-only (see `render::embedded_fonts`): the generic family
+    // always resolves to IBM Plex, so a named-font chain probing for
+    // OS-installed faces (Segoe UI/Consolas/Arial/...) would never match
+    // anything — there is no system font backend to match against.
+    let generic = if mono {
+        GenericFamily::Monospace
     } else {
-        vec![
-            FontFamilyName::named("Segoe UI"),
-            FontFamilyName::named("Arial"),
-            FontFamilyName::Generic(GenericFamily::SansSerif),
-        ]
+        GenericFamily::SansSerif
     };
     let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
-    builder.push_default(StyleProperty::FontFamily(FontFamily::List(
-        std::borrow::Cow::Owned(fallbacks),
+    builder.push_default(StyleProperty::FontFamily(FontFamily::Single(
+        FontFamilyName::Generic(generic),
     )));
     builder.push_default(StyleProperty::FontSize(font_size));
     builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(1.0)));

@@ -10,14 +10,13 @@ pub(super) fn build_chrome_text_layout(
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<vello::peniko::Color>,
 ) -> parley::Layout<vello::peniko::Color> {
-    let fallbacks = vec![
-        FontFamilyName::named("Consolas"),
-        FontFamilyName::named("Cascadia Code"),
-        FontFamilyName::named("Courier New"),
-        FontFamilyName::Generic(GenericFamily::Monospace),
-        FontFamilyName::Generic(GenericFamily::SansSerif),
-    ];
-    let font_family = FontFamily::List(std::borrow::Cow::Owned(fallbacks));
+    // Chrome text is embedded-only (see `render::embedded_fonts`): the
+    // generic `Monospace` family always resolves to IBM Plex Mono, so a
+    // named-font fallback chain probing for OS-installed monospace faces
+    // (Consolas/Cascadia Code/Courier New) would never match anything —
+    // there is no system font backend to match against.
+    let font_family =
+        FontFamily::Single(FontFamilyName::Generic(GenericFamily::Monospace));
     let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
     builder.push_default(StyleProperty::FontFamily(font_family));
     builder.push_default(StyleProperty::FontSize(CHROME_FONT_SIZE));
