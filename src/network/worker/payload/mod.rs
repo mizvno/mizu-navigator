@@ -5,6 +5,8 @@ use crate::core::errors::MizuError;
 use crate::core::types::Value;
 use crate::parser::logic::PayloadFormat;
 
+mod yaml;
+
 /// Returns the static `Content-Type` header value for the non-`Multipart`
 /// formats.
 ///
@@ -83,11 +85,7 @@ pub(super) async fn serialize_payload(
         }
         PayloadFormat::Yaml => {
             let json_val = crate::core::types::to_json(value)?;
-            serde_yaml_bw::to_string(&json_val)
-                .map(String::into_bytes)
-                .map_err(|e| {
-                    MizuError::Network(format!("request payload YAML serialisation failed: {e}"))
-                })
+            Ok(yaml::to_yaml_string(&json_val).into_bytes())
         }
         PayloadFormat::Text => match value {
             Value::String(s) => Ok(s.as_bytes().to_vec()),
