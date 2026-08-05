@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 611d0bc23ffed7a3caef97f2b0b868c55c2214cd4d4a0c9fff6b54b4c600c6e5 # shrinks to host = "]"
 cc 41dbe7fe1b90a09a256a17391519a3c14803894baf10d6a7ce6fb41542348378 # shrinks to host = "a/\t"
+cc fd55c0f896ca0883d52482a359d4cae8a729eb93a764737605adfe05d2edd887 # shrinks to host = "[é]"

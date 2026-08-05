@@ -108,7 +108,21 @@ fn is_wellformed_mizu_host(host: &str) -> bool {
     // else is a port. `[::1]:80` is caught by the trailing-text check.
     let unbracketed = match host.strip_prefix('[') {
         Some(rest) => match rest.strip_suffix(']') {
-            Some(inner) if !inner.is_empty() => inner,
+            // Brackets mean "IPv6 literal" and nothing else, so the contents
+            // must actually parse as one. Stripping the pair and then only
+            // scanning for forbidden bytes was not enough: `[é]` has no
+            // forbidden byte, so it was accepted here while `MizuUri::parse`
+            // (and `url`) rejected `mizu://[é]` for not being a valid
+            // address. That disagreement is precisely what
+            // `accepted_host_is_always_parseable` exists to catch — the
+            // choke point must never admit an origin the fetcher will read
+            // differently.
+            Some(inner) if !inner.is_empty() => {
+                if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                    return false;
+                }
+                inner
+            }
             _ => return false,
         },
         None => {
