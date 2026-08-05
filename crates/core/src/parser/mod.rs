@@ -65,7 +65,7 @@ pub use logic::{
     Action, BinOp, Expr, MizuFunction, NetworkMethod, RootTimer, TimerInterval, ValueType,
     evaluate, execute_action, parse_action, parse_action_with_urls, parse_logic, parse_root_timers,
 };
-pub use logic_worker::LogicWorker;
+pub use logic_worker::{resolve_endpoint_url, LogicWorker};
 pub use splitter::{Origin, ParsedSource, split_source, split_source_with_origin};
 pub use style::{
     MizuColor, MizuDimension, MizuFontFamily, MizuFontStyle, MizuOverflow, MizuTextAlign,

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rustc_hash::FxHashMap;
 
 use super::helpers::resolve_endpoint_url;
-use super::types::LogicWorkerTabState;
+use super::session::TabSession;
 use super::worker::LogicWorker;
 use crate::core::errors::MizuError;
 use crate::core::types::{StringInterner, Value, VariableStore};
@@ -416,4 +416,136 @@ fn run_logic_worker_depth_guard_child(ok_marker: &str) {
             println!("UNEXPECTED_RESULT: {other:?}");
         }
     }
+}
+
+// ── TabSession: the transport-free state machine ─────────────────────────────
+
+/// Builds a minimal `ReloadPayload` with the given click actions and timers.
+fn payload(
+    click_actions: HashMap<u32, Action>,
+    root_timer_actions: Vec<Action>,
+) -> crate::messages::ReloadPayload {
+    let mut interner = StringInterner::new();
+    let interner = interner.freeze();
+    crate::messages::ReloadPayload {
+        logic_fns: FxHashMap::default(),
+        click_actions,
+        submit_actions: HashMap::new(),
+        root_timer_actions,
+        interner,
+        initial_variables: Vec::new(),
+        url_registry: FxHashMap::default(),
+        document_domain: String::new(),
+        computed_bindings: Vec::new(),
+    }
+}
+
+fn navigate_action(url: &str) -> Action {
+    use crate::parser::logic::{Expr, ExprArena, ExprTree};
+    let mut arena = ExprArena::new();
+    let root = arena.alloc(Expr::Literal(Value::from(url)));
+    Action::Navigate {
+        url: ExprTree { arena, root },
+    }
+}
+
+/// The whole point of the refactor: a document can be driven to completion
+/// with no channel, no thread, and no `TabId` anywhere in sight.
+#[test]
+fn a_session_evaluates_without_any_transport() {
+    use crate::messages::UiEvent;
+
+    let mut click_actions = HashMap::new();
+    click_actions.insert(0u32, navigate_action("mizu://example.com/next"));
+
+    let mut session = TabSession::new();
+    let reload = session.apply_reload(payload(click_actions, vec![]));
+    assert!(
+        !reload.gesture,
+        "a document load is document agency, never a user gesture"
+    );
+
+    let response = session
+        .apply_event(UiEvent::Click { node_id: 0 })
+        .expect("a bound click must produce a response")
+        .expect("the navigate action must succeed");
+    assert!(matches!(
+        response.runtime_actions.as_slice(),
+        [RuntimeAction::Navigate { .. }]
+    ));
+}
+
+/// Gate G1 is derived inside `apply_event` from the event variant, so a
+/// transport cannot forge it by any means short of fabricating a `Click` —
+/// which only the UI layer can emit. This is the same invariant
+/// `gesture_is_per_event_not_ambient` pins through the mpsc shell, asserted
+/// one level down where the derivation actually happens.
+#[test]
+fn session_derives_gesture_from_the_event_variant() {
+    use crate::messages::UiEvent;
+
+    let mut click_actions = HashMap::new();
+    click_actions.insert(0u32, navigate_action("mizu://evil.example/"));
+
+    let mut session = TabSession::new();
+    session.apply_reload(payload(
+        click_actions,
+        vec![navigate_action("mizu://evil.example/")],
+    ));
+
+    let click = session
+        .apply_event(UiEvent::Click { node_id: 0 })
+        .expect("bound click responds")
+        .expect("action succeeds");
+    let timer = session
+        .apply_event(UiEvent::RootTimer { index: 0 })
+        .expect("bound timer responds")
+        .expect("action succeeds");
+
+    assert!(click.gesture, "a click is user agency");
+    assert!(
+        !timer.gesture,
+        "a timer is document agency and must never inherit a gesture"
+    );
+}
+
+/// An event that addresses nothing must produce no response at all, not an
+/// empty one. The pre-refactor loop sent nothing in these cases; collapsing
+/// them into `Some(Ok(empty))` would make the UI process a state update on
+/// every stray click.
+#[test]
+fn events_addressing_nothing_produce_no_response() {
+    use crate::messages::UiEvent;
+
+    let mut session = TabSession::new();
+    session.apply_reload(payload(HashMap::new(), vec![]));
+
+    assert!(
+        session.apply_event(UiEvent::Click { node_id: 99 }).is_none(),
+        "a click on a node with no binding must send nothing"
+    );
+    assert!(
+        session.apply_event(UiEvent::RootTimer { index: 7 }).is_none(),
+        "a timer index past the end must send nothing"
+    );
+    assert!(
+        session.apply_event(UiEvent::CloseTab).is_none(),
+        "CloseTab is the owner's business; a session cannot destroy itself"
+    );
+}
+
+/// `from_reload` is the one-shot constructor, equivalent to `new` +
+/// `apply_reload` with the initial update discarded.
+#[test]
+fn from_reload_produces_a_ready_session() {
+    use crate::messages::UiEvent;
+
+    let mut click_actions = HashMap::new();
+    click_actions.insert(3u32, navigate_action("mizu://example.com/x"));
+
+    let mut session = TabSession::from_reload(payload(click_actions, vec![]));
+    assert!(
+        session.apply_event(UiEvent::Click { node_id: 3 }).is_some(),
+        "the document must already be loaded"
+    );
 }
