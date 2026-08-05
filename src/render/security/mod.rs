@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod broker;
+
 use crate::core::storage::ValidatedDomain;
 use crate::core::types::{Value, VariableStore};
 use crate::network::{RuntimeAction, UiEvent};
