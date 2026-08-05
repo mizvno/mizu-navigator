@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 mizu-core = { path = "crates/core" }
+mizu-ipc  = { path = "crates/ipc" }
 thiserror = "2"
 nom = "7.1.3"
 tracing = "0.1.44"

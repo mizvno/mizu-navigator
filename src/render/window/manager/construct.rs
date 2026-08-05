@@ -170,7 +170,27 @@ impl MizuWindowManager {
                 #[cfg(feature = "insecure-dev")]
                 allow_insecure,
             );
-            crate::parser::logic_worker::LogicWorker::spawn(logic_worker_rx, logic_worker_tx)?;
+            // ── The multi-process cutover ────────────────────────────────
+            // Document logic now runs in sandboxed `mizu-worker` processes,
+            // one per tab, instead of the shared in-process `LogicWorker`
+            // thread. The router satisfies the identical channel contract
+            // (`Sender<(TabId, UiEvent)>` in, `Receiver<(TabId, Result<..>)>`
+            // out), so every event dispatch site and the idle-loop drain are
+            // untouched by the swap.
+            //
+            // The legacy `LogicWorker` is intentionally left compiling and
+            // reachable — see `render::security::broker::ActionOrigin` — so a
+            // human can fall back to it during GUI validation on native
+            // hardware by restoring the one line below:
+            //
+            //     crate::parser::logic_worker::LogicWorker::spawn(
+            //         logic_worker_rx, logic_worker_tx)?;
+            //
+            // Failing to start the router is fatal to construction rather
+            // than silently degrading to the in-process path: a browser that
+            // quietly stopped sandboxing documents would be strictly worse
+            // than one that refuses to open.
+            crate::worker_host::bridge::spawn_router(logic_worker_rx, logic_worker_tx)?;
         }
 
         // Embedded IBM Plex fonts only — no OS font-directory FFI backend.

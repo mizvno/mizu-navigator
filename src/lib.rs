@@ -34,3 +34,4 @@ pub use mizu_core::parser;
 /// Networking subsystem
 pub mod network;
 pub mod render;
+pub mod worker_host;
