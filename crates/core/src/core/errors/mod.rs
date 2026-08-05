@@ -134,6 +134,15 @@ pub enum MizuError {
     #[error("security violation: {0}")]
     SecurityViolation(String),
 
+    /// An IPC transport, framing, or shared-memory error that crossed the
+    /// process boundary between the main broker and the sandboxed worker.
+    ///
+    /// Stored as a `String` (not `Box<mizu_ipc::IpcError>`) to avoid a
+    /// circular crate dependency (`mizu-ipc` depends on `mizu-core`).
+    /// The display string carries full diagnostic context from `IpcError`.
+    #[error("IPC error: {0}")]
+    IpcError(String),
+
     /// Multiple parse errors collected in a single pass (style parser).
     ///
     /// The inner [`Vec`] contains every individual error found; the caller can

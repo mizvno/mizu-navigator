@@ -198,6 +198,43 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExprId(u32);
 
+impl ExprId {
+    /// Returns the raw 0-based index of this node in its owning [`ExprArena`].
+    ///
+    /// The index is meaningful only against the arena that produced this `ExprId`
+    /// (see [`ExprTree`]).  Used by the IPC serialization layer to encode the
+    /// arena as a flat `Vec<WireExpr>` + root index.
+    #[inline]
+    #[must_use]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+
+    /// Mints an `ExprId` from a raw index **without** checking that any arena
+    /// actually contains that node.
+    ///
+    /// # This weakens the type's core invariant
+    ///
+    /// Everywhere else in the codebase, an `ExprId` in hand proves the node
+    /// exists, because [`ExprArena::alloc`] is its only source. This
+    /// constructor is the one exception, and it exists for exactly one
+    /// caller: the IPC deserializer, which rebuilds an arena from a flat
+    /// `Vec<WireExpr>` whose nodes reference each other by index — including
+    /// *forward* references to nodes not yet allocated, so the ids cannot be
+    /// validated as they are minted.
+    ///
+    /// Any code path that mints ids this way **must** call
+    /// [`ExprArena::validate_references`] on the finished arena before
+    /// evaluating it. That call restores the invariant for the whole tree at
+    /// once; without it, a malicious or corrupt archive can produce an
+    /// `ExprId` that panics the evaluator on [`ExprArena::get`].
+    #[inline]
+    #[must_use]
+    pub fn from_index_unvalidated(index: u32) -> Self {
+        ExprId(index)
+    }
+}
+
 /// Owns every descendant node of one self-contained expression tree (a
 /// [`MizuFunction`] body, an [`Action`]'s expression, a [`ComputedBinding`]'s
 /// expression, ...) in one contiguous `Vec`, instead of one heap allocation
@@ -282,6 +319,140 @@ impl ExprArena {
     #[must_use]
     pub fn args(&self, start: u32, len: u32) -> &[ExprId] {
         &self.args_pool[start as usize..(start as usize + len as usize)]
+    }
+
+    /// Checks that every [`ExprId`] reachable in this arena — inside nodes and
+    /// in the shared argument pool — actually addresses a node this arena
+    /// owns, and that every `FunctionCall`'s `(args_start, args_len)` window
+    /// lies inside the pool.
+    ///
+    /// This is the counterpart to [`ExprId::from_index_unvalidated`]: an arena
+    /// rebuilt from untrusted bytes has no structural guarantee until this
+    /// returns `Ok`. After it does, indexing the arena with any `ExprId` it
+    /// contains cannot panic, which is precisely the invariant `alloc`-built
+    /// arenas get for free.
+    ///
+    /// Note this validates *references*, not *acyclicity*. A hand-built
+    /// archive can still describe a cycle (node 0 whose child is node 0);
+    /// that is caught by the evaluator's existing depth limit
+    /// (`MAX_EVAL_DEPTH`), not here, because a cycle is a non-termination
+    /// hazard rather than a memory-safety one.
+    ///
+    /// # Errors
+    ///
+    /// [`MizuError::ParseError`] naming the first out-of-range reference.
+    pub fn validate_references(&self) -> Result<(), MizuError> {
+        let node_count = self.nodes.len() as u32;
+        let pool_len = self.args_pool.len() as u32;
+
+        let check = |id: ExprId, what: &str, at: usize| -> Result<(), MizuError> {
+            if id.0 >= node_count {
+                return Err(MizuError::ParseError(format!(
+                    "arena node {at}: {what} references node {} but the arena \
+                     holds only {node_count} nodes",
+                    id.0
+                )));
+            }
+            Ok(())
+        };
+
+        for (at, node) in self.nodes.iter().enumerate() {
+            match node {
+                Expr::Literal(_) | Expr::Variable(_) => {}
+                Expr::Not(inner) => check(*inner, "operand", at)?,
+                Expr::BinaryOp { left, right, .. } => {
+                    check(*left, "left operand", at)?;
+                    check(*right, "right operand", at)?;
+                }
+                Expr::Let { value, body, .. } => {
+                    check(*value, "bound value", at)?;
+                    check(*body, "body", at)?;
+                }
+                Expr::IfElse {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    check(*condition, "condition", at)?;
+                    check(*then_expr, "then branch", at)?;
+                    check(*else_expr, "else branch", at)?;
+                }
+                Expr::FieldAccess { base, .. } => check(*base, "base", at)?,
+                Expr::FunctionCall {
+                    args_start,
+                    args_len,
+                    ..
+                } => {
+                    // Checked in u64 so a crafted `start + len` cannot wrap
+                    // back into range on 32-bit arithmetic.
+                    let end = u64::from(*args_start) + u64::from(*args_len);
+                    if end > u64::from(pool_len) {
+                        return Err(MizuError::ParseError(format!(
+                            "arena node {at}: FunctionCall args window \
+                             [{args_start}, {end}) exceeds the {pool_len}-entry \
+                             argument pool"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // The pool is shared, so validate it once as a whole rather than
+        // per-call: every entry must be a resolvable node regardless of which
+        // `FunctionCall` window happens to cover it.
+        for (at, id) in self.args_pool.iter().enumerate() {
+            if id.0 >= node_count {
+                return Err(MizuError::ParseError(format!(
+                    "argument pool entry {at} references node {} but the arena \
+                     holds only {node_count} nodes",
+                    id.0
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of nodes stored in this arena.
+    ///
+    /// Used by the IPC serialization layer to iterate nodes by index.
+    #[inline]
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns the number of entries in the shared argument pool.
+    ///
+    /// Used by the IPC serialization layer to serialize the pool as a flat
+    /// `Vec<u32>` of raw indices.
+    #[inline]
+    #[must_use]
+    pub fn args_pool_len(&self) -> usize {
+        self.args_pool.len()
+    }
+
+    /// Returns the raw index of the `i`-th argument pool entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.args_pool_len()`.
+    #[inline]
+    #[must_use]
+    pub fn args_pool_index(&self, i: usize) -> u32 {
+        self.args_pool[i].0
+    }
+
+    /// Resolves node at raw 0-based `index`.
+    ///
+    /// Panics if `index >= node_count()`.  Prefer the
+    /// [`Index<ExprId>`](std::ops::Index) impl for bounds-checked access with
+    /// a typed `ExprId`; this method exists only for the IPC serialization
+    /// path which iterates by integer index before IDs are available.
+    #[inline]
+    #[must_use]
+    pub fn get_by_index(&self, index: u32) -> &Expr {
+        &self.nodes[index as usize]
     }
 }
 
